@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/BreedingRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -122,7 +123,7 @@ void BreedingRegistry::ReadConfig(const std::filesystem::path& configPath)
     }
   }
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Breeding registry loaded {} prob entries, {} normal rewards, {} chance rewards, "
     "{} bonus entries, {} grade-probability rows",
     _failureCardProbs.size(),

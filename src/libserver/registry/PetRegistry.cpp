@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/PetRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -94,7 +95,7 @@ void PetRegistry::ReadConfig(const std::filesystem::path& configPath)
     _pets.try_emplace(petItemTid, info);
   }
 
-  spdlog::info("Pet registry loaded {} pets and {} eggs", _pets.size(), _eggs.size());
+  server::util::QuietLogInfo("Pet registry loaded {} pets and {} eggs", _pets.size(), _eggs.size());
 }
 
 EggInfo PetRegistry::GetEggInfo(server::data::Tid tid)

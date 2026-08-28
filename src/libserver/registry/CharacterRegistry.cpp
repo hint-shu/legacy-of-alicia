@@ -18,6 +18,7 @@
  **/
 
 #include <libserver/registry/CharacterRegistry.hpp>
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -56,7 +57,7 @@ void CharacterRegistry::ReadConfig(const std::filesystem::path& configPath)
 
   std::ranges::sort(_levelInfo, {}, &CharacterLevelInfo::level);
 
-  spdlog::info("Character registry loaded {} level entries", _levelInfo.size());
+  server::util::QuietLogInfo("Character registry loaded {} level entries", _levelInfo.size());
 }
 
 std::optional<CharacterLevelInfo> CharacterRegistry::GetLevelInfo(uint32_t level) const

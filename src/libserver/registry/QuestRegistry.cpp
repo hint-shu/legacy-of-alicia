@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/QuestRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -155,7 +156,7 @@ void QuestRegistry::ReadConfig(const std::filesystem::path& configPath)
     }
   }
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Quest registry loaded {} quests, {} rewards and {} reward point entries",
     _quests.size(),
     _rewards.size(),

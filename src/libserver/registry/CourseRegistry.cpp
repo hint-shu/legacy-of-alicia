@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/CourseRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -120,6 +121,30 @@ uint32_t ReadItemTypeInfo(
   return section["id"].as<uint32_t>();
 }
 
+//! LOA-fix (R68, backlog #5/#99): чтение деки спавна квестовых предметов.
+//! ★Ничего не возвращает, в отличие от соседей: у остальных секций ключ карты
+//! лежит в отдельном поле записи, а здесь запись кладётся в ВЕКТОР и ключ ей
+//! не нужен — `questDeckId` живёт внутри самой записи.
+void ReadQuestItemDeckInfo(
+  const YAML::Node& section,
+  Course::QuestItemDeck& questItemDeck)
+{
+  questItemDeck.questDeckId = section["questDeckId"].as<uint32_t>(0);
+  questItemDeck.questItemId = section["questItemId"].as<uint32_t>(0);
+  questItemDeck.spawnCount = section["spawnCount"].as<uint32_t>(0);
+
+  const auto spawnPointsSection = section["spawnPoints"]["collection"];
+  if (spawnPointsSection)
+  {
+    for (const auto& spawnPointSection : spawnPointsSection)
+    {
+      auto& spawnPoint = questItemDeck.spawnPoints.emplace_back();
+      spawnPoint.mapBlockId = spawnPointSection["mapBlockId"].as<MapBlockId>();
+      spawnPoint.deckId = spawnPointSection["deckId"].as<DeckId>();
+    }
+  }
+}
+
 } // namespace
 
 CourseRegistry::CourseRegistry()
@@ -207,12 +232,35 @@ void CourseRegistry::ReadConfig(
     }
   }
 
-  spdlog::info(
-    "Course registry loaded {} game modes, {} maps, {} deck items and {} item types",
+  // LOA-fix (R68, backlog #5/#99): ДЕКИ СПАВНА КВЕСТОВЫХ ПРЕДМЕТОВ.
+  // ★Секция НЕОБЯЗАТЕЛЬНА, и это осознанно: тот же реестр читают стенды и
+  // старые снимки конфига, а отсутствие квестовых деков — не ошибка
+  // конфигурации, а «этот мир их не раскладывает». Пустой список честно
+  // выключает всю ветку спавна (см. `RaceInstance::PrepareQuestItems`).
+  {
+    const auto questItemDeckInfosSection = coursesSection["questItemDeckInfo"];
+    if (questItemDeckInfosSection)
+    {
+      const auto collection = questItemDeckInfosSection["collection"];
+      if (collection)
+      {
+        for (const auto& questItemDeckInfoSection : collection)
+        {
+          auto& questItemDeck = _questItemDecks.emplace_back();
+          ReadQuestItemDeckInfo(questItemDeckInfoSection, questItemDeck);
+        }
+      }
+    }
+  }
+
+  server::util::QuietLogInfo(
+    "Course registry loaded {} game modes, {} maps, {} deck items, {} item types "
+    "and {} quest item decks",
     _gameModeInfo.size(),
     _mapBlockInfo.size(),
     _itemDeckInfo.size(),
-    _deckItemInfo.size());
+    _deckItemInfo.size(),
+    _questItemDecks.size());
 }
 
 const Course::GameModeInfo& CourseRegistry::GetCourseGameModeInfo(
@@ -249,6 +297,15 @@ const Course::ItemTypeInfo& CourseRegistry::GetDeckItemInfo(
   if (itemTypeInfo == _deckItemInfo.cend())
     throw std::runtime_error("Invalid item type ID");
   return itemTypeInfo->second;
+}
+
+//! LOA-fix (R68, backlog #5/#99): см. объявление в CourseRegistry.hpp.
+//! ★НЕ БРОСАЕТ, в отличие от соседей: «квестовых деков в конфиге нет» —
+//! законное состояние мира, а не запрос несуществующего id. Пустой вектор
+//! молча выключает раскладку.
+const std::vector<Course::QuestItemDeck>& CourseRegistry::GetQuestItemDecks() const
+{
+  return _questItemDecks;
 }
 
 } // namespace server::registry

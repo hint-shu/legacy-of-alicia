@@ -18,6 +18,7 @@
  **/
 
 #include <libserver/registry/ItemRegistry.hpp>
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -270,7 +271,7 @@ void ItemRegistry::ReadConfig(const std::filesystem::path& configDir)
     }
   }
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Item registry loaded {} items, {} packages and {} sets",
     _items.size(),
     _packages.size(),

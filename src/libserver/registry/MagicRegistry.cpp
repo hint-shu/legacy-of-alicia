@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/MagicRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -181,7 +182,7 @@ void MagicRegistry::ReadConfig(const std::filesystem::path& configPath)
     }
   }
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Magic registry loaded {} slot(s) ({} solo, {} team)",
     _slotInfo.size(),
     _soloPool.size(),

@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/registry/HorseRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -524,7 +525,7 @@ data::Tid HorseRegistry::GetRandomFaceForCoat(data::Tid coatTid)
   auto it = _facesByType.find(faceType);
   if (it == _facesByType.end() || it->second.empty())
   {
-    spdlog::warn("No faces configured for face type {} (coat {})", faceType, coatTid);
+    server::util::QuietLogWarn("No faces configured for face type {} (coat {})", faceType, coatTid);
     return data::InvalidTid;
   }
 

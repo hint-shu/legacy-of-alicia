@@ -116,7 +116,53 @@ struct Course
 
   struct ItemTypeInfo
   {
-    uint32_t magicSlot;
+    // LOA-fix (R63-2, round63, backlog #174): последнее поле реестров без
+    // инициализатора. Пересчёт по дереву: 241 поле с инициализатором, это —
+    // единственное без. Незанулённая память реестра уже давала у нас реальные
+    // дефекты (13-летняя инкубация от `hatchDuration`, бесплатный инкубатор от
+    // `incubatorSlots`), поэтому свойство «у КАЖДОГО поля есть значение»
+    // закрывается целиком, а не по мере проявления симптомов.
+    uint32_t magicSlot{0};
+  };
+
+  //! LOA-fix (R68, backlog #5/#99): ДЕКА СПАВНА КВЕСТОВЫХ ПРЕДМЕТОВ.
+  //!
+  //! Перенос клиентской таблицы `QuestItemDeckInfo` на сервер. Одна запись
+  //! отвечает на вопрос «какой квестовый предмет, на каких картах и в каком
+  //! количестве раскладывать гонщику, несущему соответствующий квест».
+  //!
+  //! ★ЧЕМ ОТЛИЧАЕТСЯ ОТ `DeckInfo`. Обычная дека — ОБЩИЙ для всех гонщиков
+  //! спавнер с респавном; квестовая — ПЕР-ГОНЩИКОВЫЙ набор предметов, зависящий
+  //! от того, какие квесты игрок сейчас несёт. На одной и той же точке карты у
+  //! двух игроков лежит РАЗНОЕ: дека 1002 на карте 1 обслуживает сразу два
+  //! квестовых предмета (QTemID 5 и 6), различить их общим спавнером нельзя
+  //! в принципе. Поэтому квестовые деки не попадают ни в
+  //! `GameModeInfo::usedDeckIds`, ни в `PrepareItemDecks`.
+  struct QuestItemDeck
+  {
+    //! Идентификатор деки (`QDeckID` клиентской таблицы).
+    uint32_t questDeckId{};
+    //! Идентификатор квестового предмета (`QTemID` клиентской таблицы).
+    //! ★ЭТО ЖЕ ЧИСЛО стоит в `Quest::functionValue` у квестов класса
+    //! `CollectDropItem` — сверено по всем 17 таким квестам в quests.yaml.
+    uint32_t questItemId{};
+    //! Сколько предметов выдаётся ОДНОМУ гонщику за ОДИН заезд (`SpawnCnt`).
+    uint32_t spawnCount{};
+
+    //! Точка спавна: карта + обычная дека, чьи координаты на этой карте
+    //! используются как места раскладки. Клиентский формат — «карта(дека)».
+    struct SpawnPoint
+    {
+      //! Карта, на которой действует эта точка.
+      MapBlockId mapBlockId{};
+      //! Дека, чьи координаты на карте используются. Это же число уходит
+      //! клиенту как `AcCmdRCCreateItem::itemType` и выбирает внешний вид
+      //! предмета (клиентская таблица `DeckItemParam`).
+      DeckId deckId{};
+    };
+
+    //! Точки спавна деки.
+    std::vector<SpawnPoint> spawnPoints;
   };
 
 };
@@ -136,6 +182,11 @@ public:
     DeckId deckId) const;
   [[nodiscard]] const Course::ItemTypeInfo& GetDeckItemInfo(
     DeckItemId itemTypeId) const;
+  //! LOA-fix (R68, backlog #5/#99): все деки спавна квестовых предметов.
+  //! ★Вектор, а не карта: единственный режим доступа — полный перебор с
+  //! отбором по `questItemId` и карте, ключ ни разу не нужен. Порядок
+  //! обхода = порядок в конфиге, то есть воспроизводимый.
+  [[nodiscard]] const std::vector<Course::QuestItemDeck>& GetQuestItemDecks() const;
 
 private:
   //! A collection of game mode infos.
@@ -146,6 +197,8 @@ private:
   std::unordered_map<DeckId, Course::DeckInfo> _itemDeckInfo;
   //! A collection of deck item infos.
   std::unordered_map<DeckItemId, Course::ItemTypeInfo> _deckItemInfo;
+  //! LOA-fix (R68, backlog #5/#99): деки спавна квестовых предметов.
+  std::vector<Course::QuestItemDeck> _questItemDecks;
  };
 
 }

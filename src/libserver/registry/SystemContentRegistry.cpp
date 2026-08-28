@@ -18,6 +18,8 @@
  **/
 
 #include "libserver/registry/SystemContentRegistry.hpp"
+#include "libserver/util/QuietLog.hpp"
+#include "libserver/util/AtomicFile.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -62,7 +64,7 @@ void SystemContentRegistry::ReadConfig(const std::filesystem::path& configPath)
     }
   }
 
-  spdlog::info("System content registry loaded {} parameters", _entries.size());
+  server::util::QuietLogInfo("System content registry loaded {} parameters", _entries.size());
 }
 
 void SystemContentRegistry::Save() const
@@ -83,8 +85,24 @@ void SystemContentRegistry::Save() const
     }
   }
 
-  std::ofstream fout(_configPath);
-  fout << root;
+  // LOA-fix (R58-11, round58, backlog #175): здесь не было даже проверки
+  // `is_open` — отказ открытия проходил молча, и конфиг оставался старым без
+  // единого следа. Через помощника он либо переписывается целиком, либо не
+  // трогается вовсе. Контракт «не бросать» сохранён: это путь сохранения
+  // настроек, а не данных игрока.
+  try
+  {
+    // ★Здесь YAML, а не JSON: `root` — это `YAML::Node`, и содержимое собирается
+    // тем же способом, каким его писал `operator<<`.
+    server::util::WriteFileAtomically(
+      _configPath, YAML::Dump(root), "System content file");
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Failed to save the system content registry '{}': {}",
+      _configPath.string(), x.what());
+  }
 }
 
 std::optional<int32_t> SystemContentRegistry::GetValue(uint32_t type) const
