@@ -77,6 +77,8 @@ add_library(alicia-libserver STATIC
         src/libserver/registry/PetRegistry.cpp
         src/libserver/registry/QuestRegistry.cpp
         src/libserver/registry/SystemContentRegistry.cpp
+        src/libserver/registry/AchievementRegistry.cpp
+        src/libserver/registry/CareSkillRegistry.cpp
         src/libserver/util/Locale.cpp
         src/libserver/util/Scheduler.cpp
         src/libserver/util/Stream.cpp
@@ -122,6 +124,7 @@ add_executable(alicia-server
         src/server/system/ItemSystem.cpp
         src/server/system/ModerationSystem.cpp
         src/server/system/OtpSystem.cpp
+        src/server/system/AchievementSystem.cpp
         src/server/system/QuestSystem.cpp
         src/server/system/RoomSystem.cpp
         src/server/system/MatchmakingSystem.cpp
