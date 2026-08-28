@@ -18,7 +18,10 @@
  **/
 
 #include "server/race/MagicSystem.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
+
+#include "libserver/util/Cleanup.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -29,6 +32,7 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/fmt/bin_to_hex.h>
 
+#include <atomic>
 #include <bitset>
 #include <ranges>
 
@@ -132,8 +136,11 @@ RaceNetworkHandler::RaceNetworkHandler(ServerInstance& serverInstance)
   _commandServer.RegisterCommandHandler<protocol::AcCmdCRRequestSpur>(
     [this](ClientId clientId, const auto& message)
     {
-      HandleRequestSpur(clientId, message);
-      HandleTeamGauge(clientId);
+      // LOA-fix (R57-3c, round57, backlog #195): хвост зовём ТОЛЬКО если шпора
+      // была своя. Пакет за бота обязан не дойти ни до шкалы, ни до чего-либо
+      // ещё — раньше это обеспечивал бросок, теперь обеспечивает контракт.
+      if (HandleRequestSpur(clientId, message))
+        HandleTeamGauge(clientId);
     });
 
   _commandServer.RegisterCommandHandler<protocol::AcCmdCRHurdleClearResult>(
@@ -268,11 +275,47 @@ RaceNetworkHandler::RaceNetworkHandler(ServerInstance& serverInstance)
     {
       HandleGameCreateClientItem(clientId, message);
     });
+
+  // LOA-fix (R44-5, #58/R1): вторая половина замера из R44-4. Ранч-коннект на
+  // время заезда закрыт, поэтому ВСЁ, что клиент репортит во время гонки
+  // (скорость, заносы, прыжки), приходит сюда, а не на ранч. Условия те же:
+  // только лог, троттл окном в секунду, никакого эффекта.
+  _commandServer.RegisterCommandHandler<protocol::AcCmdCRAchievementUpdateProperty>(
+    [this](ClientId clientId, const auto& message)
+    {
+      auto& clientContext = GetClientContext(clientId, false);
+      if (not clientContext.isAuthenticated)
+        return;
+
+      constexpr int64_t kAchievementProbeLinesPerSecond = 20;
+      static std::atomic<int64_t> probeWindowSecond{0};
+      static std::atomic<int64_t> probeWindowLines{0};
+
+      const auto nowSecond = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+      int64_t windowSecond = probeWindowSecond.load();
+      if (windowSecond != nowSecond
+        && probeWindowSecond.compare_exchange_strong(windowSecond, nowSecond))
+      {
+        probeWindowLines.store(0);
+      }
+      if (probeWindowLines.fetch_add(1) >= kAchievementProbeLinesPerSecond)
+        return;
+
+      server::util::QuietLogInfo(
+        "[achv-probe race] character {} event {} value '{}' ({} bytes, {}, {} dropped)",
+        clientContext.characterUid,
+        message.achievementEvent,
+        message.propertyValue,
+        message.propertyValue.size(),
+        message.isPropertyValueTerminated ? "nul-ok" : "NO-NUL",
+        message.rejectedPropertyValueBytes);
+    });
 }
 
 void RaceNetworkHandler::Initialize()
 {
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Race server listening on {}:{}",
     GetConfig().listen.address.to_string(),
     GetConfig().listen.port);
@@ -293,7 +336,7 @@ void RaceNetworkHandler::Tick()
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception ticking a race scheduler: {}", x.what());
+    server::util::QuietLogError("Exception ticking a race scheduler: {}", x.what());
   }
 
   std::scoped_lock lock(_raceInstancesMutex);
@@ -305,7 +348,7 @@ void RaceNetworkHandler::Tick()
     }
     catch (const std::exception& x)
     {
-      spdlog::error("Exception ticking a race scheduler: {}", x.what());
+      server::util::QuietLogError("Exception ticking a race scheduler: {}", x.what());
     }
   }
 }
@@ -402,7 +445,7 @@ void RaceNetworkHandler::HandleClientConnected(ClientId clientId)
 {
   _clients.try_emplace(clientId);
 
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Client {} connected to the race server from {}",
     clientId,
     _commandServer.GetClientAddress(clientId).to_string());
@@ -410,7 +453,14 @@ void RaceNetworkHandler::HandleClientConnected(ClientId clientId)
 
 void RaceNetworkHandler::HandleClientDisconnected(ClientId clientId)
 {
+  // LOA-fix (R50-6, round50, backlog #180): уборка гонки доходит до конца.
+  // `HandleLeaveRoom` бросает (комната, рассылки), а `_clients.erase` стоял
+  // после него — осиротевший контекст оставался с `roomUid` навсегда.
+  const util::RegistryEraser eraser{_clients, clientId};
+
   const auto& clientContext = GetClientContext(clientId, false);
+
+  bool roomLeaveSucceeded = true;
   if (clientContext.isAuthenticated)
   {
     std::unique_lock lock(_raceInstancesMutex);
@@ -418,21 +468,48 @@ void RaceNetworkHandler::HandleClientDisconnected(ClientId clientId)
     if (raceIter != _raceInstances.cend())
     {
       lock.unlock();
-      HandleLeaveRoom(clientId);
+      roomLeaveSucceeded = util::RunCleanupStep(
+        "race room leave",
+        clientId,
+        [&]()
+        {
+          HandleLeaveRoom(clientId);
+        });
     }
   }
 
   // If client had a P2dId, erase it from client map and release it from the pool
+  //
+  // ★ЭТОТ ШАГ НАМЕРЕННО ЗАВИСИМЫЙ, в отличие от прочих. Слепая изоляция здесь
+  // была бы хуже болезни: вернуть билет в пул, когда выход из комнаты НЕ
+  // удался, значит выдать тот же билет другому клиенту, пока комната всё ещё
+  // ссылается на прежнего. Видимая утечка билета честнее тихой коллизии,
+  // поэтому при осечке билет остаётся занятым — и мы говорим об этом в лог.
   if (_p2dIds.contains(clientId))
   {
-    // Erase client P2dId and release it
-    const race::P2dId p2dId = _p2dIds.at(clientId);
-    _p2dIds.erase(clientId);
-    _p2dIdPool.Release(p2dId);
+    if (roomLeaveSucceeded)
+    {
+      util::RunCleanupStep(
+        "race p2d ticket release",
+        clientId,
+        [&]()
+        {
+          // Erase client P2dId and release it
+          const race::P2dId p2dId = _p2dIds.at(clientId);
+          _p2dIds.erase(clientId);
+          _p2dIdPool.Release(p2dId);
+        });
+    }
+    else
+    {
+      server::util::QuietLogWarn(
+        "Keeping the p2d ticket of client {} reserved: its room leave failed, "
+        "so the room may still reference it",
+        clientId);
+    }
   }
 
-  spdlog::info("Client {} disconnected from the race server", clientId);
-  _clients.erase(clientId);
+  server::util::QuietLogInfo("Client {} disconnected from the race server", clientId);
 }
 
 void RaceNetworkHandler::DisconnectCharacter(data::Uid characterUid)
@@ -445,6 +522,32 @@ void RaceNetworkHandler::DisconnectCharacter(data::Uid characterUid)
   {
     // We really don't care.
   }
+}
+
+bool RaceNetworkHandler::IsCharacterLoadingRace(const data::Uid characterUid)
+{
+  if (characterUid == data::InvalidUid)
+    return false;
+
+  std::scoped_lock lock(_raceInstancesMutex);
+  for (auto& raceInstance : _raceInstances | std::views::values)
+  {
+    if (raceInstance.GetStage() != RaceInstance::Stage::Loading)
+      continue;
+
+    auto& racers = raceInstance.GetTracker().GetRacers();
+    const auto racerIter = racers.find(characterUid);
+    if (racerIter == racers.cend())
+      continue;
+
+    // State::Loading ставится в HandleStartRace вместе с AddRacer и снимается
+    // либо HandleLoadingComplete (Racing), либо TickLoading по дедлайну R11
+    // (Disconnected). То есть «true» здесь = «клиент грузит карту прямо сейчас».
+    return racerIter->second.state
+      == tracker::RaceTracker::Racer::State::Loading;
+  }
+
+  return false;
 }
 
 size_t RaceNetworkHandler::GetRoomCount()
@@ -480,6 +583,107 @@ uint16_t RaceNetworkHandler::GetOrCreateP2dId(ClientId clientId)
 
   _p2dIds.emplace(clientId, p2dId.value());
   return p2dId.value();
+}
+
+namespace
+{
+
+//! Ростер AI-соперников соло-заезда (R56, #61).
+//!
+//! ★Имена не выдуманы: они сверены с таблицами вождения САМОГО КЛИЕНТА.
+//! `logic_aiparam.lua` объявляет 21 блок `SAI_*Param`, и корейские имена в
+//! комментариях идут ровно этим порядком, поэтому индекс в списке и есть
+//! `personality`, которым клиент выбирает блок.
+//!
+//! Пока заведён только «обычный» тир. Апстрим захардкодил сложность и НЕ
+//! передавал её клиенту вовсе, а чем именно клиент выбирает тир — открытый
+//! вопрос (индекс внутри тира против Type из `AIParam.csv`). Списки easy/hard
+//! не заводим, пока это не проверено вживую: пустая заготовка честнее
+//! неработающего переключателя.
+constexpr const char* AiRacerNames[]{
+  "Karim", "Eden", "Warren", "Tien", "Dains", "Glen", "Meirin"};
+
+constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
+
+} // namespace
+
+bool RaceNetworkHandler::AcquireAiP2dIds(const size_t count)
+{
+  if (_aiP2dIds.size() >= count)
+    return true;
+
+  // Берём недостающее во ВРЕМЕННЫЙ набор: пока он не полон, взятое принадлежит
+  // не нам, а пулу, и обязано вернуться туда при первом же отказе.
+  std::vector<race::P2dId> acquired;
+  acquired.reserve(count - _aiP2dIds.size());
+
+  while (_aiP2dIds.size() + acquired.size() < count)
+  {
+    const std::optional<race::P2dId> p2dId = _p2dIdPool.Acquire();
+    if (not p2dId.has_value())
+    {
+      // Пул исчерпан. Возвращаем ВСЁ взятое в этой попытке: иначе каждая
+      // следующая попытка отъедала бы у живых клиентов ещё несколько id
+      // ради ростера, который всё равно не собрался.
+      for (const race::P2dId reserved : acquired)
+        _p2dIdPool.Release(reserved);
+      return false;
+    }
+
+    acquired.push_back(p2dId.value());
+  }
+
+  _aiP2dIds.insert(_aiP2dIds.end(), acquired.begin(), acquired.end());
+  return true;
+}
+
+void RaceNetworkHandler::SpawnAiRacers(RaceInstance& raceInstance)
+{
+  // ★ПОРЯДОК ВАЖЕН: сначала p2dId, потом oid. P2dId можно вернуть в пул, а oid
+  // вернуть НЕКУДА — счётчик трекера только растёт. Поэтому необратимый шаг
+  // делается последним и только тогда, когда обратимый уже удался.
+  if (not AcquireAiP2dIds(AiRacerCount))
+  {
+    // ★МЯГКИЙ ОТКАЗ, а не бросок. Соперники — украшение соло-заезда; ронять
+    // из-за них сам заезд нельзя. И ростер собирается либо целиком, либо
+    // никак: половина ботов в пакете — это половина ботов на трассе.
+    server::util::QuietLogWarn(
+      "The P2dId pool cannot supply {} AI racers; the solo race in room {} "
+      "will run without AI opponents",
+      AiRacerCount,
+      raceInstance.GetRoomUid());
+    return;
+  }
+
+  // ★Object id ботов выдаются ОДИН РАЗ НА КОМНАТУ и дальше переиспользуются —
+  // ровно так же, как трекер переиспользует id живого игрока. Свежий набор на
+  // каждый заезд сжигал бы по семь id за заезд, и `uint16_t`-счётчик обернулся
+  // бы примерно на девятитысячном заезде, выдав боту id живого игрока.
+  auto& aiOids = raceInstance.GetAiOids();
+  if (aiOids.empty())
+  {
+    aiOids.reserve(AiRacerCount);
+    for (size_t index = 0; index < AiRacerCount; ++index)
+      aiOids.push_back(raceInstance.GetTracker().ReserveOid());
+  }
+
+  auto& aiRacers = raceInstance.GetAiRacers();
+  aiRacers.reserve(AiRacerCount);
+
+  for (size_t index = 0; index < AiRacerCount; ++index)
+  {
+    aiRacers.push_back(RaceInstance::AiRacer{
+      .oid = aiOids[index],
+      .p2dId = _aiP2dIds[index],
+      .name = AiRacerNames[index],
+      .personality = static_cast<uint8_t>(index + 1),
+      .courseTime = tracker::InvalidCourseTime});
+  }
+
+  server::util::QuietLogDebug(
+    "Spawned {} AI racers for the solo race in room {}",
+    aiRacers.size(),
+    raceInstance.GetRoomUid());
 }
 
 RaceNetworkHandler::ClientContext& RaceNetworkHandler::GetClientContext(ClientId clientId, bool requireAuthorized)
@@ -518,6 +722,32 @@ RaceNetworkHandler::ClientContext& RaceNetworkHandler::GetClientContextByCharact
   }
 
   throw std::runtime_error("Character not associated with any client");
+}
+
+bool RaceNetworkHandler::IsAiRacerOfClientRace(
+  const ClientContext& clientContext,
+  const tracker::Oid oid) noexcept
+{
+  try
+  {
+    if (clientContext.roomUid == data::InvalidUid)
+      return false;
+
+    std::scoped_lock lock(_raceInstancesMutex);
+
+    const auto raceInstance = _raceInstances.find(clientContext.roomUid);
+    if (raceInstance == _raceInstances.cend())
+      return false;
+
+    return raceInstance->second.IsAiRacerOid(oid);
+  }
+  catch (...)
+  {
+    // Захват замка умеет бросить на системной ошибке. Пометка `noexcept`
+    // обязывает погасить это здесь; ответ «не бот» безопасен — обработка
+    // просто пойдёт прежним путём.
+    return false;
+  }
 }
 
 RaceInstance& RaceNetworkHandler::GetRaceInstance(
@@ -616,6 +846,85 @@ void RaceNetworkHandler::HandleEnterRoom(
 
   auto& raceInstance = raceInstanceIter->second;
 
+  // LOA-fix (R11-5a, round11, backlog #19 п.5): ШТАТНЫЙ ОТКАЗ ВО ВХОДЕ.
+  // ЕДИНСТВЕННАЯ реализация отказа входа в комнату; ею пользуются все пять
+  // веток: недоступная запись персонажа заходящего на апстримном логирующем
+  // доступе (R11-5c) и в петле ростера (R11-5), нет записи его лошади (R11-7b),
+  // переросший ответ (R11-4), гонщик так и не собрался (R11-5b).
+  // ★ ИНВАРИАНТ, РАДИ КОТОРОГО ЭТОТ ХЕЛПЕР СУЩЕСТВУЕТ: после ЛЮБОГО отказа
+  // член-список комнаты обязан совпадать с состоянием ДО попытки входа. Голый
+  // return в ветке отказа запрещён — он оставляет полудобавленного игрока
+  // (Room::AddPlayer отработал в начале обработчика), то есть призрака, который
+  // вечно занимает слот и никогда не станет ready, из-за чего комната больше
+  // никогда не сможет стартовать заезд.
+  // Зовётся, когда ростер нельзя собрать или отправить именно для ЗАХОДЯЩЕГО.
+  // Слать в этом случае EnterRoomOK нечем,
+  // а рассылать комнате EnterRoomNotify с пустым гонщиком нельзя: писатель
+  // упадёт на avatar.value() внутри write-supplier и Client::WriteLoop разорвёт
+  // соединение ВСЕМ получателям. Поэтому отвечаем заходящему тем же
+  // AcCmdCREnterRoomCancel, что и при «комната полна», и убираем занятый слот —
+  // иначе комната останется с призраком и никогда не удалится.
+  // ГДЕ ОН ОПРЕДЕЛЁН: сразу после взятия ссылки на raceInstance, то есть ВЫШЕ
+  // первого апстримного доступа к записи заходящего. Иначе ветка отказа по
+  // недоступной записи недостижима — Immutable бросает раньше неё (WARN третьей
+  // панели 2026-08-17).
+  // ВЫЗВАЛ — СРАЗУ return. Хелпер не рассчитан на повторный вызов и после него
+  // нельзя трогать ни raceInstance (ссылка могла быть инвалидирована erase'ом
+  // ниже), ни комнату (её могло не стать).
+  // МАСТЕРА НЕ ПЕРЕИЗБИРАЕМ — СОЗНАТЕЛЬНО. Хвост HandleLeaveRoom кроме уборки
+  // слота ещё и передаёт masterUid следующему игроку; здесь этого блока нет и он
+  // не нужен: masterUid проставляется ТОЛЬКО на inserted (первый вошедший в
+  // race-инстанс), заходящий в НЕПУСТУЮ комнату мастером быть не может, а отказ,
+  // который опустошает комнату, её тут же и удаляет вместе с инстансом. Условие
+  // корректности — однопоточная обработка команд (единственный io_context.run()).
+  // Если AddPlayer уедет под _raceInstancesMutex или появится второй поток
+  // обработки, сюда обязан приехать блок переизбрания мастера из HandleLeaveRoom,
+  // иначе комната останется без мастера и HandleStartRace никого не пустит.
+  const auto refuseRoomEntry = [this, clientId, &clientContext](
+    const char* reason)
+  {
+    // Ранний выход делает хелпер безопасным при повторном заходе: ниже он сам
+    // сбрасывает roomUid в InvalidUid, а GetRoomSystem().GetRoom() на
+    // несуществующей комнате БРОСАЕТ (RoomSystem: «Room does not exist»). No-op —
+    // это Room::RemovePlayer (erase по ключу), а не хелпер целиком, поэтому
+    // страховку ставим явно. Правило «после вызова — немедленный return» она НЕ
+    // отменяет, см. ★-блок в шапке раунда.
+    if (clientContext.roomUid == data::InvalidUid)
+      return;
+
+    server::util::QuietLogError(
+      "Refusing character {} entry to room {}: {}",
+      clientContext.characterUid,
+      clientContext.roomUid,
+      reason);
+
+    bool isRoomEmpty = false;
+    _serverInstance.GetRoomSystem().GetRoom(
+      clientContext.roomUid,
+      [&isRoomEmpty, characterUid = clientContext.characterUid](Room& room)
+      {
+        room.RemovePlayer(characterUid);
+        isRoomEmpty = room.GetPlayerCount() == 0;
+      });
+
+    // Хвост HandleLeaveRoom: опустевшая комната удаляется вместе с инстансом.
+    if (isRoomEmpty)
+    {
+      _serverInstance.GetRoomSystem().DeleteRoom(clientContext.roomUid);
+      _raceInstances.erase(clientContext.roomUid);
+    }
+
+    clientContext.roomUid = data::InvalidUid;
+
+    const protocol::AcCmdCREnterRoomCancel cancelResponse{};
+    _commandServer.QueueCommand<decltype(cancelResponse)>(
+      clientId,
+      [cancelResponse]()
+      {
+        return cancelResponse;
+      });
+  };
+
   // If the room instance was just created, set it up.
   if (inserted)
   {
@@ -626,25 +935,53 @@ void RaceNetworkHandler::HandleEnterRoom(
     });
   }
 
-  _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
+  // LOA-fix (R11-5c, round11, backlog #19 п.5): ЗАПИСЬ ЗАХОДЯЩЕГО ПРОВЕРЯЕМ
+  // ДО ЧТЕНИЯ, А НЕ ЛОВИМ БРОСОК.
+  // ЧТО БЫЛО НЕ ТАК: апстрим читал запись персонажа заходящего сразу, ради
+  // одной строки лога «has created/joined [Room]». Record::Immutable на
+  // недоступной записи бросает std::runtime_error (Record.hpp), а к этому
+  // моменту уже отработали Room::AddPlayer и try_emplace race-инстанса —
+  // исключение улетало в CommandServer («Unhandled exception handling command»)
+  // и оставляло в комнате полудобавленного игрока ПЛЮС свежесозданный инстанс.
+  // Ровно тот призрак #20, ради которого писан весь ★-инвариант отказа.
+  // ПОЧЕМУ ЭТО ВАЖНО ИМЕННО СЕЙЧАС: ветка «запись заходящего недоступна» в
+  // R11-5 (петля ростера) физически недостижима, пока этот доступ бросает
+  // раньше неё, — то есть без этого гарда инвариант на данном сценарии не
+  // держался вовсе (WARN третьей панели 2026-08-17).
+  // Условие ровно то же, что в R11-5, и лечение то же: штатный отказ во входе
+  // через refuseRoomEntry (слот снимается, опустевшая комната удаляется,
+  // клиенту уходит AcCmdCREnterRoomCancel) и немедленный return.
+  const auto joiningCharacterRecord =
+    _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid);
+
+  if (not joiningCharacterRecord.IsAvailable())
+  {
+    refuseRoomEntry(
+      "the character record of the joining player is unavailable "
+      "(upstream logging access)");
+    return;
+  }
+
+  joiningCharacterRecord.Immutable(
     [inserted, clientContext](const data::Character& character)
     {
       if (inserted)
-        spdlog::info("Player {} ({}) has created [Room {}]",
+        server::util::QuietLogInfo("Player {} ({}) has created [Room {}]",
           clientContext.userName,
           character.name(),
           clientContext.roomUid);
       else
-        spdlog::info("Player {} ({}) has joined [Room {}]",
+        server::util::QuietLogInfo("Player {} ({}) has joined [Room {}]",
           clientContext.userName,
           character.name(),
           clientContext.roomUid);
     });
 
-  // Todo: Roll the code for the connecting client.
-  // Todo: The response contains the code, somewhere.
-  _commandServer.SetCode(clientId, {});
-
+  // LOA-fix (R11-18, round11, backlog #19 п.1): сброс роллинг-кода ПЕРЕЕХАЛ
+  // отсюда вниз, вплотную к отправке AcCmdCREnterRoomOK. Здесь он стоял ДО
+  // сборки ростера, поэтому каждый наш отказ во входе уходил клиенту уже после
+  // ресета кода, и клиент с сервером расходились по _rollingCode (подробности —
+  // в комментарии операции R11-18 патчера и в ★-блоке шапки раунда).
   protocol::AcCmdCREnterRoomOK response{
     .isRoomWaiting = raceInstance.GetStage() == RaceInstance::Stage::Waiting,
     .uid = command.roomUid};
@@ -720,8 +1057,42 @@ void RaceNetworkHandler::HandleEnterRoom(
     // Fill data from the character record.
     const auto characterRecord = GetServerInstance().GetDataDirector().GetCharacter(
       characterUid);
+
+    // LOA-fix (R11-5, round11, backlog #19 п.5): битого участника ПРОПУСКАЕМ.
+    // Record::Immutable() на недоступной записи бросает std::runtime_error, а
+    // бросок отсюда стоит дорого: исключение ловится в CommandServer, и в
+    // результате заходящий не получает AcCmdCREnterRoomOK, а комната —
+    // AcCmdCREnterRoomNotify. Один игрок с неподгруженной записью (холодный кэш
+    // после рестарта) вешал вход в комнату ВСЕМ. Лучше отдать список без него.
+    // РАЗВИЛКА (правка после ревью панели 2026-08-17): «пропустить» законно
+    // только для ЧУЖОЙ записи. Если недоступна запись САМОГО заходящего, то
+    // joiningRacer останется пустым и уедет всей комнате — это разрыв соединения
+    // у всех (подробности в R11-5a). Такому входу отказываем целиком.
+    if (not characterRecord.IsAvailable())
+    {
+      if (characterUid == clientContext.characterUid)
+      {
+        refuseRoomEntry("the character record of the joining player is unavailable");
+        return;
+      }
+
+      server::util::QuietLogError(
+        "Character record {} is unavailable while building the room roster for "
+        "room {}; skipping this racer",
+        characterUid,
+        clientContext.roomUid);
+
+      response.racers.pop_back();
+      continue;
+    }
+
+    // LOA-fix (R11-7b, round11, backlog #19 п.5): ПРИГОДНОСТЬ ДАННЫХ ГОНЩИКА.
+    // Лямбда ниже не может ни пропустить участника, ни отказать во входе —
+    // поэтому она лишь выставляет флаг, а решение принимается сразу после неё.
+    bool isRacerDataUsable = true;
+
     characterRecord.Immutable(
-      [this, isPlayerReady, team, &protocolRacer](
+      [this, isPlayerReady, team, &protocolRacer, &isRacerDataUsable](
         const data::Character& character)
       {
         const auto& settingsRecord = GetServerInstance().GetDataDirector().GetSettings(character.settingsUid());
@@ -734,16 +1105,35 @@ void RaceNetworkHandler::HandleEnterRoom(
               {
                 // TODO: Add age here (find if it is even possible)
                 // todo: model constants
-                protocolRacer.gender =
-                  modelId == 10 ? protocol::Gender::Boy :
-                  modelId == 20 ? protocol::Gender::Girl :
-                  throw std::runtime_error("Character gender not recognised by model ID");
+                // LOA-fix (R11-6, round11, backlog #19 п.6): неизвестный modelId
+                // больше НЕ бросает. modelId по умолчанию 0
+                // (DataDefinitions.hpp), поэтому любой недосозданный или
+                // починенный DataRepair'ом персонаж ронял сборку ВСЕГО ростера
+                // комнаты — и вход подвисал не у него, а у того, кто заходит.
+                // protocol::Gender::Unspecified (=0) — легальное значение
+                // протокола, ровно для этого и заведено.
+                if (modelId == 10)
+                {
+                  protocolRacer.gender = protocol::Gender::Boy;
+                }
+                else if (modelId == 20)
+                {
+                  protocolRacer.gender = protocol::Gender::Girl;
+                }
+                else
+                {
+                  protocolRacer.gender = protocol::Gender::Unspecified;
+                  server::util::QuietLogWarn(
+                    "Character gender not recognised by model ID {}; "
+                    "sending Unspecified",
+                    modelId);
+                }
               }
             });
         }
         else
         {
-          spdlog::warn("Settings record for character {} was not found, skipping role/gender assignment...",
+          server::util::QuietLogWarn("Settings record for character {} was not found, skipping role/gender assignment...",
             character.uid());
         }
 
@@ -774,24 +1164,89 @@ void RaceNetworkHandler::HandleEnterRoom(
           protocolRacer.avatar->character, character);
 
         // Build the character equipment.
-        protocol::BuildProtocolItems(
-          protocolRacer.avatar->equipment,
-          *_serverInstance.GetDataDirector().GetItemCache().Get(
-            character.characterEquipment()));
+        // LOA-fix (R11-7, round11, backlog #19 п.2/3/5): ОДИН аппенд, с
+        // проверкой доступности и потолком длины.
+        // (п.2) Здесь был ВТОРОЙ аппенд из character.expiredEquipment() под
+        // комментарием «Build the mount equipment». Комментарий врал:
+        // protocol::Avatar имеет ровно один список equipment, сбруя после
+        // регрессии 79d32bd лежит в characterEquipment, а expiredEquipment —
+        // легаси-список horseEquipment (FileDataSource.cpp читает его из
+        // JSON-ключа "horseEquipment" с пометкой «todo: rename»). У старых
+        // сейвов он не пуст, поэтому аватар уезжал клиенту удвоенным — это один
+        // из трёх факторов переполнения клиентского буфера (#19).
+        // (п.5) DataStorage::Get(KeySpan) отдаёт nullopt, если хотя бы ОДИН
+        // предмет ещё не в кэше (типично сразу после рестарта), поэтому прежнее
+        // разыменование `*...Get(...)` было UB. Эталон проверки — лобби
+        // (LobbyNetworkHandler.cpp), но бросать здесь нельзя (см. R11-5),
+        // поэтому логируем и отдаём гонщика без экипировки.
+        // (п.3) Клиент показывает максимум 16 предметов экипировки (upstream
+        // issue #119), длина в протоколе пишется uint8_t. ЭТО СТРАХОВКА ОТ БИТЫХ
+        // ДАННЫХ, А НЕ СРЕДСТВО УДЕРЖАНИЯ ПАКЕТА ПОД 4096 (уточнено ревью панели
+        // 2026-08-17): экипировка слотовая — у персонажа шляпа/голова/тело/ноги/
+        // серьги, у лошади седло/подковы/протектор/щит, то есть до ~10 предметов,
+        // и до 16 список в норме не дорастает; protocol::Item — фиксированные 16
+        // байт без строк. Размер EnterRoomOK держат имена (EUC-KR, два байта на
+        // символ) и число гонщиков, а реальную экономию дал снятый двойной
+        // аппенд (п.2), а не этот потолок.
+        constexpr std::size_t MaxRacerEquipmentItems = 16;
 
-        // Build the mount equipment.
-        protocol::BuildProtocolItems(
-          protocolRacer.avatar->equipment,
-          *_serverInstance.GetDataDirector().GetItemCache().Get(
-            character.expiredEquipment()));
+        const auto equipmentItems = _serverInstance.GetDataDirector().GetItemCache().Get(
+          character.characterEquipment());
+        if (equipmentItems)
+        {
+          protocol::BuildProtocolItems(
+            protocolRacer.avatar->equipment,
+            *equipmentItems);
+
+          if (protocolRacer.avatar->equipment.size() > MaxRacerEquipmentItems)
+          {
+            server::util::QuietLogWarn(
+              "Character {} has {} equipment items, clamping to {} for the race "
+              "roster",
+              character.uid(),
+              protocolRacer.avatar->equipment.size(),
+              MaxRacerEquipmentItems);
+
+            protocolRacer.avatar->equipment.resize(MaxRacerEquipmentItems);
+          }
+        }
+        else
+        {
+          server::util::QuietLogError(
+            "Equipment items of character {} are not available yet; "
+            "sending the racer without equipment",
+            character.uid());
+        }
 
         const auto mountRecord = GetServerInstance().GetDataDirector().GetHorseCache().Get(
           character.mountUid());
-        mountRecord->Immutable(
-          [&protocolRacer](const data::Horse& mount)
-          {
-            protocol::BuildProtocolHorse(protocolRacer.avatar->mount, mount);
-          });
+        if (mountRecord)
+        {
+          mountRecord->Immutable(
+            [&protocolRacer](const data::Horse& mount)
+            {
+              protocol::BuildProtocolHorse(protocolRacer.avatar->mount, mount);
+            });
+        }
+        else
+        {
+          // LOA-fix (R11-7b, round11, backlog #19 п.5): БЕЗ ЛОШАДИ ГОНЩИКА НЕ
+          // ШЛЁМ (правка после ревью панели 2026-08-17). Раньше в этой ветке в
+          // пакете оставалась ДЕФОЛТНАЯ лошадь — uid 0, tid 0, пустая кличка, —
+          // то есть клиенту уезжала модель коня, которой не существует. Это
+          // ровно тот класс «плохих данных в EnterRoomOK», ради которого писан
+          // весь #19, а поведение клиента на несуществующем tid непроверено.
+          // Пустой список экипировки безопасен, отсутствующая лошадь — нет,
+          // поэтому помечаем гонщика непригодным: чужого пропустим (pop_back),
+          // заходящему откажем во входе (R11-5a). Симметрично R11-5.
+          server::util::QuietLogError(
+            "Mount {} of character {} is not available yet; "
+            "the racer cannot be put into the room roster",
+            character.mountUid(),
+            character.uid());
+
+          isRacerDataUsable = false;
+        }
 
         if (character.guildUid() != data::InvalidUid)
         {
@@ -828,18 +1283,210 @@ void RaceNetworkHandler::HandleEnterRoom(
           }
           else
           {
-            spdlog::warn("Character {} tried to load pet {} but it is not available.",
+            server::util::QuietLogWarn("Character {} tried to load pet {} but it is not available.",
               character.uid(),
               character.petUid());
           }
         }
       });
 
+    // LOA-fix (R11-7b, round11, backlog #19 п.5): гонщик с непригодными
+    // данными в пакет не попадает. Чужого просто вычёркиваем из ростера (лучше
+    // короткий список, чем модель коня, которой нет), а заходящему отказываем во
+    // входе штатным AcCmdCREnterRoomCancel — тем же путём, что и R11-5.
+    if (not isRacerDataUsable)
+    {
+      if (characterUid == clientContext.characterUid)
+      {
+        refuseRoomEntry("the mount record of the joining player is unavailable");
+        return;
+      }
+
+      response.racers.pop_back();
+      continue;
+    }
+
     if (characterUid == clientContext.characterUid)
     {
       joiningRacer = protocolRacer;
     }
   }
+
+  // LOA-fix (R11-5b, round11, backlog #19 п.5): ГОНЩИК НЕ СОБРАЛСЯ — ОТКАЗ ДО
+  // ЛЮБОГО ПАКЕТА О ВХОДЕ.
+  // Если joiningRacer так и не собрался (заходящего не оказалось в списке
+  // игроков комнаты — апстримный краевой случай), рассылать EnterRoomNotify
+  // нельзя: writer вызовет racer.avatar.value() и std::bad_optional_access из
+  // write-supplier обернётся End() — разрывом соединения у ВСЕХ получателей.
+  // ГДЕ СТОИТ И ПОЧЕМУ ИМЕННО ЗДЕСЬ (BLOCK-1 панели Codex T2 2026-08-17).
+  // Сразу за концом петли ростера: joiningRacer тут уже окончателен (последнее
+  // присваивание — в конце петли, ниже его никто не трогает), а клиенту ещё не
+  // ушло НИ ОДНОГО пакета о входе. Значит отказ уходит ДО замера размера
+  // (R11-4), ДО _commandServer.SetCode(clientId, {}) и ДО QueueCommand с
+  // AcCmdCREnterRoomOK. Прежняя редакция держала гард перед рассылкой notify,
+  // то есть ЗА уже отправленным OK: сработай он — клиент получил бы OK, а
+  // следом Cancel (пары терминалов, которой апстрим не производит никогда), плюс
+  // разошёлся бы с сервером по роллинг-коду, потому что SetCode уже отработал.
+  // Теперь ★ инвариант отказа держится и на этой ветке без всяких оговорок, а
+  // правило ★-блока «отказ обязан уходить до SetCode» выполняется без
+  // исключений.
+  // ОТКАЗЫВАЕМ ВО ВХОДЕ, А НЕ ПРОСТО ПРОПУСКАЕМ РАССЫЛКУ. Молчаливый выход
+  // оставлял бы призрака: Room::AddPlayer отработал в начале обработчика, слот
+  // занят, комната уже никогда не станет ready. refuseRoomEntry снимает слот
+  // (если он есть — erase по несуществующему uid это no-op), убирает опустевшую
+  // комнату и шлёт заходящему AcCmdCREnterRoomCancel. Так член-список комнаты
+  // после неудачной попытки входа совпадает с состоянием до неё.
+  // СТАТУС ЭТОЙ ВЕТКИ — АВАРИЙНЫЙ ГАРД АПСТРИМНОГО КРАЯ, А НЕ РАБОЧИЙ СЦЕНАРИЙ
+  // (уточнено третьей панелью 2026-08-17). Заходящий попадает в
+  // room.GetPlayers() синхронно, ещё в AddPlayer в начале обработчика, а все
+  // ранние отказы (R11-5, R11-5c, R11-7b) делают return ещё выше, — то есть на
+  // известных путях сюда не приходят. Но стоит гард теперь там, где его
+  // срабатывание не нарушает ни порядок пакетов, ни роллинг-код.
+  if (not joiningRacer.avatar.has_value())
+  {
+    server::util::QuietLogError(
+      "Room {}: the joining racer {} was not built, refusing the entry before "
+      "sending AcCmdCREnterRoomOK (broadcasting AcCmdCREnterRoomNotify with an "
+      "empty racer would drop the whole room)",
+      clientContext.roomUid,
+      clientContext.characterUid);
+
+    refuseRoomEntry("the joining player was not built into the room roster");
+    return;
+  }
+
+  // LOA-fix (R11-4, round11, backlog #19 п.1): ОТВЕТ, КОТОРЫЙ НЕ ВЛЕЗАЕТ В
+  // КЛИЕНТСКИЙ БУФЕР, НЕ ОТПРАВЛЯЕМ — И ОТКАЗЫВАЕМ ВО ВХОДЕ.
+  // ЧТО БЫЛО НЕ ТАК: исходящий путь размер не проверял вообще. AcCmdCREnterRoomOK
+  // несёт полные аватары всех игроков комнаты, а кириллица в никах/кличках/
+  // гильдиях уходит в EUC-KR по два байта на символ — поэтому у нас этот пакет
+  // перерастает клиентский приёмный буфер (protocol::BufferSize = 4096) там, где
+  // у англоязычного апстрима не перерастал. Переросток уходил молча и ронял
+  // ПРИНИМАЮЩИЙ клиент: «краш ровно у того, кто заходит в комнату» (#19).
+  // ПОЧЕМУ ПРОВЕРКА ЗДЕСЬ, А НЕ В CommandServer (BLOCK второй панели 2026-08-17).
+  // В write-supplier общей воронки записи нет ни комнаты, ни клиентского
+  // контекста. Отказ, принятый там, лечит клиент, но оставляет на сервере
+  // ПОЛУДОБАВЛЕННОГО игрока: Room::AddPlayer отработал в начале этого
+  // обработчика, clientContext.roomUid проставлен. Такой призрак вечно занимает
+  // слот, никогда не станет ready (CanRoomStart → NotAllPlayersReady, комната
+  // больше не стартует), да ещё и попадает в ростер СЛЕДУЮЩЕГО EnterRoomOK, то
+  // есть делает его ещё больше. Здесь же комната видна, поэтому отказ идёт через
+  // общий refuseRoomEntry и член-список комнаты возвращается ровно в то
+  // состояние, в котором был до попытки входа (★ инвариант отказа).
+  // КАК МЕРЯЕМ. Прогоняем готовый response через AcCmdCREnterRoomOK::Write в
+  // СКРЕТЧ-поток. Это чистая функция от response (const&), у реального пути
+  // записи свой SinkStream со своим курсором, поэтому замер ничего не портит и
+  // ничего не переупорядочивает. Скретч намеренно больше клиентского буфера: нам
+  // нужно УЗНАТЬ размер, а не уместить пакет.
+  // ЧТО ЕЩЁ ЛОВИТ ЭТОТ TRY. AcCmdCREnterRoomOK::Write бросает std::logic_error
+  // при > 10 гонщиков (RaceMessageDefinitions.cpp). Раньше этот бросок прилетал
+  // из write-supplier, Client::WriteLoop ловил его и вызывал End() — то есть РВАЛ
+  // соединение заходящему. Теперь он ловится здесь и превращается в штатный отказ.
+  // ПОЧЕМУ ПОРОГ СЧИТАЕТСЯ КАК payload + magic. Клиент читает в свой
+  // 4096-байтный буфер и заголовок, и нагрузку, поэтому «влезает» = payload плюс
+  // sizeof(MessageMagic) не больше protocol::BufferSize.
+  // EnterRoomNotify НЕ ПРОВЕРЯЕМ намеренно: он несёт ровно одного гонщика
+  // (~455 байт) и до 4096 физически не дотягивает — проверка была бы мёртвым кодом.
+  {
+    // Скретч-буфер заведомо больше и клиентского потолка (4096), и серверного
+    // MaxCommandDataSize (8192): переросток надо ИЗМЕРИТЬ, а не обрезать.
+    constexpr std::size_t EnterRoomOkProbeBufferSize = 16384;
+
+    // Мягкий порог: с него начинаем ПРЕДУПРЕЖДАТЬ, ещё ничего не отказывая.
+    // Зачем (замечание панели 2026-08-17): жёсткий потолок 4096 виден в логе
+    // ТОЛЬКО в момент отказа живому игроку, то есть узнать «насколько мы близко»
+    // можно было бы лишь постфактум, уже испортив кому-то вход. ~88% от потолка
+    // даёт запас примерно в одного гонщика (450-650 Б на человека по писателю
+    // WriteRacer), поэтому первый же прод-лог покажет распределение размеров
+    // ДО того, как порог начнёт стрелять. Это же измерение — вход для решения
+    // «4096 правда предел клиента или нет»: магазин штатно шлёт тому же клиенту
+    // куски по 7168 Б (ChunkSize в LobbyNetworkHandler), то есть универсальным
+    // 4096 не является, и предпосылка проверяется на стенде (см. смоук раунда 11
+    // в CHANGES.md).
+    constexpr std::size_t EnterRoomOkSoftLimit = 3600;
+
+    std::size_t responseCommandSize = 0;
+    bool isResponseSizeKnown = false;
+    bool doesResponseFitClientBuffer = false;
+
+    try
+    {
+      std::vector<std::byte> probeBuffer(EnterRoomOkProbeBufferSize);
+      SinkStream probeSink{std::span<std::byte>{probeBuffer}};
+
+      protocol::AcCmdCREnterRoomOK::Write(response, probeSink);
+
+      responseCommandSize = probeSink.GetCursor() + sizeof(protocol::MessageMagic);
+      isResponseSizeKnown = true;
+      doesResponseFitClientBuffer =
+        responseCommandSize <= static_cast<std::size_t>(protocol::BufferSize);
+    }
+    catch (const std::exception& serializationError)
+    {
+      // Либо ростер не влез даже в скретч, либо сработал апстримный logic_error
+      // на > 10 гонщиков. И то и другое означает «этот ответ отправить нельзя».
+      // РАЗМЕР ЗДЕСЬ НЕИЗВЕСТЕН, поэтому эта ветка — единственная, кто пишет про
+      // причину, и ниже мы её не дублируем строкой про «N байт» (NIT третьей
+      // панели: раньше следом печаталось «is 0 bytes … does not fit», то есть
+      // заведомая неправда ровно в самом интересном случае).
+      server::util::QuietLogError(
+        "Room {}: the AcCmdCREnterRoomOK roster for character {} with {} racers "
+        "cannot be serialized: {}; refusing the entry instead of crashing the "
+        "client",
+        clientContext.roomUid,
+        clientContext.characterUid,
+        response.racers.size(),
+        serializationError.what());
+
+      isResponseSizeKnown = false;
+      doesResponseFitClientBuffer = false;
+    }
+
+    if (not doesResponseFitClientBuffer)
+    {
+      // Про размер печатаем ТОЛЬКО когда он реально измерен; в catch-ветке
+      // причина уже напечатана выше.
+      if (isResponseSizeKnown)
+      {
+        server::util::QuietLogError(
+          "Room {}: the AcCmdCREnterRoomOK roster for character {} is {} bytes "
+          "with {} racers, which exceeds the client buffer of {} bytes; "
+          "refusing the entry instead of crashing the client",
+          clientContext.roomUid,
+          clientContext.characterUid,
+          responseCommandSize,
+          response.racers.size(),
+          static_cast<std::size_t>(protocol::BufferSize));
+      }
+
+      refuseRoomEntry("the room roster does not fit into the client buffer");
+      return;
+    }
+
+    // Ответ влезает, но уже подбирается к потолку — сообщаем заранее.
+    if (responseCommandSize > EnterRoomOkSoftLimit)
+    {
+      server::util::QuietLogWarn(
+        "Room {}: the AcCmdCREnterRoomOK roster for character {} is {} bytes "
+        "with {} racers, approaching the client buffer of {} bytes",
+        clientContext.roomUid,
+        clientContext.characterUid,
+        responseCommandSize,
+        response.racers.size(),
+        static_cast<std::size_t>(protocol::BufferSize));
+    }
+  }
+
+  // LOA-fix (R11-18, round11, backlog #19 п.1): СБРОС РОЛЛИНГ-КОДА — ТОЛЬКО НА
+  // УСПЕШНОМ ПУТИ. Апстримные две строки todo стояли выше по обработчику, ещё до
+  // сборки ростера, поэтому КАЖДЫЙ наш отказ во входе уходил клиенту уже после
+  // ресета _rollingCode: сервер на нуле, клиент — нет, и следующая команда
+  // клиента разбиралась чужим кодом («Malformed command … Bad command data size»
+  // в read-loop = разрыв). Апстримный отказ по «комната полна» кода не трогает,
+  // и наши теперь тоже: до этой точки доходит только успешный вход.
+  // Todo: Roll the code for the connecting client.
+  // Todo: The response contains the code, somewhere.
+  _commandServer.SetCode(clientId, {});
 
   _commandServer.QueueCommand<decltype(response)>(
     clientId,
@@ -875,12 +1522,143 @@ void RaceNetworkHandler::HandleChangeRoomOptions(
   const std::bitset<6> options(
     static_cast<uint16_t>(command.optionsBitfield));
 
+  // LOA-fix (R11-8, round11, backlog #19 п.4): КЛАМП ЧИСЛА ИГРОКОВ ДО 8 —
+  // ОДИН РАЗ И ДО МУТАЦИИ КОМНАТЫ. Лобби клампит на 8 при СОЗДАНИИ комнаты
+  // (LobbyNetworkHandler::MakeRoom), а смена опций принимала сырое uint8_t из
+  // пакета: модифицированный клиент ставил 9-10 и больше, комната пухла,
+  // AcCmdCREnterRoomOK рос вместе с ней, а на 11 гонщиках его writer бросал
+  // logic_error: в пине — прямо из write-supplier, то есть с разрывом соединения
+  // заходящему. Теперь тот же бросок перехватывает замер R11-4 в HandleEnterRoom
+  // и превращает в штатный отказ входа, но первопричину лечит именно этот кламп.
+  // Переменная заведена ЗДЕСЬ, а не внутри лямбды мутации (как было в первой
+  // редакции), потому что тем же числом обязан пользоваться и эхо-notify —
+  // иначе сервер держит 8, а все клиенты рисуют 10 пустых слотов (это нашла
+  // панель 2026-08-17). Notify ниже собирается из roomDetails, куда попадает
+  // ровно это значение.
+  constexpr uint8_t MaxRoomPlayerCount = 8;
+  const uint8_t clampedPlayerCount = std::min(
+    command.playerCount,
+    MaxRoomPlayerCount);
+
+  // LOA-fix (R11-16, round11, backlog #23): КАРТА — ТОЛЬКО ИЗ ПУЛА РЕЖИМА.
+  // Апстримный `// todo: validate command fields` выше — ровно про это: courseId
+  // клался из пакета как есть, и модифицированный клиент мог назначить комнате
+  // ЛЮБУЮ карту, включая ранчо и тестовые сцены без гоночной геометрии. Заезд на
+  // такой карте роняет клиент у ВСЕХ участников, а не только у автора.
+  // ПОЧЕМУ ПУЛ РЕЖИМА, А НЕ ВЕСЬ РЕЕСТР (правка после ревью панели 2026-08-17):
+  // первая редакция считала «карта известна CourseRegistry» достаточным
+  // условием, но в mapBlockInfo courses.yaml лежат 55 записей, среди которых
+  // ровно те, ради которых заведена задача #23 — 20000 'ranch_00', 20001
+  // 'readyroom01', 20002 'award', 610 'b_ranch_01', 35 'test_small', 44
+  // 'town_test01', 71 'b_tuto_test', 777 'test_bboo01', 879 'running_test'…
+  // Гоночные пулы заметно уже: mapPool режима Speed — 28 карт, Magic — 16.
+  // Авторитетен именно пул, поэтому сверяемся с ним.
+  // ПОЧЕМУ РЕЖИМ БЕРЁМ ИТОГОВЫЙ. Тот же пакет может менять и режим (бит 3), и
+  // карту (бит 4). Сверять карту с ТЕКУЩИМ режимом комнаты значит пропустить
+  // связку «переключи на Magic + поставь спид-карту». Считаем режим таким, каким
+  // он станет ПОСЛЕ применения этого же пакета (повторяя switch мутации ниже:
+  // неизвестный режим не применяется, значит и не участвует).
+  // ПОЧЕМУ РЕЖИМ БЕЗ ПУЛА = ОТКАЗ. В courses.yaml есть gameModeInfo только для
+  // 0/1/2; Guild (3) и Tutorial (6) реестру неизвестны, GetCourseGameModeInfo на
+  // них бросает. Такие комнаты и стартовать не могут (PrepareGameMode бросит то
+  // же исключение, Start() вернёт false), поэтому конкретную карту им не
+  // разрешаем — иначе через «сначала Guild + карта 20000, потом Speed» обход
+  // проверки становится тривиальным.
+  // Три псевдокурса (10000/10001/10002 = «все карты» / «новые» / «горячие»)
+  // обязаны проходить всегда: в CourseRegistry их НЕТ, они разворачиваются в
+  // случайную карту уже в RaceInstance::PrepareMap, и каждая комната создаётся
+  // именно с 10002 (LobbyNetworkHandler). Без этого исключения не стартовала бы
+  // ни одна комната.
+  // ЧТО ДЕЛАЕМ НА ОТКАЗЕ — НЕ голый return (это тоже находка панели): остальные
+  // биты применяются, у комнаты остаётся ПРЕЖНИЙ courseId, а notify в конце
+  // обработчика собирается из ФАКТИЧЕСКОГО roomDetails и уходит всем, включая
+  // инициатора. Клиент выбирает карту оптимистично, поэтому без notify его UI
+  // остался бы на отклонённой карте — то есть ранний return лечил бы краш
+  // рассинхроном, ровно тем, что чинит этот же батч.
+  bool isMapChangeAllowed = true;
+  if (options.test(4))
+  {
+    constexpr uint16_t AllMapsCourseId = 10000;
+    constexpr uint16_t NewMapsCourseId = 10001;
+    constexpr uint16_t HotMapsCourseId = 10002;
+
+    // Режим, который будет у комнаты ПОСЛЕ этого пакета.
+    registry::GameModeId resultingGameModeId{};
+    _serverInstance.GetRoomSystem().GetRoom(
+      clientContext.roomUid,
+      [&resultingGameModeId](Room& room)
+      {
+        resultingGameModeId = static_cast<registry::GameModeId>(
+          room.GetRoomDetails().gameMode);
+      });
+
+    if (options.test(3))
+    {
+      switch (command.gameMode)
+      {
+        case protocol::GameMode::Speed:
+          resultingGameModeId = static_cast<registry::GameModeId>(
+            Room::GameMode::Speed);
+          break;
+        case protocol::GameMode::Magic:
+          resultingGameModeId = static_cast<registry::GameModeId>(
+            Room::GameMode::Magic);
+          break;
+        case protocol::GameMode::Tutorial:
+          resultingGameModeId = static_cast<registry::GameModeId>(
+            Room::GameMode::Tutorial);
+          break;
+        default:
+          // Неизвестный режим мутация ниже не применит (там default пишет
+          // ERROR и оставляет прежний) — значит и здесь он ничего не меняет.
+          break;
+      }
+    }
+
+    bool isMapBlockAllowed =
+      command.mapBlockId == AllMapsCourseId
+      || command.mapBlockId == NewMapsCourseId
+      || command.mapBlockId == HotMapsCourseId;
+
+    if (not isMapBlockAllowed)
+    {
+      try
+      {
+        const auto& gameModeInfo = _serverInstance.GetCourseRegistry()
+          .GetCourseGameModeInfo(resultingGameModeId);
+
+        isMapBlockAllowed = std::ranges::contains(
+          gameModeInfo.mapBlockPool,
+          static_cast<registry::MapBlockId>(command.mapBlockId));
+      }
+      catch (const std::exception&)
+      {
+        // Режима нет в courses.yaml — сверять не с чем, карту не разрешаем.
+        isMapBlockAllowed = false;
+      }
+    }
+
+    if (not isMapBlockAllowed)
+    {
+      server::util::QuietLogWarn(
+        "AcCmdCRChangeRoomOptions: character {} requested map block {} outside "
+        "the map pool of game mode {} for room {}; keeping the current map and "
+        "applying the remaining options",
+        clientContext.characterUid,
+        command.mapBlockId,
+        resultingGameModeId,
+        clientContext.roomUid);
+
+      isMapChangeAllowed = false;
+    }
+  }
+
   if (options.test(0))
   {
     _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
       [&command, clientContext](const data::Character& character)
       {
-        spdlog::info("Room {}'s name changed by '{}' ('{}') to '{}'",
+        server::util::QuietLogInfo("Room {}'s name changed by '{}' ('{}') to '{}'",
           clientContext.roomUid,
           clientContext.userName,
           character.name(),
@@ -891,7 +1669,11 @@ void RaceNetworkHandler::HandleChangeRoomOptions(
   // Change the room options.
   _serverInstance.GetRoomSystem().GetRoom(
     clientContext.roomUid,
-    [&options, &command](Room& room)
+    // LOA-fix (R11-8 + R11-16b, round11): в захвате появились
+    // clampedPlayerCount (кламп посчитан ВЫШЕ, до мутации, чтобы им же
+    // пользовался эхо-notify) и isMapChangeAllowed (решение по карте принято
+    // выше, здесь оно только применяется).
+    [&options, &command, clampedPlayerCount, isMapChangeAllowed](Room& room)
     {
       auto& roomDetails = room.GetRoomDetails();
 
@@ -901,7 +1683,12 @@ void RaceNetworkHandler::HandleChangeRoomOptions(
       }
       if (options.test(1))
       {
-        roomDetails.maxPlayerCount = command.playerCount;
+        // LOA-fix (R11-8, round11, backlog #19 п.4): кладём КЛАМПНУТОЕ число.
+        // Обоснование и сам кламп — выше по обработчику. Уже сидящих в комнате
+        // это не выселяет: Room::AddPlayer лишь перестаёт пускать новых.
+        // Эхо-notify читает это же значение из roomDetails, поэтому сервер и
+        // клиенты показывают одно и то же количество слотов.
+        roomDetails.maxPlayerCount = clampedPlayerCount;
       }
       if (options.test(2))
       {
@@ -921,10 +1708,14 @@ void RaceNetworkHandler::HandleChangeRoomOptions(
             roomDetails.gameMode = Room::GameMode::Tutorial;
             break;
           default:
-            spdlog::error("Unknown game mode '{}'", static_cast<uint32_t>(command.gameMode));
+            server::util::QuietLogError("Unknown game mode '{}'", static_cast<uint32_t>(command.gameMode));
         }
       }
-      if (options.test(4))
+      // LOA-fix (R11-16b, round11, backlog #23): карта применяется, только если
+      // прошла проверку по пулу игрового режима (выше по обработчику).
+      // Отклонённая карта НЕ отбивает остальные опции пакета — комната просто
+      // остаётся на прежней, а notify ниже расскажет об этом всем клиентам.
+      if (options.test(4) && isMapChangeAllowed)
       {
         roomDetails.courseId = command.mapBlockId;
       }
@@ -934,14 +1725,34 @@ void RaceNetworkHandler::HandleChangeRoomOptions(
       }
     });
 
-  const protocol::AcCmdCRChangeRoomOptionsNotify notify{
-    .optionsBitfield = command.optionsBitfield,
-    .name = command.name,
-    .playerCount = command.playerCount,
-    .password = command.password,
-    .gameMode = command.gameMode,
-    .mapBlockId = command.mapBlockId,
-    .npcDifficulty = command.npcDifficulty};
+  // LOA-fix (R11-16c, round11, backlog #23 + #19 п.4): NOTIFY ИЗ СОСТОЯНИЯ
+  // КОМНАТЫ, А НЕ ИЗ ПОЛЕЙ ПАКЕТА.
+  // Апстрим пересылал клиентам ровно то, что прислал инициатор, и это работало
+  // только пока сервер применял пакет дословно. Теперь сервер вправе НЕ принять
+  // часть пакета — кламп числа игроков (R11-8) и отказ по карте (R11-16) — и
+  // эхо сырых полей развело бы UI всей комнаты с сервером: у всех 10 слотов при
+  // серверных 8, у инициатора выбранная тестовая карта при серверной прежней.
+  // Собираем notify из roomDetails ПОСЛЕ мутации: тогда сервер и клиенты сходятся
+  // по определению, а UI инициатора откатывается на то, что реально применилось.
+  // Биты optionsBitfield оставляем как пришли — иначе клиент просто не прочитает
+  // поле, которое мы и хотим откатить.
+  // Бонусом чинится и апстримный край: неизвестный gameMode (default в switch
+  // мутации) раньше уезжал клиентам как принятый, хотя комната его не приняла.
+  protocol::AcCmdCRChangeRoomOptionsNotify notify{
+    .optionsBitfield = command.optionsBitfield};
+
+  _serverInstance.GetRoomSystem().GetRoom(
+    clientContext.roomUid,
+    [&notify](Room& room)
+    {
+      const auto& roomDetails = room.GetRoomDetails();
+      notify.name = roomDetails.name;
+      notify.playerCount = static_cast<uint8_t>(roomDetails.maxPlayerCount);
+      notify.password = roomDetails.password;
+      notify.gameMode = static_cast<protocol::GameMode>(roomDetails.gameMode);
+      notify.mapBlockId = roomDetails.courseId;
+      notify.npcDifficulty = roomDetails.npcDifficulty;
+    });
 
   _serverInstance.GetRoomSystem().GetRoom(
     clientContext.roomUid,
@@ -972,11 +1783,113 @@ void RaceNetworkHandler::HandleChangeTeam(
 {
   const auto& clientContext = GetClientContext(clientId);
 
+  // LOA-fix (R66-5a, backlog #137): ГАРД ВЛАДЕНИЯ.
+  //
+  // До него ключ брался прямо из пакета и ничем не сверялся: любой клиент,
+  // сидящий в комнате ожидания, мог назвать идентификатор СОСЕДА и переставить
+  // его между командами — сервер послушно применял, а жертва узнавала об этом
+  // из notify, который ей же и рассылали.
+  //
+  // ★СРАВНИВАЕМ С `characterUid`, А НЕ С oid ГОНЩИКА. Соседний гард R57
+  // (`HandleRaceUserPos`: `command.oid != racer.oid`) выглядит готовым образцом,
+  // и здесь он НЕ РАБОТАЕТ: oid'ы раздаёт `RaceTracker::AddRacer` только на
+  // старте заезда, а в комнате ожидания их не существует вовсе — сравнивать
+  // было бы не с чем, и гард либо не сработал бы, либо отверг всех.
+  // Величина, которая тут реально ходит по проводу, — characterUid: ростер
+  // комнаты сервер САМ заполняет им (`protocolRacer.uid = character.uid()`,
+  // `HandleEnterRoom`), другого идентификатора игрока комнаты у клиента нет.
+  // ★Отсюда и имя поля `AcCmdCRChangeTeam.characterOid` — оно лжёт, несёт
+  // characterUid. Переименование сознательно НЕ делаем (обёртка зеркалит
+  // wire-имена клиента); пометка стоит у объявления поля.
+  //
+  // ★ОТКАЗ МОЛЧАЛИВЫЙ, И ЭТО ВЫБОР, А НЕ НЕДОДЕЛКА. Во-первых, такова уже
+  // существующая семантика отказа этого обработчика (ниже дословно: «No
+  // response needed, client does not change until it receives an OK») — без OK
+  // клиентский UI не двигается. Во-вторых, строка лога здесь была бы
+  // удалённо-управляемой: ровно этот класс дал 15 350 строк [error] за час
+  // живой игры и лечился в R57 (#195). Наблюдаемость гарда даёт ПОВЕДЕНИЕ
+  // (нет OK, нет notify, команда соседа не изменилась), а не запись в журнал.
+  if (command.characterOid != clientContext.characterUid)
+    return;
+
+  // LOA-fix (R66-5b, backlog #137): СТАДИЯ ПРОВЕРЯЕТСЯ ДО ВСЯКОЙ МУТАЦИИ.
+  //
+  // Раньше блок смены команды стоял ВЫШЕ этой проверки: вне комнаты ожидания
+  // изменение всё равно ПРИМЕНЯЛОСЬ к комнате, подавлялись только OK и notify.
+  // То есть сервер тихо расходился с тем, что видят все клиенты, и расхождение
+  // доживало до старта заезда, где состав команд читается из комнаты
+  // (`HandleStartRace` переносит `roomPlayer.GetTeam()` в трекер).
+  //
+  // ★ПОРЯДОК ЗАМКОВ ПРИ ПЕРЕНОСЕ НЕ МЕНЯЕТСЯ. Пара «_raceInstancesMutex →
+  // замок комнаты» уже берётся В ЭТОМ ЖЕ обработчике на успешном пути
+  // (`BroadcastExceptCharacterUid` → `RaceInstance::GetRoom` →
+  // `RoomSystem::GetRoom`), и в этом файле она берётся ещё на 19 участках
+  // (`HandleEnterRoom` ×5, `HandleLeaveRoom` ×4, `HandleStartRace` ×6,
+  // `HandleKickUser` ×2, `HandleAwardStart`, `HandleUserRaceItemGet`),
+  // тогда как обратной пары («замок комнаты → _raceInstancesMutex»)
+  // нет ни одной — ни прямо в лямбдах-потребителях `GetRoom`, ни через вызов
+  // метода, который берёт этот замок. До правки инверсии не было лишь потому,
+  // что замки не пересекались во времени; теперь порядок стал ЯВНЫМ и
+  // совпадает с господствующим в файле.
+  // ★Побочно чинится вторая половина того же дефекта: `GetRaceInstance` умеет
+  // бросить (комнаты нет / uid невалиден) — раньше бросок случался ПОСЛЕ
+  // мутации, то есть комната успевала измениться под исключение.
+  std::scoped_lock lock(_raceInstancesMutex);
+  const auto& raceInstance = GetRaceInstance(clientContext, false);
+
+  if (raceInstance.GetStage() != RaceInstance::Stage::Waiting)
+  {
+    // A racer tried to change teams when not in the waiting room
+    // No response needed, client does not change until it receives an OK
+    return;
+  }
+
+  // LOA-fix (R66-5c, backlog #137): НЕБРОСАЮЩИЙ ПОИСК ИГРОКА.
+  //
+  // `Room::GetPlayer` бросает `std::runtime_error("Room player does not
+  // exist")` на неизвестном ключе, а ключ приходил из пакета — удалённый
+  // клиент одной строкой вызывал исключение из-под замка комнаты.
+  //
+  // ★В КАКОМ СОСТОЯНИИ ОСТАВАЛАСЬ КОМНАТА (вопрос R49/R50) — ОТВЕТ: ЦЕЛОЙ, и
+  // это ровно тот вопрос, который нельзя было не задать. Бросок случался ДО
+  // единственной мутации (`SetTeam`), поэтому полуприменённого состояния не
+  // возникало; замок комнаты снимался раскруткой стека, потому что
+  // `RoomSystem::GetRoom` держит его через `scoped_lock` (RAII), а
+  // `_raceInstancesMutex` на тот момент ещё не был взят. Ущерб был не в порче
+  // состояния, а в том, что удалённый ввод порождал исключение и строку
+  // [error] «Unhandled exception handling command» на границе `CommandServer`.
+  // Заменяем на чистый отказ: ни исключения, ни ответа.
+  //
+  // ★ЧЕСТНО О ДОСТИЖИМОСТИ (NIT ревью, итерация 1 — прежнее обоснование здесь
+  // было ЛОЖНЫМ, и в этом проекте лживый комментарий сам по себе дефект, #139).
+  // Я утверждала, что клиент может стоять в `Room::_queuedPlayers` при уже
+  // выставленном `roomUid`. Это неверно: `HandleEnterRoom` вызывает
+  // `Room::AddPlayer` РАНЬШЕ присвоения `clientContext.roomUid`, а сам
+  // `AddPlayer` стирает запись очереди ДО вставки в `_players`; на пути
+  // «комната переполнена» roomUid вообще не присваивается.
+  // ПРОВЕРЕНО И НЕ НАЙДЕНО достижимой комбинации «roomUid валиден, гонка
+  // существует, а игрока в `_players` нет»: `Room::RemovePlayer` зовётся ровно
+  // из двух мест, и оба в том же обработчике гасят roomUid.
+  // ★ПОЭТОМУ ЭТО ЭШЕЛОНИРОВАНИЕ, А НЕ ЗАКРЫТИЕ ИЗВЕСТНОЙ ДЫРЫ, и оставлено
+  // сознательно: `Room::GetPlayer` бросает ПО КОНТРАКТУ, а этот обработчик не
+  // должен держаться на инварианте, который поддерживают три функции в стороне
+  // и которого никто не проверяет ([[total-invariant-beats-list-of-sites]]).
+  // Цена — одна проверка хеш-карты; цена ошибки в инварианте — исключение с
+  // удалённым триггером.
+  bool playerFound = false;
   _serverInstance.GetRoomSystem().GetRoom(
     clientContext.roomUid,
-    [&command](Room& room)
+    [&command, &clientContext, &playerFound](Room& room)
     {
-      auto& player = room.GetPlayer(command.characterOid);
+      if (not room.HasPlayer(clientContext.characterUid))
+        return;
+      playerFound = true;
+
+      // ★КЛЮЧ БЕРЁМ ИЗ КОНТЕКСТА СЕРВЕРА, А НЕ ИЗ ПАКЕТА. После гарда выше
+      // значения равны, поэтому поведение не меняется ни на байт; но код
+      // перестаёт зависеть от клиентского числа, и если гард когда-нибудь
+      // ослабнет, поиск всё равно не уйдёт на чужую строку.
+      auto& player = room.GetPlayer(clientContext.characterUid);
       switch (command.teamColor)
       {
         case protocol::TeamColor::Red:
@@ -989,15 +1902,16 @@ void RaceNetworkHandler::HandleChangeTeam(
       }
     });
 
-  std::scoped_lock lock(_raceInstancesMutex);
-  const auto& raceInstance = GetRaceInstance(clientContext, false);
-
-  if (raceInstance.GetStage() != RaceInstance::Stage::Waiting)
-  {
-    // A racer tried to change teams when not in the waiting room
-    // No response needed, client does not change until it receives an OK
+  // ★`default: {}` ВЫШЕ ОСТАВЛЕН КАК БЫЛ, И ЭТО ОСОЗНАННО. `TeamColor::Solo`
+  // равен `None` (= 0) и приходит легитимно, а сегодня такой запрос получает
+  // OK без мутации. Превратить его в отказ значило бы поменять УСПЕШНЫЙ путь
+  // ради пути отказа, не имея наблюдения о том, как на это реагирует
+  // настоящий клиент ([[dont-trade-success-path-for-failure-path]]). Поэтому
+  // `playerFound` означает «игрок в комнате нашёлся», а не «команда
+  // изменилась»: OK и notify уходят ровно в тех же случаях, что и до R66.
+  // Отдельная запись бэклога, не R66.
+  if (not playerFound)
     return;
-  }
 
   const protocol::AcCmdCRChangeTeamOK response{
     .characterOid = command.characterOid,
@@ -1034,7 +1948,7 @@ void RaceNetworkHandler::HandleLeaveRoom(ClientId clientId)
   _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
     [clientContext](const data::Character& character)
     {
-      spdlog::info("Player {} ({}) has left [Room {}]",
+      server::util::QuietLogInfo("Player {} ({}) has left [Room {}]",
         clientContext.userName,
         character.name(),
         clientContext.roomUid);
@@ -1124,7 +2038,7 @@ void RaceNetworkHandler::HandleLeaveRoom(ClientId clientId)
           newMasterCharacterName = character.name();
         });
 
-      spdlog::info("Player {} ({}) became the master of [Room {}] after the previous master left",
+      server::util::QuietLogInfo("Player {} ({}) became the master of [Room {}] after the previous master left",
         newMasterClientContext.userName,
         newMasterCharacterName,
         clientContext.roomUid);
@@ -1205,6 +2119,77 @@ void RaceNetworkHandler::HandleStartRace(
 
   std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext, false);
+
+  // LOA-fix (R8-1b, round8): ГАРД ПОВТОРНОГО СТАРТА (re-entrant StartRace).
+  // ЧТО БЫЛО НЕ ТАК: единственными проверками были «отправитель — мастер
+  // комнаты» и Room::CanRoomStart() (готовность игроков + баланс команд).
+  // Стадию самого заезда не смотрел никто, поэтому мастер мог прислать
+  // AcCmdCRStartRace ПОСРЕДИ заезда. Последствия две штуки:
+  //   1) Tracker::Clear() ниже сносил всех гонщиков, AddRacer заводил их заново
+  //      с finishCounted = false — латч идемпотентности финиша (R7 BLOCK-1)
+  //      обнулялся, и цикл StartRace → RaceFinal накручивал сюжетные счётчики
+  //      заездов (вместе с R8-1a это был полноценный эксплойт: метка старта
+  //      протухала, гейт правдоподобности B1 проходил мгновенно);
+  //   2) апстримный грифинг: Clear() посреди заезда выбивал остальных игроков
+  //      комнаты из трекера, и их пакеты падали в «Character is not a racer».
+  // ТЕПЕРЬ: стартовать можно только из Stage::Waiting — состояния «заезда нет».
+  // Оно восстанавливается штатно: TickFinishing зовёт Stop() и ставит Waiting.
+  // Честную игру не задевает — легальный StartRace приходит из комнаты, где
+  // предыдущий заезд уже завершён.
+  // Отвечаем существующим StartRaceCancel (Generic), а не throw: бросок здесь
+  // унёс бы соединение мастера из-за одного лишнего/дублированного пакета.
+  // LOA-fix (R11-15, round11, backlog #20 п.6): СМЯГЧЕНИЕ ГАРДА R8-1b —
+  // ПРЕДОХРАНИТЕЛЬ, А НЕ ОСНОВНОЕ ЛЕЧЕНИЕ.
+  // R8-1b (выше) закрыл re-entrant StartRace, но вместе с ним отнял апстримный
+  // аварийный рестарт застрявшей комнаты: любая комната вне Waiting становилась
+  // неразбираемой.
+  // ЧЕСТНАЯ ОЦЕНКА ПОЛЬЗЫ (уточнено ревью панели 2026-08-17). Конкретный залип,
+  // с которого начинали, — соло-комната без дедлайна — закрыт самим R11-14, и
+  // каждая стадия теперь самолечится за один Tick (Loading → Racing по
+  // дедлайну, Racing → Finishing, Finishing → Stop → Waiting), причём Tick
+  // прогоняется по ВСЕМ инстансам каждый тик. Так что эта ветка — не «расшивка
+  // соло-залипа», её больше нет, а СТРАХОВКА НА ОБЩИЙ СЛУЧАЙ: если самолечение
+  // Tick по какой-то причине не сработало (например, Tick стабильно бросает
+  // исключение на битой карте — RaceNetworkHandler::Tick его ловит и логирует,
+  // комната остаётся в своей стадии навсегда), у мастера остаётся способ
+  // разобрать комнату руками, не перезапуская сервер.
+  // Разрешаем старт, если стадия ПРОСРОЧИЛА собственный дедлайн с запасом.
+  // Инвариант раунда 8 сохраняется: пока заезд идёт нормально, Tracker::Clear()
+  // недостижим. Эксплойтом это не становится — один цикл стоил бы (лимит стадии
+  // + запас) реального времени, то есть минуты на каждую накрутку, и упирается
+  // в гейт правдоподобности B1 и в латч finishCounted.
+  // time_point::max() трактуем как «дедлайна нет» — просрочить его нельзя.
+  constexpr auto StuckRoomGracePeriod = std::chrono::seconds(30);
+
+  const bool isRaceInProgress =
+    raceInstance.GetStage() != RaceInstance::Stage::Waiting;
+  const auto stageDeadline = raceInstance.GetStageTimeoutTimePoint();
+  const bool isStageOverdue = isRaceInProgress
+    && stageDeadline != RaceInstance::Clock::time_point::max()
+    && RaceInstance::Clock::now() > stageDeadline + StuckRoomGracePeriod;
+
+  if (isStageOverdue)
+  {
+    server::util::QuietLogWarn(
+      "AcCmdCRStartRace: room {} is stuck at stage {} past its deadline; "
+      "allowing character {} to restart it",
+      clientContext.roomUid,
+      static_cast<uint32_t>(raceInstance.GetStage()),
+      clientContext.characterUid);
+  }
+
+  if (isRaceInProgress && not isStageOverdue)
+  {
+    server::util::QuietLogWarn(
+      "AcCmdCRStartRace: character {} tried to start room {} while a race is "
+      "already in progress (stage {}); ignoring",
+      clientContext.characterUid,
+      clientContext.roomUid,
+      static_cast<uint32_t>(raceInstance.GetStage()));
+
+    SendStartRaceCancel(clientId, protocol::AcCmdCRStartRaceCancel::Reason::Generic);
+    return;
+  }
 
   // Check if all race requirements are met to start the race
   data::Uid roomMasterUid{data::InvalidUid};
@@ -1319,6 +2304,30 @@ void RaceNetworkHandler::HandleStartRace(
       {
         auto& racer = raceInstance.GetTracker().AddRacer(characterUid);
         racer.state = tracker::RaceTracker::Racer::State::Loading;
+        // LOA-fix (R7 BLOCK-1, round7): явный сброс латча идемпотентности
+        // финиша. AddRacer и так отдаёт свежий Racer (Tracker::Clear() стоит
+        // выше по функции), но состояние заезда обязано инициализироваться там
+        // же, где ставится state — иначе любое будущее переиспользование
+        // трекера (пул гонщиков / рестарт заезда без Clear) тихо унесло бы
+        // квестовые счётчики в накрутку.
+        racer.finishCounted = false;
+        // LOA-fix (R24, #14 фаза 1): пер-заездная телеметрия обнуляется ЗДЕСЬ же,
+        // где ставится state — по той же причине, что finishCounted: переиспользование
+        // трекера без Clear() иначе тихо унесло бы чужой пробег в лошадь.
+        racer.topSpeedKph = 0.0f;
+        racer.distanceMetres = 0.0;
+        racer.hasPositionSample = false;
+        racer.lastPositionTimePoint =
+          std::chrono::steady_clock::time_point::max();
+        // LOA-fix (R-revenge, #13): состояние мести — пер-заездное, обнуляем
+        // ровно там же, где остальное состояние заезда (та же причина, что у
+        // finishCounted: переиспользование трекера без Clear() иначе перенесло
+        // бы чужие зачёты в следующий заезд = бесплатные морковки).
+        racer.trustedProgress = 0.0f;
+        racer.trustedProgressTimePoint =
+          std::chrono::steady_clock::time_point::max();
+        racer.revengeRows.clear();
+        racer.revengeCredits = 0;
         switch (roomPlayer.GetTeam())
         {
           case Room::Player::Team::Solo:
@@ -1333,6 +2342,30 @@ void RaceNetworkHandler::HandleStartRace(
         }
       }
     });
+
+  // LOA-fix (R68, backlog #5/#99): РАСКЛАДКА КВЕСТОВЫХ ПРЕДМЕТОВ.
+  // ★Место выбрано не «поближе». Раскладка обязана идти ПОСЛЕ `AddRacer`
+  // (иначе гонщиков ещё нет и класть предметы некому) и ДО первого прохода
+  // спавнеров: `TickItemSpawners` рассылает всё, что лежит в трекере, на
+  // ПЕРВОМ же тике — флаг `firstPassItemSpawn` после `Clear()` ещё поднят,
+  // и проверка близости на этом проходе не применяется. Оба условия
+  // выполняются ровно здесь.
+  raceInstance.PrepareQuestItems();
+
+  // === R56 (#61): соло-заезд получает AI-соперников ========================
+  // Отдельного игрового режима «Race Alone» в протоколе нет
+  // (`GameMode` = Speed / Magic / Unk4 / Tutorial), поэтому одиночество
+  // выводится из состава заезда. Считаем ПО ТРЕКЕРУ, а не по комнате: в
+  // трекере ровно те, кто реально поехал (наблюдатели и не готовые отсеяны
+  // выше). Обучение исключаем — там пустая трасса часть сценария.
+  {
+    const bool isSoloRace =
+      raceInstance.GetTracker().GetRacers().size() == 1
+      && parameters.gameMode != protocol::GameMode::Tutorial;
+
+    if (isSoloRace)
+      SpawnAiRacers(raceInstance);
+  }
 
   _serverInstance.GetRoomSystem().GetRoom(
     roomUid,
@@ -1354,6 +2387,15 @@ void RaceNetworkHandler::HandleStartRace(
       auto& raceInstance = raceInstanceIter->second;
       const auto& parameters = raceInstance.GetParameters();
 
+      // LOA-fix (R11-3c, round11, backlog #20 п.4): дедлайн загрузки взводим
+      // ЗДЕСЬ. Эта лямбда выполняется по истечении countdown комнаты и прямо
+      // ниже рассылает AcCmdCRStartRaceNotify — то есть это и есть момент,
+      // когда клиенты начинают грузить карту. Дедлайн, взведённый в
+      // RaceInstance::Start(), съедал длину countdown (дефолт 5310 мс) из
+      // бюджета загрузки, и «60 секунд» на деле были ~54.7. Теперь написанное в
+      // LoadingStageTimeout совпадает с реальностью при любом countdown с прода.
+      raceInstance.ArmLoadingDeadline();
+
       const auto& lobbyConfig = GetServerInstance().GetLobbyDirector().GetConfig();
       protocol::AcCmdCRStartRaceNotify notify{
         .raceGameMode = parameters.gameMode,
@@ -1361,7 +2403,12 @@ void RaceNetworkHandler::HandleStartRace(
         .raceMapBlockId = static_cast<uint16_t>(raceInstance.GetMapBlockId()),
         .p2pRelayAddress = lobbyConfig.advertisement.udpRaceRelay.address.to_uint(),
         .p2pRelayPort = lobbyConfig.advertisement.udpRaceRelay.port,
-        .raceMissionId = parameters.missionId,};
+        .raceMissionId = parameters.missionId,
+        // LOA-fix (S2): включаем per-race флаг травм — как в оригинальной игре.
+        // Эмулятор жёстко слал false → клиент считал травмы выключенными. true =
+        // клиент снова сам применяет свою логику травмированной лошади. Пара к
+        // серверному инфликту в RaceInstance::Stop и лечению в RanchDirector.
+        .isHorseInjuryEnabled = true,};
 
       // Build the racers.
       for (const auto& [characterUid, racer] : raceInstance.GetTracker().GetRacers())
@@ -1399,6 +2446,30 @@ void RaceNetworkHandler::HandleStartRace(
         }
       }
 
+      // === R56 (#61): боты в ростере старта ==============================
+      // Это ВЕСЬ контракт с клиентом по ботам: он водит их сам, ему достаточно
+      // увидеть их в ростере с признаком «это AI» и номером личности — дальше
+      // он берёт свою таблицу вождения и едет. Сервер за них не считает ни
+      // метра. Структура пакета не менялась: поля `unk2/unk3/unk6/unk7` уже
+      // были на проводе и до сих пор оставались нулями.
+      for (const auto& aiRacer : raceInstance.GetAiRacers())
+      {
+        notify.racers.emplace_back(
+          protocol::AcCmdCRStartRaceNotify::Player{
+            .oid = aiRacer.oid,
+            .name = aiRacer.name,
+            // 1 = «этот участник — AI, веди его сам».
+            .unk2 = 1,
+            // Номер личности внутри тира: выбор таблицы вождения.
+            .unk3 = aiRacer.personality,
+            .p2dId = aiRacer.p2dId,
+            .teamColor = protocol::TeamColor::None,
+            // Значения апстрима. Смысл полей не установлен, поэтому
+            // повторяем известное работающее, а не изобретаем своё.
+            .unk6 = 1,
+            .unk7 = 1});
+      }
+
       const bool isEligibleForSkills = (notify.raceGameMode == protocol::GameMode::Speed
         || notify.raceGameMode == protocol::GameMode::Magic)
         && notify.raceTeamMode == protocol::TeamMode::FFA;
@@ -1428,13 +2499,34 @@ void RaceNetworkHandler::HandleStartRace(
                     notify.raceGameMode == protocol::GameMode::Magic ? character.skills.magic() :
                       throw std::runtime_error("Unknown game mode");
 
+                  // LOA-fix (R11-10, round11, backlog #21): ФОЛБЭК ВМЕСТО БРОСКА.
+                  // Прежний тернарник бросал на любом activeSetId > 1. Бросок
+                  // отсюда стоит дорого: мы внутри отложенной лямбды
+                  // планировщика И внутри цикла рассылки по всем игрокам
+                  // комнаты — исключение обрывает цикл, и AcCmdCRStartRaceNotify
+                  // не получает ни виновник, ни все, кто стоял после него.
+                  // Комната зависает на загрузке целиком. R11-9 закрывает
+                  // источник, но в данных уже сохранённых персонажей значение 2
+                  // остаётся, поэтому нужен и приёмник.
+                  // В notify уходит УЖЕ исправленный id: иначе клиент получил бы
+                  // несуществующий у него набор.
+                  const auto activeSetId = skillSets.activeSetId <= 1
+                    ? skillSets.activeSetId
+                    : 0u;
+                  if (activeSetId != skillSets.activeSetId)
+                  {
+                    server::util::QuietLogWarn(
+                      "Character {} has an out-of-range active skill set {}; "
+                      "falling back to set 1",
+                      character.uid(),
+                      skillSets.activeSetId);
+                  }
+
                   // Get racer's active skill set ID and set it in notify
-                  notify.racerActiveSkillSet.setId = static_cast<uint8_t>(skillSets.activeSetId);
+                  notify.racerActiveSkillSet.setId = static_cast<uint8_t>(activeSetId);
 
                   const auto& skillSet =
-                    skillSets.activeSetId == 0 ? skillSets.set1 :
-                    skillSets.activeSetId == 1 ? skillSets.set2 :
-                    throw std::runtime_error("Invalid skill set ID");
+                    activeSetId == 1 ? skillSets.set2 : skillSets.set1;
 
                   // Slot 1, slot 2, bonus (calculated after)
                   notify.racerActiveSkillSet.skills[0] = skillSet.slot1;
@@ -1525,8 +2617,119 @@ void RaceNetworkHandler::HandleLoadingComplete(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
+  // LOA-fix (R11-12, round11, backlog #20 п.2): ГАРД СТАДИИ — ЧАСТЬ
+  // СТЕЙТ-МАШИНЫ, А НЕ АНТИЧИТ. ВЫПЛАТ НЕ КАСАЕТСЯ: ни наград, ни счётчиков
+  // квестов эта ветка не трогает, латч finishCounted (R7 BLOCK-1) живёт
+  // отдельно и здесь не читается.
+  // ЧТО БЫЛО НЕ ТАК: обработчик возвращал гонщика в Racing БЕЗУСЛОВНО — из
+  // любого его состояния и на любой стадии заезда. Опоздавший, которого
+  // TickLoading уже вычеркнул и о котором клиентам ушёл DeleteNotify (R11-11),
+  // тем самым «воскресал» посреди чужого заезда: сервер снова считал его
+  // участником и рассылал по нему LoadingCompleteNotify, а на клиентах его уже
+  // нет. Ровно отсюда расходятся ростеры.
+  // ЧТО РАЗРЕШЕНО ТЕПЕРЬ:
+  //   Stage::Loading — всё как раньше, это штатный путь;
+  //   Stage::Racing  — принимаем от того, кого ЕЩЁ НЕ вычеркнули. Так честный
+  //                    игрок, чей LoadingComplete пришёл на тик-другой позже
+  //                    перехода комнаты в Racing, не страдает — а именно за
+  //                    это в раунде 6 откатили прежний гард;
+  //   Finishing/Waiting — отбиваем: заезда для этого клиента уже нет.
+  const auto raceStage = raceInstance.GetStage();
+  const bool isLoadingCompleteAcceptable =
+    raceStage == RaceInstance::Stage::Loading
+    || (raceStage == RaceInstance::Stage::Racing
+      && racer.state != tracker::RaceTracker::Racer::State::Disconnected);
+
+  if (not isLoadingCompleteAcceptable)
+  {
+    server::util::QuietLogWarn(
+      "AcCmdCRLoadingComplete: character {} reported loading complete in room "
+      "{} at stage {} with racer state {}; ignoring to keep the roster "
+      "consistent",
+      clientContext.characterUid,
+      clientContext.roomUid,
+      static_cast<uint32_t>(raceStage),
+      static_cast<uint32_t>(racer.state));
+
+    // LOA-fix (R11-12b, round11, backlog #20 п.2): ОТБИТЬ — НЕ ЗНАЧИТ ПРОМОЛЧАТЬ
+    // (найдено панелью 2026-08-17). У AcCmdCRLoadingComplete нет ответного
+    // пакета, поэтому «просто return» оставлял опоздавшего висеть на экране
+    // загрузки: клиент ждёт отсчёта, а его для него уже не будет. Отвечаем тем
+    // же штатным AcCmdCRStartRaceCancel(Generic), что и TickLoading при
+    // вычёркивании (R11-11b), — это единственное в протоколе «заезд для тебя не
+    // состоится», и клиент выходит из загрузки сразу, а не через чужой заезд.
+    // НЕ ШЛЁМ ВТОРОЙ РАЗ (NIT второй панели 2026-08-17). Ровно одна комбинация
+    // означает «этому клиенту Cancel уже ушёл из TickLoading»: стадия Racing +
+    // состояние Disconnected + выданный oid — это в точности условие отправки в
+    // R11-11b (он шлёт тем, кого вычеркнул именно сейчас и у кого oid валиден).
+    // Тогда молчим: реакция клиента на повторный Cancel не проверена, а лишний
+    // диалог/двойной выход в лобби — видимый дефект. Во всех остальных ветках
+    // отбоя (стадии Finishing/Waiting) Cancel уходит, потому что там его никто
+    // не слал.
+    // ОСТАТОЧНЫЙ СЛУЧАЙ, ЗАФИКСИРОВАН ЧЕСТНО: гонщик мог стать Disconnected не
+    // от TickLoading, а от HandleLeaveRoom — тогда Cancel не слался, и мы его
+    // тоже не пошлём. Это безвредно: игрок уже вышел из комнаты сам, терминальный
+    // пакет ему не нужен.
+    const bool wasStartRaceCancelAlreadySent =
+      raceStage == RaceInstance::Stage::Racing
+      && racer.state == tracker::RaceTracker::Racer::State::Disconnected
+      && racer.oid != tracker::InvalidEntityOid;
+
+    if (not wasStartRaceCancelAlreadySent)
+    {
+      SendStartRaceCancel(
+        clientId,
+        protocol::AcCmdCRStartRaceCancel::Reason::Generic);
+    }
+
+    return;
+  }
+
   // Switch the racer to the racing state.
+  //
+  // LOA-fix (R66-3b, backlog #78, ИТЕРАЦИЯ 1 РЕВЬЮ): прежнее состояние
+  // запоминается ДО перезаписи — телеметрия ниже печатается только на
+  // НАСТОЯЩЕМ переходе «грузился → едет», см. её комментарий.
+  const auto previousRacerState = racer.state;
   racer.state = tracker::RaceTracker::Racer::State::Racing;
+
+  // LOA-fix (R66-3, backlog #78): сколько РЕАЛЬНО заняла загрузка у этого игрока.
+  //
+  // ★МАРКЕР `loaded` ЗДЕСЬ НЕ УКРАШЕНИЕ. Соседний путь — списание по дедлайну
+  // (`RaceInstance::TickLoading`) — печатает СВОЮ строку «did not load in time».
+  // Две ветки обязаны быть различимы В ТЕКСТЕ, иначе сводка перемешает «доехал за
+  // 4 секунды» и «не доехал вовсе, засчитан выбывшим» — и телеметрия соберёт
+  // мусор ровно в том месте, ради которого её и заводят.
+  //
+  // ★Новых полей не понадобилось: `_loadingStartTimePoint` в RaceInstance уже
+  // существует (им же считается дедлайн стадии), поэтому длительность берётся
+  // разностью, а не отдельным замером, который мог бы разъехаться с дедлайном.
+  //
+  // ★ПЕЧАТАЕМ ПЕРЕХОД, А НЕ ФАКТ ПРИЁМА ПАКЕТА (BLOCK ревью, итерация 1).
+  // Гард приёма выше СОЗНАТЕЛЬНО пускает `AcCmdCRLoadingComplete` и на стадии
+  // Racing — ради честного игрока, чей пакет опоздал на тик (R11-12). Значит
+  // клиент, уже перешедший в Racing, может слать этот пакет СКОЛЬКО УГОДНО РАЗ,
+  // и каждый повтор давал бы новую строку «loaded in» со всё бо́льшим временем.
+  // Это разом две беды: удалённо-управляемый флуд журнала (тот самый класс, что
+  // дал 15 350 строк за час и лечился в R57/#195) и отравление ИМЕННО ТОЙ
+  // сводки, ради которой строка и заводится, — «время загрузки» превратилось бы
+  // во «время с начала загрузки до последнего повтора».
+  // ★Условие `previousRacerState == Loading` даёт ровно одну строку на заезд на
+  // игрока: `Loading` ставится единожды в `HandleStartRace`, и первый же
+  // принятый LoadingComplete его снимает.
+  // ★Ветка `Disconnected → Racing` (ушедший вернулся, пока стадия Loading) не
+  // печатается намеренно: это не измерение загрузки, а воскрешение гонщика.
+  if (previousRacerState == tracker::RaceTracker::Racer::State::Loading)
+  {
+    const auto loadingElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - raceInstance.GetLoadingStartTimePoint());
+    server::util::QuietLogInfo(
+      "Room {}: racer {} (oid {}) loaded in {} ms",
+      raceInstance.GetRoomUid(),
+      clientContext.characterUid,
+      racer.oid,
+      loadingElapsed.count());
+  }
 
   // Snapshot mount stats so per-tick magic calculations don't hit the data store on every pos-update.
   GetServerInstance().GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
@@ -1592,6 +2795,17 @@ void RaceNetworkHandler::HandleLoadingComplete(
   const protocol::AcCmdCRLoadingCompleteNotify notify{
     .oid = racer.oid};
   this->Broadcast(raceInstance, notify);
+
+  // === R56 (#61): боты «догружаются» сразу ================================
+  // Серверный гейт старта их не ждёт — в трекере их нет, и это правильно. Но
+  // КЛИЕНТ ждёт отметку по каждому oid из ростера, который сам же получил, и
+  // без неё соло-заезд с ботами завис бы на экране загрузки до таймаута.
+  for (const auto& aiRacer : raceInstance.GetAiRacers())
+  {
+    const protocol::AcCmdCRLoadingCompleteNotify aiNotify{
+      .oid = aiRacer.oid};
+    this->Broadcast(raceInstance, aiNotify);
+  }
 
   // Egg spawning mechanism
 
@@ -1671,7 +2885,7 @@ void RaceNetworkHandler::HandleUserRaceFinal(
   {
     const std::chrono::hh_mm_ss raceTime{
       command.courseTime};
-    spdlog::debug("[{}] AcCmdUserRaceFinal: {} {} {}",
+    server::util::QuietLogDebug("[{}] AcCmdUserRaceFinal: {} {} {}",
       clientId,
       command.oid,
       didNotFinish
@@ -1688,21 +2902,491 @@ void RaceNetworkHandler::HandleUserRaceFinal(
   std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
+  // LOA-fix (R57-10, round57, backlog #195): «финишировал бот» — не финиш
+  // человека. Проверки владения здесь НЕТ ВООБЩЕ: `command.oid` уходит только
+  // в отладочную строку, а весь эффект применяется к отправителю. Без этого
+  // гарда первый же пакет финиша за бота защёлкнул бы человеку `finishCounted`,
+  // выставил ему courseTime, разослал времена ботов и засчитал сюжетные квесты.
+  // Времена ботов раунд 56 выставляет сам — на честном финише живого игрока.
+  if (raceInstance.IsAiRacerOid(command.oid))
+    return;
+
   // todo: sanity check for course time
-  // todo: address npc racers and update their states
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
+  // LOA-fix (batch1 task4, fix-round1; ПЕРЕДЕЛАНО R7 BLOCK-1, round7):
+  // идемпотентность засчёта финиша в СЮЖЕТНЫЕ счётчики заездов
+  // (11031/11035/11044/12021/14023/14025/14030).
+  // БЫЛО: `alreadyFinishing = (racer.state == Finishing)` — дедуп по состоянию
+  // гонщика.
+  // ПОЧЕМУ СЛОМАЛОСЬ: раунд 6 откатил гард C1, и HandleLoadingComplete снова
+  // ставит State::Racing БЕЗУСЛОВНО из любого состояния. Модифицированный
+  // клиент чередует AcCmdCRLoadingComplete → AcCmdUserRaceFinal: каждый раз
+  // состояние уходит из Finishing, alreadyFinishing == false, счётчик растёт.
+  // Гейт B1 это не ловит: он меряет время ОТ СТАРТА ЗАЕЗДА, которое только
+  // растёт — порог MinPlausibleCourseTime пройден один раз и навсегда.
+  // СТАЛО: латч racer.finishCounted (RaceTracker.hpp) — поле состояния ЗАЕЗДА,
+  // а не состояния гонщика. Ни один клиентский пакет его не сбрасывает; сброс
+  // только на старте заезда (Tracker::Clear + AddRacer + явный сброс в
+  // HandleStartRace).
+  // ПОЧЕМУ НЕ РАННИЙ `if (state == Finishing) return;`: он ломается ровно тем же
+  // чередованием (LoadingComplete вернул Racing → проверка пропускает), то есть
+  // эксплойт не закрывает, зато обрывает остальную обработку пакета (серверный
+  // кламп courseTime A3/B5 и рассылку AcCmdUserRaceFinalNotify) на честном
+  // дубле. Латч же дедуплицирует ровно то, что должно быть одноразовым.
+  // ⚠️ ВЫПЛАТ НЕ КАСАЕТСЯ: RaceInstance::Stop платит по scores/courseTime и это
+  // поле не читает — выплатной античит остаётся откаченным (раунд 6).
+  const bool alreadyFinishing = racer.finishCounted;
+  racer.finishCounted = true;
+
   racer.state = tracker::RaceTracker::Racer::State::Finishing;
-  racer.courseTime = didNotFinish
-    ? tracker::InvalidCourseTime
-    : static_cast<uint32_t>(command.courseTime.count());
+
+  // LOA-fix (A3, round3): courseTime приезжает В ПАКЕТЕ КЛИЕНТА и принимался как
+  // есть (в апстриме тут так и написано «todo: sanity check for course time»).
+  // По нему считаются призовые места (RaceInstance::Stop) и квестовые гейты
+  // (B1 и родственные), поэтому доверять ему нельзя: подложное время давало и
+  // первое место, и сюжетный прогресс.
+  // ⚠️ АКТУАЛЬНОСТЬ (раунды 6-7): «право на награду за заезд» этим клампом
+  // БОЛЬШЕ НЕ управляется. Выплатной античит (A1 / A3-множитель / B2 / C1)
+  // откачен раундом 6 как нерабочий — 2500 морковок и 420 опыта платятся по
+  // апстримному правилу, безусловно. Кламп остаётся ради рекордов, призовых
+  // мест и квестовых счётчиков. Не читать его как «деньги под защитой».
+  // Сервер знает фактическое время сам: _raceStartTimePoint — момент зелёного
+  // света, который сервер же и рассылает в AcCmdUserRaceCountdown, и клиентский
+  // таймер стартует ровно с этой метки. В честной игре расхождение — это
+  // задержка сети (десятки мс). Всё, что вышло за допуск, физически невозможно
+  // (нельзя ехать дольше, чем идёт заезд, и нельзя финишировать до старта) —
+  // в этом случае берём серверное измерение.
+  uint32_t finishCourseTime = static_cast<uint32_t>(command.courseTime.count());
+  if (not didNotFinish)
+  {
+    // LOA-fix (B5, round4): было 3000 мс. Честное расхождение — задержка
+    // сети (десятки мс; сотни на плохом канале), а трёхсекундное окно
+    // позволяло молча «подрезать» своё время и красть подиум. ТЮНИНГ: если в
+    // логе пойдут строки «reported course time … while the server measured …»
+    // у честных игроков, порог поднять.
+    constexpr int64_t CourseTimeToleranceMs = 1000;
+    const auto raceStartTimePoint = raceInstance.GetRaceStartTimePoint();
+    // LOA-fix (R15-1, quest-batch-2): ОДИН замер now() на обе ветки. Иначе
+    // проверка «финиш до старта» и вычисление elapsedMs смотрят на РАЗНЫЕ
+    // моменты времени, и на границе зелёного света можно получить
+    // отрицательный elapsedMs уже ПОСЛЕ пройденной проверки.
+    const auto nowTp = std::chrono::steady_clock::now();
+
+    // LOA-fix (R15-1, quest-batch-2): БЫЛО `if (raceStartTimePoint == max())`, а
+    // внутри `finishCourseTime = 0`. ДВЕ ошибки в одной ветке.
+    // (1) УСЛОВИЕ БЫЛО УЖЕ, ЧЕМ ДЫРА. Значение max() покрывает только окно между
+    //     RaceInstance::Start() и переходом Loading -> Racing (инвариант R8-1a).
+    //     Но метку старта TickLoading ставит В БУДУЩЕЕ:
+    //     `_raceStartTimePoint = now + seconds(mapBlockTemplate.waitTime)`
+    //     (RaceInstance.cpp ~883) — весь предстартовый отсчёт метка КОНЕЧНА и
+    //     лежит впереди. Заявленный финиш, присланный в это окно, уходил в ELSE,
+    //     где elapsedMs выходил ОТРИЦАТЕЛЬНЫМ, ветка `elapsedMs <= 0 ? 0u`
+    //     давала serverCourseTime == 0, и кламп записывал в finishCourseTime
+    //     ноль — ровно то, от чего эта правка и должна была защитить.
+    // (2) НОЛЬ — ЭТО САМОЕ БЫСТРОЕ ВОЗМОЖНОЕ ВРЕМЯ: RaceInstance::Stop раздаёт
+    //     призовые места по courseTime ПО ВОЗРАСТАНИЮ, то есть пакет «я уже
+    //     финишировал», присланный во время отсчёта, давал первое место.
+    // ТЕПЕРЬ обе двери закрыты ОДНИМ условием: финиш, заявленный ДО зелёного
+    // света (метка не выставлена ИЛИ сейчас раньше метки), физически невозможен
+    // и трактуется как НЕ ДОЕХАЛ — InvalidCourseTime, тот же маркер, что у
+    // честного DNF (его RaceInstance::Stop уже умеет ставить в конец таблицы).
+    // ЧЕСТНЫЙ ИГРОК НЕ ЗАДЕТ: его клиентский таймер стартует по
+    // AcCmdUserRaceCountdown, который сервер рассылает В ТОТ ЖЕ МОМЕНТ, когда
+    // ставит метку (TickLoading), — легального финиша раньше зелёного света не
+    // бывает.
+    // ЛАТЧ ФИНИША ТРОГАТЬ НЕ НАДО (проверено): racer.finishCounted и
+    // racer.state = Finishing выставляются ВЫШЕ по функции, ДО этого блока, и
+    // ровно так же — на любом честном DNF (didNotFinish == raceTrackProgress > 0,
+    // тоже поле клиентского пакета). То есть «финиш до старта» ведёт себя
+    // ИДЕНТИЧНО настоящему DNF, а не заводит третий вид состояния; подставить
+    // его можно только САМОМУ СЕБЕ — racer берётся по
+    // clientContext.characterUid, чужой заезд этим пакетом не испортить.
+    // ⚠️ ПАРНАЯ ОПЕРАЦИЯ — R15-2 НИЖЕ. InvalidCourseTime == UINT32_MAX, то
+    // есть он БОЛЬШЕ порога MinPlausibleCourseTime; без R15-2 эта правка
+    // закрыла бы кражу подиума, но открыла бы бесплатный сюжетный прогресс.
+    if (raceStartTimePoint == std::chrono::steady_clock::time_point::max()
+        || nowTp < raceStartTimePoint)
+    {
+      server::util::QuietLogWarn(
+        "AcCmdUserRaceFinal: character {} reported a finish before the race has "
+        "started; the finish is treated as a DNF",
+        clientContext.characterUid);
+      finishCourseTime = tracker::InvalidCourseTime;
+    }
+    else
+    {
+      // Сюда попадаем, только когда заезд ГАРАНТИРОВАННО стартовал
+      // (nowTp >= raceStartTimePoint), то есть elapsedMs >= 0. Берём ТОТ ЖЕ
+      // nowTp, что и в проверке выше: второго вызова now() нет, дрейфа между
+      // условием и вычислением тоже.
+      const int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        nowTp - raceStartTimePoint).count();
+      const uint32_t serverCourseTime = elapsedMs <= 0
+        ? 0u
+        : static_cast<uint32_t>(std::min<int64_t>(
+            elapsedMs, static_cast<int64_t>(tracker::InvalidCourseTime) - 1));
+
+      // LOA-fix (R15-1b, quest-batch-2): СЕРВЕРНЫЙ ПОЛ ПРАВДОПОДОБИЯ.
+      // ДЫРА, КОТОРУЮ ЭТО ЗАКРЫВАЕТ. Проверка выше ловит только финиш ДО
+      // зелёного света. Финиш, заявленный ЧЕРЕЗ ПОЛСЕКУНДЫ ПОСЛЕ зелёного,
+      // проходил насквозь: клиент присылал courseTime = 0, сервер намерял ~500
+      // мс, расхождение 500 мс укладывалось в допуск CourseTimeToleranceMs
+      // (1000 мс) — и КЛИЕНТСКИЙ НОЛЬ оставался в силе. А ноль — самое быстрое
+      // возможное время: RaceInstance::Stop раздаёт призовые места по
+      // courseTime ПО ВОЗРАСТАНИЮ, то есть чит забирал первое место, не проехав
+      // ни метра. Гейт правдоподобности до этой правки смотрел ТОЛЬКО на
+      // клиентское значение и такой ноль не видел.
+      // ЧТО ТЕПЕРЬ: для НИЖНЕЙ границы авторитетен СЕРВЕРНЫЙ замер. Если по
+      // часам сервера от зелёного света прошло меньше порога — финиша не было,
+      // что бы ни прислал клиент и как бы он ни укладывался в допуск.
+      // ⚠️ ПОРЯДОК ВАЖЕН: гейт стоит ДО проверки допуска и уводит её в else.
+      // Если поставить его рядом/после, следующий шаг увидит расхождение
+      // (UINT32_MAX - serverCourseTime), сочтёт его накруткой и «починит»
+      // finishCourseTime обратно в маленькое серверное число.
+      // ДОПУСК ±1000 мс НЕ ТРОГАЕМ — это отдельная ручка (B5, round4).
+      // ПОЧЕМУ ПОРОГ = MinPlausibleCourseTime (30000 мс), А НЕ НОВАЯ КОНСТАНТА:
+      //  (1) КОНСТАНТА НЕ НОВАЯ. Она уже развёрнута в проде как античит-пол:
+      //      RaceInstance::Stop гейтит ею призовые места и квестовый кредит
+      //      (`courseTime == InvalidCourseTime || courseTime <
+      //      MinPlausibleCourseTime` -> continue, две штуки), и B1-гейт
+      //      сюжетных счётчиков в этом же файле (raceCountsForQuests).
+      //  (2) КОНСИСТЕНТНОСТЬ: тот же порог и тот же смысл, только применённый к
+      //      СЕРВЕРНОМУ замеру, а не к числу из пакета. Новой поверхности
+      //      ложных срабатываний не появляется: честный финиш, который зафолсил
+      //      бы этот гейт (serverCourseTime < 30 с), УЖЕ СЕЙЧАС не получает ни
+      //      призового места, ни квестового прогресса по гейтам выше.
+      //  (3) ДАННЫЕ. В courses.yaml у ВСЕХ 52 гоночных карт timeLimit = 300 с;
+      //      30 с стоит только у ranch_00 / ranch_w / town_test01, и ни одна из
+      //      них не входит НИ В ОДИН mapPool (режимы 0/1/2, а в прод-конфиге ещё
+      //      Tutorial(6), тянут mapBlockId 1..46). Трассы, которая честно
+      //      закрывается быстрее 30 с, в игре нет — включая обучающие заезды,
+      //      которые едут по тем же картам 1..10.
+      // ЧТО НЕ ЗАДЕТО: базовая выплата (2500 морковок / 420 опыта) начисляется
+      // безусловно, ВНЕ ветки `racer.courseTime != InvalidCourseTime`
+      // (RaceInstance::Stop), поэтому DNF её не отнимает — пропускаются только
+      // событийные множители.
+      // ТЮНИНГ: если в логе пойдут ЭТИ warn'ы у честных игроков — опускать надо
+      // саму MinPlausibleCourseTime, она одна на все гейты.
+      if (serverCourseTime < tracker::MinPlausibleCourseTime)
+      {
+        server::util::QuietLogWarn(
+          "AcCmdUserRaceFinal: character {} claimed a finish {} ms after the "
+          "green light (client course time {} ms, plausible minimum {} ms); the "
+          "finish is treated as a DNF",
+          clientContext.characterUid,
+          serverCourseTime,
+          finishCourseTime,
+          tracker::MinPlausibleCourseTime);
+        finishCourseTime = tracker::InvalidCourseTime;
+      }
+      else
+      {
+        // Дальше — прежняя проверка расхождения клиент/сервер (A3 + B5). Она
+        // работает только НАД полом: сюда мы попадаем, когда серверный замер уже
+        // признан правдоподобным, и спор идёт лишь о точности числа.
+        const int64_t deviationMs = static_cast<int64_t>(finishCourseTime)
+          - static_cast<int64_t>(serverCourseTime);
+        if (deviationMs > CourseTimeToleranceMs || deviationMs < -CourseTimeToleranceMs)
+        {
+          server::util::QuietLogWarn(
+            "AcCmdUserRaceFinal: character {} reported course time {} ms while the "
+            "server measured {} ms; using the server value",
+            clientContext.characterUid,
+            finishCourseTime,
+            serverCourseTime);
+          finishCourseTime = serverCourseTime;
+        }
+      }
+    }
+  }
+
+  // LOA-fix (R9-2, round9): ВРЕМЯ ЗАЕЗДА ПИШЕТ ТОЛЬКО ПЕРВЫЙ ПАКЕТ ФИНИША.
+  // ЧТО БЫЛО НЕ ТАК: присвоение стояло безусловно, на каждом AcCmdUserRaceFinal.
+  // Накрутить время им нельзя (серверный кламп A3/B5 выше уже отработал), но
+  // СТЕРЕТЬ — можно: гонщик честно финиширует, следом прилетает второй пакет с
+  // raceTrackProgress > 0 (DNF) — и racer.courseTime становится
+  // InvalidCourseTime. А по нему RaceInstance::Stop считает призовые места и
+  // множитель — доехавший терял подиум одним лишним пакетом (свой же клиент мог
+  // прислать его и случайно, при разрыве).
+  // ТЕПЕРЬ: пишем под тем же латчем finishCounted, который выше уже
+  // дедуплицирует засчёт заезда в сюжетные счётчики (R7 BLOCK-1) — одно
+  // состояние заезда, одна точка истины, лишний гард не заводим.
+  // ЧЕСТНЫЙ ПЕРВЫЙ ФИНИШ НЕ ЗАДЕТ: alreadyFinishing вычислен ДО установки латча,
+  // на первом пакете он false — присвоение проходит ровно как раньше.
+  // Рассылка AcCmdUserRaceFinalNotify остаётся безусловной: на повторном пакете
+  // она просто повторит уже зафиксированное время вместо того, чтобы разослать
+  // затёртое.
+  if (not alreadyFinishing)
+  {
+    racer.courseTime = didNotFinish
+      ? tracker::InvalidCourseTime
+      : finishCourseTime;
+  }
 
   const protocol::AcCmdUserRaceFinalNotify notify{
     .oid = racer.oid,
     .courseTime = racer.courseTime};
 
   this->Broadcast(raceInstance, notify);
+
+  // === R56 (#61): времена финиша ботов ====================================
+  // Считаем РОВНО ОДИН РАЗ, на первом честном пакете финиша — под тем же
+  // латчем `alreadyFinishing`, под которым выше пишется время игрока. Иначе
+  // повторный пакет перекатывал бы уже показанные результаты.
+  //
+  // База — `racer.courseTime` ПОСЛЕ наших клампов A3/B5, а не поле из пакета
+  // клиента: иначе бот унаследовал бы время, которое сервер только что признал
+  // недостоверным, и чит игрока размножился бы на семерых.
+  //
+  // ★Если живой НЕ доехал, боты тоже остаются «не доехали». Апстрим этого не
+  // различал; у нас DNF — это `InvalidCourseTime` (UINT32_MAX), и арифметика
+  // от него дала бы не время, а мусор. Нулевое время (ветка «финиш до старта
+  // заезда») исключено по той же причине.
+  //
+  // ★ПОПРАВКА РАУНДА 62 (#196). Времена ниже БОЛЬШЕ НЕ СИММЕТРИЧНЫ вокруг
+  // времени игрока. Симметрия и была багом: бросок ±5 % давал пять «быстрее»
+  // из одиннадцати исходов, то есть в среднем 7·5/11 ≈ 3,2 бота получали время
+  // ЛУЧШЕ человека, который на экране пересёк черту первым, и табло
+  // (`RaceInstance::Stop`, сортировка по courseTime) ставило его четвёртым.
+  // Соло-заезд с ботами было НЕЛЬЗЯ ВЫИГРАТЬ — при любой езде.
+  if (not alreadyFinishing
+    && not raceInstance.GetAiRacers().empty()
+    && racer.courseTime != tracker::InvalidCourseTime
+    && racer.courseTime > 0)
+  {
+    // ★ЗА ЧТО ЦЕПЛЯЕМСЯ ВМЕСТО БРОСКА КУБИКА. Сервер не моделирует движение
+    // ботов, но клиент за них ОТЧИТЫВАЕТСЯ позициями, и в каждом таком пакете
+    // есть `progress` — доля трассы, нормированная клиентом в 0..1. R62-1
+    // складывает максимум этой величины в ростер. На момент, когда человек
+    // пересёк черту, отношение «прогресс бота / прогресс игрока» — это и есть
+    // отношение их темпов, то есть ЕДИНСТВЕННОЕ, что связывает табло с тем,
+    // что игрок видел на экране.
+    //
+    // Знаменатель берём ДОВЕРЕННЫЙ (`trustedProgress`, R13), а не сырой
+    // `raceProgress`: он NaN-безопасен, монотонен и ограничен правдоподобным
+    // темпом. Мусор в знаменателе отравил бы весь ростер разом.
+    const double playerTime = static_cast<double>(racer.courseTime);
+    const double playerProgress = static_cast<double>(racer.trustedProgress);
+    const bool haveReference = playerProgress > 0.0;
+
+    // Мёртвая зона фотофиниша: последний замер игрока сделан ДО черты, поэтому
+    // преимущество бота в пределах пары процентов — артефакт дискретизации, а
+    // не обгон. Спорную полосу отдаём человеку: он черту пересёк, бот — нет.
+    constexpr double PhotoFinishMargin = 0.02;
+    // Границы фантазии. Без верхней бот с прогрессом 0.05 получил бы час, без
+    // нижней — «быстрее в разы». Итог: бот быстрее игрока не более чем на ~9 %
+    // и медленнее не более чем вдвое.
+    constexpr double FastestRatio = 1.10;
+    constexpr double SlowestRatio = 0.50;
+    // Шаг «данных нет»: боты выстраиваются за игроком с интервалом в секунду.
+    constexpr int64_t NoDataStepMs = 1000;
+
+    int64_t aiIndex = 0;
+    for (auto& aiRacer : raceInstance.GetAiRacers())
+    {
+      ++aiIndex;
+
+      int64_t aiTime;
+      if (haveReference)
+      {
+        double ratio = static_cast<double>(aiRacer.raceProgress) / playerProgress;
+
+        if (ratio > 1.0 - PhotoFinishMargin && ratio < 1.0 + PhotoFinishMargin)
+          ratio = 1.0 - PhotoFinishMargin;
+
+        ratio = ratio < SlowestRatio ? SlowestRatio : ratio;
+        ratio = ratio > FastestRatio ? FastestRatio : ratio;
+
+        // Знаменатель здесь заведомо >= SlowestRatio, деления на ноль нет.
+        // ★ФИКС АПСТРИМ-БАГА B2 СОХРАНЁН ПО СУЩЕСТВУ: вся арифметика идёт в
+        // типах со знаком (у них `uint32 += uint32 * int / 100` заворачивал
+        // отрицательный бросок в ~12 часов), а результат клампится снизу.
+        aiTime = static_cast<int64_t>(playerTime / ratio + 0.5);
+      }
+      else
+      {
+        // Опорной величины нет: клиент не отчитался ни за одного бота, либо
+        // заезд закончился раньше, чем прогресс игрока успел вырасти. Тогда
+        // единственное, что сервер знает достоверно, — что человек черту
+        // ПЕРЕСЁК. Ставим ботов за ним, а не вокруг него.
+        aiTime = static_cast<int64_t>(racer.courseTime) + aiIndex * NoDataStepMs;
+      }
+
+      // Разводим совпадения на миллисекунды. Клампы выше умеют схлопнуть
+      // нескольких ботов в одно и то же число, а `RaceInstance::Stop`
+      // сортирует НЕустойчивой сортировкой — семь одинаковых времён на табло
+      // выглядели бы как ошибка, да и порядок между ними был бы случайным от
+      // запуска к запуску. Смещение на индекс детерминировано и не может
+      // перевести бота через границу «быстрее/медленнее игрока»: минимальный
+      // зазор до времени игрока — два процента дистанции, то есть секунды.
+      aiTime += aiIndex;
+
+      const int64_t clamped = std::min<int64_t>(
+        std::max<int64_t>(aiTime, 1),
+        static_cast<int64_t>(tracker::InvalidCourseTime) - 1);
+      aiRacer.courseTime = static_cast<uint32_t>(clamped);
+
+      const protocol::AcCmdUserRaceFinalNotify aiNotify{
+        .oid = aiRacer.oid,
+        .courseTime = aiRacer.courseTime};
+
+      this->Broadcast(raceInstance, aiNotify);
+    }
+
+    // ★ОДНА СТРОКА НА ЗАЕЗД, И ОНА НУЖНА. Раунд опирается на утверждение
+    // «клиент отчитывается за ботов ПОЛЕМ progress». Позиции за ботов измерены
+    // на проде (R57: 15 350 пакетов за 90 минут), а вот заполнено ли в них
+    // `progress` — из логов не видно, потому что до R62 сервер их выбрасывал.
+    // Строка ниже делает ответ наблюдаемым с первого же живого заезда:
+    // `reference=0` или сплошные нули у ботов означают, что опоры нет и работает
+    // запасная ветка ([[verify-the-oracle-before-believing-red]]).
+    std::string aiProgressReport;
+    for (const auto& aiRacer : raceInstance.GetAiRacers())
+    {
+      aiProgressReport += std::format(" {}={:.3f}/{}",
+        aiRacer.name,
+        aiRacer.raceProgress,
+        aiRacer.courseTime);
+    }
+
+    server::util::QuietLogDebug(
+      "AI finish times for character {} (course time {} ms, reference progress "
+      "{:.3f}):{}",
+      clientContext.characterUid,
+      racer.courseTime,
+      racer.trustedProgress,
+      aiProgressReport);
+  }
+
+  // LOA-fix (batch1 task4, fix-round1): server-authoritative progress for MAIN
+  // story quest 11035 «finish races: 10» on the Finishing transition — once per
+  // race per participant (incl. DNF: counts race PARTICIPATION, not placement).
+  // 11035 is a Main quest (groupType 0) turned in at an NPC, so we advance its
+  // data::Quest record here mirroring HandleUseFoodItem (P4a): guard InProgress,
+  // ++progress capped at successValue, ReadyToClaim on completion. PERSIST-ONLY:
+  // no notify from the RACE channel — AcCmdRCUpdateQuestNotify is a ranch/journal
+  // packet and the client is on the race director here; progress is reflected on
+  // the next ranch-enter / quest-window open. Deadlock-safe: we hold only
+  // _raceInstancesMutex (not a record lock); Character shared + Quest unique are
+  // DIFFERENT records (no same-record nesting), same shape as P4a.
+  // LOA-fix (B1, round4): см. комментарий у патча в apply_patches.py —
+  // сюжетные счётчики заездов идут под тот же гейт правдоподобности, что и
+  // награда/дейлики в RaceInstance::Stop.
+  const bool raceCountsForQuests =
+    not didNotFinish
+    // LOA-fix (R15-2, quest-batch-2): ОБЯЗАТЕЛЬНАЯ ПАРА К R15-1. После R15-1
+    // «финиш до старта» приходит сюда со временем InvalidCourseTime ==
+    // UINT32_MAX, а это ЗАВЕДОМО БОЛЬШЕ MinPlausibleCourseTime (30000) — гейт
+    // правдоподобности он проходит сам собой. Без этой строки правка R15-1 не
+    // закрывала бы эксплойт, а меняла его форму: подиум перестал бы красться,
+    // зато сюжетные счётчики заездов начали бы расти с одного пакета.
+    && finishCourseTime != tracker::InvalidCourseTime
+    && finishCourseTime >= tracker::MinPlausibleCourseTime;
+
+  if (not alreadyFinishing && not raceCountsForQuests)
+  {
+    // DNF — штатное событие (тайм-аут карты в командном заезде), поэтому debug.
+    // А вот ЗАЯВЛЕННЫЙ финиш за неправдоподобное время — улика, поэтому warn.
+    if (didNotFinish)
+    {
+      server::util::QuietLogDebug(
+        "AcCmdUserRaceFinal: character {} did not finish; story race counters "
+        "not advanced",
+        clientContext.characterUid);
+    }
+    else if (finishCourseTime == tracker::InvalidCourseTime)
+    {
+      // LOA-fix (R15-3, quest-batch-2): косметика к R15-1. У «финиша до старта»
+      // время теперь InvalidCourseTime, и общая ветка ниже напечатала бы
+      // «course time 4294967295 ms» — улика читалась бы как накрутка времени,
+      // хотя причина другая. Отдельная строка = отдельный диагноз в логе.
+      server::util::QuietLogWarn(
+        "AcCmdUserRaceFinal: character {} reported a finish before the race "
+        "started; treated as a DNF, story race counters not advanced",
+        clientContext.characterUid);
+    }
+    else
+    {
+      server::util::QuietLogWarn(
+        "AcCmdUserRaceFinal: character {} finished implausibly (course time {} "
+        "ms, plausible minimum {} ms); story race counters not advanced",
+        clientContext.characterUid,
+        finishCourseTime,
+        tracker::MinPlausibleCourseTime);
+    }
+  }
+
+  if (not alreadyFinishing && raceCountsForQuests)
+  {
+    const auto characterRecord = GetServerInstance().GetDataDirector().GetCharacter(
+      clientContext.characterUid);
+    characterRecord.Immutable(
+      [this, clientId, characterUid = clientContext.characterUid](
+        const data::Character& character)
+    {
+      const auto questRecords = GetServerInstance().GetDataDirector().GetQuestCache().Get(
+        character.quests());
+      if (not questRecords)
+        return;
+      for (const auto& questRecord : *questRecords)
+      {
+        questRecord.Mutable([this, clientId, characterUid](data::Quest& quest)
+        {
+          if (quest.isCompleted() != data::Quest::Status::InProgress)
+            return;
+          // LOA-fix (F1, quest-batch-1): раньше здесь был захардкожен один 11035.
+          // Шесть MAIN-квестов с ТЕМ ЖЕ условием «заездов в любом режиме: N»
+          // (function TRUE, gameModeFlag 111, successType 1 — сверено по
+          // quests.yaml и registry.jsonl) были мертвы только потому, что им не
+          // отдали tid'ы: 11031 (5), 11044 (5), 12021 (10), 14023 (3),
+          // 14025 (10), 14030 (8). За одним 11031 висит 30 сюжетных квестов.
+          const auto qid = static_cast<uint32_t>(quest.questId());
+          bool raceCountQuest = false;
+          for (uint32_t raceTid : {11031u, 11035u, 11044u, 12021u, 14023u, 14025u, 14030u})
+            if (raceTid == qid) { raceCountQuest = true; break; }
+          if (not raceCountQuest)
+            return;
+          const auto tmpl = GetServerInstance().GetQuestRegistry().GetQuest(qid);
+          if (not tmpl.has_value())
+            return;
+          // LOA-fix (F5): кап и перевод статуса разделены — добитая до цели
+          // InProgress-запись становится ReadyToClaim, а не застревает.
+          if (quest.progress() < tmpl->successValue)
+            quest.progress() = quest.progress() + 1;
+          if (quest.progress() >= tmpl->successValue)
+            quest.isCompleted() = data::Quest::Status::ReadyToClaim;
+
+          // LOA-fix (R16-1, quest-batch-2): ЖИВОЙ NOTIFY ПРОГРЕССА С РЕЙС-КАНАЛА.
+          // БЫЛО «PERSIST-ONLY»: прогресс сюжетных счётчиков заездов писался в
+          // запись, но клиент об этом не узнавал до следующего входа на ранчо
+          // или переоткрытия журнала — игрок доезжал десять заездов и видел
+          // 0/10. Причина отказа от notify была в допущении «AcCmdRCUpdateQuestNotify
+          // (0x3fe) — ранчовый пакет», но оно неверно: сам апстрим документирует
+          // структуру как «Can be used in either ranch or race», а на рейс-сокете
+          // у нас уже штатно ходит RC-пакет того же семейства —
+          // AcCmdRCUpdateDailyQuestNotify (0x35c) из SendDailyQuestNotificationToCharacter.
+          // Шлём тем же способом, что и хук кормления на ранчо (RanchDirector),
+          // только адресата не ищем: clientId — это и есть автор пакета финиша.
+          // ⚠️ FOLLOW-UP (R16-3, ОТЛОЖЕН): маршрутизация notify для MAIN-квестов,
+          // которые двигает диспатч PrizeWinner/RunMap в RaceInstance::Stop, —
+          // ей нужен отдельный метод SendQuestProgressNotificationToCharacter и
+          // поиск клиента по characterUid. Не делаем до живой проверки, что
+          // клиент действительно РИСУЕТ 0x3fe, придя по рейс-сокету.
+          protocol::AcCmdRCUpdateQuestNotify questNotify{};
+          questNotify.characterUid = static_cast<uint32_t>(characterUid);
+          questNotify.questTid = static_cast<uint16_t>(qid);
+          questNotify.objectiveProgress.progress = quest.progress();
+          questNotify.objectiveProgress.isCompleted =
+            quest.progress() >= tmpl->successValue;
+          _commandServer.QueueCommand<protocol::AcCmdRCUpdateQuestNotify>(
+            clientId,
+            [questNotify]() { return questNotify; });
+        });
+      }
+    });
+  }
 }
 
 void RaceNetworkHandler::HandleRaceResult(
@@ -1723,9 +3407,26 @@ void RaceNetworkHandler::HandleRaceResult(
     .action = protocol::AcCmdRCUpdateMountInfoNotify::Action::ProgressHorsePotential};
   bool potentialProgressed = false;
 
+  // LOA-fix (R20-2, #93): СЕРВЕРНЫЙ КЛАМП КЛАСС-ОПЫТА. gainedClassProgress
+  // приходит сырым uint32 из клиентского AcCmdCRRaceResult; без капа один
+  // крафт-пакет выводит лошадь на класс 30. Режем к правдоподобному потолку
+  // (обоснование порога — в шапке раунда 20), честный клиент под него не
+  // попадает. Кламп, не отказ: прогресс усекаем, игрока не наказываем.
+  uint32_t clampedClassProgress = command.gainedClassProgress;
+  if (clampedClassProgress > tracker::MaxPlausibleClassProgress)
+  {
+    server::util::QuietLogWarn(
+      "AcCmdCRRaceResult: character {} reported gainedClassProgress {} exceeding "
+      "the plausible per-race maximum {}; clamping (possible client tampering)",
+      clientContext.characterUid,
+      clampedClassProgress,
+      tracker::MaxPlausibleClassProgress);
+    clampedClassProgress = tracker::MaxPlausibleClassProgress;
+  }
+
   characterRecord.Immutable(
     [this, &response, &potentialNotify, &potentialProgressed,
-      gainedClassProgress = command.gainedClassProgress](const data::Character& character)
+      gainedClassProgress = clampedClassProgress](const data::Character& character)
     {
       response.currentCarrots = character.carrots();
 
@@ -1879,9 +3580,15 @@ void RaceNetworkHandler::HandleStarPointGet(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
-  // TODO: Revise this in NPC races
+  // LOA-fix (R57-3, round57, backlog #195): TODO апстрима выше — про этот
+  // самый случай, и он наступил вместе с R56. Клиент ведёт AI-соперников сам и
+  // отчитывается за них; их oid — не подлог. Выход ТИХИЙ и ДО всякого действия:
+  // тело ниже считает по `racer`, то есть по ЖИВОМУ игроку.
   if (command.characterOid != racer.oid)
   {
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
     throw std::runtime_error(
       "Client tried to perform action on behalf of different racer");
   }
@@ -1914,7 +3621,7 @@ void RaceNetworkHandler::HandleStarPointGet(
     });
 }
 
-void RaceNetworkHandler::HandleRequestSpur(
+bool RaceNetworkHandler::HandleRequestSpur(
   ClientId clientId,
   const protocol::AcCmdCRRequestSpur& command)
 {
@@ -1927,9 +3634,14 @@ void RaceNetworkHandler::HandleRequestSpur(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
-  // TODO: Revise this in NPC races
+  // LOA-fix (R57-3a, round57, backlog #195): пакет за бота законен, но обработку
+  // надо прервать ЦЕЛИКОМ, вместе с хвостом лямбды-регистрации. Возврат `false`
+  // именно это и означает: «пакет был не от отправителя, дальше ничего не делаем».
   if (command.characterOid != racer.oid)
   {
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return false;
+
     throw std::runtime_error(
       "Client tried to perform action on behalf of different racer");
   }
@@ -1967,6 +3679,112 @@ void RaceNetworkHandler::HandleRequestSpur(
     {
       return starPointResponse;
     });
+
+  // LOA-fix (batch1 task4, fix-round1): server-authoritative progress for MAIN
+  // story quest 11036 «use spur in speed races: 30» (quests.yaml groupType 0, NOT
+  // a daily). Per-EVENT (every valid spur; no dedup) — we only reach here after
+  // the star-point cost check+deduct above, so this is a real, paid spur. Gate on
+  // Speed SOLO only (11036's def flag = SpeedSoloAction; speed-TEAM spurs must NOT
+  // count). 11036 is a Main quest turned in at an NPC, so we advance its
+  // data::Quest record here mirroring HandleUseFoodItem (P4a). PERSIST-ONLY (same
+  // race-channel reasoning + deadlock-safety as the finish hook): progress shows
+  // on next ranch-enter / quest-window open.
+  if (parameters.gameMode == protocol::GameMode::Speed
+      && parameters.teamMode != protocol::TeamMode::Team
+      // ⚠️ (N4, round7) ЭТО ГЕЙТ КВЕСТ-СЧЁТЧИКА, А НЕ ДЕНЕГ. Выплата за заезд
+      // никакого racer.state не читает: выплатной античит по состоянию гонщика
+      // откачен раундом 6 (см. CHANGES «Раунд 6»). Худшее, что делает ошибка
+      // здесь, — квест не двигается; денег игрок не теряет.
+      // Codex re-review WARN: считать ТОЛЬКО спуры во время самой гонки. Без этого
+      // модифицированный клиент мог бы дослать спуры остатком старпоинтов в
+      // finishing-окне (racer уже Finishing) и накрутить 11036 несуществующими рывками.
+      && racer.state == tracker::RaceTracker::Racer::State::Racing)
+  {
+    const auto characterRecord = GetServerInstance().GetDataDirector().GetCharacter(
+      clientContext.characterUid);
+    characterRecord.Immutable(
+      [this, clientId, characterUid = clientContext.characterUid](
+        const data::Character& character)
+    {
+      const auto questRecords = GetServerInstance().GetDataDirector().GetQuestCache().Get(
+        character.quests());
+      if (not questRecords)
+        return;
+      for (const auto& questRecord : *questRecords)
+      {
+        questRecord.Mutable([this, clientId, characterUid](data::Quest& quest)
+        {
+          if (quest.isCompleted() != data::Quest::Status::InProgress)
+            return;
+          if (quest.questId() != 11036u)
+            return;
+          const auto tmpl = GetServerInstance().GetQuestRegistry().GetQuest(11036u);
+          if (not tmpl.has_value())
+            return;
+          // LOA-fix (F5, quest-batch-1): кап и перевод статуса разделены (см.
+          // хук кормления в RanchDirector) — иначе запись 30/30 со статусом
+          // InProgress застревает навсегда.
+          if (quest.progress() < tmpl->successValue)
+            quest.progress() = quest.progress() + 1;
+          if (quest.progress() >= tmpl->successValue)
+            quest.isCompleted() = data::Quest::Status::ReadyToClaim;
+
+          // LOA-fix (R16-2, quest-batch-2): тот же живой notify, что и в хуке
+          // финиша (см. развёрнутое обоснование там) — 11036 «покажи рывок в
+          // скоростных заездах: 30» раньше рос молча, счётчик в журнале стоял
+          // на месте до следующего входа на ранчо.
+          protocol::AcCmdRCUpdateQuestNotify questNotify{};
+          questNotify.characterUid = static_cast<uint32_t>(characterUid);
+          questNotify.questTid = 11036u;
+          questNotify.objectiveProgress.progress = quest.progress();
+          questNotify.objectiveProgress.isCompleted =
+            quest.progress() >= tmpl->successValue;
+          _commandServer.QueueCommand<protocol::AcCmdRCUpdateQuestNotify>(
+            clientId,
+            [questNotify]() { return questNotify; });
+        });
+      }
+    });
+  }
+
+  // LOA-fix (R27, #10): дейлики «покажи рывок» 1006 (40) и 1017 (90) ВЫНЕСЕНЫ
+  // из блока MAIN-квеста 11036 в СОБСТВЕННЫЙ гейт БЕЗ условия по teamMode.
+  // ПОЧЕМУ: F8 поставил дейлик-диспатч ВНУТРЬ гейта 11036, у которого есть
+  // `teamMode != Team` (11036 соло-по-дизайну, подтверждено владельцем), и
+  // командные рывки не засчитывались дейликам — та же недоплата, что R26
+  // починил у прыжков (1005/1016) и фаерболов (1008/1019): их диспатчи
+  // teamMode никогда не гейтили, поэтому одной маски в IsModeMatch им хватило.
+  // Гейт 11036 выше ОСТАЛСЯ ДОСЛОВНО ПРЕЖНИМ (Speed && teamMode != Team &&
+  // Racing) и ЗАКРЫТ ДО этого блока — 11036 остаётся соло-only.
+  // Здесь ровно два условия: Speed (1006/1017 — «в скоростных заездах»; magic
+  // всё равно отсёк бы IsModeMatch: 35 & 4 == 0, 35 & 8 == 0) и
+  // racer.state == Racing (анти-накрутка: рывки в finishing-окне не считаем —
+  // тот же гард, что и был). Личный приз в команде НЕ протекает: это другой
+  // канал (ToPrizeGameModeFlag, 33 & 2 == 0), его арбитрит negative-test R26.
+  if (parameters.gameMode == protocol::GameMode::Speed
+      && racer.state == tracker::RaceTracker::Racer::State::Racing)
+  {
+    const auto spurDailyNotifies = GetServerInstance().GetQuestSystem().OnQuestEvent(
+      clientContext.characterUid,
+      QuestSystem::QuestEvent::Any,
+      QuestSystem::ToGameModeFlag(parameters.gameMode, parameters.teamMode),
+      0,
+      {1006u, 1017u});
+    for (const auto& spurNotify : spurDailyNotifies)
+    {
+      SendDailyQuestNotificationToCharacter(
+        spurNotify.characterUid,
+        spurNotify.questId,
+        spurNotify.objectiveProgress,
+        spurNotify.carrotsReward,
+        spurNotify.rewardType,
+        spurNotify.unk2,
+        spurNotify.mountExp);
+    }
+  }
+
+  // Пакет был от самого отправителя — хвост лямбды (командная шкала) уместен.
+  return true;
 }
 
 void RaceNetworkHandler::HandleHurdleClearResult(
@@ -1982,9 +3800,15 @@ void RaceNetworkHandler::HandleHurdleClearResult(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
-  // TODO: Revise this in NPC races
+  // LOA-fix (R57-3, round57, backlog #195): TODO апстрима выше — про этот
+  // самый случай, и он наступил вместе с R56. Клиент ведёт AI-соперников сам и
+  // отчитывается за них; их oid — не подлог. Выход ТИХИЙ и ДО всякого действия:
+  // тело ниже считает по `racer`, то есть по ЖИВОМУ игроку.
   if (command.characterOid != racer.oid)
   {
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
     throw std::runtime_error(
       "Client tried to perform action on behalf of different racer");
   }
@@ -2034,6 +3858,37 @@ void RaceNetworkHandler::HandleHurdleClearResult(
 
       // Update boost gauge
       starPointResponse.starPointValue = racer.starPointValue;
+
+      // LOA-fix (NEW-1, round3): дейлики «перфект-прыжков N раз» — 1005 (100) и
+      // 1016 (250). До этого их прогресс писал КЛИЕНТ пакетом 0x344, то есть
+      // 500 очков награды дня выдавались за одно сообщение, без единого прыжка.
+      // Событие сервер видит: перфект-прыжок приходит СЮДА ЖЕ, где начисляется
+      // буст-шкала, — тот же уровень доверия, что и у всей гоночной механики.
+      // gameModeFlag дейликов = 35 (SpeedSoloAction), лишние режимы отсеет
+      // IsModeMatch. Гейт racer.state == Racing — как у рывка (F8): вне самой
+      // гонки прыжки не считаем.
+      // ⚠️ (N4, round7) ЭТО ГЕЙТ КВЕСТ-СЧЁТЧИКА, А НЕ ДЕНЕГ: выплатной античит
+      // по racer.state откачен раундом 6, награда за заезд состояние не читает.
+      if (racer.state == tracker::RaceTracker::Racer::State::Racing)
+      {
+        const auto jumpDailyNotifies = GetServerInstance().GetQuestSystem().OnQuestEvent(
+          clientContext.characterUid,
+          QuestSystem::QuestEvent::PerfectJump,
+          QuestSystem::ToGameModeFlag(parameters.gameMode, parameters.teamMode),
+          0,
+          {1005u, 1016u});
+        for (const auto& jumpNotify : jumpDailyNotifies)
+        {
+          SendDailyQuestNotificationToCharacter(
+            jumpNotify.characterUid,
+            jumpNotify.questId,
+            jumpNotify.objectiveProgress,
+            jumpNotify.carrotsReward,
+            jumpNotify.rewardType,
+            jumpNotify.unk2,
+            jumpNotify.mountExp);
+        }
+      }
       break;
     }
     case protocol::AcCmdCRHurdleClearResult::HurdleClearType::Good:
@@ -2067,7 +3922,7 @@ void RaceNetworkHandler::HandleHurdleClearResult(
     }
     default:
     {
-      spdlog::warn("Unhandled hurdle clear type {}",
+      server::util::QuietLogWarn("Unhandled hurdle clear type {}",
         static_cast<uint8_t>(command.hurdleClearType));
       return;
     }
@@ -2121,9 +3976,15 @@ void RaceNetworkHandler::HandleStartingRate(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
-  // TODO: Revise this in NPC races
+  // LOA-fix (R57-3, round57, backlog #195): TODO апстрима выше — про этот
+  // самый случай, и он наступил вместе с R56. Клиент ведёт AI-соперников сам и
+  // отчитывается за них; их oid — не подлог. Выход ТИХИЙ и ДО всякого действия:
+  // тело ниже считает по `racer`, то есть по ЖИВОМУ игроку.
   if (command.characterOid != racer.oid)
   {
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
     throw std::runtime_error(
       "Client tried to perform action on behalf of different racer");
   }
@@ -2162,14 +4023,206 @@ void RaceNetworkHandler::HandleRaceUserPos(
   auto& racer = raceInstance.GetTracker().GetRacer(
     clientContext.characterUid);
 
-  // TODO: Revise this in NPC races
+  // LOA-fix (R62-1, round62, backlog #196): ЕДИНСТВЕННЫЙ наблюдаемый сигнал о
+  // том, где на трассе бот. Ботов ведёт клиент, и он же присылает их позиции —
+  // это и есть тот трафик, который R57 научился игнорировать молча. Игнорировать
+  // его ЦЕЛИКОМ оказалось слишком: без него сервер выдумывал времена финиша
+  // ботов симметрично вокруг времени игрока, и человек, пересёкший черту первым,
+  // получал в среднем четвёртое место (#196).
+  //
+  // ★ВЫЗОВ СТОИТ ДО СРАВНЕНИЯ ВЛАДЕНИЯ И САМ СЕБЯ ГАРДИТ. Для oid живого
+  // гонщика это пустая операция, поэтому «свой» путь не меняется ни на байт, а
+  // дословная форма гарда R57 ниже остаётся нетронутой — её проверяет оракул
+  // #195 по числу совпадений.
+  raceInstance.NoteAiRacerProgress(command.oid, command.progress);
+
+  // LOA-fix (R57-4, round57, backlog #195). Именно это место дало 15 350 из
+  // 15 589 строк [error] за час живой игры: клиент шлёт позицию за каждого из
+  // семи ботов на каждом тике. Пропустить пакет ДАЛЬШЕ было бы хуже флуда —
+  // ниже копится телеметрия лошади (R24) и доверенный прогресс мести (R13).
   if (command.oid != racer.oid)
   {
+    if (raceInstance.IsAiRacerOid(command.oid))
+      return;
+
     throw std::runtime_error(
       "Client tried to perform action on behalf of different racer");
   }
 
-  // TODO: player position anticheat
+  // LOA-fix (R24, #14 фаза 1): копим topSpeed / totalDistance. Скорость уже в
+  // пакете (member4, км/ч). Мир: 1 юнит ≈ 1 метр. finishCounted — латч «уже
+  // отфинишировал». Читаем прошлую позицию ДО перезаписи worldPosition ниже.
+  if (racer.state == tracker::RaceTracker::Racer::State::Racing
+    && not racer.finishCounted)
+  {
+    const auto now = std::chrono::steady_clock::now();
+
+    // ★Гейт зелёного света: racer переходит в Racing уже на ЗАГРУЗКЕ, а старт
+    // (GetRaceStartTimePoint) ставится на 1-10с в БУДУЩЕЕ (обратный отсчёт). Без
+    // этого гейта клиент писал бы пре-гоночную скорость и до ~833м фейк-движения
+    // на отсчёте. До старта GetRaceStartTimePoint в будущем/max() → не копим и НЕ
+    // сеем: worldPosition ниже всё равно обновится, поэтому первый пост-старт пакет
+    // просто сеет заново (первая дельта не считается).
+    if (now >= raceInstance.GetRaceStartTimePoint())
+    {
+      // Клиентская скорость недоверенная → кламп по потолку.
+      if (command.member4 > racer.topSpeedKph
+        && command.member4 <= tracker::MaxPlausibleSpeedKph)
+      {
+        racer.topSpeedKph = command.member4;
+      }
+
+      if (racer.hasPositionSample)
+      {
+        // Бюджет перемещения за прошедшее время: телепорт/респавн/лаг-скачок
+        // ОТБРАСЫВАЕМ, а не копим. dt режем 2 с — пауза сервера не разрешение.
+        const auto elapsedMs = std::chrono::duration_cast<
+          std::chrono::milliseconds>(now - racer.lastPositionTimePoint).count();
+        const float dtSeconds = elapsedMs <= 0
+          ? 0.0f
+          : std::min(2.0f, static_cast<float>(elapsedMs) / 1000.0f);
+        const float budget = std::min(
+          tracker::MaxPlausiblePositionDeltaMetres,
+          (tracker::MaxPlausibleSpeedKph / 3.6f) * dtSeconds);
+
+        const float step = (command.position - racer.worldPosition).Length();
+        if (step <= budget)
+          racer.distanceMetres += static_cast<double>(step);
+      }
+
+      racer.hasPositionSample = true;
+      racer.lastPositionTimePoint = now;
+    }
+  }
+
+  // === LOA-fix (R-revenge, #13): ДОВЕРЕННЫЙ ПРОГРЕСС + ДЕТЕКТОР МЕСТИ ========
+  // Полностью серверное определение бонуса «Неплохая месть». Клиент НЕ участвует:
+  // опкод 0x206 (AcCmdCRRevengeAssign) не реализован и реализован не будет.
+  // Анти-форж стоит на том, что строку прогресса гонщика X пишет ТОЛЬКО
+  // соединение самого X — гард `command.oid != racer.oid` в начале этой функции.
+  // Соло-читер не может сфабриковать «обидчика»: обидчик обязан прислать свои
+  // пакеты сам. raceProgress НЕ трогаем (по нему ранжирует MagicSystem).
+  // Локи: всё под уже взятым _raceInstancesMutex, новых локов нет.
+  // Стоимость: O(гонщиков) на пакет позиции (<= 8), карта revengeRows крошечная.
+  {
+    const auto revengeNow = std::chrono::steady_clock::now();
+
+    // Гейт зелёного света — тот же, что у телеметрии R24: до старта
+    // GetRaceStartTimePoint лежит в будущем (обратный отсчёт), «прогресс» на
+    // отсчёте — не прогресс.
+    if (revengeNow >= raceInstance.GetRaceStartTimePoint()
+      && racer.state == tracker::RaceTracker::Racer::State::Racing
+      && not racer.finishCounted)
+    {
+      // --- G2: свой прогресс через бюджет правдоподобия + храповик ----------
+      // NaN-безопасная санитизация: `NaN > 0.0f` ложно, значение уходит в 0.
+      float clientProgress = 0.0f;
+      if (command.progress > 0.0f)
+        clientProgress = command.progress > 1.0f ? 1.0f : command.progress;
+
+      if (racer.trustedProgressTimePoint
+          == std::chrono::steady_clock::time_point::max())
+      {
+        // Первый пост-стартовый пакет ТОЛЬКО сеет отсчёт времени: доверенный
+        // прогресс стартует с нуля, что бы клиент ни объявил. Модклиент,
+        // объявивший progress = 1.0 на старте, выглядит ровно как самый быстрый
+        // ЧЕСТНЫЙ гонщик — не быстрее.
+        racer.trustedProgressTimePoint = revengeNow;
+      }
+      else
+      {
+        const auto elapsedMs = std::chrono::duration_cast<
+          std::chrono::milliseconds>(
+            revengeNow - racer.trustedProgressTimePoint).count();
+        const float budget = elapsedMs <= 0
+          ? 0.0f
+          : static_cast<float>(elapsedMs)
+              / static_cast<float>(tracker::MinPlausibleCourseTime);
+        const float capped = std::min(clientProgress,
+          racer.trustedProgress + budget);
+        // ★ХРАПОВИК: только вверх. Понижение своего прогресса — это попытка
+        // сфабриковать «меня обогнали», а не движение по трассе.
+        if (capped > racer.trustedProgress)
+          racer.trustedProgress = std::min(capped, 1.0f);
+        racer.trustedProgressTimePoint = revengeNow;
+      }
+
+      // --- G7: только командный заезд и только ЧУЖАЯ команда ----------------
+      if (racer.team != tracker::RaceTracker::Racer::Team::Solo
+        && racer.revengeCredits < tracker::RevengeMaxCredits)
+      {
+        for (const auto& [rivalUid, rival] : raceInstance.GetTracker().GetRacers())
+        {
+          if (rivalUid == clientContext.characterUid)
+            continue;
+          if (rival.team == tracker::RaceTracker::Racer::Team::Solo
+            || rival.team == racer.team)
+            continue;
+          // --- G8: соперник обязан быть ЖИВЫМ ---------------------------
+          // Замороженный прогресс отвалившегося/залагавшего игрока обогнать
+          // «легко» — такой обгон местью не считается.
+          if (rival.state != tracker::RaceTracker::Racer::State::Racing
+            || rival.finishCounted)
+            continue;
+          if (rival.trustedProgressTimePoint
+              == std::chrono::steady_clock::time_point::max()
+            || (revengeNow - rival.trustedProgressTimePoint)
+                 > tracker::RevengeRivalFreshness)
+            continue;
+
+          auto& revengeRow = racer.revengeRows[rivalUid];
+          // --- G5: один зачёт на соперника (терминальное состояние) -------
+          if (revengeRow.state
+              == tracker::RaceTracker::Racer::RevengeState::Revenged)
+            continue;
+
+          // --- G3: гистерезис -------------------------------------------
+          const float margin = racer.trustedProgress - rival.trustedProgress;
+          const bool relationHolds =
+            revengeRow.state == tracker::RaceTracker::Racer::RevengeState::Idle
+              ? margin <= -tracker::RevengeOvertakeHysteresis   // он впереди
+              : margin >= tracker::RevengeOvertakeHysteresis;   // мы впереди
+
+          if (not relationHolds)
+          {
+            revengeRow.since = std::chrono::steady_clock::time_point::max();
+            continue;
+          }
+
+          // --- G4: выдержка ---------------------------------------------
+          if (revengeRow.since == std::chrono::steady_clock::time_point::max())
+          {
+            revengeRow.since = revengeNow;
+            continue;
+          }
+          if ((revengeNow - revengeRow.since) < tracker::RevengeDwellDuration)
+            continue;
+
+          revengeRow.since = std::chrono::steady_clock::time_point::max();
+          if (revengeRow.state
+              == tracker::RaceTracker::Racer::RevengeState::Idle)
+          {
+            // Обидчик зафиксирован — теперь ждём ответного устойчивого обгона.
+            revengeRow.state = tracker::RaceTracker::Racer::RevengeState::Passed;
+          }
+          else
+          {
+            revengeRow.state =
+              tracker::RaceTracker::Racer::RevengeState::Revenged;
+            racer.revengeCredits += 1;
+            server::util::QuietLogDebug(
+              "Revenge: character {} revenged rival {} ({}/{})",
+              clientContext.characterUid,
+              rivalUid,
+              racer.revengeCredits,
+              tracker::RevengeMaxCredits);
+            if (racer.revengeCredits >= tracker::RevengeMaxCredits)
+              break;
+          }
+        }
+      }
+    }
+  }
 
   racer.worldPosition = command.position;
   racer.raceProgress = command.progress;
@@ -2182,8 +4235,14 @@ void RaceNetworkHandler::HandleChat(
   const auto& clientContext = GetClientContext(clientId);
 
   // Perform moderation before proceeding with chat processing
-  const auto verdict = _serverInstance.GetChatSystem().ProcessChatMessage(
+  const auto chatVerdict = _serverInstance.GetChatSystem().ProcessChatMessage(
     clientContext.characterUid, command.message);
+
+  // LOA-fix (R55-4, round55, backlog #179 часть 5): см. R55-3.
+  if (not chatVerdict)
+    return;
+
+  const auto& verdict = *chatVerdict;
 
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
@@ -2215,7 +4274,7 @@ void RaceNetworkHandler::HandleChat(
     {
       if (verdict.isPrevented)
       {
-        spdlog::info("[Room {}] (prevented) {} ({}): {}",
+        server::util::QuietLogInfo("[Room {}] (prevented) {} ({}): {}",
           clientContext.roomUid,
           characterName,
           userName,
@@ -2223,7 +4282,7 @@ void RaceNetworkHandler::HandleChat(
       }
       else
       {
-        spdlog::info("[Room {}] (muted) {} ({}): {}",
+        server::util::QuietLogInfo("[Room {}] (muted) {} ({}): {}",
           clientContext.roomUid,
           characterName,
           userName,
@@ -2237,7 +4296,7 @@ void RaceNetworkHandler::HandleChat(
       return;
     }
 
-    spdlog::info("[Room {}] {} ({}): {}",
+    server::util::QuietLogInfo("[Room {}] {} ({}): {}",
       clientContext.roomUid,
       characterName,
       userName,
@@ -2367,7 +4426,7 @@ void RaceNetworkHandler::HandleRelay(
           command.fromOid,
           command.toOid);
 
-      spdlog::warn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {:02X}",
+      server::util::QuietLogWarn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {:02X}",
         clientId,
         header,
         static_cast<uint16_t>(command.payloadType),
@@ -2480,7 +4539,11 @@ void RaceNetworkHandler::HandleRequestMagicItem(
   // TODO: Revise this on NPC races
   if (command.characterOid != racer.oid)
   {
-    spdlog::warn("Client tried to perform action on behalf of different racer");
+    // LOA-fix (R57-5, round57, backlog #195): oid бота — законен, молчим.
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
+    server::util::QuietLogWarn("Client tried to perform action on behalf of different racer");
     return;
   }
 
@@ -2546,7 +4609,11 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // TODO: Revise this in NPC races
   if (command.characterOid != racer.oid)
   {
-    spdlog::warn("Client tried to perform action on behalf of different racer");
+    // LOA-fix (R57-5, round57, backlog #195): oid бота — законен, молчим.
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
+    server::util::QuietLogWarn("Client tried to perform action on behalf of different racer");
     return;
   }
 
@@ -2714,6 +4781,40 @@ void RaceNetworkHandler::HandleUseMagicItem(
     }
   }
 
+  // LOA-fix (NEW-1, round3): дейлики «попаданий магическим шаром» — 1008 (20) и
+  // 1019 (50). basicType 2 = FireBall (magic.yaml: type 2 обычный, type 3 крит,
+  // basicType у обоих 2). Прогресс раньше писал клиент. Строгого «попадания»
+  // сервер не считает — targetList приезжает от клиента, — но засчитываем только
+  // РЕАЛЬНЫЙ каст: предмет должен был лежать на руках (гейт выше по функции), он
+  // тут же расходуется (magicItem.reset() ниже), цель непустая и гонщик в гонке.
+  // Это несравнимо строже прежнего «клиент прислал число».
+  // gameModeFlag дейликов = 76 (MagicSoloAction), остальное отсеет IsModeMatch.
+  // ⚠️ (N4, round7) ЭТО ГЕЙТ КВЕСТ-СЧЁТЧИКА, А НЕ ДЕНЕГ: выплатной античит по
+  // racer.state откачен раундом 6, награда за заезд состояние не читает.
+  if (magicSlotInfo.basicType == 2
+      && not targetList.empty()
+      && racer.state == tracker::RaceTracker::Racer::State::Racing)
+  {
+    const auto& magicParameters = raceInstance.GetParameters();
+    const auto fireballDailyNotifies = GetServerInstance().GetQuestSystem().OnQuestEvent(
+      clientContext.characterUid,
+      QuestSystem::QuestEvent::FireballAttack,
+      QuestSystem::ToGameModeFlag(magicParameters.gameMode, magicParameters.teamMode),
+      0,
+      {1008u, 1019u});
+    for (const auto& fireballNotify : fireballDailyNotifies)
+    {
+      SendDailyQuestNotificationToCharacter(
+        fireballNotify.characterUid,
+        fireballNotify.questId,
+        fireballNotify.objectiveProgress,
+        fireballNotify.carrotsReward,
+        fireballNotify.rewardType,
+        fireballNotify.unk2,
+        fireballNotify.mountExp);
+    }
+  }
+
   racer.magicItem.reset();
 }
 
@@ -2726,6 +4827,15 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
   std::scoped_lock lock(_raceInstancesMutex);
 
   auto& raceInstance = GetRaceInstance(clientContext);
+
+  // LOA-fix (R57-11, round57, backlog #195): «предмет подобрал бот» — не выдача
+  // человеку. Проверки владения здесь нет: `characterOid` идёт только эхом в
+  // исходящие пакеты, а выдача (яйцо, магический предмет, звёздные точки)
+  // делается ОТПРАВИТЕЛЮ. Семь ботов, катающихся по предметам, выдавали бы их
+  // живому игроку — и ни одной строки в логе.
+  if (raceInstance.IsAiRacerOid(command.characterOid))
+    return;
+
   auto& racer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
 
   // Check event items first (eggs, etc.)
@@ -2765,11 +4875,104 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
     return;
   }
 
+  // LOA-fix (R68, backlog #5/#99): ПОДБОР КВЕСТОВОГО ПРЕДМЕТА.
+  //
+  // Ветка стоит ЗДЕСЬ — после яиц и ДО общих деков — по двум причинам:
+  // квестовые предметы пер-гонщиковые (как яйца), и в общей карте деков их нет
+  // вовсе, поэтому ниже они упёрлись бы в жалобу «picked up untracked item
+  // deck» и подбор бы просто терялся.
+  //
+  // ★СНАЧАЛА СНИМАЕМ ПРЕДМЕТ, ПОТОМ ЗАСЧИТЫВАЕМ. Повторный пакет с тем же oid
+  // (лаг, дубликат, модклиент) обязан не найти предмета и уйти молча: иначе
+  // один предмет двигал бы счётчик квеста сколько угодно раз.
+  if (const auto* questItem = raceInstance.GetTracker().FindQuestItem(
+        clientContext.characterUid, command.itemDeckId))
+  {
+    // ★ГЕЙТ «ЗАЕЗД ИДЁТ ПРЯМО СЕЙЧАС». Три условия закрывают три РАЗНЫХ окна,
+    // в которых предмет физически лежит в трекере, а подобрать его честно
+    // нельзя:
+    //   * стадия — предметы раскладываются в `HandleStartRace`, то есть ещё в
+    //     `Loading`, и НЕ снимаются в `Stop()`: трекер чистит только следующий
+    //     `HandleStartRace`. Без этой проверки модклиент собирал бы весь
+    //     квест, сидя в комнате ожидания ПОСЛЕ заезда;
+    //   * зелёный свет — стадия `Racing` наступает за отсчёт до старта
+    //     (`waitTime` карты, 10 с), и всё это время игрок стоит. Тот же гейт
+    //     `now >= GetRaceStartTimePoint()` стоит на телеметрии R24 и на
+    //     детекторе мести — берём его же, а не изобретаем свой;
+    //   * состояние гонщика — уже финишировавший стоит на финише и подбирать
+    //     ничего не может.
+    // ★МОЛЧА, БЕЗ ЛОГА: путь удалённо-управляемый, а логирование на таком пути
+    // уже давало 15 350 строк за час живой игры (R57/#195).
+    // ★ЧЕГО ЭТОТ ГЕЙТ НЕ ДЕЛАЕТ: он не проверяет, что гонщик РЯДОМ с
+    // предметом. Серверной проверки близости в этом коде нет НИ У ОДНОГО вида
+    // предметов (подковы, магия, яйца), а `racer.worldPosition` приходит от
+    // клиента и не клампится — проверка по нему обходилась бы враньём о
+    // позиции и при этом умела бы отказать честному игроку на лаге. Это
+    // названный остаток раунда, а не недосмотр.
+    const auto raceStage = raceInstance.GetStage();
+    const bool raceIsLive =
+      (raceStage == RaceInstance::Stage::Racing
+        || raceStage == RaceInstance::Stage::Finishing)
+      && std::chrono::steady_clock::now() >= raceInstance.GetRaceStartTimePoint()
+      && racer.state == tracker::RaceTracker::Racer::State::Racing;
+
+    if (not raceIsLive)
+      return;
+
+    // Копии ДО удаления: `RemoveQuestItem` инвалидирует указатель.
+    const uint32_t questItemType = questItem->itemType;
+    const uint32_t questItemId = questItem->questItemId;
+    const uint32_t questItemTid = questItem->questTid;
+
+    raceInstance.GetTracker().RemoveQuestItem(
+      clientContext.characterUid, command.itemDeckId);
+    racer.trackedDecks.erase(command.itemDeckId);
+
+    // Клиенты в комнате убирают предмет с карты.
+    const protocol::AcCmdGameRaceItemGet questItemGet{
+      .characterOid = command.characterOid,
+      .itemId = command.itemDeckId,
+      .itemType = questItemType};
+    this->Broadcast(raceInstance, questItemGet);
+
+    // ★ЗАСЧИТЫВАЕМ РОВНО В ТОТ КВЕСТ, РАДИ КОТОРОГО ПРЕДМЕТ ЛЕЖАЛ, и только в
+    // него: список из ОДНОГО tid. Передать сюда все 12 значило бы отдать +1
+    // каждому активному квесту того же класса — пять сюжетных делят QTemID 3,
+    // три делят QTemID 6, — то есть напечатать прогресс из одного объекта.
+    // ★Сверка значения (`matchFunctionValue = true`) остаётся ПОВЕРХ этого как
+    // инвариант: предмет положен ради этого квеста, значит его `QTemID` обязан
+    // совпасть с `Quest::functionValue`. Если когда-нибудь разойдётся —
+    // прогресс не двинется, а не двинется НЕ ТОТ.
+    const auto advancedQuests = GetServerInstance().GetQuestSystem().AdvanceMainQuests(
+      clientContext.characterUid,
+      std::vector<uint32_t>{questItemTid},
+      true,
+      questItemId);
+
+    // ЖИВОЙ NOTIFY ПРОГРЕССА С РЕЙС-КАНАЛА — тем же способом, что доказан
+    // R16-1 для сюжетных счётчиков заездов: 0x3fe клиент рисует и придя по
+    // рейс-сокету. Без него игрок собирает предметы весь заезд и видит 0/20
+    // до следующего входа на ранчо.
+    for (const auto& advancedQuest : advancedQuests)
+    {
+      protocol::AcCmdRCUpdateQuestNotify questNotify{};
+      questNotify.characterUid = static_cast<uint32_t>(clientContext.characterUid);
+      questNotify.questTid = static_cast<uint16_t>(advancedQuest.questTid);
+      questNotify.objectiveProgress.progress = advancedQuest.progress;
+      questNotify.objectiveProgress.isCompleted = advancedQuest.completed;
+      _commandServer.QueueCommand<protocol::AcCmdRCUpdateQuestNotify>(
+        clientId,
+        [questNotify]() { return questNotify; });
+    }
+
+    return;
+  }
+
   auto& items = raceInstance.GetTracker().GetItemDecks();
   const auto deckIter = items.find(command.itemDeckId);
   if (deckIter == items.end())
   {
-    spdlog::warn("Client {} picked up untracked item deck {}", clientId, command.itemDeckId);
+    server::util::QuietLogWarn("Client {} picked up untracked item deck {}", clientId, command.itemDeckId);
     return;
   }
 
@@ -2824,7 +5027,7 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
             racer.starPointValue = std::min(racer.starPointValue+10000, gameModeInfo.starPointsMax);
             break;
           default:
-            spdlog::warn("Player {} picked up unknown item type {}",
+            server::util::QuietLogWarn("Player {} picked up unknown item type {}",
               clientId, deck.currentItem);
             break;
         }
@@ -2954,7 +5157,11 @@ void RaceNetworkHandler::HandleStartMagicTarget(
   // TODO: Revise this in NPC races
   if (command.casterOid != racer.oid)
   {
-    spdlog::warn("Character OID mismatch in HandleStartMagicTarget");
+    // LOA-fix (R57-6, round57, backlog #195): oid бота — законен, молчим.
+    if (raceInstance.IsAiRacerOid(command.casterOid))
+      return;
+
+    server::util::QuietLogWarn("Character OID mismatch in HandleStartMagicTarget");
     return;
   }
 
@@ -2968,7 +5175,12 @@ void RaceNetworkHandler::HandleStartMagicTarget(
 
   if (targetIter == racers.end())
   {
-    spdlog::warn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+    // LOA-fix (R57-8, round57, backlog #195): цель-бот — не ошибка. Живой
+    // игрок вправе навести магию на AI-соперника; у сервера просто нет для
+    // него состояния, поэтому наводить нечего и жаловаться не на что.
+    if (not raceInstance.IsAiRacerOid(command.targetOid))
+      server::util::QuietLogWarn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+
     return;
   }
 
@@ -2993,13 +5205,18 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
 
   if (command.targetOid!= racer.oid)
   {
-    spdlog::warn("Character OID mismatch in HandleChangeMagicTarget");
+    // LOA-fix (R57-7, round57, backlog #195): здесь поле названо targetOid, но
+    // проверяется им ОТПРАВИТЕЛЬ (наименование апстрима). oid бота — законен.
+    if (raceInstance.IsAiRacerOid(command.targetOid))
+      return;
+
+    server::util::QuietLogWarn("Character OID mismatch in HandleChangeMagicTarget");
     return;
   }
 
   if (!racer.pendingMagicTarget.has_value())
   {
-    spdlog::warn("Caster does not have dragon in HandleChangeMagicTarget");
+    server::util::QuietLogWarn("Caster does not have dragon in HandleChangeMagicTarget");
     return;
   }
 
@@ -3014,7 +5231,12 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
 
   if (targetIter == racers.end())
   {
-    spdlog::warn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+    // LOA-fix (R57-9, round57, backlog #195): цель-бот — не ошибка (текст
+    // жалобы апстрима здесь ошибочно называет чужую функцию и чужое поле;
+    // трогать его не стали, чтобы правка осталась про один дефект).
+    if (not raceInstance.IsAiRacerOid(command.targetOid2))
+      server::util::QuietLogWarn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+
     return;
   }
 
@@ -3089,6 +5311,25 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
+  // LOA-fix (R57-12, round57, backlog #195). ★ГАРД СТОИТ НА `targetOid`, И ЭТО
+  // НЕ ОЧЕВИДНО: хендлер target-reported — отправитель и есть ЦЕЛЬ, клиент
+  // сообщает «на МНЕ сработал эффект от attackerOid», поэтому `targetRacer`
+  // ищется по characterUid отправителя. Наш собственный разбор PLAN-129 §4
+  // фиксирует ту же семантику.
+  //
+  // Отсюда два вывода, оба важные:
+  //  * `targetOid` = кого объявили задетым. Назвали бота — у сервера для него
+  //    состояния нет, делать нечего. Без этого гарда пакет всё равно доходит до
+  //    хвоста, где `targetRacer.pendingMagicTarget.reset()` выполняется
+  //    БЕЗУСЛОВНО, то есть чужой «эффект по боту» сбивал бы наводку ЖИВОМУ;
+  //  * `attackerOid` гардить НЕЛЬЗЯ. Бот, ударивший игрока, — законное событие,
+  //    и клиент честно о нём сообщает. Гард там выбрасывал бы эти пакеты, и
+  //    магия ботов перестала бы действовать на человека: правка ради тишины
+  //    сломала бы игру. Поймано ревью — первая редакция раунда гардила именно
+  //    `attackerOid`.
+  if (raceInstance.IsAiRacerOid(command.targetOid))
+    return;
+
   auto& targetRacer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfoByEffectId(command.effectId);
@@ -3156,8 +5397,14 @@ void RaceNetworkHandler::HandleOpCmd(
 
   std::vector<std::string> feedback;
 
-  const auto result = GetServerInstance().GetChatSystem().ProcessChatMessage(
+  const auto chatVerdict = GetServerInstance().GetChatSystem().ProcessChatMessage(
     clientContext.characterUid, "//" + command.command);
+
+  // LOA-fix (R55-5, round55, backlog #179 часть 5): см. R55-3.
+  if (not chatVerdict)
+    return;
+
+  const auto& result = *chatVerdict;
 
   if (not result.commandVerdict)
   {
@@ -3181,11 +5428,19 @@ void RaceNetworkHandler::HandleChangeSkillCardPresetId(
   const ClientId clientId,
   const protocol::AcCmdCRChangeSkillCardPresetID& command)
 {
-  if (command.setId < 0 || command.setId > 2)
+  // LOA-fix (R11-9, round11, backlog #21): диапазон 0..1, а не 0..2.
+  // Наборов скиллов у персонажа ФИЗИЧЕСКИ два (skills.<mode>.set1 и .set2), но
+  // приём пропускал ещё и setId = 2 и сохранял его в activeSetId. На старте
+  // заезда это значение уводило сборку AcCmdCRStartRaceNotify в throw, и notify
+  // не получал никто из тех, кто стоял в обходе после виновника — вся комната
+  // висла на загрузке. Отбиваем на входе, там где это дёшево и без последствий.
+  if (command.setId > 1)
   {
-    // TODO: throw? return?
-    // Calling client requested to change skill preset to something out of range
-    // 0 < setId < 3
+    server::util::QuietLogWarn(
+      "AcCmdCRChangeSkillCardPresetID: client {} requested out-of-range skill "
+      "preset {}; ignoring (valid range is 0..1)",
+      clientId,
+      command.setId);
     return;
   }
 
@@ -3220,7 +5475,7 @@ void RaceNetworkHandler::RemoveEffect(
 {
   if (effectId >= tracker::RaceTracker::Racer::EffectCount)
   {
-    spdlog::error("RemoveEffect: effectId {} out of range", effectId);
+    server::util::QuietLogError("RemoveEffect: effectId {} out of range", effectId);
     return;
   }
   racer.effects[effectId] = false;
@@ -3301,7 +5556,7 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
   // Guard against misconfigured skillEffectId crashing the server
   if (magicSlotInfo.skillEffectId >= tracker::RaceTracker::Racer::EffectCount)
   {
-    spdlog::error(
+    server::util::QuietLogError(
       "ScheduleSkillEffect: skillEffectId {} out of range (max {})",
       magicSlotInfo.skillEffectId,
       tracker::RaceTracker::Racer::EffectCount - 1);
@@ -3484,7 +5739,7 @@ void RaceNetworkHandler::HandleInviteUser(
   if (not canInvite)
   {
     // Cannot invite character
-    spdlog::warn("Character '{}', which is in a race waiting room, tried to invite character '{}' who is not in an invitable state",
+    server::util::QuietLogWarn("Character '{}', which is in a race waiting room, tried to invite character '{}' who is not in an invitable state",
       clientContext.characterUid,
       command.recipientCharacterUid);
     _commandServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
@@ -3522,7 +5777,7 @@ void RaceNetworkHandler::HandleRequestUser(
 
   if (not isAdmin)
   {
-    spdlog::warn("User '{}'('{}'), which is not an admin, tried to summon character '{}'",
+    server::util::QuietLogWarn("User '{}'('{}'), which is not an admin, tried to summon character '{}'",
       userName,
       invokerCharacterName,
       command.characterName);
@@ -3617,7 +5872,7 @@ void RaceNetworkHandler::HandleKickUser(
 
   if (clientContext.characterUid != roomMasterUid)
   {
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Player {} ({}) tried to kick Player {} ({}) but is not the room master.",
       kickerUserName,
       kickerCharacterName,
@@ -3629,7 +5884,7 @@ void RaceNetworkHandler::HandleKickUser(
   // Prevent self-kick.
   if (command.characterUid == clientContext.characterUid)
   {
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Player {} ({}) tried to kick themselves.",
       kickerUserName,
       kickerCharacterName);
@@ -3646,7 +5901,7 @@ void RaceNetworkHandler::HandleKickUser(
 
   if (!isTargetInRoom)
   {
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Player {} ({}) tried to kick Player {} ({}) who is not in the room.",
       kickerUserName,
       kickerCharacterName,
@@ -3665,7 +5920,7 @@ void RaceNetworkHandler::HandleKickUser(
 
   if (targetIsGameMaster)
   {
-    spdlog::info(
+    server::util::QuietLogInfo(
       "Player {} ({}) tried to kick Player {} ({}) who is a GameMaster.",
       kickerUserName,
       kickerCharacterName,
@@ -3682,7 +5937,7 @@ void RaceNetworkHandler::HandleKickUser(
   }
   catch (const std::exception& ex)
   {
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Player {} ({}) tried to kick Player {} ({}) but no active client was found: {}",
       kickerUserName,
       kickerCharacterName,
@@ -3692,7 +5947,7 @@ void RaceNetworkHandler::HandleKickUser(
     return;
   }
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Player {} ({}) kicked Player {} ({}) from [Room {}].",
     kickerUserName,
     kickerCharacterName,
@@ -3857,8 +6112,41 @@ void RaceNetworkHandler::HandleTeamGauge(const ClientId clientId)
     // Reference: `TeamSpurGaugeInfo`/`ReduceWaitTime` in libconfig
     constexpr auto SpurStartDelay = std::chrono::milliseconds(1500);
 
+    // LOA-fix (R30-1, round30, backlog #128, SECURITY/LIFETIME): захват
+    // ПО ЗНАЧЕНИЮ вместо ссылок. БЫЛО `&racer, &spurringTeamInfo` — обе ссылки
+    // указывают ВНУТРЬ RaceInstance::_tracker, то есть в узел
+    // `_raceInstances` (RaceNetworkHandler.hpp:363). Джоб исполняется через
+    // SpurStartDelay=1500 мс на потоке директора; за это окно
+    // HandleLeaveRoom (:1770) или refuseRoomEntry (:710) успевают сделать
+    // `_raceInstances.erase(roomUid)` — узел уничтожен, ссылки повисли.
+    // Проверка существования ниже спасает `raceInstance`, но НЕ `racer`:
+    // `Tracker::Clear()` (:1935, HandleStartRace) сносит `_racers` У ЖИВОГО
+    // инстанса — find() проходит, а `racer.team` читается из освобождённой
+    // памяти (UAF-read). `racer.team` неизменен на всю длительность заезда
+    // (RaceTracker.hpp:112, ставится при AddRacer/ChangeTeam до старта),
+    // поэтому копия по значению эквивалентна по смыслу и безопасна по
+    // времени жизни. `spurringTeamInfo` не захватываем вовсе — внутренний
+    // джоб (R30-3) переищет инстанс сам.
+    // LOA-fix (R67-6, backlog #128b): ВНЕШНИЙ ДЖОБ ЗАХВАТЫВАЕТ ЭПОХУ ЗАЕЗДА.
+    //
+    // `roomUid` отвечает на вопрос «та ли это КОМНАТА», и до сих пор только на
+    // него и отвечали. Вопрос «тот ли это ЗАЕЗД» не задавался вовсе, а
+    // `RaceInstance` комната переиспользует из заезда в заезд. Между
+    // планированием и исполнением проходит SpurStartDelay = 1500 мс: за это
+    // окно комната успевает финишировать и стартовать заново (`HandleStartRace`
+    // → `Tracker::Clear()` → `RaceInstance::Start()`), и джоб ПРОШЛОГО заезда
+    // рассылал спур участникам НОВОГО и ставил в очередь разблокировку против
+    // чужого трекера.
+    // ★Эпоха берётся ПО ЗНАЧЕНИЮ ровно там же и так же, как `roomUid`: копия
+    // uint32_t не бросает, то есть захват не умеет «не установиться»
+    // ([[obligation-that-can-fail-to-install]]).
     _scheduler.Queue(
-      [this, roomUid = raceInstance.GetRoomUid(), &racer, &spurringTeamInfo, maxPoints, teamSize]()
+      [this,
+       roomUid = raceInstance.GetRoomUid(),
+       raceEpoch = raceInstance.GetRaceEpoch(),
+       spurringTeam = racer.team,
+       maxPoints,
+       teamSize]()
       {
         std::scoped_lock lock(_raceInstancesMutex);
         const auto raceInstanceIter = _raceInstances.find(roomUid);;
@@ -3867,19 +6155,33 @@ void RaceNetworkHandler::HandleTeamGauge(const ClientId clientId)
 
         const auto& raceInstance = raceInstanceIter->second;
 
+        // ★ГАРД ЭПОХИ (R67-6). Комната та же, а заезд уже другой — значит
+        // этот спур принадлежит прошлому заезду. Тихий no-op: ни рассылки,
+        // ни постановки джоба разблокировки. Проверка стоит ДО всякого
+        // побочного действия — после него гасить было бы уже нечего.
+        if (raceInstance.GetRaceEpoch() != raceEpoch)
+          return;
+
         const float BaseLoseTeamSpurConsumeRate = -10.0f;
         const float BaseWinTeamSpurConsumeRate = -2.5f;
 
         // Reset boost gauge for the team that lost it.
+        // LOA-fix (R30-2, round30, backlog #128): читаем КОПИЮ `spurringTeam`
+        // вместо `racer.team` — сам `racer` больше не захвачен (см. R30-1).
+        // Тернарник с throw оставлен ДОСЛОВНО как апстримный стиль; он теперь
+        // мёртвый (Solo/None отсекает throw при выборе `spurringTeamInfo`
+        // ВЫШЕ, до Queue), но если когда-нибудь оживёт — Scheduler::Tick
+        // стирает джоб и перебрасывает, а RaceNetworkHandler::Tick (:288-297)
+        // ловит `const std::exception&`. Терминации не будет.
         protocol::AcCmdRCTeamSpurGauge beatenSpur{
           .team =
             // This red/blue swap is intentional, if team A wins, team B is punished and reset.
-            racer.team == tracker::RaceTracker::Racer::Team::Red ? tracker::RaceTracker::Racer::Team::Blue :
-            racer.team == tracker::RaceTracker::Racer::Team::Blue ? tracker::RaceTracker::Racer::Team::Red :
+            spurringTeam == tracker::RaceTracker::Racer::Team::Red ? tracker::RaceTracker::Racer::Team::Blue :
+            spurringTeam == tracker::RaceTracker::Racer::Team::Blue ? tracker::RaceTracker::Racer::Team::Red :
             throw std::runtime_error(
               std::format(
                 "Unrecognised racer team '{}'",
-                static_cast<uint32_t>(racer.team))),
+                static_cast<uint32_t>(spurringTeam))),
           .currentPoints = 0.0f,
           .newPoints = 0.0f,
           .markerSpeed = BaseLoseTeamSpurConsumeRate * teamSize, // Scales with `LoseTeamSpurConsumeRate`
@@ -3888,7 +6190,7 @@ void RaceNetworkHandler::HandleTeamGauge(const ClientId clientId)
 
         // Trigger spur for the team that has won it.
         protocol::AcCmdRCTeamSpurGauge successfulSpur{
-          .team = racer.team,
+          .team = spurringTeam,
           .currentPoints = maxPoints / 10.0f,
           .newPoints = 0.0f,
           .markerSpeed = BaseWinTeamSpurConsumeRate * teamSize, // Scales with `WinTeamSpurConsumeRate`
@@ -3901,10 +6203,67 @@ void RaceNetworkHandler::HandleTeamGauge(const ClientId clientId)
           (maxPoints / 10.0f) / (std::abs(BaseWinTeamSpurConsumeRate) * teamSize);
 
         // Schedule unlock of the spurring team's gauge after the spur completes.
+        // LOA-fix (R30-3, round30, backlog #128, SECURITY/UAF-WRITE): ЯДРО ФИКСА.
+        // БЫЛО: `[&spurringTeamInfo]() { spurringTeamInfo.gaugeLocked = false; }`
+        // — захват ССЫЛКИ на `RaceInstance::_tracker.redTeam/.blueTeam` с
+        // задержкой spurDurationSeconds = (maxPoints/10)/(2.5*teamSize) = 7-10 с,
+        // БЕЗ гарда живости и БЕЗ блокировки. Scheduler (Scheduler.hpp) не умеет
+        // отменять джобы и не отдаёт хендл — джоб выстрелит В ЛЮБОМ СЛУЧАЕ.
+        // Если за эти 7-10 с комната опустела, `_raceInstances.erase(roomUid)`
+        // (:710 refuseRoomEntry, :1770 HandleLeaveRoom) уничтожает RaceInstance,
+        // и джоб пишет `bool` в освобождённую кучу = USE-AFTER-FREE WRITE.
+        // Это не исключение — ни один catch этого не видит, порча памяти тихая.
+        // Достижимо в ЧЕСТНОЙ игре: командный Speed-заезд, калибр дошёл до
+        // максимума, все вышли в лобби в течение ~10 с.
+        // СТАЛО: захват ПО ЗНАЧЕНИЮ (`roomUid`, `spurringTeam`) + переиск
+        // инстанса под `_raceInstancesMutex` + гард живости + no-op, если
+        // инстанса уже нет. Ровно тот же шаблон, что у джоба истечения
+        // эффекта (:4767-4802) и у джоба стены льда (:3997-4018).
+        // Побочно закрывается ВТОРОЙ дефект: старый джоб не брал мьютекс
+        // вообще, то есть писал `gaugeLocked` с потока директора, пока
+        // сетевой поток читает его в HandleTeamGauge (:5111) — гонка данных
+        // даже на ЖИВОМ инстансе. Теперь запись под тем же мьютексом.
         _scheduler.Queue(
-          [&spurringTeamInfo]()
+          [this, roomUid, raceEpoch, spurringTeam]()
           {
-            spurringTeamInfo.gaugeLocked = false;
+            // Fail-closed: команда обязана быть Red или Blue. Сюда мы попадаем
+            // только после успешного выбора `spurringTeamInfo` выше (Solo/None
+            // там бросает ДО Queue), но джоб не должен полагаться на то, что
+            // произошло 1.5 с назад в другом кадре — Solo молча ушёл бы в
+            // blueTeam. Бросать здесь нельзя (мы на потоке директора), поэтому
+            // тихий no-op.
+            if (spurringTeam != tracker::RaceTracker::Racer::Team::Red
+              and spurringTeam != tracker::RaceTracker::Racer::Team::Blue)
+              return;
+
+            std::scoped_lock unlockLock(_raceInstancesMutex);
+            const auto unlockRaceInstanceIter = _raceInstances.find(roomUid);
+            if (unlockRaceInstanceIter == _raceInstances.cend())
+              return;
+
+            // LOA-fix (R67-7, backlog #128b): ГАРД ЭПОХИ У ДЖОБА
+            // РАЗБЛОКИРОВКИ — ИМЕННО ОН ДЕЛАЕТ ВОЗВРАТ R30-4 БЕЗОПАСНЫМ.
+            //
+            // Задержка здесь spurDurationSeconds = (maxPoints/10)/(2.5*teamSize)
+            // = 7-10 с — самое широкое окно во всём обработчике. Заезд за это
+            // время успевает кончиться и начаться заново, а `Tracker::Clear()`
+            // (R67-5) отдаёт новому заезду СВЕЖИЙ незалоченный калибр. Без
+            // этой проверки джоб прошлого заезда снял бы блокировку, которую
+            // новый заезд поставил честно, — команда получила бы второй спур
+            // подряд.
+            // ★Гард внешнего джоба этого НЕ покрывает: между ним и этим
+            // остаются те самые 7-10 с, в которые рестарт и попадает чаще
+            // всего. Две проверки закрывают два РАЗНЫХ окна, а не одно
+            // дважды.
+            if (unlockRaceInstanceIter->second.GetRaceEpoch() != raceEpoch)
+              return;
+
+            auto& unlockTracker = unlockRaceInstanceIter->second.GetTracker();
+            auto& unlockTeamInfo =
+              spurringTeam == tracker::RaceTracker::Racer::Team::Red
+                ? unlockTracker.redTeam
+                : unlockTracker.blueTeam;
+            unlockTeamInfo.gaugeLocked = false;
           },
           Scheduler::Clock::now() + std::chrono::milliseconds(
             static_cast<int64_t>(spurDurationSeconds * 1000)));
@@ -3942,7 +6301,7 @@ void RaceNetworkHandler::HandleTriggerizeAct(
   // The racer is neither in a speed mode or adv map
   if (not isSpeedGameMode or not isAdvMap)
   {
-    spdlog::warn("Character '{}' tried to trigger an interactive object but is not in a speed adv map race.",
+    server::util::QuietLogWarn("Character '{}' tried to trigger an interactive object but is not in a speed adv map race.",
       clientContext.characterUid);
     return;
   }
@@ -3961,23 +6320,94 @@ void RaceNetworkHandler::HandleGameCreateClientItem(
   ClientId clientId,
   const protocol::AcCmdCRGameCreateClientItem& command)
 {
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "AcCmdCRGameCreateClientItem: {} {} [{}, {}, {}] [{}, {}, {}, {}]",
     command.someonesOid,
     command.unk1,
     command.position.x, command.position.y, command.position.z,
     command.unk3[0], command.unk3[1], command.unk3[2], command.unk3[3]);
 
+  // LOA-fix (R57-13, round57, backlog #195): «предмет создал бот» — не спавн для
+  // человека. `someonesOid` здесь уходит только в лог, а сам спавн привязывается
+  // к отправителю; проверки владения нет. Гард стоит ДО всякой жалобы, потому
+  // что пакет за бота обязан быть тихим на ЛЮБОЙ ветке этого обработчика.
+  if (IsAiRacerOfClientRace(GetClientContext(clientId), command.someonesOid))
+    return;
+
   if (command.unk1 != 0)
-    // Only egg spawning (unk1 == 0) is implemented
-    throw new std::runtime_error("AcCmdCRGameCreateClientItem::unk1 != 0, other case not implemented");
+  {
+    // LOA-fix (#125, SECURITY/AVAILABILITY): unk1 приходит с ПРОВОДА (client-controlled).
+    // `throw new` бросал УКАЗАТЕЛЬ → catch(const std::exception&) в диспетчере команд
+    // (CommandServer.cpp:363-376) НЕ ловит → std::terminate = REMOTE CRASH
+    // (модклиент шлёт unk1 != 0 → сервер падает одним пакетом).
+    // Реализован только спавн яиц (unk1==0); прочие случаи ГРАЦИОЗНО игнорируем
+    // (R25/R104-прецедент: throw → warn + return), не роняя сервер.
+    server::util::QuietLogWarn(
+      "HandleGameCreateClientItem: oid {} sent unk1={} (only egg-spawn unk1==0 implemented); ignoring",
+      command.someonesOid, command.unk1);
+    return;
+  }
 
   const auto& clientContext = GetClientContext(clientId);
-  auto& raceInstance = GetRaceInstance(clientContext);
+
+  // LOA-fix (R33-1, round33, backlog #125b, SECURITY/CONCURRENCY + DoS).
+  // Тело хендлера разбито на ТРИ фазы: дёшево-под-локом → дорого-без-лока →
+  // дёшево-под-локом. Подробный разбор «почему именно так» — в шапке раунда в
+  // apply_patches.py и в plans/PLAN-125b-createitem-split-critsec.md.
+  //
+  // КАП = максимум ОДНОВРЕМЕННО живых event-item'ов у гонщика (НЕ «одно яйцо за
+  // заезд»): подбор зовёт RemoveEventItem, вектор пустеет, легальный повторный
+  // спавн проходит. Проектное значение — сервер предлагает спавн один раз за
+  // заезд (HandleLoadingComplete), живой размер вектора проектно 0 или 1.
+  constexpr std::size_t MaxEventItemsPerRacer = 1;
+
+  // Снимок идентити ПО ЗНАЧЕНИЮ: дальше фазы 1 никакие ссылки в _raceInstances
+  // (инстанс, трекер, гонщик) не переживают снятие мьютекса — только эти скаляры.
+  const data::Uid characterUid = clientContext.characterUid;
+  const data::Uid roomUid = clientContext.roomUid;
+
+  // ---- ФАЗА 1: дёшево, ПОД _raceInstancesMutex -----------------------------
+  // Только дешёвые, room-bounded операции: лукап инстанса, mapBlockId, размер
+  // eventItems. ★ТОЧНОСТЬ (NIT ревью round33): это НЕ O(1) — _raceInstances
+  // это unordered_map (O(1) в среднем), а IsRacer/GetRacer ходят в
+  // RaceTracker::_racers = std::map<data::Uid, Racer>, то есть O(log R) по
+  // числу гонщиков комнаты (R ≤ 8). Существенно не «константа», а то, что под
+  // этим локом НЕТ ни реестров, ни RNG, ни record-локов, ни I/O.
+  registry::MapBlockId mapBlockId{};
+  std::size_t heldEventItems = 0;
+  bool capHit = false;
+  {
+    std::scoped_lock lock(_raceInstancesMutex);
+
+    // checkRacer = true по умолчанию → бросает, если персонаж не гонщик.
+    // Бросок caught-noisy в диспетчере (std::runtime_error по ЗНАЧЕНИЮ), как и до фикса.
+    auto& raceInstance = GetRaceInstance(clientContext);
+    mapBlockId = raceInstance.GetMapBlockId();
+
+    const auto& racer = raceInstance.GetTracker().GetRacer(characterUid);
+    heldEventItems = racer.eventItems.size();
+    capHit = heldEventItems >= MaxEventItemsPerRacer;
+  }
+
+  // ★warn СНАРУЖИ критической секции: spdlog делает файловый/консольный I/O, и
+  // под директор-глобальным мьютексом это готовый рычаг для флуда.
+  if (capHit)
+  {
+    server::util::QuietLogWarn(
+      "HandleGameCreateClientItem: character {} already holds {} event item(s) (cap {}); "
+      "ignoring extra client-item spawn",
+      characterUid, heldEventItems, MaxEventItemsPerRacer);
+    return;
+  }
+
+  // ---- ФАЗА 2: дорого, БЕЗ ЛОКА -------------------------------------------
+  // Реестры (read-only, грузятся на старте), взвешенный RNG-выбор яйца и
+  // record-lock персонажа. Именно этот участок под _raceInstancesMutex и был
+  // регрессом по доступности, из-за которого раунд переделан.
 
   // Get region for this map.
   const auto& mapBlockInfo = _serverInstance.GetCourseRegistry().GetMapBlockInfo(
-    raceInstance.GetMapBlockId());
+    mapBlockId);
   const auto regionEggs = _serverInstance.GetPetRegistry().GetEggsByRegion(mapBlockInfo.region);
   if (regionEggs.empty())
     return;
@@ -3994,7 +6424,7 @@ void RaceNetworkHandler::HandleGameCreateClientItem(
   // Check if the player already owns this egg.
   bool alreadyOwned = false;
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
-    clientContext.characterUid);
+    characterUid);
   characterRecord.Immutable([&](const data::Character& character)
   {
     alreadyOwned = _serverInstance.GetItemSystem().HasItem(character, selectedEgg.tid);
@@ -4004,10 +6434,51 @@ void RaceNetworkHandler::HandleGameCreateClientItem(
   if (alreadyOwned)
     return;
 
-  // Add to per-racer event item tracker regardless of ownership.
-  auto& item = raceInstance.GetTracker().AddEventItem(clientContext.characterUid);
-  item.position = command.position;
-  item.itemType = selectedEgg.deckItemId;
+  // Решение фазы 2 — ПО ЗНАЧЕНИЮ (regionEggs/selectedEgg локальны, но в фазу 3
+  // сознательно не переносим ни одной ссылки).
+  const uint32_t selectedItemType = selectedEgg.deckItemId;
+  const auto selectedPosition = command.position;
+
+  // ---- ФАЗА 3: дёшево, СНОВА ПОД _raceInstancesMutex -----------------------
+  // Ре-лукап и ре-валидация: за время фазы 2 комната могла закрыться
+  // (HandleLeaveRoom стирает из _raceInstances), гонщик — выйти, а параллельный
+  // пакет — успеть занять кап. Прецедент ре-лукапа по roomUid — R30-3.
+  bool capHitLate = false;
+  {
+    std::scoped_lock lock(_raceInstancesMutex);
+
+    const auto raceInstanceIter = _raceInstances.find(roomUid);
+    if (raceInstanceIter == _raceInstances.cend())
+      return;
+
+    auto& tracker = raceInstanceIter->second.GetTracker();
+    if (not tracker.IsRacer(characterUid))
+      return;
+
+    auto& racer = tracker.GetRacer(characterUid);
+    // ★АВТОРИТЕТНАЯ проверка капа (TOCTOU-гард): без неё два одновременных
+    // пакета оба прошли бы фазу 1 при size() == 0 и оба сделали emplace_back.
+    if (racer.eventItems.size() >= MaxEventItemsPerRacer)
+    {
+      capHitLate = true;
+    }
+    else
+    {
+      // Add to per-racer event item tracker regardless of ownership.
+      // ★Запись под тем же мьютексом, под которым директор-тред ИТЕРИРУЕТ
+      // racer.eventItems в TickItemSpawners → data-race UAF закрыт.
+      auto& item = tracker.AddEventItem(characterUid);
+      item.position = selectedPosition;
+      item.itemType = selectedItemType;
+    }
+  }
+
+  // ★Снова: I/O только после снятия лока.
+  if (capHitLate)
+    server::util::QuietLogWarn(
+      "HandleGameCreateClientItem: character {} lost the cap race (cap {}); "
+      "ignoring extra client-item spawn",
+      characterUid, MaxEventItemsPerRacer);
 }
 
 } // namespace server

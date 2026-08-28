@@ -38,7 +38,66 @@ namespace server::tracker
 //! Invalid course time represents a did not finish state in the client scoreboard.
 constexpr uint32_t InvalidCourseTime = std::numeric_limits<uint32_t>::max();
 
+//! LOA-fix (A3, round3): минимально правдоподобное время прохождения трассы, мс.
+//! ⚠️ ЧТО ЭТИМ ГЕЙТИТСЯ (N1, round7 — актуально после отката раунда 6):
+//! ТОЛЬКО КВЕСТОВЫЙ ПРОГРЕСС — сюжетные счётчики заездов (B1), призовые места и
+//! диспатч квестов в RaceInstance::Stop. ВЫПЛАТУ (2500 морковок / 420 опыта)
+//! этот порог НЕ трогает: выплатной античит заездов (A1 / A3-множитель / B2 /
+//! C1) откачен раундом 6 как нерабочий, награда считается по АПСТРИМНОМУ
+//! правилу — безусловно. Не читать этот комментарий как «короткий заезд не
+//! оплачивается деньгами»: оплачивается.
+//! ПОЧЕМУ КОНСТАНТА, А НЕ ДАННЫЕ КАРТЫ: в courses.yaml длины трасс нет вообще,
+//! а timeLimit у всех 52 боевых карт одинаковый (300 с; 30 с только у ranch_00 /
+//! ranch_w / town_test01, которые заездами не являются) — вывести честный
+//! минимум «по карте» не из чего. 30 с выбраны с большим запасом: реальный круг
+//! в игре идёт полторы-три минуты. ТЮНИНГ: если в логе появятся отказы честным
+//! игрокам («course time … is below the plausible minimum»), порог опустить.
+constexpr uint32_t MinPlausibleCourseTime = 30000;
+
+//! Максимум правдоподобного прироста класс-опыта за ОДИН заезд (#93). Клиент
+//! шлёт gainedClassProgress сам; без капа модифицированный клиент чеканит
+//! классы одним пакетом. 10000 = 2.92× наблюдаемого по pcap максимума (3429) и
+//! 1.5 класса (levelUpPoints.base 6650). ТЮНИНГ: если в логе пойдут отказы
+//! честным («exceeding the plausible per-race maximum»), порог поднять.
+constexpr uint32_t MaxPlausibleClassProgress = 10000;
+
+//! LOA-fix (R24, #14 фаза 1): потолок правдоподобной скорости за заезд. member4 —
+//! КЛИЕНТСКИЙ и неверифицированный; без капа модклиент чеканит ВЕЧНЫЙ рекорд
+//! mountInfo.topSpeed (running max, откат только правкой данных при остановленном
+//! сервере). 300 км/ч = 2.94x наблюдённого по pcap максимума (101.91) — та же
+//! пропорция, что в MaxPlausibleClassProgress. Тюнинг: если честные упрутся —
+//! в логе пойдёт warn, поднять.
+constexpr float MaxPlausibleSpeedKph = 300.0f;
+
+//! LOA-fix (R24, #14 фаза 1): жёсткий потолок ОДНОГО шага позиции, метры. Основной
+//! фильтр — динамический бюджет MaxPlausibleSpeedKph*dt; эта константа страхует
+//! случай, когда залип сам сервер и dt выдал огромный бюджет. Наблюдённый макс шага
+//! в pcap — 10.68 м при каденции 3.83 Гц.
+constexpr float MaxPlausiblePositionDeltaMetres = 200.0f;
+
 constexpr std::chrono::milliseconds EventThrottleDuration{250};
+
+//! LOA-fix (R-revenge, #13): ПАРАМЕТРЫ АНТИ-ФОРЖА БОНУСА «НЕПЛОХАЯ МЕСТЬ».
+//! Месть определяется ТОЛЬКО сервером. Клиентская декларация цели (опкод 0x206
+//! AcCmdCRRevengeAssign) в процесс НЕ входит: структуры и хендлера для неё нет,
+//! и реализовывать её НЕЛЬЗЯ — это была бы дыра «объяви себе месть сам».
+//! Гистерезис обгона: доля трассы, на которую надо ОТОРВАТЬСЯ, чтобы обгон
+//! засчитался. Дребезг «ноздря в ноздрю» мести не даёт.
+constexpr float RevengeOvertakeHysteresis = 0.01f;
+
+//! Выдержка: столько надо НЕПРЕРЫВНО удерживать отрыв, чтобы позиция считалась
+//! устоявшейся. Убивает пинг-понг на финишной прямой и обмен «мгновенными»
+//! обгонами двух сговорившихся аккаунтов.
+constexpr std::chrono::milliseconds RevengeDwellDuration{3000};
+
+//! Максимальный возраст последнего пакета позиции СОПЕРНИКА, при котором его
+//! прогресс считается живым. Отвалившийся/залагавший соперник замораживает свой
+//! trustedProgress — «обгон трупа» местью не считается.
+constexpr std::chrono::milliseconds RevengeRivalFreshness{3000};
+
+//! Потолок числа зачтённых соперников (третий порог клиентской шкалы). Больше
+//! не платим: тиры 500/750/1000 морковок и 100/150/200 класс-опыта.
+constexpr uint32_t RevengeMaxCredits = 3;
 
 //! A race tracker.
 class RaceTracker
@@ -49,6 +108,37 @@ public:
   {
     Oid oid{};
     uint32_t itemType{};
+    protocol::Vector3 position{};
+  };
+
+  //! LOA-fix (R68, backlog #5/#99): КВЕСТОВЫЙ ПРЕДМЕТ гонщика.
+  //!
+  //! ★ОТДЕЛЬНАЯ СТРУКТУРА, А НЕ `EventItem`, и это не вкусовщина. У яичного
+  //! вектора стоит ЖЁСТКИЙ КАП `MaxEventItemsPerRacer = 1` (гард #125b в
+  //! `HandleGameCreateClientItem`), а квестовых предметов гонщику
+  //! раскладывается до 32 за заезд — переиспользование либо сломало бы гард
+  //! яиц, либо обрезало бы раскладку до одного предмета.
+  struct QuestItem
+  {
+    //! Object id предмета. Выдаётся из ТОГО ЖЕ счётчика `_nextItemDeckOid`,
+    //! что у обычных деков и яиц: у клиента все предметы заезда живут в одном
+    //! пространстве идентификаторов.
+    Oid oid{};
+    //! Внешний вид (клиентская таблица `DeckItemParam`, напр. 1003 = осколок
+    //! кристалла). Уходит клиенту как `AcCmdRCCreateItem::itemType`.
+    uint32_t itemType{};
+    //! `QTemID` предмета — то же число, что в `Quest::functionValue`.
+    //! Используется как СВЕРКА при засчитывании, а не как идентификатор цели.
+    uint32_t questItemId{};
+    //! ★TID КВЕСТА, РАДИ КОТОРОГО ЭТОТ ПРЕДМЕТ ПОЛОЖЕН, — и это главное поле.
+    //! Одного `questItemId` НЕ ХВАТАЕТ: пять сюжетных квестов делят QTemID 3
+    //! (12016/14014/14019/14020/14021), три — QTemID 6 (12015/14024/14028), два
+    //! — QTemID 5 (12013/12014). Если засчитывать по предмету, один подобранный
+    //! осколок двигал бы ВСЕ активные квесты своего класса разом — «печать»
+    //! прогресса из одного объекта. Предмет кладётся ПЕР-КВЕСТОВО и
+    //! засчитывается ровно в тот квест, ради которого лежал.
+    uint32_t questTid{};
+    //! Мировая позиция предмета (уже со смещением карты).
     protocol::Vector3 position{};
   };
 
@@ -78,10 +168,79 @@ public:
     uint32_t starPointValue{};
     uint32_t jumpComboValue{};
     uint32_t courseTime{InvalidCourseTime};
+    //! LOA-fix (R7 BLOCK-1, round7): латч «финиш этого гонщика уже засчитан в
+    //! КВЕСТОВЫЕ счётчики заездов». Состояние-НЕЗАВИСИМЫЙ: racer.state для
+    //! дедупа не годится — HandleLoadingComplete безусловно возвращает Racing
+    //! из ЛЮБОГО состояния (апстримное поведение; гард C1 откачен раундом 6),
+    //! поэтому чередование LoadingComplete → RaceFinal сбрасывало прежнюю
+    //! проверку `state == Finishing` и накручивало счётчики.
+    //! Живёт ровно один заезд: HandleStartRace зовёт Tracker::Clear(), после
+    //! чего AddRacer() создаёт Racer заново (значение по умолчанию false).
+    //! Денег НЕ касается: выплата в RaceInstance::Stop это поле не читает.
+    bool finishCounted{false};
     std::optional<uint32_t> magicItem{};
     //! The racer's progress on the race track.
     //! Normalised by the client to: 0.0f <= x <= 1.0f
     float raceProgress{};
+
+    //! LOA-fix (R-revenge, #13): ДОВЕРЕННЫЙ прогресс — серверная копия
+    //! raceProgress, которая (а) растёт не быстрее правдоподобного темпа
+    //! (вся трасса за MinPlausibleCourseTime) и (б) НИКОГДА не убывает.
+    //! ПОЧЕМУ ОТДЕЛЬНОЕ ПОЛЕ: по raceProgress ранжирует MagicSystem.cpp:94
+    //! (выдача магических предметов по месту) — любая правка семантики там
+    //! была бы регрессией магии. Здесь нулевой риск.
+    //! ПОЧЕМУ МОНОТОННО (★самая тонкая дыра): если позволить прогрессу падать,
+    //! модклиент занижает свой progress → «его обогнали» → возвращает честный →
+    //! «месть» без единого реального обгона. Храповик это закрывает.
+    //! Живёт РОВНО один заезд (сброс там же, где finishCounted).
+    float trustedProgress{};
+    //! Момент последнего движения trustedProgress. Служит двум целям: бюджет
+    //! темпа (свой) и проверка свежести (чужой). max() = ещё не стартовал.
+    std::chrono::steady_clock::time_point trustedProgressTimePoint{
+      std::chrono::steady_clock::time_point::max()};
+
+    //! Состояние «мести» относительно ОДНОГО соперника из чужой команды.
+    enum class RevengeState
+    {
+      //! Нас ещё не обгоняли (или обгон не выдержан).
+      Idle,
+      //! Соперник устойчиво впереди — «обидчик» зафиксирован.
+      Passed,
+      //! Мы устойчиво вернулись вперёд — месть зачтена. Терминальное.
+      Revenged,
+    };
+
+    struct RevengeRow
+    {
+      RevengeState state{RevengeState::Idle};
+      //! Момент, с которого текущее ожидаемое отношение (соперник впереди /
+      //! мы впереди) держится непрерывно. max() = отношение сейчас не выполнено.
+      std::chrono::steady_clock::time_point since{
+        std::chrono::steady_clock::time_point::max()};
+    };
+
+    //! Строки мести, ключ — characterUid соперника. Размер ограничен числом
+    //! гонщиков чужой команды (<= 7). Живёт ровно один заезд.
+    std::map<data::Uid, RevengeRow> revengeRows;
+    //! Число ТЕРМИНАЛЬНЫХ мстей за заезд — источник тира выплаты в
+    //! RaceInstance::Stop(). Клампится RevengeMaxCredits.
+    uint32_t revengeCredits{};
+
+    //! LOA-fix (R24, #14 фаза 1): пер-заездная телеметрия для mountInfo лошади.
+    //! Живёт РОВНО один заезд: HandleStartRace зовёт Tracker::Clear() → AddRacer()
+    //! создаёт Racer заново с дефолтами (+ явный сброс там же, где finishCounted).
+    //! ПОТОКИ: под _raceInstancesMutex (как весь трекер), НЕ атомарные. Трогать
+    //! только из Handle*-хендлера под локом либо из RaceInstance::Stop().
+    //! Максимум клиентской скорости (member4) за заезд, км/ч.
+    float topSpeedKph{};
+    //! Пройденный путь за заезд, метры (1 мир-юнит ≈ 1 метр).
+    double distanceMetres{};
+    //! Первый пакет позиции только СЕЕТ worldPosition (иначе первая дельта от
+    //! {0,0,0} принесёт ~8000 ложных «метров»).
+    bool hasPositionSample{false};
+    //! Момент прошлого пакета позиции — для бюджета правдоподобного шага.
+    std::chrono::steady_clock::time_point lastPositionTimePoint{
+      std::chrono::steady_clock::time_point::max()};
 
     //! A set of tracked items in racer's proximity.
     std::unordered_set<Oid> trackedDecks;
@@ -90,6 +249,12 @@ public:
 
     //! Per-racer event items (e.g. eggs) visible only to this racer.
     std::vector<EventItem> eventItems;
+
+    //! LOA-fix (R68, backlog #5/#99): пер-гонщиковые КВЕСТОВЫЕ предметы.
+    //! Живут ровно один заезд: раскладываются в `HandleStartRace` сразу после
+    //! `AddRacer` (то есть уже после `Tracker::Clear()`), а `Clear()` сносит
+    //! гонщиков целиком вместе с этим вектором.
+    std::vector<QuestItem> questItems;
 
     //! Active skill effects indexed by skillEffectId (0-23).
     static constexpr size_t EffectCount = 24;
@@ -175,6 +340,17 @@ public:
   //! @param characterUid Character UID.
   //! @returns A reference to the racer record.
   Racer& AddRacer(data::Uid characterUid);
+
+  //! Резервирует object id, НЕ создавая гонщика (R56, #61).
+  //!
+  //! ★Зачем отдельный метод. AI-соперники соло-заезда намеренно НЕ живут в
+  //! трекере (см. RaceInstance::AiRacer — иначе синтетическая сущность попала
+  //! бы во все ПИШУЩИЕ пути: награды, травмы, дейлики, телеметрию). Но их
+  //! object id обязан быть уникален среди id живых гонщиков, иначе клиент
+  //! спутает бота с игроком. Единственный способ это гарантировать —
+  //! раздавать оба вида id ИЗ ОДНОГО счётчика, а не из «заведомо свободного
+  //! диапазона»: заведомо свободных диапазонов не бывает.
+  [[nodiscard]] Oid ReserveOid();
   //! Removes a racer from tracking.
   //! @param characterUid Character UID.
   void RemoveRacer(data::Uid characterUid);
@@ -223,6 +399,22 @@ public:
   [[nodiscard]] EventItem& GetEventItem(data::Uid characterUid, Oid oid);
   //! Removes a per-racer event item by OID.
   void RemoveEventItem(data::Uid characterUid, Oid oid);
+
+  //! LOA-fix (R68, backlog #5/#99): добавляет гонщику квестовый предмет.
+  //! ★БРОСАЕТ, если персонаж не гонщик (через `GetRacer`), — и это правильно:
+  //! путь СЕРВЕРНЫЙ (раскладка на старте заезда), гонщик там существует по
+  //! построению, а тихий пропуск скрыл бы поломку жизненного цикла заезда.
+  //! @returns Ссылка на новую запись (oid уже выдан).
+  QuestItem& AddQuestItem(data::Uid characterUid);
+  //! Ищет квестовый предмет гонщика по OID.
+  //! ★НЕ БРОСАЕТ ВООБЩЕ — ни на чужом oid, ни на не-гонщике (в отличие от
+  //! `GetEventItem`): путь КЛИЕНТСКИЙ, и «такого предмета у тебя нет» там
+  //! обычное дело (чужой oid, уже подобранный oid, дубликат пакета).
+  //! @returns Указатель на запись либо `nullptr`.
+  [[nodiscard]] QuestItem* FindQuestItem(data::Uid characterUid, Oid oid);
+  //! Снимает квестовый предмет гонщика по OID. Тоже НЕ бросает: зовётся с того
+  //! же клиентского пути сразу после `FindQuestItem`.
+  void RemoveQuestItem(data::Uid characterUid, Oid oid);
 
   //! Returns the next object instance ID and increments the internal counter.
   //! @param increment The value to increment the internal counter by.

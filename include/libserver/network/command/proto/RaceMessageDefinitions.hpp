@@ -284,6 +284,15 @@ struct AcCmdCRChangeRoomOptionsNotify
 
 struct AcCmdCRChangeTeam
 {
+  //! ★ИМЯ ЛЖЁТ (LOA-fix R66-5, backlog #137). Поле несёт **characterUid**, а не
+  //! идентификатор гонщика (oid): oid'ы раздаёт `RaceTracker::AddRacer` только
+  //! на старте заезда, а эта команда живёт в комнате ОЖИДАНИЯ, где их ещё нет.
+  //! Клиент берёт значение из ростера комнаты, который сервер сам и заполняет
+  //! characterUid'ами (`RaceNetworkHandler::HandleEnterRoom`).
+  //! ★Переименование СОЗНАТЕЛЬНО не делается: структура зеркалит wire-имена
+  //! клиента, и расхождение имён здесь — свойство протокола, а не опечатка
+  //! нашего кода. Гард владения в `HandleChangeTeam` сверяет это поле именно
+  //! с `clientContext.characterUid`.
   uint32_t characterOid{};
   TeamColor teamColor{};
 

@@ -47,6 +47,8 @@ public:
   void Tick();
 
   void DisconnectCharacter(data::Uid characterUid);
+  //! LOA-fix (R12-3, round12): проброс в сетевой хендлер, см. R12-1.
+  [[nodiscard]] bool IsCharacterLoadingRace(data::Uid characterUid);
   void NotifySummonCharacter(
     data::Uid characterUid,
     bool force,

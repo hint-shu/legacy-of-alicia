@@ -173,17 +173,32 @@ bool MatchmakingSystem::Queue(
   const protocol::GameMode gameMode,
   const protocol::TeamMode teamMode)
 {
-  const auto [iter, inserted] = _matchmakingQueue.try_emplace(characterUid);
+  // LOA-fix (R36-2, round36, backlog #90a-B2): ГОНКА ДАННЫХ. try_emplace и
+  // запись в entry шли БЕЗ _matchmakingQueueMutex, хотя Search и Dequeue берут
+  // его всегда. Пишущий вызов приходит с ЛОББИ-СЕТЕВОГО потока
+  // (LobbyNetworkHandler::HandleEnterRoomQuick), а Search крутится на потоке
+  // лобби-директора (планировщик) — то есть rehash unordered_map мог идти
+  // одновременно с find/erase. Это UB, а не «редкое расхождение счётчика».
+  //
+  // ★ЛОК СНИМАЕТСЯ ДО Search. Search дёргает Scheduler::Queue, а тот берёт
+  // _jobsMutex планировщика; держать под нашим замком чужой — это порядок
+  // локов, из которого растут дедлоки. Мьютекс очереди остаётся ЛИСТОВЫМ
+  // (дисциплина раунда 21): под ним только операции с самой map.
+  {
+    std::scoped_lock lock(_matchmakingQueueMutex);
 
-  // Check if matchmaking map already has this character queued
-  if (not inserted)
-    return false;
+    const auto [iter, inserted] = _matchmakingQueue.try_emplace(characterUid);
 
-  // Add matchmaking details to entry
-  iter->second = MatchmakingSystem::Entry{
-    .queuedAt = Scheduler::Clock::now(),
-    .gameMode = gameMode,
-    .teamMode = teamMode};
+    // Check if matchmaking map already has this character queued
+    if (not inserted)
+      return false;
+
+    // Add matchmaking details to entry
+    iter->second = MatchmakingSystem::Entry{
+      .queuedAt = Scheduler::Clock::now(),
+      .gameMode = gameMode,
+      .teamMode = teamMode};
+  }
 
   // Trigger search timer
   this->Search(characterUid, gameMode, teamMode);

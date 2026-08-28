@@ -18,6 +18,7 @@
  **/
 
 #include "server/race/RaceDirector.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/race/RaceNetworkHandler.hpp"
 #include "server/ServerInstance.hpp"
@@ -57,7 +58,7 @@ void RaceDirector::Tick()
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception ticking a race scheduler: {}", x.what());
+    server::util::QuietLogError("Exception ticking a race scheduler: {}", x.what());
   }
 
   // todo: temporarily also tick network handler until everything is migrated
@@ -68,6 +69,11 @@ void RaceDirector::DisconnectCharacter(const data::Uid characterUid)
 {
   GetNetworkHandler().DisconnectCharacter(
     characterUid);
+}
+
+bool RaceDirector::IsCharacterLoadingRace(const data::Uid characterUid)
+{
+  return GetNetworkHandler().IsCharacterLoadingRace(characterUid);
 }
 
 void RaceDirector::NotifySummonCharacter(

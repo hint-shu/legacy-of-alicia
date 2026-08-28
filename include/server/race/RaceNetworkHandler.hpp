@@ -78,6 +78,12 @@ public:
 
   void DisconnectCharacter(data::Uid characterUid);
 
+  //! LOA-fix (R12-1, round12, backlog #85): находится ли персонаж ПРЯМО СЕЙЧАС
+  //! в стадии загрузки карты заезда. Зовётся из ЛОББИ-потока, поэтому трогает
+  //! только `_raceInstances` под `_raceInstancesMutex` и НИКОГДА `_clients`
+  //! (та карта принадлежит гоночному потоку и мьютексом не закрыта).
+  [[nodiscard]] bool IsCharacterLoadingRace(data::Uid characterUid);
+
   //! Get room count.
   //! @return Room count.
   [[nodiscard]] size_t GetRoomCount();
@@ -146,7 +152,43 @@ private:
     std::string userName;
   };
 
+  //! «Этот object id — бот в заезде ЭТОГО клиента?» — НЕБРОСАЮЩАЯ форма
+  //! вопроса (R57, #195).
+  //!
+  //! Отличается от `GetRaceInstance(...).IsAiRacerOid(...)` ровно тем, что не
+  //! бросает, когда клиент вообще не в заезде. Это нужно там, где вопрос задаётся
+  //! РАНЬШЕ всех прочих проверок: прямой вызов завёл бы новую строку ошибки на
+  //! пути, который сегодня до заезда не ходит.
+  //! Отрицательный ответ означает «не бот ЛИБО спросить не у кого» — для
+  //! единственного правила раунда («пакет за бота тихо игнорируем») этого
+  //! достаточно: в сомнении обработка идёт прежним путём.
+  [[nodiscard]] bool IsAiRacerOfClientRace(
+    const ClientContext& clientContext,
+    tracker::Oid oid) noexcept;
+
   race::P2dId GetOrCreateP2dId(ClientId clientId);
+
+  //! Заводит AI-соперников для соло-заезда (R56, #61).
+  //! Отказ мягкий: если ростер не удалось собрать, заезд едет БЕЗ ботов.
+  void SpawnAiRacers(RaceInstance& raceInstance);
+
+  //! Обеспечивает набор из `count` постоянных P2dId для ботов (R56, #61).
+  //! @retval `true`  набор готов и лежит в `_aiP2dIds`
+  //! @retval `false` пул исчерпан; НИ ОДИН id не изъят
+  //!
+  //! ★Почему ПОСТОЯННЫЕ, а не «на заезд». Апстрим писал ботам `p2dId = oid`;
+  //! у нас так нельзя — пул раздаёт id С НУЛЯ, и бот столкнулся бы с живым
+  //! клиентом. Берём нужное количество из ТОГО ЖЕ пула один раз за время жизни
+  //! сервера и переиспользуем во всех комнатах: коллизия невозможна, а
+  //! возвращать в пул нечего — значит, и утечь при разрушении комнаты нечему.
+  //! Боты по ретрансляции не ездят, поэтому совпадение id между комнатами
+  //! безвредно.
+  //!
+  //! ★ВСЁ ИЛИ НИЧЕГО (находка ревью R56-i1). Прошлая версия брала id по одному
+  //! и при исчерпании пула на середине оставляла уже взятые у себя навсегда —
+  //! ростер всё равно не собирался, а ёмкость для ЖИВЫХ клиентов таяла с
+  //! каждой попыткой. Теперь неполный набор возвращается в пул целиком.
+  [[nodiscard]] bool AcquireAiP2dIds(size_t count);
 
   ClientContext& GetClientContext(
     ClientId clientId,
@@ -241,7 +283,10 @@ private:
     ClientId clientId,
     const protocol::AcCmdCRStarPointGet& command);
 
-  void HandleRequestSpur(
+  //! Обрабатывает шпору. Возвращает «пакет был от самого отправителя»
+  //! (R57, #195): для пакета, присланного за AI-соперника, — `false`, и тогда
+  //! вызывающий обязан пропустить и хвостовую обработку командной шкалы.
+  [[nodiscard]] bool HandleRequestSpur(
     ClientId clientId,
     const protocol::AcCmdCRRequestSpur& command);
 
@@ -351,6 +396,8 @@ private:
   std::unordered_map<ClientId, race::P2dId> _p2dIds;
   //! A pool for active race clients with P2dIds.
   race::P2dIdPool _p2dIdPool;
+  //! Постоянные P2dId AI-соперников (R56, #61); см. `GetAiP2dId`.
+  std::vector<race::P2dId> _aiP2dIds;
 
   std::mutex _raceInstancesMutex;
   //! A map of all race instanced indexed by room UIDs.
