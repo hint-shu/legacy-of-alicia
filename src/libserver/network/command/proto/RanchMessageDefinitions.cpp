@@ -1966,8 +1966,82 @@ void AcCmdCRAchievementUpdateProperty::Read(
   AcCmdCRAchievementUpdateProperty& command,
   SourceStream& stream)
 {
-  stream.Read(command.achievementEvent)
-    .Read(command.member2);
+  // LOA-fix (R44-3, #58/R0, находка ревью iteration 2): тело короче двух байт
+  // бросало бы на чтении номера события — то есть ДО тела хендлера, до
+  // аутентификации и до троттла, печатая [error] на каждый пакет. Пустой пакет
+  // 0x16b собрать тривиально, поэтому проверяем длину сами и уходим с
+  // дефолтами: команда останется бессмысленной, но не создаст ни исключения,
+  // ни строки в логе.
+  if (stream.Size() - stream.GetCursor() < sizeof(command.achievementEvent))
+  {
+    while (stream.GetCursor() < stream.Size())
+    {
+      char discarded = '\0';
+      stream.Read(discarded);
+    }
+    return;
+  }
+
+  stream.Read(command.achievementEvent);
+
+  // LOA-fix (R44-3, #58/R0): см. R44-2 — значение приходит строкой до NUL, а не
+  // двумя байтами. Читаем его ВРУЧНУЮ, а НЕ штатным `Read(std::string)`, и вот
+  // почему (находка ревью R44, iteration 1):
+  //   * штатное чтение крутит цикл до NUL, а на строке БЕЗ завершающего нуля
+  //     упирается в границу тела команды — `SourceStream::Read` кидает
+  //     `overflow_error`. Бросок происходит в РАЗБОРЕ, то есть ДО тела нашего
+  //     хендлера: до проверки аутентификации и до троттла. `CommandServer`
+  //     ловит исключение и печатает `[error]` на КАЖДЫЙ такой пакет — любой
+  //     клиент разогнал бы этим неограниченный синхронный лог-флуд;
+  //   * остаток тела после NUL штатное чтение не трогает, и курсор расходится
+  //     с размером — в сборках с включёнными assert'ами это сработавшая
+  //     проверка `assert(cursor == size)` сразу после хендлера (наш боевой
+  //     образ RelWithDebInfo идёт с -DNDEBUG, но полагаться на это не будем).
+  // Поэтому: читаем ровно то, что лежит в теле, останавливаемся на NUL, длину
+  // режем клиентским пределом (16 цифр: клиент печатает значение "%d" в буфер
+  // на 17 байт) и ДОЧИТЫВАЕМ остаток до конца тела. Ни одного пути с броском.
+  // Перекодировку CP949 не применяем намеренно: здесь по протоколу десятичное
+  // число, и гонять через локаль враждебные байты незачем.
+  constexpr std::size_t kMaxAchievementPropertyLength = 16;
+
+  command.propertyValue.clear();
+  command.isPropertyValueTerminated = false;
+  command.rejectedPropertyValueBytes = 0;
+  while (stream.GetCursor() < stream.Size())
+  {
+    char character = '\0';
+    stream.Read(character);
+    if (character == '\0')
+    {
+      command.isPropertyValueTerminated = true;
+      break;
+    }
+    // ★Значение пишет КЛИЕНТ, а мы его логируем: пропусти мы сюда перевод
+    // строки или слово из стоп-списка мониторинга — и клиент рисовал бы в
+    // нашем логе лишние физические строки и поддельные тревоги (собственный
+    // замер уже поймал этот класс на слове «terminated»). По протоколу здесь
+    // десятичное число, поэтому оставляем ТОЛЬКО цифры, точку и минус, а всё
+    // прочее считаем и в значение не пускаем — счётчик сохраняет улику «клиент
+    // прислал не число», не пуская в лог ни байта его текста.
+    const bool isNumericCharacter = (character >= '0' and character <= '9')
+      or character == '.' or character == '-';
+    if (not isNumericCharacter)
+    {
+      if (command.rejectedPropertyValueBytes < 0xFF)
+        ++command.rejectedPropertyValueBytes;
+      continue;
+    }
+    if (command.propertyValue.size() < kMaxAchievementPropertyLength)
+      command.propertyValue += character;
+  }
+
+  // Хвост после NUL (или после обрезки по длине) выбрасываем, чтобы курсор
+  // всегда совпал с размером тела.
+  while (stream.GetCursor() < stream.Size())
+  {
+    char discarded = '\0';
+    stream.Read(discarded);
+  }
 }
 
 void AcCmdCRHousingBuild::Write(
@@ -2551,6 +2625,102 @@ void AcCmdCRStatusPointApplyCancel::Read(
   // empty
 }
 
+// === LOA (batch2): care-skill command (de)serialization ===============
+
+void AcCmdCRStudyCareSkill::Write(
+  const AcCmdCRStudyCareSkill&,
+  SinkStream&)
+{
+  // client -> server only
+  throw std::runtime_error("Not implemented");
+}
+
+void AcCmdCRStudyCareSkill::Read(
+  AcCmdCRStudyCareSkill& command,
+  SourceStream& stream)
+{
+  // Captured live: body is exactly one byte {skillId}. Rank is NOT sent.
+  stream.Read(command.skillId);
+}
+
+void AcCmdCRStudyCareSkillOK::Write(
+  const AcCmdCRStudyCareSkillOK& command,
+  SinkStream& stream)
+{
+  // BEST-GUESS layout (UNVERIFIED) — see design spec.
+  stream.Write(command.skillId)
+    .Write(command.rank)
+    .Write(command.points)
+    .Write(command.progress);
+}
+
+void AcCmdCRStudyCareSkillOK::Read(
+  AcCmdCRStudyCareSkillOK&,
+  SourceStream&)
+{
+  // server -> client only
+  throw std::runtime_error("Not implemented");
+}
+
+void AcCmdCRStudyCareSkillCancel::Write(
+  const AcCmdCRStudyCareSkillCancel&,
+  SinkStream&)
+{
+  // empty
+}
+
+void AcCmdCRStudyCareSkillCancel::Read(
+  AcCmdCRStudyCareSkillCancel&,
+  SourceStream&)
+{
+  // empty
+}
+
+void AcCmdCRResetCareSkill::Write(
+  const AcCmdCRResetCareSkill&,
+  SinkStream&)
+{
+  // client -> server only
+  throw std::runtime_error("Not implemented");
+}
+
+void AcCmdCRResetCareSkill::Read(
+  AcCmdCRResetCareSkill&,
+  SourceStream&)
+{
+  // best guess: empty request body
+}
+
+void AcCmdCRResetCareSkillOK::Write(
+  const AcCmdCRResetCareSkillOK& command,
+  SinkStream& stream)
+{
+  // BEST-GUESS layout (UNVERIFIED) — see design spec.
+  stream.Write(command.refundedPoints);
+}
+
+void AcCmdCRResetCareSkillOK::Read(
+  AcCmdCRResetCareSkillOK&,
+  SourceStream&)
+{
+  // server -> client only
+  throw std::runtime_error("Not implemented");
+}
+
+void AcCmdCRResetCareSkillCancel::Write(
+  const AcCmdCRResetCareSkillCancel&,
+  SinkStream&)
+{
+  // empty
+}
+
+void AcCmdCRResetCareSkillCancel::Read(
+  AcCmdCRResetCareSkillCancel&,
+  SourceStream&)
+{
+  // empty
+}
+
 void AcCmdCRChangeSkillCardPreset::Write(
   const AcCmdCRChangeSkillCardPreset&,
   SinkStream&)
@@ -2901,6 +3071,21 @@ void AcCmdCRRegisterDailyQuestGroupOK::Read(
   AcCmdCRRegisterDailyQuestGroupOK&,
   SourceStream&)
   {
+  throw std::runtime_error("Not implemented");
+}
+
+// LOA-fix (F4, quest-batch-1): пустой Cancel для 0x33e (см. заголовок).
+void AcCmdCRRegisterDailyQuestGroupCancel::Write(
+  const AcCmdCRRegisterDailyQuestGroupCancel&,
+  SinkStream&)
+{
+  // Empty.
+}
+
+void AcCmdCRRegisterDailyQuestGroupCancel::Read(
+  AcCmdCRRegisterDailyQuestGroupCancel&,
+  SourceStream&)
+{
   throw std::runtime_error("Not implemented");
 }
 

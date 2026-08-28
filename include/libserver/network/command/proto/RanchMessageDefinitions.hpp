@@ -1121,6 +1121,126 @@ struct AcCmdCRStatusPointApplyCancel
     SourceStream& stream);
 };
 
+// === LOA (batch2): care-skill commands ================================
+// AcCmdCRStudyCareSkill 0x277 (client->server), OK 0x278, Cancel 0x279;
+// AcCmdCRResetCareSkill 0x27d, OK 0x27e, Cancel 0x27f. Modelled on the
+// AcCmdCRStatusPointApply trio. The 0x277 request body is exactly one byte
+// {skillId} (captured live). The OK layouts are a BEST GUESS (see design spec)
+// and may need one live-test adjustment; the framing is length-delimited so a
+// wrong OK size only mis-parses that one command, it does not desync the stream.
+
+//! Client -> server: study/advance a care skill. Body = {uint8 skillId} (1 byte).
+struct AcCmdCRStudyCareSkill
+{
+  uint8_t skillId{};
+
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRStudyCareSkill;
+  }
+
+  static void Write(
+    const AcCmdCRStudyCareSkill& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRStudyCareSkill& command,
+    SourceStream& stream);
+};
+
+//! Server -> client OK. BEST-GUESS layout (UNVERIFIED): echoes the updated
+//! single-skill state so the client refreshes without a relog.
+struct AcCmdCRStudyCareSkillOK
+{
+  uint8_t skillId{};
+  uint8_t rank{};
+  uint16_t points{};
+  uint32_t progress{};
+
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRStudyCareSkillOK;
+  }
+
+  static void Write(
+    const AcCmdCRStudyCareSkillOK& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRStudyCareSkillOK& command,
+    SourceStream& stream);
+};
+
+//! Server -> client Cancel. Empty body (mirrors StatusPointApplyCancel).
+struct AcCmdCRStudyCareSkillCancel
+{
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRStudyCareSkillCancel;
+  }
+
+  static void Write(
+    const AcCmdCRStudyCareSkillCancel& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRStudyCareSkillCancel& command,
+    SourceStream& stream);
+};
+
+//! Client -> server: reset learned care skills. Body assumed empty (best guess).
+struct AcCmdCRResetCareSkill
+{
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRResetCareSkill;
+  }
+
+  static void Write(
+    const AcCmdCRResetCareSkill& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRResetCareSkill& command,
+    SourceStream& stream);
+};
+
+//! Server -> client OK. BEST-GUESS layout (UNVERIFIED): {uint16 refundedPoints}.
+struct AcCmdCRResetCareSkillOK
+{
+  uint16_t refundedPoints{};
+
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRResetCareSkillOK;
+  }
+
+  static void Write(
+    const AcCmdCRResetCareSkillOK& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRResetCareSkillOK& command,
+    SourceStream& stream);
+};
+
+//! Server -> client Cancel. Empty body (mirrors StatusPointApplyCancel).
+struct AcCmdCRResetCareSkillCancel
+{
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRResetCareSkillCancel;
+  }
+
+  static void Write(
+    const AcCmdCRResetCareSkillCancel& command,
+    SinkStream& stream);
+
+  static void Read(
+    AcCmdCRResetCareSkillCancel& command,
+    SourceStream& stream);
+};
+
 struct AcCmdCRTryBreeding
 {
   uint32_t mareUid{};
@@ -1292,10 +1412,29 @@ struct AcCmdCRBreedingAbandonCancel
 
 struct AcCmdCRAchievementUpdateProperty
 {
-  //! 75 - level up
-  //! Table `Achievements`
+  //! Выбирает отслеживаемое свойство: совпадает с `UserAchvEvent` таблиц
+  //! `Achievements` и `AchvEventPropertyLink`, которые его именуют (26 —
+  //! счётчик заносов, 38 — максимальная скорость, 75 — уровень диалога с NPC).
   uint16_t achievementEvent{};
-  uint16_t member2{};
+  //! LOA-fix (R44-2, #58/R0): значение приходит ДЕСЯТИЧНЫМ ТЕКСТОМ — строкой
+  //! до NUL-байта (клиент печатает его "%d" в буфер на 17 байт, то есть не
+  //! более 16 цифр), а НЕ двумя байтами. Прежнее `uint16_t member2` читало два
+  //! байта вместо строки и разбирало команду неверно; вреда это не приносило
+  //! только потому, что хендлера у команды не было вовсе. Абсолютное это
+  //! значение или приращение — по проводу пока не установлено, снимаем
+  //! замером R44-4/R44-5.
+  std::string propertyValue{};
+  //! LOA-fix (R44-2, #58/R1): пришло ли значение с завершающим нулём. НЕ поле
+  //! провода, а результат разбора: клиент без завершения (или с хвостом длиннее
+  //! предела) — сам по себе улика, и в замере её видно, а не теряется.
+  //! ★В строку лога пишем «nul-ok»/«NO-NUL», а НЕ «terminated»: слово
+  //! «terminate» входит в стоп-список мониторинга аварий, и собственный замер
+  //! поднимал бы ложную тревогу на каждом пакете.
+  bool isPropertyValueTerminated{};
+  //! LOA-fix (R44-2, #58/R1): сколько НЕ-числовых байт клиент прислал в
+  //! значении. Тоже результат разбора, а не поле провода: сами байты в лог не
+  //! попадают (инъекция строк), а факт «пришло не число» сохраняется.
+  uint8_t rejectedPropertyValueBytes{};
 
   static Command GetCommand()
   {
@@ -4603,6 +4742,32 @@ struct AcCmdCRRegisterDailyQuestGroupOK
   //! @param stream Source stream.
   static void Read(
     AcCmdCRRegisterDailyQuestGroupOK& command,
+    SourceStream& stream);
+};
+
+//! LOA-fix (F4, quest-batch-1): отказ на AcCmdCRRegisterDailyQuestGroup 0x33e.
+//! Опкод 0x340 был объявлен в CommandProtocol.hpp, но структуры не существовало,
+//! поэтому отказать в перезаписи трёх дневных слотов было нечем. Пустое тело —
+//! как у AcCmdCRGiveupQuestCancel.
+struct AcCmdCRRegisterDailyQuestGroupCancel
+{
+  static Command GetCommand()
+  {
+    return Command::AcCmdCRRegisterDailyQuestGroupCancel;
+  }
+
+  //! Writes the command to a provided sink stream.
+  //! @param command Command.
+  //! @param stream Sink stream.
+  static void Write(
+    const AcCmdCRRegisterDailyQuestGroupCancel& command,
+    SinkStream& stream);
+
+  //! Reader a command from a provided source stream.
+  //! @param command Command.
+  //! @param stream Source stream.
+  static void Read(
+    AcCmdCRRegisterDailyQuestGroupCancel& command,
     SourceStream& stream);
 };
 
