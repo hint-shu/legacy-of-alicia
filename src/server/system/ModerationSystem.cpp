@@ -19,6 +19,8 @@
 
 #include "server/system/ModerationSystem.hpp"
 
+#include <libserver/util/QuietLog.hpp>
+
 #include <yaml-cpp/yaml.h>
 
 namespace server
@@ -56,8 +58,36 @@ ModerationSystem::Verdict ModerationSystem::Moderate(
 
   for (const auto& word : _words)
   {
+    // LOA-fix (R55-12, round55, backlog #179 часть 5): пояс ВНУТРИ цикла, а не
+    // вокруг него — отказ на одном правиле не имеет права отменять проверку по
+    // остальным.
+    bool matches = false;
+    try
+    {
+      matches = std::regex_search(input, word.regex);
+    }
+    catch (...)
+    {
+      // ★ЗАКРЫВАЕМСЯ, А НЕ ОТКРЫВАЕМСЯ. Исход проверки неизвестен, и выбор
+      // между «пропустить» и «заблокировать» тут НЕ симметричен:
+      //   * пропустить = обход модерации, то есть чужая проблема (мат в общем
+      //     канале видят все);
+      //   * заблокировать = пострадало РОВНО ОДНО сообщение РОВНО ТОГО, кто его
+      //     прислал. Атакующий, подобравший ввод против движка регулярок,
+      //     блокирует сам себя — коллатерали нет.
+      // Поэтому отказ трактуем как «запрещено».
+      //
+      // Уровень DEBUG, а не ERROR, сознательно: ввод задаёт игрок, и запись
+      // уровня ошибки на каждое такое сообщение была бы управляемым извне
+      // заливом лога.
+      util::QuietLogDebug(
+        "Moderation rule check failed on player input; treating the message as prevented");
+      verdict.isPrevented = true;
+      break;
+    }
+
     // Check if any part of the input matches the word.
-    if (!std::regex_search(input, word.regex))
+    if (!matches)
       continue;
 
     // Check if the word is prevented or just censored.

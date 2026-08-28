@@ -22,6 +22,7 @@
 #include "server/ServerInstance.hpp"
 #include "Version.hpp"
 
+#include <libserver/util/QuietLog.hpp>
 #include <libserver/util/Util.hpp>
 
 #include <charconv>
@@ -67,7 +68,15 @@ std::vector<std::string> CommandManager::HandleCommand(
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception executing command handler for '{}': {}", literal, x.what());
+    util::QuietLogError("Exception executing command handler for '{}': {}", literal, x.what());
+    return {"Server error, contact administrators."};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-9b, round49, backlog #178): HandleCommand объявлен noexcept,
+    // а исполняет ЧУЖИЕ обработчики команд — самый вероятный источник
+    // неожиданного броска во всём файле. Игрок получит ту же строку об ошибке.
+    util::QuietLogError("Unknown exception executing command handler for '{}'", literal);
     return {"Server error, contact administrators."};
   }
 }
@@ -83,9 +92,10 @@ ChatSystem::~ChatSystem()
 {
 }
 
-ChatSystem::ChatVerdict ChatSystem::ProcessChatMessage(
+std::optional<ChatSystem::ChatVerdict> ChatSystem::ProcessChatMessage(
   data::Uid characterUid,
   const std::string& message) noexcept
+try
 {
   ChatVerdict verdict;
 
@@ -130,6 +140,35 @@ ChatSystem::ChatVerdict ChatSystem::ProcessChatMessage(
 
   verdict.message = message;
   return verdict;
+}
+catch (const std::exception& x)
+{
+  // LOA-fix (R55-2, round55, backlog #179 часть 5): ТРИ источника броска в
+  // теле выше, и любой из них раньше означал `std::terminate`:
+  //   1) `GetUserByCharacterUid` бросает ПО ЗАМЫСЛУ, когда игрока нет в
+  //      лобби, — штатный путь ошибки, а не дефицит памяти. Игрок отключился
+  //      или его прибрали, пока сообщение шло, — и сервер умирал;
+  //   2) выделения на строке, длину которой задаёт КЛИЕНТ (`substr`,
+  //      `std::format`, присваивание сообщения);
+  //   3) `ProcessCommandMessage` не помечена `noexcept` и тоже выделяет.
+  //      ★Обработчик команды при этом накрыт ещё с R49-9b — его бросок сюда
+  //      не долетает, так что источник скромнее, чем кажется.
+  //
+  // ★Отдаём ПУСТОТУ, а не сконструированный вердикт: пустой `ChatVerdict`
+  // выглядел бы как обычное сообщение, и вызывающий разослал бы в канал
+  // пустую строку — тихая порча вместо падения
+  // ([[muffling-a-throw-is-not-a-fix]]: спрашиваем не «поймали ли», а в каком
+  // состоянии остались все на пути).
+  util::QuietLogError("Chat message from character {} was not processed: {}",
+    characterUid, x.what());
+  return std::nullopt;
+}
+catch (...)
+{
+  util::QuietLogError(
+    "Chat message from character {} was not processed: unknown exception",
+    characterUid);
+  return std::nullopt;
 }
 
 ChatSystem::CommandVerdict ChatSystem::ProcessCommandMessage(
@@ -183,7 +222,7 @@ void ChatSystem::RegisterUserCommands()
         "Story of Alicia dedicated server software",
         " available under the GPL-2.0 license",
         "",
-        "Running story-of-alicia/alicia-server",
+        "Running legacy-of-alicia",
         std::format("  v{}", BuildVersion),
         std::format("Hosted by:"),
         std::format("  {}", brandName)};
@@ -244,8 +283,7 @@ void ChatSystem::RegisterUserCommands()
     {
       std::vector<std::string> response;
 
-      const auto& userInstances = _serverInstance.GetLobbyDirector().GetUsers();
-      const auto userCount = userInstances.size();
+      const auto userCount = _serverInstance.GetLobbyDirector().GetUserCount();
 
       response.emplace_back() = std::format(
         "There's {} {} online.",
@@ -876,10 +914,12 @@ void ChatSystem::RegisterAdminCommands()
 
       std::vector<std::string> userList;
 
-      const auto& userInstances = _serverInstance.GetLobbyDirector().GetUsers();
+      const auto userInstances = _serverInstance.GetLobbyDirector().SnapshotUsers();
       userList.emplace_back(std::format("Users ({}):", userInstances.size()));
 
-      for (const auto& userInstance : userInstances | std::views::values)
+      // ★Снимок — уже последовательность самих `UserInstance`, поэтому
+      // `views::values` здесь больше не нужен (и не компилируется).
+      for (const auto& userInstance : userInstances)
       {
         userList.emplace_back(std::format(
           UserLine,
@@ -959,7 +999,10 @@ void ChatSystem::RegisterAdminCommands()
         return {"Notice sent to character"};
       }
 
-      for (const auto& userInstance : _serverInstance.GetLobbyDirector().GetUsers() | std::views::values)
+      // ★ПО СНИМКУ, А НЕ ПО ЖИВОЙ КАРТЕ: тело перебора возвращается в тот же
+      // директор (`NotifyCharacter`), и удержанный на весь перебор замок
+      // поставил бы нас на грань повторного захвата.
+      for (const auto& userInstance : _serverInstance.GetLobbyDirector().SnapshotUsers())
       {
         _serverInstance.GetLobbyDirector().NotifyCharacter(userInstance.characterUid, message);
       }
@@ -1048,7 +1091,7 @@ void ChatSystem::RegisterAdminCommands()
 
       const auto invokerUserName =
         _serverInstance.GetLobbyDirector().GetUserByCharacterUid(invokerCharacterUid).userName;
-      spdlog::info("Admin {} promoted user '{}' ({}) to {} staff",
+      server::util::QuietLogInfo("Admin {} promoted user '{}' ({}) to {} staff",
         invokerUserName,
         userName,
         characterName,
@@ -1602,7 +1645,8 @@ void ChatSystem::RegisterAdminCommands()
         }
 
         const auto name = arguments[1];
-        for (const auto& [userName, userInstance] : _serverInstance.GetLobbyDirector().GetUsers())
+        // Имя лежит внутри `UserInstance`, поэтому пара ключ-значение не нужна.
+        for (const auto& userInstance : _serverInstance.GetLobbyDirector().SnapshotUsers())
         {
           const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
             userInstance.characterUid);
@@ -1642,7 +1686,7 @@ void ChatSystem::RegisterAdminCommands()
           return {std::format("User '{}' is not online", name)};
         }
 
-        const auto& userInstance = _serverInstance.GetLobbyDirector().GetUser(name);
+        const auto userInstance = _serverInstance.GetLobbyDirector().GetUser(name);
         const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
           userInstance.characterUid);
 
@@ -1736,7 +1780,7 @@ void ChatSystem::RegisterAdminCommands()
           _serverInstance.GetRanchDirector().Disconnect(targetCharacterUid);
           _serverInstance.GetLobbyDirector().DisconnectCharacter(targetCharacterUid);
 
-          spdlog::info("GM {} ({}) has reset user '{}' whose character uid was '{}'",
+          server::util::QuietLogInfo("GM {} ({}) has reset user '{}' whose character uid was '{}'",
             invokerUserName,
             invokerCharacterName,
             username,
@@ -1801,7 +1845,7 @@ void ChatSystem::RegisterAdminCommands()
               horse.name() = newName;
             });
 
-          spdlog::info("GM {} ({}) has renamed horse '{}' from '{}' to '{}'",
+          server::util::QuietLogInfo("GM {} ({}) has renamed horse '{}' from '{}' to '{}'",
             invokerUserName,
             invokerCharacterName,
             horseUid,
@@ -1844,7 +1888,7 @@ void ChatSystem::RegisterAdminCommands()
               pet.name() = newName;
             });
 
-          spdlog::info("GM {} ({}) has renamed pet '{}' from '{}' to '{}'",
+          server::util::QuietLogInfo("GM {} ({}) has renamed pet '{}' from '{}' to '{}'",
             invokerUserName,
             invokerCharacterName,
             petUid,
@@ -1887,7 +1931,7 @@ void ChatSystem::RegisterAdminCommands()
               guild.name() = newName;
             });
 
-          spdlog::info("GM {} ({}) has renamed guild '{}' from '{}' to '{}'",
+          server::util::QuietLogInfo("GM {} ({}) has renamed guild '{}' from '{}' to '{}'",
             invokerUserName,
             invokerCharacterName,
             guildUid,
@@ -1933,7 +1977,7 @@ void ChatSystem::RegisterAdminCommands()
 
           _serverInstance.GetRaceDirector().NotifyRoomNameChanged(roomUid);
 
-          spdlog::info("GM {} ({}) has renamed room '{}' from '{}' to '{}'",
+          server::util::QuietLogInfo("GM {} ({}) has renamed room '{}' from '{}' to '{}'",
             invokerUserName,
             invokerCharacterName,
             roomUid,
@@ -1992,7 +2036,7 @@ void ChatSystem::RegisterAdminCommands()
               settings.macros() = std::array<std::string, 8>{};
             });
 
-          spdlog::info("GM {} ({}) cleared all macros for user '{}'",
+          server::util::QuietLogInfo("GM {} ({}) cleared all macros for user '{}'",
             invokerUserName,
             invokerCharacterName,
             targetUserName);
@@ -2068,7 +2112,7 @@ void ChatSystem::RegisterAdminCommands()
               std::erase(officers, previousOwnerUid);
             });
 
-          spdlog::info("GM {} ({}) transferred ownership of guild '{}' ({}) from uid {} to {} ({})",
+          server::util::QuietLogInfo("GM {} ({}) transferred ownership of guild '{}' ({}) from uid {} to {} ({})",
             invokerUserName,
             invokerCharacterName,
             guildName,
@@ -2245,7 +2289,7 @@ void ChatSystem::RegisterAdminCommands()
             characterName = character.name();
           });
 
-        spdlog::info("Admin {} set experience of '{}' ({}) from {} to {} (level {} to {})",
+        server::util::QuietLogInfo("Admin {} set experience of '{}' ({}) from {} to {} (level {} to {})",
           invokerUserName,
           characterName,
           targetCharacterUid,
@@ -2281,7 +2325,7 @@ void ChatSystem::RegisterAdminCommands()
             characterName = character.name();
           });
 
-        spdlog::info("Admin {} set carrots of '{}' ({}) from {} to {}",
+        server::util::QuietLogInfo("Admin {} set carrots of '{}' ({}) from {} to {}",
           invokerUserName,
           characterName,
           targetCharacterUid,
@@ -2316,7 +2360,7 @@ void ChatSystem::RegisterAdminCommands()
       }
       catch (const std::exception& x)
       {
-        spdlog::error("Failed to load configurations: {}", x.what());
+        server::util::QuietLogError("Failed to load configurations: {}", x.what());
         return {
           "Error trying to load game"
           "and server configs."

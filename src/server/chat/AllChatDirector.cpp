@@ -18,6 +18,7 @@
  **/
 
 #include "server/chat/AllChatDirector.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -52,7 +53,7 @@ AllChatDirector::AllChatDirector(ServerInstance& serverInstance)
 
 void AllChatDirector::Initialize()
 {
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "All chat server listening on {}:{}",
     GetConfig().listen.address.to_string(),
     GetConfig().listen.port);
@@ -91,7 +92,7 @@ Config::AllChat& AllChatDirector::GetConfig()
 
 void AllChatDirector::HandleClientConnected(network::ClientId clientId)
 {
-  spdlog::debug("Client {} connected to the all chat server from {}",
+  server::util::QuietLogDebug("Client {} connected to the all chat server from {}",
     clientId,
     _chatterServer.GetClientAddress(clientId).to_string());
   _clients.try_emplace(clientId);
@@ -99,7 +100,7 @@ void AllChatDirector::HandleClientConnected(network::ClientId clientId)
 
 void AllChatDirector::HandleClientDisconnected(network::ClientId clientId)
 {
-  spdlog::debug("Client {} disconnected from the all chat server", clientId);
+  server::util::QuietLogDebug("Client {} disconnected from the all chat server", clientId);
   _clients.erase(clientId);
 }
 
@@ -124,7 +125,7 @@ void AllChatDirector::HandleChatterEnterRoom(
   {
     // Client failed chat authentication
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    spdlog::warn("Client '{}' tried to login to all chat as character '{}' but failed authentication with auth code '{}'",
+    server::util::QuietLogWarn("Client '{}' tried to login to all chat as character '{}' but failed authentication with auth code '{}'",
       clientId,
       command.characterUid,
       command.code);
@@ -180,13 +181,21 @@ void AllChatDirector::HandleChatterChat(
   const auto userName = _serverInstance.GetLobbyDirector().GetUserByCharacterUid(
     clientContext.characterUid).userName;
 
-  spdlog::info("[Global] {} ({}): {}",
+  server::util::QuietLogInfo("[Global] {} ({}): {}",
     characterName,
     userName,
     command.message);
 
-  const auto verdict = _serverInstance.GetChatSystem().ProcessChatMessage(
+  const auto chatVerdict = _serverInstance.GetChatSystem().ProcessChatMessage(
     clientContext.characterUid, command.message);
+
+  // LOA-fix (R55-3, round55, backlog #179 часть 5): пустое значение = сообщение
+  // не обработано. Причина уже записана в лог внутри; здесь просто молчим —
+  // отвечать игроку нечем, а рассылать пустую строку в канал нельзя.
+  if (not chatVerdict)
+    return;
+
+  const auto& verdict = *chatVerdict;
 
   if (verdict.commandVerdict)
   {

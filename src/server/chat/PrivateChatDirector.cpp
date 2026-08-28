@@ -18,6 +18,9 @@
  **/
 
 #include "server/chat/PrivateChatDirector.hpp"
+#include "libserver/util/QuietLog.hpp"
+
+#include "libserver/util/Cleanup.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -52,7 +55,7 @@ PrivateChatDirector::PrivateChatDirector(ServerInstance& serverInstance)
 
 void PrivateChatDirector::Initialize()
 {
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Private chat server listening on {}:{}",
     GetConfig().listen.address.to_string(),
     GetConfig().listen.port);
@@ -113,7 +116,7 @@ const std::optional<network::ClientId> PrivateChatDirector::GetTargetClientIdByC
 
 void PrivateChatDirector::HandleClientConnected(network::ClientId clientId)
 {
-  spdlog::debug("Client {} connected to the private chat server from {}",
+  server::util::QuietLogDebug("Client {} connected to the private chat server from {}",
     clientId,
     _chatterServer.GetClientAddress(clientId).to_string());
   _conversations.try_emplace(clientId);
@@ -121,23 +124,40 @@ void PrivateChatDirector::HandleClientConnected(network::ClientId clientId)
 
 void PrivateChatDirector::HandleClientDisconnected(network::ClientId clientId)
 {
-  spdlog::debug("Client {} disconnected from the private chat server", clientId);
+  server::util::QuietLogDebug("Client {} disconnected from the private chat server", clientId);
+
+  // LOA-fix (R50-8, round50, backlog #180): `_conversations.at(clientId)`
+  // бросает по отсутствию записи, а постановка команды в очередь выделяет
+  // память — и то и другое стояло ДО снятия записи.
+  const util::RegistryEraser eraser{_conversations, clientId};
 
   // Terminate the disconnect client's private chat instance
   protocol::ChatCmdEndChatTrs notify{};
-  _chatterServer.QueueCommand<decltype(notify)>(clientId, [notify](){ return notify; });
+  util::RunCleanupStep(
+    "private chat self notification",
+    clientId,
+    [&]()
+    {
+      _chatterServer.QueueCommand<decltype(notify)>(clientId, [notify](){ return notify; });
+    });
 
   // Terminate the corresponding client's private chat instance
-  const auto& conversationContext = _conversations.at(clientId);
-  const std::optional<ClientId> targetClientId = GetTargetClientIdByContext(
-    conversationContext);
-  if (targetClientId.has_value())
-  {
-    // Target client found, disconnect
-    _chatterServer.QueueCommand<decltype(notify)>(targetClientId.value(), [notify](){ return notify; });
-  }
-
-  _conversations.erase(clientId);
+  // ★Шаг независимый: собеседник обязан узнать о конце разговора даже если
+  // уведомление уходящему клиенту не удалось.
+  util::RunCleanupStep(
+    "private chat peer notification",
+    clientId,
+    [&]()
+    {
+      const auto& conversationContext = _conversations.at(clientId);
+      const std::optional<ClientId> targetClientId = GetTargetClientIdByContext(
+        conversationContext);
+      if (targetClientId.has_value())
+      {
+        // Target client found, disconnect
+        _chatterServer.QueueCommand<decltype(notify)>(targetClientId.value(), [notify](){ return notify; });
+      }
+    });
 }
 
 void PrivateChatDirector::HandleChatterEnterRoom(
@@ -151,7 +171,7 @@ void PrivateChatDirector::HandleChatterEnterRoom(
   // Always 0 for private chats
   const uint32_t unk3 = command.guildUid;
 
-  spdlog::debug("[{}] (Private) ChatCmdEnterRoom: {} {} {} {}",
+  server::util::QuietLogDebug("[{}] (Private) ChatCmdEnterRoom: {} {} {} {}",
     clientId,
     targetCharacterUid,
     invokerCharacterUid,
@@ -204,7 +224,7 @@ void PrivateChatDirector::HandleChatterChat(
   network::ClientId clientId,
   const protocol::ChatCmdChat& command)
 {
-  spdlog::debug("[{}] ChatCmdChat: {} [{}]",
+  server::util::QuietLogDebug("[{}] ChatCmdChat: {} [{}]",
     clientId,
     command.message,
     command.role == protocol::ChatCmdChat::Role::User ? "User" :
@@ -240,7 +260,7 @@ void PrivateChatDirector::HandleChatterInputState(
   network::ClientId clientId,
   const protocol::ChatCmdInputState& command)
 {
-  spdlog::debug("[{}] ChatCmdInputState: {}",
+  server::util::QuietLogDebug("[{}] ChatCmdInputState: {}",
     clientId,
     command.state);
 

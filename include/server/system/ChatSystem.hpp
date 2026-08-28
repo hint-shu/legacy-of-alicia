@@ -78,7 +78,16 @@ public:
   //! Handles a chat message sent by the client.
   //! @param characterUid UID of the character.
   //! @param message Message that was sent.
-  [[nodiscard]] ChatVerdict ProcessChatMessage(
+  //! ★КОНТРАКТ, КОТОРЫЙ ВЫЗЫВАЮЩИЙ НЕ МОЖЕТ ПРОИГНОРИРОВАТЬ (R55-1,
+  //! round55, backlog #179 часть 5). Пустое значение = «сообщение не
+  //! обработано, ничего не отправляй».
+  //!
+  //! ★Почему `optional`, а не поле-флаг в вердикте: поле можно забыть
+  //! проверить, и тогда вызывающий разошлёт ПУСТОЕ сообщение всем в канале —
+  //! тихая порча вместо падения. `optional` заставляет разыменовать, то есть
+  //! отказ невозможно не заметить: проверки требует КОМПИЛЯТОР, а не
+  //! внимательность. Тот же приём, что `bool` в R51 и `MutateOutcome` в R52.
+  [[nodiscard]] std::optional<ChatVerdict> ProcessChatMessage(
     data::Uid characterUid,
     const std::string& message) noexcept;
 

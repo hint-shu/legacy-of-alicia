@@ -18,6 +18,7 @@
  **/
 
 #include "server/system/RewardSystem.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -39,7 +40,7 @@ data::Uid RewardSystem::CreateReward(
   auto rewardRecord = _serverInstance.GetDataDirector().CreateReward();
   if (not rewardRecord)
   {
-    spdlog::error("Failed to create reward record in for character {}", characterUid);
+    server::util::QuietLogError("Failed to create reward record in for character {}", characterUid);
     return data::InvalidUid;
   }
 
@@ -59,7 +60,7 @@ data::Uid RewardSystem::CreateReward(
       claimUid = reward.claimUid();
     });
 
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Created reward record [claimUid: {}, characterUid: {}, type: {}, carrots: {}]",
     claimUid, characterUid, static_cast<uint32_t>(type), carrots);
 
@@ -72,14 +73,14 @@ bool RewardSystem::ClaimReward(
 {
   if (claimUid == data::InvalidUid || characterUid == data::InvalidUid)
   {
-    spdlog::warn("Invalid claimUid {} or characterUid {}", claimUid, characterUid);
+    server::util::QuietLogWarn("Invalid claimUid {} or characterUid {}", claimUid, characterUid);
     return false;
   }
 
   auto rewardRecord = _serverInstance.GetDataDirector().GetReward(claimUid);
   if (not rewardRecord)
   {
-    spdlog::warn("Reward record {} not found", claimUid);
+    server::util::QuietLogWarn("Reward record {} not found", claimUid);
     return false;
   }
 
@@ -97,13 +98,13 @@ bool RewardSystem::ClaimReward(
 
   if (isAlreadyClaimed)
   {
-    spdlog::warn("Reward record {} was already claimed", claimUid);
+    server::util::QuietLogWarn("Reward record {} was already claimed", claimUid);
     return false;
   }
 
   if (targetCharacterUid != characterUid)
   {
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Claiming character UID {} does not match target character UID {} for reward {}",
       characterUid, targetCharacterUid, claimUid);
     return false;
@@ -123,7 +124,7 @@ bool RewardSystem::ClaimReward(
     }
     else
     {
-      spdlog::error("Failed to fetch character record for UID {} to grant reward carrots", characterUid);
+      server::util::QuietLogError("Failed to fetch character record for UID {} to grant reward carrots", characterUid);
       return false;
     }
   }
@@ -137,7 +138,7 @@ bool RewardSystem::ClaimReward(
       reward.claimedAt() = now;
     });
 
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Successfully claimed reward {} for character UID {} (carrots granted: {})",
     claimUid, characterUid, carrotsToGrant);
 

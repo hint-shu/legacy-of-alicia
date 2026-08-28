@@ -18,6 +18,9 @@
  **/
 
 #include "server/messenger/MessengerDirector.hpp"
+#include "libserver/util/QuietLog.hpp"
+
+#include "libserver/util/Cleanup.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -160,7 +163,7 @@ MessengerDirector::MessengerDirector(ServerInstance& serverInstance)
 
 void MessengerDirector::Initialize()
 {
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Messenger server listening on {}:{}",
     GetConfig().listen.address.to_string(),
     GetConfig().listen.port);
@@ -344,7 +347,7 @@ Config::Messenger& MessengerDirector::GetConfig()
 
 void MessengerDirector::HandleClientConnected(const network::ClientId clientId)
 {
-  spdlog::debug("Client {} connected to the messenger server from {}",
+  server::util::QuietLogDebug("Client {} connected to the messenger server from {}",
     clientId,
     _chatterServer.GetClientAddress(clientId).to_string());
   _clients.try_emplace(clientId);
@@ -352,26 +355,36 @@ void MessengerDirector::HandleClientConnected(const network::ClientId clientId)
 
 void MessengerDirector::HandleClientDisconnected(const network::ClientId clientId)
 {
-  spdlog::debug("Client {} disconnected from the messenger server", clientId);
+  server::util::QuietLogDebug("Client {} disconnected from the messenger server", clientId);
+
+  // LOA-fix (R50-7, round50, backlog #180): рассылка присутствия «не в сети» —
+  // бросающая работа, а запись реестра снималась после неё. Осиротевшая запись
+  // держит присутствие живым: друзья видят игрока в сети, пока сервер не
+  // перезапустят.
+  const util::RegistryEraser eraser{_clients, clientId};
 
   // Call update state like a client would do before disconnect
-  HandleChatterUpdateState(clientId, protocol::ChatCmdUpdateState{
-    .presence = protocol::Presence{
-      .status = protocol::Status::Offline,
-      .scene = protocol::Presence::Scene::Ranch,
-      .sceneUid = 0
-    }});
+  util::RunCleanupStep(
+    "messenger presence update",
+    clientId,
+    [&]()
+    {
+      HandleChatterUpdateState(clientId, protocol::ChatCmdUpdateState{
+        .presence = protocol::Presence{
+          .status = protocol::Status::Offline,
+          .scene = protocol::Presence::Scene::Ranch,
+          .sceneUid = 0
+        }});
+    });
 
   // TODO: broadcast notify to friends & guilds that character is offline
-
-  _clients.erase(clientId);
 }
 
 void MessengerDirector::HandleChatterLogin(
   const network::ClientId clientId,
   const protocol::ChatCmdLogin& command)
 {
-  spdlog::debug("[{}] ChatCmdLogin: {} {} {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdLogin: {} {} {} {}",
     clientId,
     command.characterUid,
     command.name,
@@ -394,7 +407,7 @@ void MessengerDirector::HandleChatterLogin(
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    spdlog::warn("Client {} tried to login as character {} but failed authentication with auth code {}",
+    server::util::QuietLogWarn("Client {} tried to login as character {} but failed authentication with auth code {}",
       clientId,
       command.characterUid,
       command.code);
@@ -638,7 +651,7 @@ void MessengerDirector::HandleChatterBuddyAddReply(
   const network::ClientId clientId,
   const protocol::ChatCmdBuddyAddReply& command)
 {
-  spdlog::debug("ChatCmdBuddyAddReply: {} {}",
+  server::util::QuietLogDebug("ChatCmdBuddyAddReply: {} {}",
     command.requestingCharacterUid,
     command.requestAccepted);
 
@@ -862,7 +875,7 @@ void MessengerDirector::HandleChatterBuddyMove(
   network::ClientId clientId,
   const protocol::ChatCmdBuddyMove& command)
 {
-  spdlog::debug("[{}] ChatCmdBuddyMove: {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdBuddyMove: {} {}",
     clientId,
     command.characterUid,
     command.groupUid);
@@ -942,7 +955,7 @@ void MessengerDirector::HandleChatterGroupAdd(
   network::ClientId clientId,
   const protocol::ChatCmdGroupAdd& command)
 {
-  spdlog::debug("[{}] ChatCmdGroupAdd: {}", clientId, command.groupName);
+  server::util::QuietLogDebug("[{}] ChatCmdGroupAdd: {}", clientId, command.groupName);
 
   const auto& clientContext = GetClientContext(clientId);
 
@@ -953,6 +966,44 @@ void MessengerDirector::HandleChatterGroupAdd(
     [&command, &groupUid, &errorCode](data::Character& character)
     {
       auto& groups = character.contacts.groups();
+
+      // LOA-fix (R31-2, round31, backlog #127, SECURITY/REMOTE-CRASH):
+      // ★rbegin() НА ПУСТОЙ std::map — ЭТО SIGSEGV. Строка ниже разыменовывает
+      // rbegin() без единой проверки. Под -O2 -DNDEBUG это разыменование
+      // нулевого узла дерева: не исключение, а нарушение памяти, поэтому
+      // try/catch в ChatterServer::OnClientData его НЕ ЛОВИТ — падает весь
+      // процесс сервера (лобби, ранчо, гонки и чат живут в одном бинаре).
+      // ★КАК ДОХОДИТ ДО ПУСТОЙ MAP (2 шага, оба с провода): groups создаётся с
+      // единственной группой по умолчанию {0} (LobbyNetworkHandler, создание
+      // персонажа), а HandleChatterGroupDelete до R31-3 не запрещал удалять
+      // группу 0 — клиент шлёт ChatCmdGroupDelete{groupUid = 0}, map пустеет,
+      // следующий ChatCmdGroupAdd падает здесь.
+      // ★ВТОРАЯ НОГА, БЕЗ УДАЛЕНИЯ ВООБЩЕ: аккаунты, заведённые через
+      // register-on-first-use (#18c), стартуют с contacts.groups == null, то есть
+      // с УЖЕ пустой картой — у них падает самый первый ChatCmdGroupAdd, и этот
+      // guard покрывает в том числе такой свежий auth-аккаунт.
+      // ★ЧИНИМ, А НЕ ОТКАЗЫВАЕМ. R31-3 закрывает вход, но у персонажей, чьи
+      // сейвы УЖЕ испорчены до фикса, groups так и остаётся пустой — им отказ
+      // не помог бы, а группа друзей нужна для всей контакт-логики. Поэтому
+      // восстанавливаем инвариант «группа 0 существует всегда». Ровно так же
+      // самолечится приём заявки в друзья выше по файлу (try_emplace
+      // (FriendsCategoryUid) с пометкой «Friends group might not be initially
+      // initialised»), так что поведение не новое, а уже принятое в этом файле.
+      // После восстановления rbegin() указывает на группу 0 и nextGroupUid = 1 —
+      // ровно то, что дал бы нетронутый сейв.
+      if (groups.empty())
+      {
+        server::util::QuietLogWarn(
+          "Character {} has no contact groups at all (default friends group was lost); "
+          "restoring the default friends group before adding a new one",
+          character.uid());
+
+        auto& friendsGroup = groups[FriendsCategoryUid];
+        friendsGroup.uid = FriendsCategoryUid;
+        friendsGroup.name = "_internal_friends_group_";
+        friendsGroup.createdAt = util::Clock::now();
+      }
+
       const auto& nextGroupUid = groups.rbegin()->first + 1;
 
       // Sanity check if group uid is default friends group uid
@@ -1060,6 +1111,34 @@ void MessengerDirector::HandleChatterGroupDelete(
     {
       auto& groups = character.contacts.groups();
 
+      // LOA-fix (R31-3, round31, backlog #127, SECURITY/REMOTE-CRASH):
+      // ★ГРУППА ПО УМОЛЧАНИЮ НЕУДАЛЯЕМА. groupUid приходит С ПРОВОДА
+      // (ChatCmdGroupDelete::Read читает один uint32) и до этого фикса ноль
+      // проходил насквозь: contains(0) — правда, «перенос участников» копировал
+      // группу 0 саму в себя, а затем erase(0) стирал её. Дальше:
+      //   • следующий ChatCmdGroupAdd делает rbegin() на ПУСТОЙ map → SIGSEGV
+      //     (корневая нога #127, см. R31-2);
+      //   • AllChatDirector::HandleChatterInputState делает groups().at(0) →
+      //     out_of_range на каждом изменении состояния ввода (ловится, но
+      //     превращает чат игрока в мусор в логе);
+      //   • сама ветка «default friend group missing» ниже становится
+      //     недостижимой самопроверкой — она проверяла последствие, а не вход.
+      // Отказ ставим ПЕРВЫМ, до contains(): группа 0 существует всегда, поэтому
+      // порядок важен только для читаемости, но fail-closed-проверка входного
+      // поля обязана стоять раньше любой работы с данными.
+      // ★КОД ОШИБКИ переиспользуем существующий GroupDeleteGroupDoesNotExist:
+      // клиент умеет его отрисовать, а заводить новый энумератор ChatterErrorCode
+      // ради этого нельзя — клиентская таблица строк нам недоступна, неизвестный
+      // код даст пустое окно вместо сообщения.
+      if (command.groupUid == FriendsCategoryUid)
+      {
+        server::util::QuietLogWarn(
+          "Character {} tried to delete the default friends group; refusing",
+          character.uid());
+        errorCode.emplace(protocol::ChatterErrorCode::GroupDeleteGroupDoesNotExist);
+        return;
+      }
+
       // Confirm the existence of the group and
       // sanity check the existence of default friends group
       if (not groups.contains(command.groupUid))
@@ -1109,7 +1188,7 @@ void MessengerDirector::HandleChatterLetterList(
 {
   bool isInboxRequested = command.mailboxFolder == protocol::MailboxFolder::Inbox;
   bool isSentRequested = command.mailboxFolder == protocol::MailboxFolder::Sent;
-  spdlog::debug("[{}] ChatCmdLetterList: {} [{} {}]",
+  server::util::QuietLogDebug("[{}] ChatCmdLetterList: {} [{} {}]",
     clientId,
     isInboxRequested ? "Inbox" :
       isSentRequested ? "Sent" : "Unknown",
@@ -1118,7 +1197,7 @@ void MessengerDirector::HandleChatterLetterList(
 
   if (not isInboxRequested and not isSentRequested)
   {
-    spdlog::warn("[{}] ChatCmdLetterList: requested unrecognised mailbox {}",
+    server::util::QuietLogWarn("[{}] ChatCmdLetterList: requested unrecognised mailbox {}",
       clientId,
       static_cast<uint8_t>(command.mailboxFolder));
 
@@ -1172,7 +1251,7 @@ void MessengerDirector::HandleChatterLetterList(
     // Safety mechanism, just in case no mail by that UID was found
     if (iter == mailbox.cend())
     {
-      spdlog::warn("Character {} tried to request mail after mail {} but that mail does not exist.",
+      server::util::QuietLogWarn("Character {} tried to request mail after mail {} but that mail does not exist.",
         clientContext.characterUid,
         command.request.lastMailUid);
       errorCode.emplace(protocol::ChatterErrorCode::MailListInvalidUid);
@@ -1314,7 +1393,7 @@ void MessengerDirector::HandleChatterLetterSend(
   network::ClientId clientId,
   const protocol::ChatCmdLetterSend& command)
 {
-  spdlog::debug("[{}] ChatCmdLetterSend: {} [{}]",
+  server::util::QuietLogDebug("[{}] ChatCmdLetterSend: {} [{}]",
     clientId,
     command.recipient,
     command.body);
@@ -1433,7 +1512,7 @@ void MessengerDirector::HandleChatterLetterRead(
   network::ClientId clientId,
   const protocol::ChatCmdLetterRead& command)
 {
-  spdlog::debug("[{}] ChatCmdLetterRead: {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdLetterRead: {} {}",
     clientId,
     command.unk0,
     command.mailUid);
@@ -1447,14 +1526,14 @@ void MessengerDirector::HandleChatterLetterRead(
   if (command.mailUid == data::InvalidUid)
   {
     // Character tried to request an invalid mail
-    spdlog::warn("Character {} tried to request an invalid mail",
+    server::util::QuietLogWarn("Character {} tried to request an invalid mail",
       clientContext.characterUid);
     errorCode.emplace(protocol::ChatterErrorCode::MailInvalidUid);
   }
   else if (not mailRecord.IsAvailable())
   {
     // Mail does not exist or is not available
-    spdlog::warn("Character {} tried to request a mail {} that does not exist or is not available",
+    server::util::QuietLogWarn("Character {} tried to request a mail {} that does not exist or is not available",
       clientContext.characterUid,
       command.mailUid);
     errorCode.emplace(protocol::ChatterErrorCode::MailDoesNotExistOrNotAvailable);
@@ -1507,7 +1586,7 @@ void MessengerDirector::HandleChatterLetterDelete(
 {
   bool isRequestSent = command.folder == protocol::MailboxFolder::Sent;
   bool isRequestInbox = command.folder == protocol::MailboxFolder::Inbox;
-  spdlog::debug("[{}] ChatCmdLetterDelete: {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdLetterDelete: {} {}",
     clientId,
     isRequestSent ? "Sent" :
       isRequestInbox ? "Inbox" : "Unknown",
@@ -1520,7 +1599,7 @@ void MessengerDirector::HandleChatterLetterDelete(
   if (not isRequestSent and not isRequestInbox)
   {
     // Mailbox unrecognised
-    spdlog::warn("Character {} tried to delete a mail from unrecognised mailbox {}",
+    server::util::QuietLogWarn("Character {} tried to delete a mail from unrecognised mailbox {}",
       clientContext.characterUid,
       static_cast<uint8_t>(command.folder));
     errorCode.emplace(protocol::ChatterErrorCode::LetterDeleteUnknownMailboxFolder);
@@ -1528,7 +1607,7 @@ void MessengerDirector::HandleChatterLetterDelete(
   else if (not (mailRecord = _serverInstance.GetDataDirector().GetMail(command.mailUid)).IsAvailable())
   {
     // Mail is not available
-    spdlog::warn("Character {} tried to delete mail {} which is currently not available",
+    server::util::QuietLogWarn("Character {} tried to delete mail {} which is currently not available",
       clientContext.characterUid,
       command.mailUid);
     errorCode.emplace(protocol::ChatterErrorCode::LetterDeleteUnknownMailboxFolder);
@@ -1582,7 +1661,7 @@ void MessengerDirector::HandleChatterLetterDelete(
   if (errorCode.has_value())
   {
     if (errorCode.value() == protocol::ChatterErrorCode::LetterDeleteMailDoesNotBelongToCharacter)
-      spdlog::debug("Character {} tried to delete mail {} which they do not own from {} mailbox",
+      server::util::QuietLogDebug("Character {} tried to delete mail {} which they do not own from {} mailbox",
         clientContext.characterUid,
         command.mailUid,
         command.folder == protocol::MailboxFolder::Sent ? "Sent" :
@@ -1633,7 +1712,7 @@ void MessengerDirector::HandleChatterUpdateState(
     command.presence.scene == protocol::Presence::Scene::Race ? "Race" :
     std::format("Unknown scene {}", static_cast<uint32_t>(command.presence.scene));
     
-  spdlog::debug("[{}] ChatCmdUpdateState: [{}] [{}] {}",
+  server::util::QuietLogDebug("[{}] ChatCmdUpdateState: [{}] [{}] {}",
     clientId,
     status,
     scene,
@@ -1642,7 +1721,7 @@ void MessengerDirector::HandleChatterUpdateState(
   // Sometimes ChatCmdUpdateState is received with status value > 5 containing giberish and causes crashes
   if (static_cast<uint8_t>(command.presence.status) > 5)
   {
-    spdlog::warn("Client {} sent unrecognised ChatCmdUpdateState::Status {}",
+    server::util::QuietLogWarn("Client {} sent unrecognised ChatCmdUpdateState::Status {}",
       clientId,
       static_cast<uint8_t>(command.presence.status));
     return;
@@ -1779,7 +1858,7 @@ void MessengerDirector::HandleChatterChatInvite(
       return str;
     };
 
-  spdlog::debug("[{}] ChatCmdChatInvite: [{}]",
+  server::util::QuietLogDebug("[{}] ChatCmdChatInvite: [{}]",
     clientId,
     concatParticipants(command.chatParticipantUids));
 
@@ -1884,7 +1963,7 @@ void MessengerDirector::HandleChatterChannelInfo(
   const network::ClientId clientId,
   const protocol::ChatCmdChannelInfo&)
 {
-  spdlog::debug("[{}] ChatCmdChannelInfo", clientId);
+  server::util::QuietLogDebug("[{}] ChatCmdChannelInfo", clientId);
 
   const auto& clientContext = GetClientContext(clientId);
 
@@ -1944,7 +2023,7 @@ void MessengerDirector::HandleChatterGuildLogin(
 {
   // ChatCmdGuildLogin is sent after ChatCmdLogin
 
-  spdlog::debug("[{}] ChatCmdGuildLogin: {} {} {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdGuildLogin: {} {} {} {}",
     clientId,
     command.characterUid,
     command.name,
@@ -1962,7 +2041,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    spdlog::warn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication with auth code '{}'",
+    server::util::QuietLogWarn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication with auth code '{}'",
       clientId,
       command.guildUid,
       command.characterUid,
@@ -1988,7 +2067,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   if (not clientContext.isAuthenticated)
   {
     // Client is not authenticated with chatter server
-    spdlog::warn("Client {} tried to login to guild {} but is not authenticated with the chatter server.",
+    server::util::QuietLogWarn("Client {} tried to login to guild {} but is not authenticated with the chatter server.",
       clientId,
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginClientNotAuthenticated);
@@ -1996,7 +2075,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   else if (command.characterUid != clientContext.characterUid)
   {
     // Command `characterUid` does match the client context `characterUid 
-    spdlog::warn("Client {} tried to login, who is character {}, to guild {} on behalf of another character {}",
+    server::util::QuietLogWarn("Client {} tried to login, who is character {}, to guild {} on behalf of another character {}",
       clientId,
       clientContext.characterUid,
       command.guildUid,
@@ -2006,7 +2085,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   else if (characterGuildUid != command.guildUid)
   {
     // Character does not belong to the guild in the guild login
-    spdlog::warn("Character {} tried to login to guild {} but character is not a guild member.",
+    server::util::QuietLogWarn("Character {} tried to login to guild {} but character is not a guild member.",
       clientContext.characterUid,
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginCharacterNotGuildMember);
