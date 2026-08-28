@@ -10,6 +10,22 @@ The upstream history is preserved in full in this repository; everything on top 
 
 This fork is **not** affiliated with or endorsed by Story of Alicia Studio. Please do not direct questions about this fork to them.
 
+## What this fork adds
+
+Plain-language summary of the gameplay and reliability work we built on top of the upstream server. This list will grow as we keep adding to the project.
+
+- **Story quests and quest arcs** — playable questlines with proper start/finish, rewards, and multi-step story arcs.
+- **Daily quests** — daily tasks that reset each day and hand out their rewards.
+- **Achievement system** — achievements that track your progress as you play and award cosmetic rewards, built on a clean event system so new achievements are easy to add.
+- **Horse racing that actually works** — fixes to race start, the countdown, in-race item pickups, and matchmaking so races run correctly for multiple players.
+- **Horse care skills** — the grooming/feeding care activities and their progression.
+- **Breeding and horse market fixes** — breeding, the stallion market, and horse handling behave correctly.
+- **Economy protection** — closed a number of exploits that let players gain free or negative currency, and reworked how rewards are paid out.
+- **Moderation and chat** — improvements to in-game moderation tools and chat.
+- **Crash and stability fixes** — the server no longer crashes on malformed or unexpected client data; it logs and keeps running.
+- **Reliable saving** — player progress is written to disk atomically, so a crash can't corrupt your data.
+- **Configurable content** — quests, items, achievements, magic, pets, breeding and more are loaded from readable config files.
+
 ## License
 
 GPL-2.0. See [LICENSE](LICENSE). Every file that carries a `Copyright (C) ... Story Of Alicia` header keeps it — those are the upstream authors' and are preserved as the license requires.
