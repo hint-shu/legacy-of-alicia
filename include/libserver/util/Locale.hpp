@@ -49,7 +49,7 @@ namespace locale
 //! @param input Input string.
 //! @param maxStringByteCapacity Byte capacity of the string.
 //! @returns `true` if the name is valid, otherwise returns `false`.
-[[nodiscard]] bool IsNameValid(const std::string& input, size_t maxStringByteCapacity = 16);
+[[nodiscard]] bool IsNameValid(const std::string& input, size_t maxStringByteCapacity = 18);
 
 } // namespace locale
 

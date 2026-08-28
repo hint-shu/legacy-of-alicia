@@ -3,6 +3,7 @@
 //
 
 #include "libserver/util/Locale.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Deferred.hpp"
 
@@ -34,8 +35,8 @@ constexpr size_t MinLatinLetterCount = 3;
 constexpr size_t MinKoreanLetterCount = 2;
 
 constexpr std::u16string_view KoreanLettersPattern = u"[가-힣]";
-constexpr std::u16string_view LatinLettersPattern = u"[A-Za-z0-9()\\[\\]{}]";
-constexpr std::u16string_view ValidLettersPattern = u"[^가-힣A-Za-z0-9()\\[\\]{}]";
+constexpr std::u16string_view LatinLettersPattern = u"[А-Яа-яЁёA-Za-z0-9()\\[\\]{}]";
+constexpr std::u16string_view ValidLettersPattern = u"[^가-힣А-Яа-яЁёA-Za-z0-9()\\[\\]{}]";
 
 } // anon namespace
 
@@ -60,7 +61,7 @@ std::string ToUtf8(const std::string& input)
   {
     if (error == U_FILE_ACCESS_ERROR)
     {
-      spdlog::error("Unicode ICU data for conversion from EUC-KR not available");
+      server::util::QuietLogError("Unicode ICU data for conversion from EUC-KR not available");
     }
 
     throw std::runtime_error(
@@ -133,7 +134,7 @@ std::string FromUtf8(const std::string& input)
   {
     if (error == U_FILE_ACCESS_ERROR)
     {
-      spdlog::error("Unicode ICU data for conversion to EUC-KR not available");
+      server::util::QuietLogError("Unicode ICU data for conversion to EUC-KR not available");
     }
 
     throw std::runtime_error(

@@ -72,6 +72,17 @@ uint32_t TimePointToAliciaTime(const Clock::time_point& timePoint)
   return DateTimeToAliciaTime(dateTime);
 }
 
+uint32_t CurrentGameDayIndex()
+{
+  // LOA-fix (batch1 task3): day-index (days since the Unix epoch) with the day
+  // boundary shifted to 06:00 UTC. Subtract 6h before flooring to whole days so
+  // a new "game day" (the daily-quest rollover) begins at 06:00 UTC, not at
+  // midnight. Mirrors the floor<days> idiom used in TimePointToAliciaTime above.
+  return static_cast<uint32_t>(
+    std::chrono::floor<std::chrono::days>(
+      Clock::now() - std::chrono::hours{6}).time_since_epoch().count());
+}
+
 uint32_t DurationToAliciaTime(const Clock::duration& duration)
 {
   // The extracted date time from the duration.

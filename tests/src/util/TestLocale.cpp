@@ -52,13 +52,17 @@ void TestNameValidation()
     // Korean range boundaries: U+AC00 and U+D7A3
     "\xEA\xB0\x80" "\xED\x9E\xA3",
     // Mixed Korean, latin and digit characters
-    "\xEA\xB0\x80" "A0"};
+    "\xEA\xB0\x80" "A0",
+    // LOA-fix (#29): 18 узких символов — новая граница cap (валидно при 18).
+    "ABCDEFGHIJKLMNOPQR",
+    // LOA-fix (#29): кириллические имена теперь принимаются (U+0400-04FF, «Конь»).
+    "\xD0\x9A" "\xD0\xBE" "\xD0\xBD" "\xD1\x8C"};
 
   constexpr std::array invalidNames = {
     // Invalid because of length
     "",
     "ab",
-    "ABCDEFGHIJKLMNOPQ",
+    "ABCDEFGHIJKLMNOPQRS",
     // Invalid because of symbols
     "%!@^",
     "Name-With-Hyphen",

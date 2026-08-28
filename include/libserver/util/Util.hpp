@@ -66,6 +66,13 @@ uint32_t DateTimeToAliciaTime(const DateTime& dateTime);
 //! @returns Alicia time representing the date and time of the time point.
 uint32_t TimePointToAliciaTime(const Clock::time_point& timePoint);
 
+//! LOA-fix (batch1 task3): returns the day-index (days since the Unix epoch) of
+//! the current game day, where the day boundary is 06:00 UTC — the daily-quest
+//! rollover. Subtracting 6h before flooring to whole days shifts the boundary
+//! from midnight to 06:00 UTC.
+//! @returns Day-index of the current game day.
+uint32_t CurrentGameDayIndex();
+
 //! Converts duration to alicia time.
 //! @param duration Duration.
 //! @returns Alicia time representing the duration.
