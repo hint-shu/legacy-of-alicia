@@ -18,15 +18,198 @@
  **/
 
 #include "server/authentication/LocalAuthenticationBackend.hpp"
+#include "libserver/util/AtomicFile.hpp"
+#include "libserver/util/QuietLog.hpp"
+
+#include <array>
+#include <cstddef>
+#include <fstream>
+#include <iomanip>
+#include <random>
+#include <sstream>
+#include <string>
+#include <system_error>
+
+#include <nlohmann/json.hpp>
+
+#include <libserver/util/picosha2.hpp>
 
 namespace server
 {
 
-std::optional<bool> LocalAuthenticationBackend::Authenticate(
-  [[maybe_unused]] const std::string& userName,
-  [[maybe_unused]] const std::string& userToken)
+namespace
 {
-  return true;
+
+//! LOA-fix (#18c): раундов растяжки. SHA-256 быстрый — прогоняем его много раз,
+//! чтобы перебор пароля был дорогим (KDF из быстрого хеша). Проверка — не
+//! горячий путь (раз на логин), 100k раундов ~единицы мс.
+constexpr int kPasswordStretchRounds = 100000;
+
+//! 16 случайных байт соли в hex. std::random_device — крипто-энтропия ОС
+//! (уже используется в кодовой базе: OtpSystem.hpp, LobbyNetworkHandler.cpp).
+std::string GenerateSaltHex()
+{
+  std::random_device rd;
+  std::array<unsigned char, 16> salt{};
+  for (auto& byte : salt)
+    byte = static_cast<unsigned char>(rd() & 0xFF);
+  std::ostringstream oss;
+  for (unsigned char byte : salt)
+    oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+  return oss.str();
+}
+
+//! Растянутый хеш пароля: h0 = SHA256(saltHex || password), затем ещё
+//! (rounds-1) раз h = SHA256(hex(h)). Детерминирован — register и verify на
+//! ОДНОМ сервере всегда совпадают (совместимость с внешним инструментом не
+//! требуется: миграция идёт через grandfather-вход, сервер сам хеширует). Соль
+//! на юзера → одинаковые пароли дают разные хеши.
+std::string StretchPassword(const std::string& saltHex, const std::string& password)
+{
+  std::string hash = picosha2::hash256_hex_string(saltHex + password);
+  for (int round = 1; round < kPasswordStretchRounds; ++round)
+    hash = picosha2::hash256_hex_string(hash);
+  return hash;
+}
+
+//! Сравнение хешей за постоянное время (не сливаем через тайминг позицию
+//! первого несовпадения байта).
+bool ConstantTimeEquals(const std::string& lhs, const std::string& rhs)
+{
+  if (lhs.size() != rhs.size())
+    return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < lhs.size(); ++i)
+    diff |= static_cast<unsigned char>(lhs[i] ^ rhs[i]);
+  return diff == 0;
+}
+
+//! Атомарная запись файла аккаунта (tmp + rename). false при любом сбое —
+//! вызывающий трактует как отказ (fail-closed), чтобы НИКОГДА не пустить с
+//! незаписанным паролем.
+bool WriteUserJsonAtomic(const std::filesystem::path& path, const nlohmann::json& json)
+{
+  // LOA-fix (R58-10, round58, backlog #175): та же атомарность, но через общего
+  // помощника. Своя копия имела три дефекта: закрытие потока не проверялось
+  // (деструктор ошибку сброса глотает), ранний `return false` ОСТАВЛЯЛ временный
+  // файл на диске, и права исходного файла терялись при переименовании.
+  // ★Контракт функции сохранён дословно: `false` на любом сбое, ни одного броска
+  // наружу — вызывающий трактует отказ как fail-closed и не пускает с
+  // незаписанным паролем.
+  try
+  {
+    server::util::WriteFileAtomically(path, json.dump(2), "User file");
+    return true;
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Failed to write the user file '{}': {}", path.string(), x.what());
+    return false;
+  }
+}
+
+} // namespace
+
+LocalAuthenticationBackend::LocalAuthenticationBackend(
+  std::filesystem::path usersDirectory)
+  : _usersDirectory(std::move(usersDirectory))
+{
+}
+
+std::optional<bool> LocalAuthenticationBackend::Authenticate(
+  const std::string& userName,
+  const std::string& userToken)
+{
+  // #18b/#18c: имя логина — строгий allowlist [A-Za-z0-9_-] (как в
+  // инсталляторе/лаунчере). Разом закрывает path traversal (нет '/', '\\',
+  // '.', '..'), NUL/control-байты и unicode-трюки → имя ВСЕГДА безопасное имя
+  // файла в каталоге users. Сервер не доверяет клиенту — проверяет сам.
+  if (userName.empty() || userName.size() > 48)
+    return false;
+  for (const char nameChar : userName)
+  {
+    const bool allowed = (nameChar >= 'A' && nameChar <= 'Z')
+      || (nameChar >= 'a' && nameChar <= 'z')
+      || (nameChar >= '0' && nameChar <= '9')
+      || nameChar == '_' || nameChar == '-';
+    if (not allowed)
+      return false;
+  }
+
+  // #18c: userToken == authKey из settings.json == ПАРОЛЬ. Пустой пароль не
+  // регистрируем и не пускаем (HandleLogin уже отсекает пустой authKey — дубль).
+  if (userToken.empty())
+    return false;
+
+  const std::filesystem::path userPath = _usersDirectory / (userName + ".json");
+
+  std::error_code ec;
+  const bool exists = std::filesystem::exists(userPath, ec);
+  if (ec)
+    return false; // fail-closed на ошибке ФС
+
+  // --- Ветка 1: новое имя → register-on-first-use ---
+  // Создаём аккаунт с солью+хешем присланного пароля. characterUid=0
+  // (InvalidUid) → игрок пойдёт в создание персонажа. CreateUser в
+  // FileDataSource — заглушка, поэтому пишем файл здесь (иначе пароль негде
+  // сохранить: login-флоу пароля не видит).
+  if (not exists)
+  {
+    const std::string salt = GenerateSaltHex();
+    const std::string hash = StretchPassword(salt, userToken);
+    nlohmann::json json;
+    json["name"] = userName;
+    json["token"] = "";
+    json["characterUid"] = 0;
+    json["infractions"] = nlohmann::json::array();
+    json["lastSeenOnline"] = 0;
+    json["passwordHash"] = hash;
+    json["passwordSalt"] = salt;
+    return WriteUserJsonAtomic(userPath, json); // не записалось → false (fail-closed)
+  }
+
+  // --- Существующий аккаунт: читаем сохранённый хеш ---
+  nlohmann::json json;
+  try
+  {
+    std::ifstream in(userPath);
+    if (not in.is_open())
+      return false;
+    json = nlohmann::json::parse(in);
+  }
+  catch (const std::exception&)
+  {
+    return false; // битый JSON → fail-closed
+  }
+
+  const std::string storedHash = json.value("passwordHash", std::string{});
+  const std::string storedSalt = json.value("passwordSalt", std::string{});
+
+  // Битая пара (ровно ОДНО поле пусто) — порча файла/ручная правка/будущий баг.
+  // Fail-closed: НЕ переустанавливаем пароль, иначе аккаунт с УЖЕ заданным
+  // паролем можно было бы захватить повторным grandfather.
+  const bool bothEmpty = storedHash.empty() && storedSalt.empty();
+  const bool bothSet = not storedHash.empty() && not storedSalt.empty();
+  if (not bothEmpty && not bothSet)
+    return false;
+
+  // --- Ветка 2: легаси-аккаунт БЕЗ пароля (ОБА поля пусты) → grandfather ---
+  // Принимаем и запоминаем присланный пароль как пароль аккаунта. Все прочие
+  // поля (name/token/characterUid/infractions/lastSeenOnline) сохраняются как
+  // есть — nlohmann хранит непрочитанные ключи. Персонаж владельца не теряется.
+  if (bothEmpty)
+  {
+    const std::string salt = GenerateSaltHex();
+    const std::string hash = StretchPassword(salt, userToken);
+    json["passwordHash"] = hash;
+    json["passwordSalt"] = salt;
+    return WriteUserJsonAtomic(userPath, json);
+  }
+
+  // --- Ветка 3: пароль задан → сверяем ---
+  const std::string computed = StretchPassword(storedSalt, userToken);
+  return ConstantTimeEquals(computed, storedHash);
 }
 
 } // namespace server

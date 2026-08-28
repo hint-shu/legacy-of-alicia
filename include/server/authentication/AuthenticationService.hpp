@@ -49,7 +49,10 @@ public:
   void Tick() noexcept;
 
   //! Thread safe
-  void QueueAuthentication(
+  //! LOA-fix (R51-4, round51, backlog #179): возвращает признак успеха. Отказ
+  //! означает «просьба НЕ поставлена в очередь» — вызывающий обязан не считать
+  //! вход отправленным, чтобы попытка повторилась на следующем тике.
+  [[nodiscard]] bool QueueAuthentication(
     const std::string& userName,
     const std::string& userToken) noexcept;
 

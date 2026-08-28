@@ -21,6 +21,8 @@
 
 #include "spdlog/spdlog.h"
 
+#include <libserver/util/QuietLog.hpp>
+
 #include <pqxx/transaction>
 
 namespace server
@@ -64,29 +66,49 @@ std::optional<bool> PostgresAuthenticationBackend::Authenticate(
   }
   catch (const pqxx::broken_connection&)
   {
-    spdlog::warn("Lost connection to authentication backend, attempting to perform a reconnect");
+    util::QuietLogWarn("Lost connection to authentication backend, attempting to perform a reconnect");
     Connect();
     return std::nullopt;
   }
   catch (const std::exception& x)
   {
-    spdlog::warn("Exception while authenticating user: {}", x.what());
+    util::QuietLogWarn("Exception while authenticating user: {}", x.what());
+    return std::nullopt;
+  }
+  catch (...)
+  {
+    util::QuietLogWarn("Unknown exception while authenticating user");
     return std::nullopt;
   }
 }
 
 void PostgresAuthenticationBackend::Connect() noexcept
 {
-  const auto timerBegin = std::chrono::steady_clock::now();
+  // LOA-fix (R49-10, round49, backlog #178): функция объявлена noexcept, но
+  // тело заведомо бросающее — pqxx кидает при недоступной базе, а зовут её
+  // ИМЕННО тогда, когда связь уже потеряна (ветка перехвата Authenticate).
+  // Пояса не было вовсе: первый же обрыв связи с базой убивал процесс.
+  try
+  {
+    const auto timerBegin = std::chrono::steady_clock::now();
 
-  _pqcx.emplace(_uri);
-  _pqcx->prepare(
-    GetUserSessionTokenName.data(),
-    "SELECT token, expires_at FROM sessions WHERE username = $1");
+    _pqcx.emplace(_uri);
+    _pqcx->prepare(
+      GetUserSessionTokenName.data(),
+      "SELECT token, expires_at FROM sessions WHERE username = $1");
 
-  const auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - timerBegin);
-  spdlog::info("Connection to authentication backend established in {}ms", time.count());
+    const auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - timerBegin);
+    util::QuietLogInfo("Connection to authentication backend established in {}ms", time.count());
+  }
+  catch (const std::exception& x)
+  {
+    util::QuietLogWarn("Failed to connect to the authentication backend: {}", x.what());
+  }
+  catch (...)
+  {
+    util::QuietLogWarn("Failed to connect to the authentication backend: unknown exception");
+  }
 }
 
 } // namespace server

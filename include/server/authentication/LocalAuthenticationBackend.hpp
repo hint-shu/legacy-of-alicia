@@ -22,6 +22,8 @@
 
 #include "AuthenticationBackend.hpp"
 
+#include <filesystem>
+
 namespace server
 {
 
@@ -29,11 +31,19 @@ class LocalAuthenticationBackend final
   : public AuthenticationBackend
 {
 public:
+  //! LOA-fix (#18b): каталог users (<data basePath>/users), *.json-файлы
+  //! которого задают, какие аккаунты существуют. Прокинут, чтобы Authenticate
+  //! мог отклонять неизвестные имена вместо прежнего безусловного `return true`.
+  explicit LocalAuthenticationBackend(std::filesystem::path usersDirectory);
+
   ~LocalAuthenticationBackend() override = default;
 
   std::optional<bool> Authenticate(
     const std::string& userName,
     const std::string& userToken) override;
+
+private:
+  std::filesystem::path _usersDirectory;
 };
 
 } // namespace server
