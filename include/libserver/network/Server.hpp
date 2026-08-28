@@ -28,6 +28,7 @@
 #include <deque>
 #include <functional>
 #include <queue>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 
@@ -73,11 +74,21 @@ class Client : public std::enable_shared_from_this<Client>
 {
 public:
   //! Default constructor.
-  //! @param socket Underlying socket (remote address is read from it).
+  //! LOA-fix (R51-1, round51, backlog #179): адрес и порт приходят СНАРУЖИ, а
+  //! `noexcept` снят. Причины две и обе настоящие: запрос адреса у сокета
+  //! бросает (клиент мог оборвать соединение сразу после приёма), а члены
+  //! `asio::streambuf` выделяют память ДО входа в тело — то есть под `noexcept`
+  //! конструктор убивал процесс ещё до первой своей строки. Отказ осмыслен
+  //! вызывающим: пояс приёма (R50-2) напишет строку, соединение не состоится,
+  //! приём переармируется.
+  //! @param remoteAddress Адрес, уже прочитанный приёмным обработчиком.
+  //! @param remotePort Порт оттуда же.
   explicit Client(
     ClientId clientId,
     asio::ip::tcp::socket&& socket,
-    EventHandlerInterface& networkEventHandler) noexcept;
+    asio::ip::address_v4 remoteAddress,
+    uint16_t remotePort,
+    EventHandlerInterface& networkEventHandler);
 
   //! Begins the client's asynchronous read loop.
   void Begin();
@@ -132,8 +143,10 @@ class Server : public EventHandlerInterface
 {
 public:
   //! Default constructor.
+  //! LOA-fix (R51-7, round51, backlog #179): без `noexcept` — члены
+  //! выделяют память при конструировании.
   explicit Server(
-    EventHandlerInterface& networkEventHandler) noexcept;
+    EventHandlerInterface& networkEventHandler);
 
   //! Begins the server on the current thread.
   //! Blocks the current thread until stopped.
@@ -146,7 +159,8 @@ public:
     uint16_t port);
 
   //! Ends the server.
-  void End();
+  //! Останавливает сервер. Не бросает (R49-17, backlog #178).
+  void End() noexcept;
 
   //! Get client.
   std::shared_ptr<Client> GetClient(ClientId clientId);
@@ -165,7 +179,9 @@ private:
 
   void AcceptLoop() noexcept;
   void TickLoop() noexcept;
-  bool IsConnectionThrottled(const asio::ip::address_v4& address) noexcept;
+  //! LOA-fix (R51-2, round51, backlog #179): без `noexcept` — растит
+  //! реестр адресов, а отказ уже осмыслен поясом приёма соединения.
+  bool IsConnectionThrottled(const asio::ip::address_v4& address);
   void OnThrottleDisconnect(const asio::ip::address_v4& address) noexcept;
 
   asio::io_context _io_ctx;
@@ -176,6 +192,18 @@ private:
   ClientId _client_id = 0;
   //! Map of clients.
   std::unordered_map<ClientId, std::shared_ptr<Client>> _clients;
+  //! LOA-fix (R61-2, round61, backlog #202): замок карты клиентов.
+  //! ★ЗАЧЕМ. Карту МУТИРУЕТ свой сетевой поток (`try_emplace` на приёме,
+  //! `erase` на разрыве), а ЧИТАЮТ её потоки директоров через `GetClient` —
+  //! на КАЖДОЙ отправке команды. Рехэш карты под чужим `find` — это SIGSEGV,
+  //! а не порча байтов: узлы переезжают, и чужой итератор указывает в никуда.
+  //! ★ПОЧЕМУ ЗАМОК, А НЕ МАРШРУТИЗАЦИЯ (`asio::post`). Замок ложится ВНУТРЬ
+  //! `GetClient`, то есть место, где «надо не забыть взять замок», ровно одно
+  //! на 350+ вызовов. Маршрутизация же вводила бы новый механизм (в проекте
+  //! `post` не используется НИГДЕ) ценой аллокации задачи на каждой отправке,
+  //! а заезды тикают 50 Гц.
+  //! ★РАЗДЕЛЯЕМЫЙ, а не исключительный: читателей 350+, писателей двое.
+  mutable std::shared_mutex _clientsMutex;
   //! Per-address state for connection throttling.
   std::unordered_map<asio::ip::address_v4, AddressState> _addressStates;
 

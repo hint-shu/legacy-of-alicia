@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/network/command/CommandServer.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Deferred.hpp"
 #include "libserver/util/Util.hpp"
@@ -117,6 +118,60 @@ CommandServer::CommandServer(
 {
 }
 
+CommandServer::~CommandServer()
+{
+  // LOA-fix (R49-14c, round49, backlog #178): деструктор по умолчанию убивал
+  // процесс, если поток сервера всё ещё жив — а он остаётся живым каждый раз,
+  // когда директор вышел через исключение и не дошёл до своего Terminate().
+  try
+  {
+    EndHost();
+  }
+  catch (...)
+  {
+  }
+
+}
+
+namespace
+{
+
+//! LOA-fix (R49-4a, round49, backlog #178): тот же доклад, что и у директорских
+//! потоков — из ветки перехвата под функцией потока бросать нельзя вообще.
+//! LOA-fix (R49-14b, round49, backlog #178): остановка сервера — сама бросающая
+//! операция (`Server::End` зовёт `_acceptor.close()` в бросающей перегрузке), а
+//! стоит она в ветке перехвата ПРЯМО под функцией потока. Бросок оттуда —
+//! std::terminate.
+template <typename ServerType>
+void StopQuietly(ServerType& server) noexcept
+{
+  try
+  {
+    server.End();
+  }
+  catch (...)
+  {
+  }
+}
+
+void ReportHostFailure(const char* reason) noexcept
+{
+  try
+  {
+    server::util::QuietLogError("Unhandled command server network exception: {}", reason);
+
+    for (const auto& entry : std::stacktrace::current())
+    {
+      server::util::QuietLogError("[Stack] {}({}): {}", entry.source_file(), entry.source_line(), entry.description());
+    }
+  }
+  catch (...)
+  {
+  }
+}
+
+} // anon namespace
+
 void CommandServer::BeginHost(const asio::ip::address& address, uint16_t port)
 {
   _serverThread = std::thread(
@@ -128,14 +183,13 @@ void CommandServer::BeginHost(const asio::ip::address& address, uint16_t port)
       }
       catch (const std::exception& x)
       {
-        spdlog::error("Unhandled command server network exception: {}", x.what());
-
-        for (const auto& entry : std::stacktrace::current())
-        {
-          spdlog::error("[Stack] {}({}): {}", entry.source_file(), entry.source_line(), entry.description());
-        }
-
-        _server.End();
+        ReportHostFailure(x.what());
+        StopQuietly(_server);
+      }
+      catch (...)
+      {
+        ReportHostFailure("unknown exception");
+        StopQuietly(_server);
       }
     });
 }
@@ -161,11 +215,74 @@ void CommandServer::DisconnectClient(
   _server.GetClient(clientId)->End();
 }
 
+void CommandServer::CreateClient(const ClientId clientId)
+{
+  // LOA-fix (R61-14, round61, backlog #208): запись заводится РОВНО ОДИН РАЗ —
+  // на подключении, и больше нигде.
+  // ★ЗАЧЕМ ИМЕННО ТАК (находка ревью, итерация 2). Пока запись мог создать
+  // любой обратившийся, удаление не было ТЕРМИНАЛЬНЫМ: снятая на разрыве
+  // запись тут же воскресала — либо запоздавшим пакетом, либо `SetCode` с
+  // потока директора, — и снимать её было уже некому. Течь #208 возвращалась
+  // молча, а комментарий в коде уверял, что этого не бывает.
+  std::unique_lock lock(_clientsMutex);
+  _clients.try_emplace(clientId, std::make_shared<CommandClient>());
+}
+
+std::shared_ptr<CommandClient> CommandServer::FindClient(
+  const ClientId clientId) const
+{
+  // ★РАЗДЕЛЯЕМЫЙ ЗАМОК И НИКАКОЙ ВСТАВКИ. Возвращается КОПИЯ указателя:
+  // вызывающий работает с объектом уже без замка и переживает и рехэш, и
+  // удаление записи другим потоком.
+  std::shared_lock lock(_clientsMutex);
+  const auto it = _clients.find(clientId);
+  return it == _clients.end() ? nullptr : it->second;
+}
+
+void CommandServer::RemoveClient(const ClientId clientId)
+{
+  // LOA-fix (R61-14b, round61, backlog #208): запись о клиенте УДАЛЯЕТСЯ.
+  // ★До этого раунда во всём файле не было ни одного `erase`, ни одного
+  // `clear` — карта росла по числу СОЕДИНЕНИЙ за всю жизнь процесса, а не по
+  // числу одновременных игроков: идентификаторы монотонны, переиспользования
+  // нет, поэтому каждый вход, каждое переподключение и каждый оборванный
+  // коннект добавляли запись НАВСЕГДА. И это не пара байт: внутри код
+  // шифрования, а до чистки #208 лежала ещё и мёртвая очередь.
+  // ★УДАЛЕНИЕ ТЕРМИНАЛЬНО: заводит запись только `CreateClient`, поэтому после
+  // снятия воскресить её некому — ни запоздавшим пакетом, ни чужим потоком.
+  // ★ЗНАЧЕНИЕ ВЫНИМАЕТСЯ ИЗ-ПОД ЗАМКА И РАЗРУШАЕТСЯ СНАРУЖИ: деструктор
+  // `CommandClient` не должен отрабатывать под замком карты.
+  std::shared_ptr<CommandClient> removed;
+  {
+    std::unique_lock lock(_clientsMutex);
+    const auto it = _clients.find(clientId);
+    if (it == _clients.end())
+      return;
+    removed = std::move(it->second);
+    _clients.erase(it);
+  }
+}
+
 void CommandServer::SetCode(
   const ClientId client,
   const protocol::XorCode code)
 {
-  _clients[client].SetCode(code);
+  // LOA-fix (R61-13, round61, backlog #202): через единственный вход в карту.
+  // Зовётся с потоков лобби и заезда — то есть это ровно тот чужепоточный
+  // писатель, из-за которого возможен одновременный рехэш с двух сторон.
+  // ★ПОИСК НЕ ВСТАВЛЯЮЩИЙ: если записи уже нет, клиент разорвался, и создавать
+  // её заново значило бы вернуть течь #208 (запись, которую больше некому
+  // снять). Молча пропускаем — это штатная гонка разрыва, а не ошибка.
+  const auto clientRecord = FindClient(client);
+  if (not clientRecord)
+  {
+    server::util::QuietLogWarn(
+      "Ignoring code assignment for client {}: the client is already gone",
+      client);
+    return;
+  }
+
+  clientRecord->SetCode(code);
 }
 
 CommandServer::NetworkEventHandler::NetworkEventHandler(
@@ -182,12 +299,28 @@ void CommandServer::NetworkEventHandler::HandleNetworkTick()
 void CommandServer::NetworkEventHandler::OnClientConnected(
   network::ClientId clientId)
 {
+  // LOA-fix (R61-18a, round61, backlog #208): запись заводится ЗДЕСЬ и только
+  // здесь — до того, как обработчик сможет что-либо отправить этому клиенту.
+  _commandServer.CreateClient(clientId);
+
   _commandServer._eventHandler.HandleClientConnected(clientId);
 }
 
 void CommandServer::NetworkEventHandler::OnClientDisconnected(
   network::ClientId clientId)
 {
+  // LOA-fix (R61-18b, round61, backlog #208): удаление ОБЯЗАНО случиться ДАЖЕ
+  // ЕСЛИ ОБРАБОТЧИК БРОСИЛ.
+  // ★ЭТО НАХОДКА РЕВЬЮ, И ОНА БЫЛА РЕАЛЬНОЙ ТЕЧЬЮ. `HandleClientDisconnected`
+  // умеет бросать: все три реализации обращаются к `GetClientContext`, который
+  // на отсутствующей записи кидает «client is not available». Бросок ловится
+  // этажом выше, процесс живёт, `Server::_clients` чистится — а снятие ЭТОЙ
+  // записи, стой оно простой строкой ниже, просто не выполнялось бы. То есть
+  // ровно на пути отказа течь #208 оставалась.
+  // ★Апстрим выше по стеку уже пришёл к тому же выводу (R49-21): удаление
+  // делается В ЛЮБОМ СЛУЧАЕ и ПО КЛЮЧУ. Здесь тот же приём.
+  const Deferred removeRecord([&] { _commandServer.RemoveClient(clientId); });
+
   _commandServer._eventHandler.HandleClientDisconnected(clientId);
 }
 
@@ -195,6 +328,12 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
   network::ClientId clientId,
   const std::span<const std::byte>& data)
 {
+  // LOA-fix (R21-3b, round21, backlog #95): отметка «клиент говорит» ДО разбора
+  // команд. Здесь, а не в хендлере: AcCmdCRHeartbeat (0x12) хендлера не имеет и
+  // уходит в ветку «Unhandled command» — хук уровнем выше её бы не увидел.
+  // Дефолтная реализация — no-op, платит только директор ранчо (R21-2a).
+  _commandServer._eventHandler.HandleClientActivity(clientId);
+
   SourceStream commandStream(data);
 
   while (commandStream.GetCursor() != commandStream.Size())
@@ -272,16 +411,34 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
 
     SourceStream commandDataStream(nullptr);
 
-    auto& client = _commandServer._clients[clientId];
+    // LOA-fix (R61-15, round61, backlog #202): КОПИЯ УКАЗАТЕЛЯ, А НЕ ССЫЛКА
+    // ВНУТРЬ КАРТЫ. Прежняя `auto&` жила всю обработку команды, и вставка с
+    // потока лобби или заезда в это время делала её висячей. Теперь объект
+    // держится своим указателем и переживает любой рехэш.
+    // ★ПОИСК НЕ ВСТАВЛЯЮЩИЙ: запись заводится только на подключении. Её
+    // отсутствие здесь означает, что клиент уже разорвался, а данные с его
+    // сокета ещё в пути. Создавать запись заново нельзя — снимать её было бы
+    // некому, и течь #208 вернулась бы.
+    // ★ДАННЫЕ ПОГЛОЩАЮТСЯ ЦЕЛИКОМ, а не отбрасываются возвратом нуля: вызывающий
+    // делает `consume(результат)`, и ноль оставил бы буфер неразобранным —
+    // то есть бесконечный цикл вместо аккуратного завершения.
+    const auto client = _commandServer.FindClient(clientId);
+    if (not client)
+    {
+      server::util::QuietLogWarn(
+        "Discarding {} bytes for client {}: the client is already gone",
+        data.size(), clientId);
+      return data.size();
+    }
 
     const auto commandId = static_cast<protocol::Command>(magic.id);
 
     // Validate and process the command data.
     if (commandDataSize > 0)
     {
-      client.RollCode();
+      client->RollCode();
 
-      const uint32_t code = client.GetRollingCodeInt();
+      const uint32_t code = client->GetRollingCodeInt();
 
       // Extract the padding from the code.
       const auto padding = code & 7;
@@ -311,7 +468,7 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
 
       // Apply XOR algorithm to the data.
       XorAlgorithm(
-        client.GetRollingCode(),
+        client->GetRollingCode(),
         dataSourceStream,
         dataSinkStream);
 
@@ -321,7 +478,7 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
       if (_commandServer.debugIncomingCommandData
         && not IsMuted(commandId))
       {
-        spdlog::debug("Read data for command '{}' (0x{:X}),\n\n"
+        server::util::QuietLogDebug("Read data for command '{}' (0x{:X}),\n\n"
           "XOR code: {:#X},\n"
           "Command data size: {} (padding: {}),\n"
           "Actual command data size: {}\n"
@@ -343,7 +500,7 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
       if (_commandServer.debugCommands
         && not IsMuted(commandId))
       {
-        spdlog::warn(
+        server::util::QuietLogWarn(
           "Unhandled command '{}' (0x{:x})",
           GetCommandName(commandId),
           magic.id);
@@ -362,7 +519,7 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
       }
       catch (const std::exception& x)
       {
-        spdlog::error(
+        server::util::QuietLogError(
           "Unhandled exception handling command '{}' (0x{:x}): {}",
           protocol::GetCommandName(commandId),
           magic.id,
@@ -375,7 +532,7 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
       if (_commandServer.debugCommands
         && not IsMuted(commandId))
       {
-        spdlog::debug(
+        server::util::QuietLogDebug(
           "Handled command '{}' (0x{:x})",
           GetCommandName(commandId),
           magic.id);
@@ -415,7 +572,7 @@ void CommandServer::SendCommand(
         if (debugOutgoingCommandData
           && not IsMuted(commandId))
         {
-          spdlog::debug("Write data for command '{}' (0x{:X}),\n\n"
+          server::util::QuietLogDebug("Write data for command '{}' (0x{:X}),\n\n"
             "Command data size: {} \n"
             "Data dump: \n\n{}\n",
             GetCommandName(commandId),
@@ -442,7 +599,7 @@ void CommandServer::SendCommand(
         if (debugCommands
           && not IsMuted(commandId))
         {
-          spdlog::debug("Sent command message '{}' (0x{:X})",
+          server::util::QuietLogDebug("Sent command message '{}' (0x{:X})",
           GetCommandName(commandId),
           static_cast<uint32_t>(commandId));
         }

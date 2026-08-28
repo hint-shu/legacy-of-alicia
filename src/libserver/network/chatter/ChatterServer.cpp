@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/network/chatter/ChatterServer.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "libserver/util/Deferred.hpp"
 #include "libserver/util/Stream.hpp"
 #include "libserver/util/Util.hpp"
@@ -52,10 +53,56 @@ ChatterServer::ChatterServer(
 
 ChatterServer::~ChatterServer()
 {
-  _server.End();
-  if (_serverThread.joinable())
-    _serverThread.join();
+  // LOA-fix (R49-14e, round49, backlog #178): деструктор неявно noexcept, а обе
+  // строки внутри бросающие — `End()` закрывает акцептор бросающей перегрузкой,
+  // `join()` кидает std::system_error.
+  try
+  {
+    _server.End();
+    if (_serverThread.joinable())
+      _serverThread.join();
+  }
+  catch (...)
+  {
+  }
+
 }
+
+namespace
+{
+
+//! LOA-fix (R49-14g, round49, backlog #178): см. R49-14b — остановка сервера
+//! тоже бросает, а стоит под функцией потока.
+template <typename ServerType>
+void StopChatterQuietly(ServerType& server) noexcept
+{
+  try
+  {
+    server.End();
+  }
+  catch (...)
+  {
+  }
+}
+
+//! LOA-fix (R49-5a, round49, backlog #178): см. R49-4a.
+void ReportChatterHostFailure(const char* reason) noexcept
+{
+  try
+  {
+    server::util::QuietLogError("Unhandled chatter server network exception: {}", reason);
+
+    for (const auto& entry : std::stacktrace::current())
+    {
+      server::util::QuietLogError("[Stack] {}({}): {}", entry.source_file(), entry.source_line(), entry.description());
+    }
+  }
+  catch (...)
+  {
+  }
+}
+
+} // anon namespace
 
 void ChatterServer::BeginHost(network::asio::ip::address_v4 address, uint16_t port)
 {
@@ -67,14 +114,13 @@ void ChatterServer::BeginHost(network::asio::ip::address_v4 address, uint16_t po
     }
     catch (const std::exception& x)
     {
-      spdlog::error("Unhandled chatter server network exception: {}", x.what());
-
-      for (const auto& entry : std::stacktrace::current())
-      {
-        spdlog::error("[Stack] {}({}): {}", entry.source_file(), entry.source_line(), entry.description());
-      }
-
-      _server.End();
+      ReportChatterHostFailure(x.what());
+      StopChatterQuietly(_server);
+    }
+    catch (...)
+    {
+      ReportChatterHostFailure("unknown exception");
+      StopChatterQuietly(_server);
     }
   });
 }
@@ -171,7 +217,7 @@ size_t ChatterServer::OnClientData(
 
     if (debugIncomingCommandData)
     {
-      spdlog::debug("Read data for command '{}' (0x{:X}),\n\n"
+      server::util::QuietLogDebug("Read data for command '{}' (0x{:X}),\n\n"
         "Command data size: {} \n"
         "Data dump: \n\n{}\n",
         GetChatterCommandName(static_cast<protocol::ChatterCommand>(header.commandId)),
@@ -186,7 +232,7 @@ size_t ChatterServer::OnClientData(
     {
       if (debugCommands)
       {
-        spdlog::warn("Unhandled chatter command: {} ({:#x})", 
+        server::util::QuietLogWarn("Unhandled chatter command: {} ({:#x})", 
           GetChatterCommandName(static_cast<protocol::ChatterCommand>(header.commandId)),
           header.commandId);
       }
@@ -200,14 +246,14 @@ size_t ChatterServer::OnClientData(
         
         if (debugCommands)
         {
-          spdlog::debug("Handled chatter command: {} ({:#x})", 
+          server::util::QuietLogDebug("Handled chatter command: {} ({:#x})", 
             GetChatterCommandName(static_cast<protocol::ChatterCommand>(header.commandId)),
             header.commandId);
         }
       }
       catch (const std::exception& ex)
       {
-        spdlog::error("Unhandled exception handling chatter command {} ({:#x}): {}",
+        server::util::QuietLogError("Unhandled exception handling chatter command {} ({:#x}): {}",
           GetChatterCommandName(static_cast<protocol::ChatterCommand>(header.commandId)),
           header.commandId,
           ex.what());

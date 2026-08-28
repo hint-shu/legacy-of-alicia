@@ -25,7 +25,8 @@
 #include "libserver/network/Server.hpp"
 #include "libserver/util/Stream.hpp"
 
-#include <queue>
+#include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace server
@@ -51,7 +52,12 @@ public:
   [[nodiscard]] int32_t GetRollingCodeInt() const;
 
 private:
-  std::queue<CommandSupplier> _commandQueue;
+  // LOA-fix (R61-20, round61, находка ревью): МЁРТВЫЙ ЧЛЕН УБРАН.
+  // `_commandQueue` не читался и не писался НИГДЕ — единственное упоминание во
+  // всём дереве было это объявление. При этом он делал каждую запись о клиенте
+  // тяжёлой (пустая `std::queue` — сотни байт против четырёх у кода), то есть
+  // именно он составлял бОльшую часть цены течи #208: карта росла по числу
+  // соединений за всю жизнь процесса, и каждая запись тащила эту очередь.
   protocol::XorCode _rollingCode{};
 };
 
@@ -79,6 +85,17 @@ public:
     virtual void HandleNetworkTick() {}
     virtual void HandleClientConnected(ClientId clientId) = 0;
     virtual void HandleClientDisconnected(ClientId clientId) = 0;
+
+    //! LOA-fix (R21-3a, round21, backlog #95): вызывается на КАЖДУЮ входящую
+    //! дейтаграмму клиента, ДО разбора команд. Нужен именно на этом уровне, а
+    //! не на уровне хендлеров: канал держит живым в том числе AcCmdCRHeartbeat
+    //! (0x12), у которой зарегистрированного хендлера нет вообще.
+    //! Дефолт — no-op: лобби/гонка/мессенджер ничего не платят и не меняются.
+    //! ★Реализация обязана быть дешёвой и НЕ бросать: исключение отсюда уходит
+    //! в сетевой read-loop и рвёт клиенту соединение.
+    //! @param clientId ID клиента, приславшего данные (в дефолтной пустышке
+    //!        не именован — иначе -Wunused-parameter на каждом наследнике).
+    virtual void HandleClientActivity(ClientId) {}
   };
 
   //! Constructor.
@@ -86,8 +103,9 @@ public:
   CommandServer(
     EventHandlerInterface& eventHandlerInterface);
 
-  //! Default destructor.
-  ~CommandServer() = default;
+  //! Destructor. Останавливает и дожидается поток сервера, если он ещё жив
+  //! (R49-14c, backlog #178).
+  ~CommandServer();
 
   CommandServer(const CommandServer&) = delete;
   CommandServer& operator=(const CommandServer&) = delete;
@@ -151,6 +169,22 @@ private:
     CommandServer& _commandServer;
   };
 
+  //! LOA-fix (R61-12, round61, backlog #202/#208): ЕДИНСТВЕННЫЕ входы в карту.
+  //! ★Смысл не в краткости, а в том, чтобы «место, где надо не забыть взять
+  //! замок» было ровно ОДНО. Список мест обязательно отстанет от кода; одна
+  //! точка — нет. Наружу отдаётся КОПИЯ указателя, поэтому вызывающий работает
+  //! с объектом уже без замка и переживает любой рехэш.
+  //!
+  //! ★ПОИСК НЕ ВСТАВЛЯЕТ — И ЭТО ГЛАВНОЕ СВОЙСТВО (находка ревью, итерация 2).
+  //! Пока поиск был вставляющим, удаление не было ТЕРМИНАЛЬНЫМ: запоздавший
+  //! пакет или `SetCode` с потока директора воскрешали запись уже после снятия,
+  //! и течь #208 возвращалась. Запись заводится ровно один раз — на подключении.
+  void CreateClient(ClientId clientId);
+  [[nodiscard]] std::shared_ptr<CommandClient> FindClient(ClientId clientId) const;
+
+  //! LOA-fix (R61-12b, round61, backlog #208): удаление записи о клиенте.
+  void RemoveClient(ClientId clientId);
+
   //!
   void SendCommand(
     ClientId clientId,
@@ -162,7 +196,27 @@ private:
   bool debugCommands = constants::DebugCommands;
 
   std::unordered_map<protocol::Command, RawCommandHandler> _handlers{};
-  std::unordered_map<ClientId, CommandClient> _clients{};
+  //! LOA-fix (R61-11, round61, backlog #202): значение стало `shared_ptr`.
+  //!
+  //! ★ЧТО ИМЕННО ЗАЩИЩЕНО — ЧИТАТЬ ВНИМАТЕЛЬНО. Замок и указатель закрывают
+  //! ВРЕМЯ ЖИЗНИ ЗАПИСИ и рехэш КАРТЫ. Содержимое самого `CommandClient`
+  //! (`_rollingCode`) НЕ синхронизировано и этим раундом НЕ чинится: `SetCode`
+  //! приходит с потоков лобби и заезда, а `RollCode`/`GetRollingCode` — с
+  //! сетевого. Это дореформенная гонка, заведена как #216.
+  //! ★Формулировка нарочно узкая. Первая редакция этого блока утверждала
+  //! инвариант, которого нет («приём однопоточный»), и ревью поймало это как
+  //! BLOCK: ложное утверждение о потокобезопасности живёт тихо и подводит
+  //! следующий раунд, который на него обопрётся. Здесь написано ровно то, что
+  //! верно, и явно сказано, что НЕ верно.
+  //!
+  //! ★ПОЧЕМУ УКАЗАТЕЛЬ, А НЕ ЗНАЧЕНИЕ. В карту ВСТАВЛЯЛИ обе стороны через
+  //! вставляющий `operator[]`, а `OnClientData` брал ССЫЛКУ внутрь карты и жил
+  //! с ней всю обработку команды — вставка с чужого потока делала её висячей.
+  //! Указатель это лечит: объект перестаёт ездить при рехэше, и взятая копия
+  //! остаётся действительной, даже если карта переехала целиком.
+  std::unordered_map<ClientId, std::shared_ptr<CommandClient>> _clients{};
+  //! Замок карты. Разделяемый на чтение, исключительный на вставку/удаление.
+  mutable std::shared_mutex _clientsMutex{};
 
   EventHandlerInterface& _eventHandler;
   NetworkEventHandler _serverNetworkEventHandler;

@@ -21,6 +21,7 @@
 #define CHATTER_SERVER_HPP
 
 #include "libserver/network/Server.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "libserver/util/Stream.hpp"
 #include "libserver/Constants.hpp"
 #include "libserver/util/Util.hpp"
@@ -110,7 +111,7 @@ public:
 
       if (debugOutgoingCommandData)
       {
-        spdlog::debug("Write data for command '{}' (0x{:X}),\n\n"
+        server::util::QuietLogDebug("Write data for command '{}' (0x{:X}),\n\n"
           "Command data size: {} \n"
           "Data dump: \n\n{}\n",
           GetChatterCommandName(T::GetCommand()),
@@ -149,7 +150,7 @@ public:
       
       if (debugCommands)
       {
-        spdlog::debug("Sent chatter command message '{}' (0x{:X})",
+        server::util::QuietLogDebug("Sent chatter command message '{}' (0x{:X})",
           GetChatterCommandName(T::GetCommand()),
           static_cast<uint16_t>(T::GetCommand()));
       }
