@@ -18,6 +18,7 @@
  **/
 
 #include "server/tracker/RanchTracker.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -65,7 +66,7 @@ void RanchTracker::RemoveHorse(data::Uid horse)
   // Only erase if the horse is actually tracked.
   if (!_horses.contains(horse))
   {
-    spdlog::debug("Could not remove horse UID {} from ranch tracker - not found", horse);
+    server::util::QuietLogDebug("Could not remove horse UID {} from ranch tracker - not found", horse);
     return;
   }
 

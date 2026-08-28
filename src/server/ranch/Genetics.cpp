@@ -18,6 +18,7 @@
  **/
 
 #include "server/ranch/Genetics.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "server/ServerInstance.hpp"
 
 #include <libserver/util/Util.hpp>
@@ -414,7 +415,7 @@ Genetics::ManeTailResult Genetics::CalculateManeTailGenetics(
   result.maneTid = registry.GetRandomManeFromColorAndShape(colorGroupId, maneShape);
   if (result.maneTid == data::InvalidTid)
   {
-    spdlog::warn("Genetics: no mane for colour group {} shape {}, using fallback", colorGroupId, maneShape);
+    server::util::QuietLogWarn("Genetics: no mane for colour group {} shape {}, using fallback", colorGroupId, maneShape);
     result.maneTid = 1; // White short mane.
   }
 
@@ -423,7 +424,7 @@ Genetics::ManeTailResult Genetics::CalculateManeTailGenetics(
   result.tailTid = registry.FindTailByColorAndShape(maneColor, tailShape);
   if (result.tailTid == data::InvalidTid || result.tailTid == 0)
   {
-    spdlog::warn("Genetics: no tail matching mane colour for shape {}, using colour-group lookup", tailShape);
+    server::util::QuietLogWarn("Genetics: no tail matching mane colour for shape {}, using colour-group lookup", tailShape);
     result.tailTid = registry.GetRandomTailByColorGroupAndShape(colorGroupId, tailShape);
     if (result.tailTid == data::InvalidTid)
       result.tailTid = 1; // White short tail.
@@ -439,7 +440,7 @@ data::Tid Genetics::CalculateFoalFace(const data::Tid foalSkinTid)
   const data::Tid faceTid = registry.GetRandomFaceForCoat(foalSkinTid);
   if (faceTid == data::InvalidTid)
   {
-    spdlog::warn("Genetics: no face for coat {}, using fallback", foalSkinTid);
+    server::util::QuietLogWarn("Genetics: no face for coat {}, using fallback", foalSkinTid);
     return 1; // First marking.
   }
 
@@ -623,7 +624,7 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
 
   if (RollPercent() >= probability)
   {
-    spdlog::debug("Genetics: foal gets no potential (needed < {})", probability);
+    server::util::QuietLogDebug("Genetics: foal gets no potential (needed < {})", probability);
     return result;
   }
 
@@ -631,7 +632,7 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
   const auto& potentialTypes = registry.GetPotentialTypes();
   if (potentialTypes.empty())
   {
-    spdlog::warn("Genetics: no potential types configured");
+    server::util::QuietLogWarn("Genetics: no potential types configured");
     return result;
   }
   std::uniform_int_distribution<size_t> typeDist(0, potentialTypes.size() - 1);
@@ -671,7 +672,7 @@ data::Tid Genetics::CalculateFoalSkin(
   const data::Tid stallionSkin = ReadPart(stallionUid, Part::Skin);
   if (mareSkin == 0 || stallionSkin == 0)
   {
-    spdlog::error("Genetics: parent missing for skin calculation");
+    server::util::QuietLogError("Genetics: parent missing for skin calculation");
     return 1; // Chestnut.
   }
 

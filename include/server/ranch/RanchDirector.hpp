@@ -31,7 +31,20 @@
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 
+// LOA-fix (R34-9, round34, backlog #96): <atomic> — под
+// _connectSeqCounter (std::atomic<std::uint64_t>), <cstdint> — под сам
+// std::uint64_t (connectSeq в ClientContext и значение очереди отложенных
+// разрывов). В пине оба заголовка отсутствовали; полагаться на транзитивный
+// подтяг через <mutex>/spdlog нельзя — стандарт этого не обещает.
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <mutex>
 #include <random>
+// LOA-fix (R48-1, #58/R2-D): <span> и <string_view> — под список доказанных
+// условий достижения, который хук передаёт системе (SendAchievementEvent).
+#include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -58,8 +71,74 @@ public:
   void HandleClientConnected(ClientId clientId) override;
   void HandleClientDisconnected(ClientId client) override;
 
-  //!
+  //! LOA-fix (R21, round21, backlog #95): ОСВЕЖАЕТ (и только освежает) отметку
+  //! «этот клиент говорил по ранч-сокету». Зовётся из CommandServer на КАЖДУЮ
+  //! входящую дейтаграмму ранч-канала (включая AcCmdCRHeartbeat 0x12, у которой
+  //! нет зарегистрированного хендлера) — до разбора команды.
+  //! ★UPDATE-ONLY: записи НЕ СОЗДАЁТ. Создание живёт ровно в одном месте —
+  //! HandleEnterRanch. Иначе частый штамп воскрешал бы запись, только что
+  //! стёртую teardown'ом с ЧУЖОГО потока, и плодил сирот (разбор гонки — в
+  //! шапке раунда 21).
+  //! ★ПОТОК: ранч-поток. Читать _clients здесь законно (тот же поток, что и все
+  //! остальные хендлеры ранчо); мьютекс реестра берётся ОТДЕЛЬНО и только на
+  //! операцию с map — вложенных локов нет.
+  //! Не бросает: контекст ищем через find, отсутствие клиента = тихий выход
+  //! (исключение отсюда порвало бы соединение в read-loop сети).
+  //! @param clientId ID клиента ранч-канала.
+  void HandleClientActivity(ClientId clientId) override;
+
+  //! LOA-fix (R34-3, round34, backlog #96): ПРОСИТ порвать ранч-соединение
+  //! персонажа. ★НЕ РВЁТ ЕГО ЗДЕСЬ И НЕ ТРОГАЕТ _clients.
+  //! Зовётся с ЧУЖИХ потоков: лобби-СЕТЕВОГО (LobbyNetworkHandler::
+  //! HandleNetworkTick, сетевой таймаут) и лобби-директорского (ChatSystem,
+  //! GM-бан и GM-сброс персонажа). До раунда 34 метод прямо оттуда обходил и
+  //! правил _clients директора ранчо, которая не защищена ничем и принадлежит
+  //! ранч-сетевому потоку, — гонка #96. Заодно DisconnectClient чужим потоком
+  //! доходил до Server::_clients, ВТОРОЙ незащищённой map.
+  //! ★ПОЧЕМУ МАРШРУТИЗАЦИЯ, А НЕ МЬЮТЕКС: GetClientContext отдаёт
+  //! ClientContext& НАРУЖУ, ссылка переживает любой лок внутри аксессора и
+  //! разъезжается по хендлерам — «залочить map» здесь = ложная безопасность.
+  //! ★Реальный разрыв делает DrainPendingDisconnects на ранч-сетевом тике,
+  //! задержка ≤1 c. Возврата «получилось/нет» у метода не было и раньше.
+  //! ★РЕКОННЕКТ ВНУТРИ ОКНА ЗАКРЫТ ШТАМПОМ ПОКОЛЕНИЯ. Очередь ключуется
+  //! characterUid'ом, поэтому сам по себе он не отличает старую сессию от
+  //! той, которой персонаж успел переподключиться за ≤1 c (на стенде такой
+  //! реконнект укладывается в 0.25 c, а _clients спокойно держит ДВЕ
+  //! аутентифицированные записи одного персонажа — дедупа по characterUid при
+  //! входе нет). Поэтому метод снимает СНИМОК _connectSeqCounter (requestSeq)
+  //! и кладёт его в очередь вместе с UID, а дренаж рвёт только соединение с
+  //! connectSeq <= requestSeq — родившееся ДО просьбы. Свежее соединение имеет
+  //! connectSeq > requestSeq и не может быть выбрано; старое, наоборот, будет
+  //! найдено. Для GM-бана это принципиально: иначе забаненный, успевший
+  //! переподключиться, терял свежее соединение, а СТАРОЕ переживало дренаж —
+  //! обход санкции.
   void Disconnect(data::Uid characterUid);
+
+  //! LOA-fix (R21, round21, backlog #95): «персонаж прямо сейчас активен на
+  //! ранчо?» — свежесть последнего входящего ранч-пакета. ЕДИНСТВЕННЫЙ метод
+  //! директора ранчо, который законно звать с ЧУЖОГО потока (лобби-тик): он
+  //! трогает только _ranchActivityMutex и _ranchActivity и НИКОГДА _clients.
+  //! ★Лок ЛИСТОВОЙ: под ним не берётся другой лок и не делается вызовов наружу.
+  //! @param characterUid UID персонажа.
+  //! @param freshness Окно свежести (старше — считаем неактивным).
+  //! @returns true, если ранч-сокет персонажа говорил не позже freshness назад.
+  [[nodiscard]] bool IsCharacterActiveOnRanch(
+    data::Uid characterUid,
+    std::chrono::seconds freshness) const;
+
+  //! LOA-fix (R21, round21, backlog #95): ПЕРИОДИЧЕСКАЯ УБОРКА реестра
+  //! активности — сносит все записи старше maxAge. Это ГАРАНТИЯ ВЕРХНЕЙ ГРАНИЦЫ
+  //! памяти: выходные пути (disconnect/leave/kick) убирают записи быстро, но
+  //! teardown умеет бежать на ЧУЖОМ потоке, и редкая гонка enter-vs-disconnect
+  //! способна оставить сироту, которую не подберёт ни один выходной путь.
+  //! Живому игроку уборка не грозит: он переставляет метку каждые ≤8.5 c, а
+  //! maxAge берётся заведомо больше окна свежести (90 c против 30 c).
+  //! ★Как и IsCharacterActiveOnRanch, законно зовётся с ЧУЖОГО потока
+  //! (лобби-тик): трогает только _ranchActivityMutex и _ranchActivity.
+  //! ★Лок ЛИСТОВОЙ: обход + erase, никаких вызовов наружу. O(n), n ≤ числа
+  //! игроков, стоящих на ранчо.
+  //! @param maxAge Возраст, начиная с которого запись считается мусором.
+  void SweepRanchActivity(std::chrono::seconds maxAge);
 
   //!
   void BroadcastSetIntroductionNotify(
@@ -71,6 +150,33 @@ public:
     data::Uid characterUid,
     data::Uid rancherUid,
     data::Uid horseUid);
+
+  //! LOA-fix (SYNC-1): рассылает смену лошади всем клиентам ранча и обновляет
+  //! трекер лошадей инстанса (новая лошадь уходит из загона, прошлая — в загон).
+  //! @param clientId Клиент, сменивший лошадь.
+  //! @param previousMountUid UID прошлой лошади.
+  //! @param newMountUid UID новой лошади.
+  void BroadcastMountChange(
+    ClientId clientId,
+    data::Uid previousMountUid,
+    data::Uid newMountUid);
+
+  //! LOA-fix (SYNC-3): собирает ростерную запись персонажа для рассылок
+  //! (тот же состав полей, что и в EnterRanchOK), без исключений.
+  //! @param characterUid UID персонажа.
+  //! @param rancherUid UID владельца ранча, в инстансе которого он находится.
+  //! @param protocolCharacter Заполняемая ростерная запись.
+  //! @returns true, если запись пригодна к отправке.
+  bool BuildRanchCharacterInfo(
+    data::Uid characterUid,
+    data::Uid rancherUid,
+    protocol::RanchCharacter& protocolCharacter);
+
+  //! LOA-fix (SYNC-3): переспавнивает ростерную запись игрока у остальных
+  //! клиентов ранча (Leave+Enter), чтобы применились изменившиеся данные
+  //! персонажа — прежде всего ник.
+  //! @param clientId Клиент, чью запись обновляем.
+  void BroadcastRanchCharacterRefresh(ClientId clientId);
 
   //! Send a RequestUser notification to a character connected to this director.
   void SummonCharacter(
@@ -104,6 +210,19 @@ public:
     data::Uid characterUid,
     const protocol::AcCmdRCUpdateDailyQuestNotify& updateNotify);
 
+  //! Сообщает системе достижений о серверном событии и отправляет персонажу
+  //! то, что она вернула.
+  //! @param characterUid Персонаж, совершивший действие.
+  //! @param achievementEvent Номер шины событий (UserAchvEvent).
+  //! @param provenConditions Условия, проверенные на месте события; пусто, если
+  //!        достижение просто считает события.
+  //! ★Не бросает НИКОГДА (R48-11, находка ревью): значок не имеет права стоить
+  //! игроку действия, которое он уже совершил.
+  void SendAchievementEvent(
+    data::Uid characterUid,
+    uint16_t achievementEvent,
+    std::span<const std::string_view> provenConditions = {}) noexcept;
+
   void SendGuildInviteDeclined(
     data::Uid characterUid,
     data::Uid inviterCharacterUid,
@@ -122,6 +241,27 @@ public:
   ServerInstance& GetServerInstance();
   Config::Ranch& GetConfig();
 
+  //! LOA-fix (batch1 task3 → R10, round10): server-authoritative суточный сброс
+  //! дейлик-квестов. Если группа дейликов персонажа сбрасывалась раньше
+  //! текущего игрового дня (граница 06:00 UTC) — ОДНОЙ мутацией очищает три
+  //! слота целей, обнуляет rewardPoints, снимает carrotsClaimed и
+  //! dailyRewardClaimed и ставит lastResetDate = сегодня. Атомарность
+  //! обязательна: раздельное снятие dailyRewardClaimed при живом вчерашнем
+  //! прогрессе — это эксплойт бесплатной награды дня (C2/E1). Идемпотентен:
+  //! повторный вызов в тот же игровой день — no-op. No-op и если у персонажа
+  //! ещё нет группы дейликов.
+  //!
+  //! PUBLIC, А НЕ PRIVATE (R10): зовётся из лобби —
+  //! LobbyNetworkHandler::SendLoginOK и ::HandleRequestDailyQuestList, то есть
+  //! ДО того, как клиент снимет снапшот дневных целей. Из HandleEnterRanch
+  //! вызов убран: там уже поздно, а push-канала «набор сброшен» в протоколе
+  //! нет. Тред-безопасно: метод трогает только записи DataDirector (мутации под
+  //! их собственным shared_mutex) и не касается ни _clients, ни планировщика
+  //! ранча, так что вызов с лобби-треда законен — ровно как у
+  //! HorseSystem::PromoteMaturedFoals рядом.
+  //! @param characterUid UID персонажа.
+  void ResetDailyQuestsIfNeeded(data::Uid characterUid);
+
 private:
   struct ClientContext
   {
@@ -131,6 +271,24 @@ private:
     bool isAuthenticated{false};
     //! Unique ID of the client's character.
     data::Uid characterUid{data::InvalidUid};
+    //! LOA-fix (R34-8, round34, backlog #96): ★НОМЕР ПОКОЛЕНИЯ СОЕДИНЕНИЯ.
+    //! Уникальный возрастающий номер, выданный этому соединению в момент
+    //! accept'а (HandleClientConnected, R34-7) из _connectSeqCounter. Ноль =
+    //! запись ещё не проштампована (в норме недостижимо: штамп ставится сразу
+    //! после try_emplace, до того как клиент может что-либо прислать).
+    //! ★ПОТОКИ: пишется РОВНО ОДИН РАЗ и только ранч-сетевым потоком при
+    //! подключении; читается тем же ранч-сетевым потоком в
+    //! DrainPendingDisconnects. Чужие потоки его НЕ ЧИТАЮТ (им хватает
+    //! снимка счётчика), поэтому новой межпотоковой шаренной памяти поле не
+    //! добавляет — она вся сидит в atomic-счётчике.
+    //! ★ЗАЧЕМ: отличить соединение, родившееся ДО просьбы о разрыве
+    //! (connectSeq <= requestSeq — его и рвём), от реконнекта, родившегося
+    //! ПОСЛЕ (connectSeq > requestSeq — не трогаем). См. R34-2/R34-4.
+    //! ★И БОЛЬШЕ ТОГО (skip-if-newer-survives, R34-4): само наличие такого
+    //! реконнекта ОТМЕНЯЕТ разрыв старых соединений этого персонажа целиком —
+    //! их teardown чистит ранч-состояние по characterUid и затёр бы живую
+    //! сессию реконнекта. Подробности в DrainPendingDisconnects.
+    std::uint64_t connectSeq{};
     //! Unique ID of the owner of the ranch the client is visiting.
     data::Uid visitingRancherUid{data::InvalidUid};
 
@@ -162,6 +320,11 @@ private:
     tracker::RanchTracker tracker;
     //! A set of clients connected to the ranch.
     std::unordered_set<ClientId> clients;
+    //! LOA-fix (SYNC-9): последний пространственный снапшот каждого персонажа
+    //! инстанса, ключ — UID персонажа. Позиции/поворота в protocol::RanchCharacter
+    //! нет, они ходят только снапшотами, поэтому вошедшему гостю их неоткуда
+    //! взять — кэшируем и проигрываем при входе. Чистится на выходе с ранча.
+    std::unordered_map<data::Uid, protocol::RanchCommandRanchSnapshotNotify> snapshots;
   };
 
   //! Get client context.
@@ -202,10 +365,19 @@ private:
   //! Promotes matured foals for every character currently standing on their
   //! own ranch, announcing the grow-up to that ranch. Only the tracked
   //! maturing foals are inspected.
+  //! LOA-fix (R35-1, round35, backlog #124): ★КОНТРАКТ ПОТОКА. Метод обходит и
+  //! МУТИРУЕТ `_clients` (в том числе ClientContext::maturingFoals), трогает
+  //! `_ranches` и `_commandServer` ⇒ звать его можно ТОЛЬКО с РАНЧ-СЕТЕВОГО
+  //! потока, то есть из HandleNetworkTick (R35-4). До раунда 35 он бежал прямо
+  //! из задачи планировщика на потоке ранч-ДИРЕКТОРА и рвал гонку с
+  //! HandleClientConnected/HandleClientDisconnected.
   void RunFoalMaturityCheck();
 
   //! Queues the next foal maturity check on the scheduler, re-scheduling
   //! itself so the sweep runs on a fixed interval.
+  //! LOA-fix (R35-1, round35, backlog #124): задача планировщика больше НЕ
+  //! исполняет проход — она только звонит будильником (`_foalMaturityCheckDue`)
+  //! и перезаводит себя. Сам проход снимает ранч-сетевой поток.
   void ScheduleFoalMaturityCheck() noexcept;
 
   //! Announces that a foal grew up to an adult to the owning client and the
@@ -493,6 +665,18 @@ private:
     ClientId clientId,
     const protocol::AcCmdCRStatusPointApply command);
 
+  //! LOA (batch2): learn/advance a care skill (0x277). Phase 1 = learn+persist,
+  //! no strict validation, no effects. newRank = current learned rank + 1.
+  void HandleStudyCareSkill(
+    ClientId clientId,
+    const protocol::AcCmdCRStudyCareSkill& command);
+
+  //! LOA (batch2): reset learned care skills (0x27d). Phase 1 = clear learned
+  //! ranks, no 30000-carrot charge.
+  void HandleResetCareSkill(
+    ClientId clientId,
+    const protocol::AcCmdCRResetCareSkill& command);
+
   void HandleChangeSkillCardPreset(
     ClientId clientId,
     const protocol::AcCmdCRChangeSkillCardPreset command);
@@ -594,6 +778,48 @@ private:
     ClientId clientId,
     const protocol::AcCmdCRBreedingWishlistDel& command);
 
+  //! LOA-fix (R34-1, round34, backlog #96): СЛИВ ОЧЕРЕДИ ОТЛОЖЕННЫХ РАЗРЫВОВ.
+  //! Зовётся ТОЛЬКО из HandleNetworkTick, то есть строго на РАНЧ-СЕТЕВОМ потоке
+  //! (CommandServer::_serverThread) — единственном, которому законно трогать
+  //! _clients и _commandServer.
+  //! ★Очередь снимается целиком под _pendingDisconnectsMutex, лок ОТПУСКАЕТСЯ,
+  //! и только потом рвутся соединения: под листовым локом не должно быть ни
+  //! одного вызова наружу (дисциплина раунда 21).
+  //! ★DisconnectClient СИНХРОННО стирает запись из _clients (Client::End()
+  //! зовёт OnClientDisconnected в том же стеке), поэтому ClientId выбирается
+  //! ОТДЕЛЬНЫМ проходом и разрыв делается уже ПОСЛЕ выхода из обхода map.
+  void DrainPendingDisconnects();
+
+  //! LOA-fix (R38-1, round38, backlog #131): ДЕДУП СЕССИЙ ОДНОГО ПЕРСОНАЖА.
+  //! Рвёт ВСЕ уже аутентифицированные ранч-соединения персонажа, КРОМЕ
+  //! указанного нового. Зовётся ровно из одной точки — HandleEnterRanch, сразу
+  //! после успешной авторизации по OTP и ДО того, как новая сессия начнёт
+  //! раскладывать своё ранч-состояние.
+  //! ★ПОТОК: только РАНЧ-СЕТЕВОЙ (владелец _clients и _commandServer).
+  //! HandleEnterRanch приходит либо прямо из обработчика команды ранч-канала,
+  //! либо из _enterRanchDeferrer.Tick() внутри HandleNetworkTick — оба на этом
+  //! потоке. Гонки #96 здесь нет по построению.
+  //! ★★РВЁТ ПРЯМЫМ DisconnectClient, НЕ ЧЕРЕЗ Disconnect(characterUid).
+  //! Disconnect() кладёт просьбу в _pendingDisconnects со снимком
+  //! requestSeq = _connectSeqCounter.load(). connectSeq НОВОЙ сессии B выдан ещё
+  //! на accept'е и УЖЕ учтён этим счётчиком, то есть B.connectSeq <= requestSeq.
+  //! Значит дренаж снёс бы КАЖДУЮ сессию этого персонажа с
+  //! connectSeq <= requestSeq — ВКЛЮЧАЯ саму легитимную B, — и сделал бы это
+  //! ПОЗЖЕ, отдельным тиком (асинхронно), когда B уже финализировала своё
+  //! ранч-состояние: ровно инверсия #96. Поэтому нужен прямой СИНХРОННЫЙ
+  //! DisconnectClient: рвётся ТОЛЬКО заранее существовавший стейл-набор и
+  //! целиком ДО того, как B положит своё состояние.
+  //! ★2 ШАГА: DisconnectClient синхронно доходит до _clients.erase, поэтому
+  //! ClientId сначала собираются ПО ЗНАЧЕНИЮ отдельным проходом, и только
+  //! потом идут разрывы — вне обхода map.
+  //! ★СЕМАНТИКА: побеждает ПОСЛЕДНИЙ вход (старая сессия вытесняется, новая
+  //! пускается) — переподключение обязано вытеснить собственного призрака.
+  //! @param newClientId Клиент, который прямо сейчас входит (его не трогаем).
+  //! @param characterUid UID персонажа, предъявленный и подтверждённый OTP.
+  void DedupeStaleCharacterSessions(
+    ClientId newClientId,
+    data::Uid characterUid);
+
   //!
   ServerInstance& _serverInstance;
   //!
@@ -606,6 +832,86 @@ private:
   std::unordered_map<ClientId, ClientContext> _clients;
   //!
   std::unordered_map<data::Uid, RanchInstance> _ranches;
+
+  //! LOA-fix (R21-1c, round21, backlog #95): ★ЛИСТОВОЙ мьютекс реестра
+  //! активности. Единственная разделяемая между потоками структура директора
+  //! ранчо. ПРАВИЛО, нарушение которого = deadlock ранчо↔лобби: под этим локом
+  //! НЕ берётся ни один другой лок и НЕ делается ни одного вызова наружу
+  //! (_clients, _ranches, _commandServer, _scheduler). Только сама map.
+  //! mutable — чтобы IsCharacterActiveOnRanch остался const-методом.
+  mutable std::mutex _ranchActivityMutex;
+
+  //! LOA-fix (R21-1c, round21, backlog #95): момент последнего ВХОДЯЩЕГО пакета
+  //! ранч-канала по каждому персонажу, стоящему на ранчо. Пишется ранч-потоком
+  //! (HandleClientActivity), читается лобби-потоком (IsCharacterActiveOnRanch) —
+  //! обе операции строго под _ranchActivityMutex. Запись заводится лениво, на
+  //! первом же пакете аутентифицированного клиента, уже вошедшего на ранчо, и
+  //! стирается на КАЖДОМ выходе (disconnect / leave / kick) — стирание, а не
+  //! свежесть, даёт верхнюю границу памяти.
+  std::unordered_map<data::Uid, std::chrono::steady_clock::time_point> _ranchActivity;
+
+  //! LOA-fix (R34-2, round34, backlog #96): ★ЛИСТОВОЙ мьютекс очереди
+  //! отложенных разрывов. Второй (после _ranchActivityMutex) и последний
+  //! межпотоковый замок директора ранчо. Правило то же, нарушение = deadlock:
+  //! под этим локом НЕ берётся ни один другой лок и НЕ делается ни одного
+  //! вызова наружу (_clients, _ranches, _commandServer, _scheduler).
+  std::mutex _pendingDisconnectsMutex;
+
+  //! LOA-fix (R34-2, round34, backlog #96): ★ШТАМП ПОКОЛЕНИЯ СОЕДИНЕНИЙ.
+  //! Монотонный счётчик «рождений» ранч-соединений. Каждое принятое соединение
+  //! получает в HandleClientConnected уникальный возрастающий номер
+  //! (ClientContext::connectSeq, см. R34-7), каждая просьба о разрыве
+  //! запоминает СНИМОК счётчика на момент просьбы (requestSeq, см. R34-4).
+  //! ★ЗАЧЕМ: очередь ключуется characterUid'ом, а он у персонажа один на все
+  //! его соединения — по нему нельзя отличить СТАРУЮ сессию от той, которой
+  //! персонаж успел переподключиться внутри окна слива. Номер поколения
+  //! отличает их по построению: connectSeq <= requestSeq ⇒ соединение
+  //! РОДИЛОСЬ ДО просьбы (кандидат на разрыв); connectSeq > requestSeq ⇒
+  //! родилось ПОСЛЕ, просьба была не про него (не трогаем).
+  //! ★ПОТОКИ: инкремент делает ранч-сетевой поток, load — чужие потоки в
+  //! Disconnect ⇒ std::atomic. Операции ДЕФОЛТНЫЕ (seq_cst) осознанно: цена
+  //! одного fetch_add на соединение ничтожна, а правильность важнее.
+  //! Переполнение uint64 недостижимо (это счётчик TCP-accept'ов).
+  std::atomic<std::uint64_t> _connectSeqCounter{0};
+
+  //! LOA-fix (R35-2, round35, backlog #124): ★БУДИЛЬНИК ПРОВЕРКИ ЖЕРЕБЯТ.
+  //! Ставится в true задачей планировщика на потоке ранч-ДИРЕКТОРА
+  //! (ScheduleFoalMaturityCheck, раз в FoalMaturityCheckInterval = 60 c),
+  //! снимается exchange(false) РАНЧ-СЕТЕВЫМ потоком в HandleNetworkTick,
+  //! который тут же и делает проход RunFoalMaturityCheck.
+  //! ★ПОЧЕМУ ФЛАГ, А НЕ ОЧЕРЕДЬ (в отличие от _pendingDisconnects, R34-2): у
+  //! этой работы нет полезной нагрузки. Директорский поток не может вычислить,
+  //! КОМУ слать уведомление, не читая `_clients` — а это ровно та гонка,
+  //! которую раунд 35 и убирает. Единица работы одна: «пройди всех».
+  //! ★ЛИСТОВОЙ ПРИМИТИВ: под atomic по построению не берётся ни один лок и не
+  //! делается ни одного вызова наружу — дисциплина раундов 21/34 соблюдена в
+  //! пределе.
+  //! ★СХЛОПЫВАНИЕ БЕЗОБИДНО: два звонка подряд дают один проход, а проход и так
+  //! обрабатывает ВСЕ созревшие к `now` записи.
+  //! Операции ДЕФОЛТНЫЕ (seq_cst) осознанно: цена одного exchange в секунду
+  //! ничтожна, а правильность важнее.
+  std::atomic<bool> _foalMaturityCheckDue{false};
+
+  //! Признак того, что перезавод таймера созревания НЕ УДАЛСЯ (R55, #179
+  //! часть 5). Читается сетевым тиком ранча, который повторяет попытку.
+  //!
+  //! ★Флаг существует только чтобы отказ не был ТИХИМ: без него неудачная
+  //! постановка означала бы навсегда потерянный таймер без единого следа.
+  std::atomic<bool> _foalMaturityRearmFailed{false};
+
+  //! LOA-fix (R34-2, round34, backlog #96): очередь отложенных разрывов —
+  //! UID персонажа → requestSeq (снимок _connectSeqCounter на момент просьбы).
+  //! Просьбы приходят с ЧУЖИХ потоков: лобби-тик (сетевой таймаут) через
+  //! RanchDirector::Disconnect и GM-команды бана/сброса из ChatSystem.
+  //! Пишется чужими потоками, читается и опустошается РАНЧ-СЕТЕВЫМ потоком в
+  //! HandleNetworkTick (задержка ≤1 c — период Server::TickLoop).
+  //! map, а не vector: повторные просьбы про один UID схлопываются, что даёт
+  //! верхнюю границу памяти = числу онлайн-персонажей; при схлопывании
+  //! хранится МАКСИМАЛЬНЫЙ requestSeq — порог «до какого поколения рвать».
+  //! ★ПОЧЕМУ НЕ ПАРА {characterUid, clientId}: у чужого потока clientId нет,
+  //! он знает только персонажа, а достать id = снова читать чужую _clients —
+  //! ровно та гонка, которую раунд 34 и убирает.
+  std::unordered_map<data::Uid, std::uint64_t> _pendingDisconnects;
 
   //! A command deferrer for the `AcCmdCRMountFamilyTree` command.
   CommandDeferrer<protocol::AcCmdCRMountFamilyTree> _mountFamilyTreeDeferrer;

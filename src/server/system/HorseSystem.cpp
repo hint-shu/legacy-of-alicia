@@ -18,6 +18,7 @@
  **/
 
 #include "server/system/HorseSystem.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -121,7 +122,7 @@ uint32_t HorseSystem::RepairLineages(const data::Uid characterUid)
     });
     ++repairedCount;
 
-    spdlog::info(
+    server::util::QuietLogInfo(
       "Repaired the lineage of horse {} of character {}: {} -> {}",
       horseUid,
       characterUid,

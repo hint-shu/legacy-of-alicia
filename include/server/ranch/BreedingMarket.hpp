@@ -168,16 +168,88 @@ private:
     data::Uid stallionUid{data::InvalidUid};
   };
 
-  data::Uid RegisterStallion(
+  //! Что стало с выплатой владельцу.
+  //!
+  //! ★Три состояния, а не два, ровно по той же причине, что и у изменения
+  //! записи: `RewardSystem::CreateReward` умеет вернуть «не создал» ЧЕСТНО
+  //! (пустой uid), а умеет и бросить УЖЕ ПОСЛЕ того, как заявка заполнена.
+  //! Во втором случае мы не знаем, есть заявка или нет, и обязаны выбрать
+  //! сторону: НЕ возвращать долг, иначе повтор снятия выдаст вторую заявку.
+  enum class PayoutResult
+  {
+    //! Платить было нечего либо заявка создана.
+    Paid,
+    //! Заявки ТОЧНО нет — долг можно вернуть в запись и повторить позже.
+    NotCreated,
+    //! Заявка может существовать. Долг НЕ возвращаем: дубль хуже потери.
+    Unknown,
+  };
+
+  //! Занимает слот рынка под лошадь ДО всякой опасной работы.
+  //!
+  //! ★Слот занимается ЗАГЛУШКОЙ (`stallionUid = InvalidUid`) под
+  //! exclusive-замком. Это делает финальную публикацию небросающей (узел карты
+  //! уже существует, вписать в него значение памяти не требует) и заодно
+  //! закрывает гонку двух одновременных регистраций одной лошади.
+  [[nodiscard]] bool ClaimRegistrationSlot(
+    data::Uid characterUid,
+    data::Uid horseUid) noexcept;
+  //! Освобождает занятый слот.
+  void ReleaseRegistrationSlot(data::Uid horseUid) noexcept;
+  //! Делает всю бросающую работу регистрации, КРОМЕ денег.
+  //! @returns UID созданной записи жеребца; `InvalidUid` — не удалось.
+  [[nodiscard]] data::Uid PrepareRegistration(
     data::Uid characterUid,
     data::Uid horseUid,
     int32_t breedingFee) const noexcept;
-  void UnregisterStallion(
+  //! Снимает сбор и публикует регистрацию ПОД ОДНИМ ЗАМКОМ.
+  //!
+  //! ★Оба действия вместе именно потому, что порознь между ними возникает
+  //! окно «деньги сняты, регистрации нет», и закрывать его пришлось бы
+  //! возвратом — то есть компенсацией, которая сама умеет не сработать.
+  //! Под общим замком публикация не может сорваться отдельно от оплаты:
+  //! узел карты уже создан заглушкой, вписать в него значение нельзя не смочь.
+  [[nodiscard]] bool CommitRegistration(
+    data::Uid characterUid,
+    data::Uid horseUid,
+    data::Uid stallionUid,
+    int32_t breedingFee) noexcept;
+  //! Возвращает лошадь в обычное состояние и удаляет запись жеребца.
+  void TakeStallionOffTheMarket(
+    data::Uid horseUid,
+    data::Uid stallionUid) const noexcept;
+  //! Создаёт заявку на выплату владельцу.
+  //! ★Вызывается ВНУТРИ того же изменения записи, которое гасит долг, — см.
+  //! `UnregisterStallion`. Письмо отправляется отдельно и уже вне изменения:
+  //! почта ходит к сессиям игроков, и держать под ней замок записи незачем.
+  [[nodiscard]] PayoutResult CreateBreedingPayout(
+    data::Uid ownerUid,
+    data::Uid horseUid,
+    data::Uid stallionUid,
+    Earnings& earnings) const noexcept;
+  //! Отправляет владельцу письмо о выплате.
+  void SendBreedingPayoutMail(
+    data::Uid ownerUid,
+    data::Uid horseUid,
+    data::Uid stallionUid,
+    const Earnings& earnings) const noexcept;
+  //! Снимает жеребца с рынка: гасит долг, возвращает тип, удаляет запись и
+  //! платит владельцу.
+  //! @returns `true`, если вызывающий обязан стереть регистрацию из карты.
+  [[nodiscard]] bool UnregisterStallion(
     data::Uid horseUid,
     data::Uid stallionUid) const noexcept;
   void ScheduleExpirationCheck() noexcept;
   void RunExpirationCheck() noexcept;
-  bool CanRegisterStallion(data::Uid characterUid) const;
+  //! Сбор витрины без пояса; вызывается только из `CollectMarketSnapshot`.
+  //! ★Фильтр по ССЫЛКЕ: копия у публичной обёртки уже есть, а вторая копия
+  //! трёх множеств на КАЖДОМ успешном показе витрины была бы платой успешного
+  //! пути за разделение функции надвое.
+  [[nodiscard]] Snapshot CollectMarketSnapshotUnsafe(
+    SnapshotOrder order,
+    const SnapshotFilter& filter) const;
+  //! ★Вызывается ТОЛЬКО под exclusive-замком `_mutex`: читает карту рынка.
+  [[nodiscard]] bool CanRegisterStallion(data::Uid characterUid) const noexcept;
 
   //! Reference to the server instance
   ServerInstance& _serverInstance;
@@ -190,6 +262,12 @@ private:
 
   //! Map of horses which are registered as stallions.
   std::unordered_map<data::Uid, Registration> _horseRegistrations;
+
+  //! Стоит ли проверка истечения в планировщике.
+  //! ★Без этого признака одна сорвавшаяся постановка означала бы, что рынок
+  //! перестал истекать НАВСЕГДА: жеребцы висели бы в списке вечно, бесплатно.
+  //! `Tick` пробует поставить снова.
+  bool _expirationCheckScheduled{false};
 };
 
 } // namespace server
