@@ -17,7 +17,7 @@ You'll also need to add the `/bin` folder to the `PATH` environment variable so 
 
 1. Clone the repository
 ```bash
-git clone https://github.com/Story-Of-Alicia/alicia-server.git
+git clone --recurse-submodules <this-repository-url> legacy-of-alicia
 ```
 2. Initialize the repository's submodules
 ```bash

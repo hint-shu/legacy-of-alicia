@@ -21,4 +21,7 @@ Here are the review rules:
 [Read how to compile the server](COMPILING.md).
 
 ## Communication
-Join the [dedicated development server on Discord](https://discord.gg/bP4pNWvVHM).
+Open an issue or a pull request on this repository.
+
+Please do not take questions about this fork to the upstream Story of Alicia
+project - this fork is not affiliated with or endorsed by them.

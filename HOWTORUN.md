@@ -7,7 +7,7 @@ Here's a quick set-up through **docker compose**. It sets up alicia server insta
 ```yaml
 services:
  instance:
-   image: 'ghcr.io/story-of-alicia/alicia-server:latest'
+   image: 'ghcr.io/legacy-of-alicia/alicia-server:latest'
    restart: unless-stopped
    ports:
      - '10030-10035:10030-10035/tcp'
@@ -32,7 +32,11 @@ On the server there is two categories of configurations, one for the general ser
 
 #### Authentication
 
-The server requires an authentication service to authenticate user credentials. Currently, the server supports `local` and `postgres` backends. Local does no verification at all, while Postgres uses a table in a specified database. Todo documentation. Ask in Studio server. 
+The server requires an authentication service to authenticate user credentials. Currently, the server supports `local` and `postgres` backends.
+
+The `local` backend verifies credentials against per-user records stored on disk: each account gets a random 16-byte salt, and the password is stored as a stretched SHA-256 hash (`SHA256(saltHex || password)`, iterated). Verification is a constant-shape hash comparison — no plaintext password is ever written. Accounts are created with *register-on-first-use*: the first successful login for an unknown username registers that username with the password supplied, and every later login for that username is verified against the stored salt and hash.
+
+The `postgres` backend verifies credentials against a table in a specified database.
 
 ## Client
 ### Client
@@ -46,17 +50,15 @@ There's three available game configurations in the production version:
   - lobby server address: `aliciadev`
   - lobby server port: `10030`
 - **prototype** (ID: `3`)
-  - lobby server address: `prototype.storyofalicia.com`
+  - lobby server address: `your-server-host`
   - lobby server port: `10030`
 - **production** (ID: `4`)
-  - lobby server address: `system.storyofalicia.com`
+  - lobby server address: `your-system-host`
   - lobby server port: `10030`
 
 Development configuration is meant for connecting to a server that is hosted locally. Please notice the development configuration uses `aliciadev` hostname. You must add this hostname to your hosts file (`C:\Windows\System32\drivers\etc\hosts`) on the computer you're running the client on, and point it to an IP where the server is listening on. Usually that is going to be `127.0.0.1` (loopback).
 
-Prototype configuration is meant for connecting to the online prototype. Currently hosted by @Chrommd, more information available at the [prototype's website](https://bruhvrum.github.io/registertest/).
-
-Production configuration is meant for connecting to the officialy released server. Not available yet.
+Prototype and production configurations are meant for connecting to a remote server. Point `your-server-host` / `your-system-host` at whatever host you run this server on.
 
 ### Launching game in development configuration
 

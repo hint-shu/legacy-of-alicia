@@ -18,3 +18,17 @@ Testing/
 
 # Secrets
 .env
+
+# Runtime state (never commit).
+# Root-anchored on purpose: an unanchored `data/` would also swallow the
+# `src/libserver/data/` and `include/libserver/data/` source directories.
+/data/
+/logs/
+/dumps/
+
+# Credentials
+*.key
+*.pem
+*.cred
+*.token
+resources/config/server/config.local.yaml

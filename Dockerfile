@@ -31,8 +31,8 @@ RUN cp -r ./resources/* /var/lib/alicia-server/
 
 FROM gcc:15
 
-LABEL author="Story of Alicia Developers" maintainer="dev@storyofalicia.com"
-LABEL org.opencontainers.image.source="https://github.com/Story-Of-Alicia/alicia-server"
+LABEL author="Legacy of Alicia contributors" maintainer="legacy-of-alicia"
+LABEL org.opencontainers.image.source="https://github.com/legacy-of-alicia/legacy-of-alicia"
 LABEL org.opencontainers.image.description="Dedicated server implementation for the Alicia game series"
 
 # Setup the runtime environent

@@ -1,7 +1,7 @@
 # Instance of Postgres for development purposes
 services:
   instance:
-    image: ghcr.io/story-of-alicia/authentication-server
+    image: ghcr.io/legacy-of-alicia/authentication-server
     restart: always
     pull_policy: always
     env_file:
