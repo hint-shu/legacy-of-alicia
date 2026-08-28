@@ -22,6 +22,7 @@
 #include "libserver/data/DataRepair.hpp"
 #include "libserver/data/file/FileDataSource.hpp"
 #include "libserver/util/Deferred.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -39,7 +40,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving user '{}' from the primary data source: {}",
             key,
             x.what());
@@ -56,7 +57,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing user '{}' from the primary data source: {}", key, x.what());
         }
 
@@ -64,7 +65,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
       },
       [&](const auto& key)
       {
-        spdlog::error("Invalid delete operation on user '{}' from the primary data source", key);
+        server::util::QuietLogError("Invalid delete operation on user '{}' from the primary data source", key);
         return false;
       })
   , _infractionStorage(
@@ -77,7 +78,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
       }
       catch (const std::exception& x)
       {
-        spdlog::error(
+        server::util::QuietLogError(
           "Exception retrieving infraction {} from the primary data source: {}", key, x.what());
       }
 
@@ -92,7 +93,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
       }
       catch (const std::exception& x)
       {
-        spdlog::error(
+        server::util::QuietLogError(
           "Exception storing infraction {} on the primary data source: {}", key, x.what());
       }
 
@@ -107,7 +108,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
       }
       catch (const std::exception& x)
       {
-        spdlog::error(
+        server::util::QuietLogError(
           "Exception deleting infraction {} from the primary data source: {}", key, x.what());
       }
       return false;
@@ -122,8 +123,22 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
-            "Exception retrieving character {} from the primary data source: {}", key, x.what());
+          // LOA-fix (R65-4, backlog #135): о ПЕРВОМ отказе подряд говорим, о
+          // повторных молчим. Ключ сюда приходит от КЛИЕНТА, и мусорный
+          // characterUid давал строку на КАЖДУЮ попытку чтения — управляемый
+          // извне шум в логе и лишняя поверхность отказа.
+          // ★Уровень понижен до `warn` осознанно: «нет записи по произвольному
+          // идентификатору» — это нормальный ответ, а не отказ сервера. Плюс
+          // `[error]` глушил наши же приёмочные гейты, которые считают строки
+          // этого уровня (R63 уже ловил на этом ложную тревогу).
+          // ★Троттл берёт счётчик, который хранилище ВЕДЁТ И ТАК, — новой
+          // машинерии не заводим. На момент вызова он хранит число ПРЕДЫДУЩИХ
+          // подряд идущих отказов, поэтому ноль означает «этот отказ первый».
+          if (_characterStorage.GetRetrieveFailureCount(key) == 0)
+          {
+            server::util::QuietLogWarn(
+              "Failed to retrieve character {} from the primary data source: {}", key, x.what());
+          }
         }
 
         return false;
@@ -137,7 +152,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing character {} on the primary data source: {}", key, x.what());
         }
 
@@ -152,7 +167,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting character {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -167,7 +182,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving horse {} from the primary data source: {}", key, x.what());
         }
 
@@ -182,7 +197,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing horse {} on the primary data source: {}", key, x.what());
         }
 
@@ -197,7 +212,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting horse {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -212,7 +227,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving item {} from the primary data source: {}", key, x.what());
         }
 
@@ -227,7 +242,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing item {} on the primary data source: {}", key, x.what());
         }
 
@@ -242,7 +257,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting item {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -257,7 +272,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving storage item {} from the primary data source: {}", key, x.what());
         }
 
@@ -272,7 +287,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing storage item {} on the primary data source: {}", key, x.what());
         }
 
@@ -287,7 +302,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting storage item {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -302,7 +317,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving egg {} from the primary data source: {}", key, x.what());
         }
 
@@ -317,7 +332,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing egg {} on the primary data source: {}", key, x.what());
         }
 
@@ -332,7 +347,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting egg {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -347,7 +362,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving pet {} from the primary data source: {}", key, x.what());
         }
 
@@ -362,7 +377,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing pet {} on the primary data source: {}", key, x.what());
         }
 
@@ -377,7 +392,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting pet {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -392,7 +407,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving housing {} from the primary data source: {}", key, x.what());
         }
 
@@ -407,7 +422,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing housing {} on the primary data source: {}", key, x.what());
         }
 
@@ -422,7 +437,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting housing {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -437,8 +452,14 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
        }
        catch (const std::exception& x)
        {
-         spdlog::error(
-           "Exception retrieving guild {} from the primary data source: {}", key, x.what());
+         // LOA-fix (R65-4, backlog #135): то же, что у персонажа — guildUid
+         // тоже приходит от клиента. Один уровень, один троттл, без новой
+         // машинерии.
+         if (_guildStorage.GetRetrieveFailureCount(key) == 0)
+         {
+           server::util::QuietLogWarn(
+             "Failed to retrieve guild {} from the primary data source: {}", key, x.what());
+         }
        }
 
        return false;
@@ -452,7 +473,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
        }
        catch (const std::exception& x)
        {
-         spdlog::error(
+         server::util::QuietLogError(
            "Exception storing guild {} on the primary data source: {}", key, x.what());
        }
 
@@ -467,7 +488,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting guild {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -482,7 +503,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving settings {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -496,7 +517,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing settings {} on the primary data source: {}", key, x.what());
         }
         return false;
@@ -510,7 +531,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting settings {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -525,7 +546,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving daily quest group {} from the primary data source: {}", key, x.what());
         }
 
@@ -540,7 +561,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing daily quest group {} on the primary data source: {}", key, x.what());
         }
         return false;
@@ -554,7 +575,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting daily quest group {} from the primary data source: {}", key, x.what());
            }
         return false;
@@ -569,7 +590,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving mail {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -583,7 +604,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing mail {} on the primary data source: {}", key, x.what());
         }
         return false;
@@ -597,7 +618,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting mail {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -612,7 +633,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving quest {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -626,7 +647,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing quest {} on the primary data source: {}", key, x.what());
         }
         return false;
@@ -640,7 +661,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting quest {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -655,7 +676,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving stallion {} from the primary data source: {}", key, x.what());
         }
 
@@ -670,7 +691,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing stallion {} on the primary data source: {}", key, x.what());
         }
 
@@ -685,7 +706,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting stallion {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -700,7 +721,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception retrieving reward {} from the primary data source: {}", key, x.what());
         }
 
@@ -715,7 +736,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception storing reward {} on the primary data source: {}", key, x.what());
         }
 
@@ -730,7 +751,7 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
         }
         catch (const std::exception& x)
         {
-          spdlog::error(
+          server::util::QuietLogError(
             "Exception deleting reward {} from the primary data source: {}", key, x.what());
         }
         return false;
@@ -774,7 +795,7 @@ void DataDirector::Terminate()
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Unhandled exception while terminating data director: {}", x.what());
+    server::util::QuietLogError("Unhandled exception while terminating data director: {}", x.what());
   }
 
   if (auto* fileDataSource = dynamic_cast<FileDataSource*>(_primaryDataSource.get()))
@@ -806,7 +827,35 @@ void DataDirector::Tick()
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Unhandled exception ticking the storages in data director: {}", x.what());
+    server::util::QuietLogError("Unhandled exception ticking the storages in data director: {}", x.what());
+  }
+  catch (...)
+  {
+    // LOA-fix (R54-2a, round54, backlog #179 часть 4): не-std бросок уходил
+    // мимо пояса и убивал поток директора, а с ним и обслуживание. Реакция
+    // ТА ЖЕ, что у соседней ветки: записать и продолжить.
+    //
+    // ★ГРАНИЦА ПЕРЕПИСАНА ПО ФАКТУ (R65-3, backlog #186). До R65 здесь честно
+    // стояло «продолжить НЕ означает ничего не потеряно»: обработчики очередей
+    // снимали флаг ДО обхода, очередь сохранения ещё и очищала набор заранее,
+    // и бросок в середине терял необработанный хвост. Теперь у всех трёх
+    // очередей стоят стражи: чтение и удаление возвращают флаг, сохранение
+    // возвращает и сами ключи.
+    // ★НО ГАРАНТИЯ ИМЕННО ТАКАЯ, КАКАЯ НАПИСАНА, И НЕ БОЛЬШЕ (уточнено ревью):
+    // возврат ключей сам выделяет память, поэтому при её исчерпании часть хвоста
+    // всё же может не вернуться. Тогда об этом говорится отдельной строкой с
+    // числом невозвращённых. То есть «продолжить» означает «хвост возвращается
+    // по мере возможности, а потеря НАЗЫВАЕТСЯ» — а не «ничего не теряется».
+    // ★Комментарий переписан ВМЕСТЕ с поведением намеренно: устаревшая
+    // «честная граница» опаснее отсутствующей — она останавливает поиск у
+    // следующего, кто сюда придёт (класс #223/#139).
+    //
+    // ★Перехвата вокруг тика ПЛАНИРОВЩИКА здесь СОЗНАТЕЛЬНО НЕТ: `Scheduler`
+    // на не-std броске ВОЗВРАЩАЕТ задачу в очередь и перебрасывает, прямо
+    // рассчитывая (и это записано в его комментарии R36), что выше её никто не
+    // проглотит. Проглотив, мы получили бы вечный повтор падающей задачи и
+    // голодание всех остальных.
+    server::util::QuietLogError("Unhandled exception ticking the storages in data director: unknown exception");
   }
 
   try
@@ -815,7 +864,7 @@ void DataDirector::Tick()
   }
   catch (std::exception& x)
   {
-    spdlog::error("Unhandled exception ticking the scheduler in the data director: {}", x.what());
+    server::util::QuietLogError("Unhandled exception ticking the scheduler in the data director: {}", x.what());
   }
 }
 
@@ -835,7 +884,7 @@ void DataDirector::RequestLoadUserData(
   userDataContext.isBeingLoaded.store(true, std::memory_order::relaxed);
   userDataContext.timeout = Scheduler::Clock::now() + std::chrono::seconds(10);
 
-  spdlog::info("Load for data of user '{}' requested", userName);
+  server::util::QuietLogInfo("Load for data of user '{}' requested", userName);
 
   // Todo schedule load directly from the data source instead of this partial loading hell.
   ScheduleUserLoad(userDataContext, userName);
@@ -858,7 +907,7 @@ void DataDirector::RequestLoadCharacterData(
   userDataContext.isBeingLoaded.store(true, std::memory_order::relaxed);
   userDataContext.timeout = Scheduler::Clock::now() + std::chrono::seconds(10);
 
-  spdlog::info("Load for character data of user '{}' requested", userName);
+  server::util::QuietLogInfo("Load for character data of user '{}' requested", userName);
 
   // Todo schedule load directly from the data source instead of this partial loading hell.
   ScheduleCharacterLoad(userDataContext, characterUid);
@@ -897,7 +946,7 @@ Record<data::User> DataDirector::CreateUser()
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a character record on the primary data source: {}", x.what());
+    server::util::QuietLogError("Exception while creating a character record on the primary data source: {}", x.what());
     return {};
   }
 }
@@ -916,7 +965,30 @@ Record<data::Character> DataDirector::GetCharacter(data::Uid characterUid) noexc
 {
   if (characterUid == data::InvalidUid)
     return {};
-  return _characterStorage.Get(characterUid).value_or(Record<data::Character>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _characterStorage.Get(characterUid).value_or(Record<data::Character>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Character' record '{}' failed: {}",
+      characterUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Character' record '{}' failed: unknown exception",
+      characterUid);
+  }
+
+  return {};
 }
 
 Record<data::Character> DataDirector::CreateCharacter() noexcept
@@ -934,7 +1006,15 @@ Record<data::Character> DataDirector::CreateCharacter() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a character record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a character record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a character record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -959,7 +1039,15 @@ Record<data::Infraction> DataDirector::CreateInfraction() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating infraction record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating infraction record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating infraction record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -973,7 +1061,30 @@ Record<data::Horse> DataDirector::GetHorse(data::Uid horseUid) noexcept
 {
   if (horseUid == data::InvalidUid)
     return {};
-  return _horseStorage.Get(horseUid).value_or(Record<data::Horse>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _horseStorage.Get(horseUid).value_or(Record<data::Horse>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Horse' record '{}' failed: {}",
+      horseUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Horse' record '{}' failed: unknown exception",
+      horseUid);
+  }
+
+  return {};
 }
 
 Record<data::Horse> DataDirector::CreateHorse() noexcept
@@ -991,7 +1102,15 @@ Record<data::Horse> DataDirector::CreateHorse() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a horse record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a horse record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a horse record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1005,7 +1124,30 @@ Record<data::Item> DataDirector::GetItem(data::Uid itemUid) noexcept
 {
   if (itemUid == data::InvalidUid)
     return {};
-  return _itemStorage.Get(itemUid).value_or(Record<data::Item>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _itemStorage.Get(itemUid).value_or(Record<data::Item>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Item' record '{}' failed: {}",
+      itemUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Item' record '{}' failed: unknown exception",
+      itemUid);
+  }
+
+  return {};
 }
 
 Record<data::Item> DataDirector::CreateItem() noexcept
@@ -1022,7 +1164,15 @@ Record<data::Item> DataDirector::CreateItem() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating an item record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating an item record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating an item record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1036,7 +1186,30 @@ Record<data::StorageItem> DataDirector::GetStorageItemCache(data::Uid storedItem
 {
   if (storedItemUid == data::InvalidUid)
     return {};
-  return _storageItemStorage.Get(storedItemUid).value_or(Record<data::StorageItem>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _storageItemStorage.Get(storedItemUid).value_or(Record<data::StorageItem>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'StorageItem' record '{}' failed: {}",
+      storedItemUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'StorageItem' record '{}' failed: unknown exception",
+      storedItemUid);
+  }
+
+  return {};
 }
 
 Record<data::StorageItem> DataDirector::CreateStorageItem() noexcept
@@ -1054,7 +1227,15 @@ Record<data::StorageItem> DataDirector::CreateStorageItem() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a storage item record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a storage item record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a storage item record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1068,7 +1249,30 @@ Record<data::Egg> DataDirector::GetEgg(data::Uid eggUid) noexcept
 {
   if (eggUid == data::InvalidUid)
     return {};
-  return _eggStorage.Get(eggUid).value_or(Record<data::Egg>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _eggStorage.Get(eggUid).value_or(Record<data::Egg>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Egg' record '{}' failed: {}",
+      eggUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Egg' record '{}' failed: unknown exception",
+      eggUid);
+  }
+
+  return {};
 }
 
 Record<data::Egg> DataDirector::CreateEgg() noexcept
@@ -1086,7 +1290,15 @@ Record<data::Egg> DataDirector::CreateEgg() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a egg recird on the data source: {}", x.what());
+    util::QuietLogError("Exception while creating a egg recird on the data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a egg recird on the data source: unknown exception");
     return {};
   }
 }
@@ -1100,19 +1312,58 @@ Record<data::Pet> DataDirector::GetPet(data::Uid petUid) noexcept
 {
   if (petUid == data::InvalidUid)
     return {};
-  return _petStorage.Get(petUid).value_or(Record<data::Pet>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _petStorage.Get(petUid).value_or(Record<data::Pet>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Pet' record '{}' failed: {}",
+      petUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Pet' record '{}' failed: unknown exception",
+      petUid);
+  }
+
+  return {};
 }
 
 Record<data::Pet> DataDirector::CreatePet() noexcept
 {
-  return _petStorage.Create(
-    [this]()
-    {
-      data::Pet pet;
-      _primaryDataSource->CreatePet(pet);
+  // LOA-fix (R49-18, round49, backlog #178): перехвата не было ВООБЩЕ.
+  try
+  {
+    return _petStorage.Create(
+      [this]()
+      {
+        data::Pet pet;
+        _primaryDataSource->CreatePet(pet);
 
-      return std::make_pair(pet.uid(), std::move(pet));
-    });
+        return std::make_pair(pet.uid(), std::move(pet));
+      });
+  }
+  catch (const std::exception& x)
+  {
+    util::QuietLogError(
+      "Exception while creating a pet record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    util::QuietLogError(
+      "Exception while creating a pet record on the primary data source: unknown exception");
+    return {};
+  }
 }
 
 DataDirector::PetStorage& DataDirector::GetPetCache()
@@ -1124,7 +1375,30 @@ Record<data::Guild> DataDirector::GetGuild(data::Uid guildUid) noexcept
 {
   if (guildUid == data::InvalidUid)
     return {};
-  return _guildStorage.Get(guildUid).value_or(Record<data::Guild>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _guildStorage.Get(guildUid).value_or(Record<data::Guild>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Guild' record '{}' failed: {}",
+      guildUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Guild' record '{}' failed: unknown exception",
+      guildUid);
+  }
+
+  return {};
 }
 
 Record<data::Guild> DataDirector::CreateGuild() noexcept
@@ -1142,7 +1416,15 @@ Record<data::Guild> DataDirector::CreateGuild() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a guild record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a guild record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a guild record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1156,7 +1438,30 @@ Record<data::Housing> DataDirector::GetHousingCache(data::Uid housingUid) noexce
 {
   if (housingUid == data::InvalidUid)
     return {};
-  return _housingStorage.Get(housingUid).value_or(Record<data::Housing>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _housingStorage.Get(housingUid).value_or(Record<data::Housing>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Housing' record '{}' failed: {}",
+      housingUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Housing' record '{}' failed: unknown exception",
+      housingUid);
+  }
+
+  return {};
 }
 
 Record<data::Housing> DataDirector::CreateHousing() noexcept
@@ -1174,7 +1479,15 @@ Record<data::Housing> DataDirector::CreateHousing() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a housing record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a housing record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a housing record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1188,7 +1501,30 @@ Record<data::Settings> DataDirector::GetSettings(data::Uid settingsUid) noexcept
 {
   if (settingsUid == data::InvalidUid)
     return {};
-  return _settingsStorage.Get(settingsUid).value_or(Record<data::Settings>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _settingsStorage.Get(settingsUid).value_or(Record<data::Settings>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Settings' record '{}' failed: {}",
+      settingsUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Settings' record '{}' failed: unknown exception",
+      settingsUid);
+  }
+
+  return {};
 }
 
 Record<data::Settings> DataDirector::CreateSettings() noexcept
@@ -1206,7 +1542,15 @@ Record<data::Settings> DataDirector::CreateSettings() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a settings record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a settings record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a settings record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1220,7 +1564,30 @@ Record<data::Mail> DataDirector::GetMail(data::Uid mailUid) noexcept
 {
   if (mailUid == data::InvalidUid)
     return {};
-  return _mailStorage.Get(mailUid).value_or(Record<data::Mail>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _mailStorage.Get(mailUid).value_or(Record<data::Mail>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Mail' record '{}' failed: {}",
+      mailUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Mail' record '{}' failed: unknown exception",
+      mailUid);
+  }
+
+  return {};
 }
 
 Record<data::Mail> DataDirector::CreateMail() noexcept
@@ -1238,7 +1605,15 @@ Record<data::Mail> DataDirector::CreateMail() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a mail record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a mail record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a mail record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1252,7 +1627,30 @@ Record<data::Quest> DataDirector::GetQuest(data::Uid questUid) noexcept
 {
   if (questUid == data::InvalidUid)
     return {};
-  return _questStorage.Get(questUid).value_or(Record<data::Quest>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _questStorage.Get(questUid).value_or(Record<data::Quest>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Quest' record '{}' failed: {}",
+      questUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Quest' record '{}' failed: unknown exception",
+      questUid);
+  }
+
+  return {};
 }
 
 Record<data::Quest> DataDirector::CreateQuest() noexcept
@@ -1270,7 +1668,15 @@ Record<data::Quest> DataDirector::CreateQuest() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a quest record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a quest record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a quest record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1284,7 +1690,30 @@ Record<data::Stallion> DataDirector::GetStallion(data::Uid stallionUid) noexcept
 {
   if (stallionUid == data::InvalidUid)
     return {};
-  return _stallionStorage.Get(stallionUid).value_or(Record<data::Stallion>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _stallionStorage.Get(stallionUid).value_or(Record<data::Stallion>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Stallion' record '{}' failed: {}",
+      stallionUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Stallion' record '{}' failed: unknown exception",
+      stallionUid);
+  }
+
+  return {};
 }
 
 Record<data::Stallion> DataDirector::CreateStallion() noexcept
@@ -1302,7 +1731,15 @@ Record<data::Stallion> DataDirector::CreateStallion() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a stallion record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a stallion record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a stallion record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1326,7 +1763,30 @@ Record<data::Reward> DataDirector::GetReward(data::Uid claimUid) noexcept
 {
   if (claimUid == data::InvalidUid)
     return {};
-  return _rewardStorage.Get(claimUid).value_or(Record<data::Reward>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _rewardStorage.Get(claimUid).value_or(Record<data::Reward>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Reward' record '{}' failed: {}",
+      claimUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'Reward' record '{}' failed: unknown exception",
+      claimUid);
+  }
+
+  return {};
 }
 
 Record<data::Reward> DataDirector::CreateReward() noexcept
@@ -1344,7 +1804,15 @@ Record<data::Reward> DataDirector::CreateReward() noexcept
   }
   catch (const std::exception& x)
   {
-    spdlog::error("Exception while creating a reward record on the primary data source: {}", x.what());
+    util::QuietLogError("Exception while creating a reward record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    // LOA-fix (R49-6, round49, backlog #178): функция объявлена noexcept —
+    // неизвестное исключение отсюда убивало процесс. Отдаём пустую запись,
+    // ровно как в обычной ветке: вызывающий код уже умеет её проверять.
+    util::QuietLogError("Exception while creating a reward record on the primary data source: unknown exception");
     return {};
   }
 }
@@ -1372,7 +1840,7 @@ void DataDirector::ScheduleUserLoad(
       // If the timeout is reached we should return and warn about the timeout.
       if (Scheduler::Clock::now() > userDataContext.timeout)
       {
-        spdlog::warn("Timeout reached loading data for user '{}': {}", userName, userDataContext.debugMessage);
+        server::util::QuietLogWarn("Timeout reached loading data for user '{}': {}", userName, userDataContext.debugMessage);
         userDataContext.isBeingLoaded.store(false, std::memory_order::relaxed);
         return;
       }
@@ -1423,19 +1891,58 @@ Record<data::DailyQuestGroup> DataDirector::GetDailyQuestGroup(data::Uid dailyQu
 {
   if (dailyQuestGroupUid == data::InvalidUid)
     return {};
-  return _dailyQuestGroupStorage.Get(dailyQuestGroupUid).value_or(Record<data::DailyQuestGroup>{});
+
+  // LOA-fix (R54, round54, backlog #179 часть 4): функция объявлена
+  // noexcept, а `Get` внутри выделяет память трижды. Бросок отсюда убивал
+  // ВЕСЬ процесс, причём при вызове откуда угодно — пояс на стороне
+  // вызывающего срабатывает позже, чем noexcept. Отказ уходит в тот же
+  // канал пустой записи, который вызывающие уже проверяют.
+  try
+  {
+    return _dailyQuestGroupStorage.Get(dailyQuestGroupUid).value_or(Record<data::DailyQuestGroup>{});
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'DailyQuestGroup' record '{}' failed: {}",
+      dailyQuestGroupUid, x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Lookup of the 'DailyQuestGroup' record '{}' failed: unknown exception",
+      dailyQuestGroupUid);
+  }
+
+  return {};
 }
 
 Record<data::DailyQuestGroup> DataDirector::CreateDailyQuestGroup() noexcept
 {
-  return _dailyQuestGroupStorage.Create(
-    [this]()
-    {
-      data::DailyQuestGroup group;
-      _primaryDataSource->CreateDailyQuestGroup(group);
+  // LOA-fix (R49-18, round49, backlog #178): перехвата не было ВООБЩЕ.
+  try
+  {
+    return _dailyQuestGroupStorage.Create(
+      [this]()
+      {
+        data::DailyQuestGroup group;
+        _primaryDataSource->CreateDailyQuestGroup(group);
 
-      return std::make_pair(group.uid(), std::move(group));
-    });
+        return std::make_pair(group.uid(), std::move(group));
+      });
+  }
+  catch (const std::exception& x)
+  {
+    util::QuietLogError(
+      "Exception while creating a daily quest group record on the primary data source: {}", x.what());
+    return {};
+  }
+  catch (...)
+  {
+    util::QuietLogError(
+      "Exception while creating a daily quest group record on the primary data source: unknown exception");
+    return {};
+  }
 }
 
 DataDirector::DailyQuestGroupStorage& DataDirector::GetDailyQuestGroupCache()
@@ -1461,7 +1968,7 @@ void DataDirector::ScheduleCharacterLoad(
       // If the timeout is reached we should return and warn about the timeout.
       if (Scheduler::Clock::now() > userDataContext.timeout)
       {
-        spdlog::warn("Timeout reached loading data for character '{}': {}", characterUid, userDataContext.debugMessage);
+        server::util::QuietLogWarn("Timeout reached loading data for character '{}': {}", characterUid, userDataContext.debugMessage);
         userDataContext.isBeingLoaded.store(false, std::memory_order::relaxed);
         return;
       }

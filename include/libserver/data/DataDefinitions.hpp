@@ -136,6 +136,10 @@ struct User
   dao::Field<Uid> characterUid{InvalidUid};
   //! The last time the user was seen online. 1 means currently online.
   dao::Field<Clock::time_point> lastSeenOnline{};
+  //! LOA-fix (#18c): растянутый хеш пароля (hex) и соль (hex). Пусто =
+  //! пароль не задан (легаси-аккаунт → grandfather на первом входе).
+  dao::Field<std::string> passwordHash{};
+  dao::Field<std::string> passwordSalt{};
 };
 
 //! Infraction
@@ -343,6 +347,38 @@ struct Character
 
   dao::Field<bool> isRanchLocked{};
 
+  // LOA-fix (R45-1, #58/R2): фундамент достижений. Форма взята из апстримового
+  // PR #281, чтобы порт реестра и системы лёг поверх без переделки схемы.
+  //! Три tid'а «главных значков» карточки персонажа; 0 = пустой слот. Клиент
+  //! не требует, чтобы они были заработаны, и допускает повторы.
+  dao::Field<std::array<uint16_t, 3>> keyAchievements{};
+
+  //! Прогресс одного достижения.
+  struct AchievementEntry
+  {
+    //! tid из клиентской таблицы `Achievements`.
+    uint16_t tid{};
+    //! Накопленный прогресс к порогам тиров.
+    uint32_t progress{};
+    //! Момент взятия каждого из четырёх тиров; эпоха = тир не взят. ★ЧИСЛО
+    //! непустых = достигнутый тир, поэтому сам тир НЕ хранится: одно состояние
+    //! вместо двух, и рассинхрону между ними неоткуда взяться.
+    std::array<Clock::time_point, 4> tierEarnedAt{};
+  };
+  dao::Field<std::vector<AchievementEntry>> achievements{};
+
+  //! Состояние наград за грейды одной книги достижений. Сам грейд книги не
+  //! хранится — он следует из достижений, которые в неё входят.
+  struct AchievementBookEntry
+  {
+    //! Номер книги, интервал <0, 8>.
+    uint8_t bookId{};
+    //! Ноль = награда за этот грейд не забрана. Смысл несёт только
+    //! ноль/не-ноль; что именно лежит в забранной записи — открыто.
+    std::array<uint32_t, 4> tierRewardClaimed{};
+  };
+  dao::Field<std::vector<AchievementBookEntry>> achievementBooks{};
+
   dao::Field<Uid> settingsUid{InvalidUid};
 
   struct Skills
@@ -376,6 +412,55 @@ struct Character
   } mailbox{};
 
   dao::Field<std::vector<Uid>> quests{};
+
+  //! LOA (batch2): care-skill («Уход») state. Mirrors the login-payload model
+  //! ManagementSkills{class, progress, points} + SkillRanks{vector<{id,rank}>}.
+  //! Migration is zero-touch: old character files lack the "careSkills" key and
+  //! load as all-zero / empty (see FileDataSource).
+  struct CareSkills
+  {
+    //! One learned care skill and its current rank (login SkillRanks::Skill).
+    struct LearnedSkill
+    {
+      uint8_t id{};
+      uint8_t rank{};
+    };
+
+    //! Spendable care points («очки ухода»).
+    dao::Field<uint32_t> carePoints{};
+    //! Care-class («Смотритель») level, CareSkillLevel key.
+    dao::Field<uint8_t> careClassLevel{};
+    //! Care-class experience toward the next level (max ~2675).
+    dao::Field<uint32_t> careProgress{};
+    //! Learned care skills with their current rank.
+    dao::Field<std::vector<LearnedSkill>> learnedRanks{};
+  } careSkills{};
+
+  //! LOA (R65, backlog #175): ссылка, СНЯТАЯ с персонажа как нечитаемая.
+  //!
+  //! ★ЗАЧЕМ ПОЛЕ, А НЕ ПРОСТО СТИРАНИЕ. Уборка нечитаемых ссылок нужна: без неё
+  //! персонаж перестаёт грузиться совсем. Но раньше она стирала ссылку НАСОВСЕМ
+  //! и сохраняла персонажа обратно — и с этого момента возврат файла предмета из
+  //! бэкапа уже ничего не давал, потому что персонаж на него больше не
+  //! ссылался. Здесь ссылка уходит из живой коллекции (персонаж заходит, как и
+  //! прежде), но остаётся В ЗАПИСИ, то есть операция перестала быть необратимой.
+  //!
+  //! ★Почему в самой записи, а не в боковом журнале: карантин обязан меняться
+  //! АТОМАРНО вместе с коллекцией, из которой ссылка ушла. Отдельный файл — это
+  //! второй источник правды, который разъедется с первым при первом же сбое.
+  //!
+  //! Миграция нулевая в обе стороны: старые файлы ключа не имеют и читаются как
+  //! пустой карантин, а пустой карантин НЕ СЕРИАЛИЗУЕТСЯ вовсе (см.
+  //! FileDataSource) — у здорового персонажа файл не меняется ни на байт.
+  struct DamagedReference
+  {
+    //! UID снятой записи.
+    Uid uid{InvalidUid};
+    //! Вид ссылки теми же словами, что в логе уборки: «horse», «inventory
+    //! item», «egg», «mount»…
+    std::string kind{};
+  };
+  dao::Field<std::vector<DamagedReference>> damagedReferences{};
 };
 
 struct Horse
@@ -558,6 +643,31 @@ struct DailyQuestGroup
   dao::Field<bool> carrotsClaimed{false};
   //! The 3 daily quest slots.
   dao::Field<std::array<DailyQuestEntry, 3>> quests{};
+  //! LOA-fix (batch1 task3): day-index (days since the Unix epoch, day boundary
+  //! at 06:00 UTC) of the last daily-quest reset. 0 = never reset. Old JSON
+  //! files lack this key and load as 0, so the first ranch-enter after deploy
+  //! fires exactly one reset.
+  dao::Field<uint32_t> lastResetDate{0};
+  //! LOA-fix (F2, quest-batch-1): whether the DAILY GROUP reward (the
+  //! QuestRewardPoint threshold loot claimed via AcCmdCRRequestDailyQuestReward
+  //! 0x350) has already been handed out for the current game day. There was no
+  //! such flag at all, so the loot could be re-claimed indefinitely. Reset by
+  //! ResetDailyQuestsIfNeeded and by a new-day registration of the group. Old
+  //! JSON files lack this key and load as false.
+  dao::Field<bool> dailyRewardClaimed{false};
+  //! LOA-fix (R17-cap, quest-batch-2, #8): horse class-exp CLAIMED from daily quests
+  //! today, per account (capped at DailyClassExpCap = one horse class/day). "Claimed",
+  //! not "applied": a missing/max-class mount still consumes it (fail-closed anti-farm —
+  //! never grants MORE than the cap, mount-independent). Reset on the daily rollover by
+  //! BOTH entry points (ResetDailyQuestsIfNeeded on login + the fillGroup new-day path).
+  //! Old JSON without this key loads as 0.
+  dao::Field<uint32_t> dailyClassExpGranted{0};
+  //! LOA-fix (R42, #8 F2): день последнего сброса СЧЁТЧИКА класс-опыта (индекс
+  //! игрового дня, граница 06:00 UTC). ОТДЕЛЬНАЯ от lastResetDate (та — для квест-
+  //! сброса): счётчик капа сбрасывается независимо от квестов, поэтому spend-путь
+  //! может само-исцелить его на границе дня, НЕ трогая lastResetDate (иначе подавил
+  //! бы квест-сброс). Старый JSON без ключа грузится как 0 → первый spend само-сбросит.
+  dao::Field<uint32_t> dailyClassExpResetDate{0};
 };
 
 struct Quest

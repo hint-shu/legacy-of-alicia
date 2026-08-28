@@ -18,10 +18,19 @@
  **/
 
 #include "libserver/data/file/FileDataSource.hpp"
+#include "libserver/util/QuietLog.hpp"
+#include <algorithm>
+#include <limits>
+#include <ranges>
+#include "libserver/util/AtomicFile.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <format>
+#include <limits>
+
+#include <spdlog/spdlog.h>
 #include <fstream>
 #include <regex>
 
@@ -37,6 +46,98 @@ std::filesystem::path ProduceDataFilePath(
   if (not std::filesystem::exists(root))
     std::filesystem::create_directories(root);
   return root / (filename + ".json");
+}
+
+//! Наибольший UID, ФАКТИЧЕСКИ встречающийся в именах файлов каталога
+//! (LOA-fix, R58-4, round58, backlog #175).
+//!
+//! ★Существует, чтобы счётчик УЖЕ НИКОГДА не выдал занятый идентификатор, что бы
+//! ни случилось с мета-файлом. Потерянный, обнулённый или откаченный мета
+//! перестаёт быть катастрофой: пол берётся из самих данных. Приём не новый — так
+//! уже устроен `ListRegisteredStallions` в этом же файле.
+//! Следующий идентификатор с ПРОВЕРКОЙ ИСЧЕРПАНИЯ (LOA-fix, R58-16, #175).
+//!
+//! ★Апстримный `++счётчик` не проверял ничего, и это было терпимо, пока верхнее
+//! значение задавал только мета-файл. Пол по фактическим именам файлов, который
+//! вводит этот раунд, сделал верхнюю границу достижимой С ДИСКА: файл с именем
+//! `4294967294.json` поднял бы счётчик к самому краю, и через два выпуска
+//! идентификатор стал бы нулём, то есть `InvalidUid`. Иначе говоря, защита от
+//! обнуления счётчиков сама открывала дорогу к обнулению. Найдено ревью
+//! (итерация 2).
+//!
+//! Отказ ГРОМКИЙ и с откатом: выдать занятый или недействительный идентификатор
+//! хуже, чем не выдать никакого.
+uint32_t NextUid(std::atomic<uint32_t>& counter, const std::string_view what)
+{
+  // ★ПРОВЕРКА ДО ИЗМЕНЕНИЯ, А НЕ ПОСЛЕ. Прежняя редакция делала `fetch_add` и
+  // откатывала счётчик, если значение оказалось негодным, — но между этими
+  // двумя шагами испорченное значение УЖЕ ОПУБЛИКОВАНО, и соседний поток успел
+  // бы его прочитать. А выдача идёт не с одного потока: `Create*` зовут лобби,
+  // ранчо, мессенджер и сетевые потоки. Найдено ревью (итерация 3).
+  //
+  // Цикл сравнения-с-обменом меняет счётчик только тогда, когда следующее
+  // значение заведомо годное, поэтому негодного не существует ни мгновения.
+  uint32_t current = counter.load(std::memory_order::relaxed);
+
+  for (;;)
+  {
+    if (current >= std::numeric_limits<uint32_t>::max() - 1)
+    {
+      throw std::runtime_error(
+        std::format("Ran out of {} identifiers", what));
+    }
+
+    const uint32_t next = current + 1;
+    if (counter.compare_exchange_weak(
+          current, next, std::memory_order::relaxed, std::memory_order::relaxed))
+    {
+      return next;
+    }
+  }
+}
+
+uint32_t HighestUidInDirectory(const std::filesystem::path& root)
+{
+  uint32_t highest = 0;
+
+  std::error_code error;
+  if (not std::filesystem::is_directory(root, error) || error)
+    return highest;
+
+  for (const auto& entry : std::filesystem::directory_iterator(root, error))
+  {
+    if (error)
+      break;
+    if (not entry.is_regular_file() || entry.path().extension() != ".json")
+      continue;
+
+    // ★РАЗБОР СТРОГИЙ, И ЭТО НЕ ПЕДАНТИЗМ. `std::stoul` принимает знак и
+    // молча игнорирует хвост, поэтому файл с именем `-1.json` дал бы
+    // UINT32_MAX — а следующий `++счётчик` завернул бы его в 0, то есть в
+    // `InvalidUid`. Фикс, поставленный ПРОТИВ обнуления счётчиков, сам открыл
+    // бы дорогу к обнулению. Найдено ревью (итерация 1).
+    const auto stem = entry.path().stem().string();
+    if (stem.empty() || stem.size() > 10
+      || not std::ranges::all_of(stem, [](const unsigned char symbol)
+        {
+          return symbol >= '0' && symbol <= '9';
+        }))
+    {
+      continue;
+    }
+
+    uint64_t parsed = 0;
+    for (const char symbol : stem)
+      parsed = parsed * 10 + static_cast<uint64_t>(symbol - '0');
+
+    // Значение, не помещающееся в счётчик, — тоже не наша запись.
+    if (parsed == 0 || parsed >= std::numeric_limits<uint32_t>::max())
+      continue;
+
+    highest = std::max(highest, static_cast<uint32_t>(parsed));
+  }
+
+  return highest;
 }
 
 } // anon namespace
@@ -75,13 +176,39 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   // Read the meta-data file and parse the sequential UIDs.
   const std::filesystem::path metaFilePath = ProduceDataFilePath(
     _metaFilePath, "meta");
+  // LOA-fix (R58-5, round58, backlog #175): уборка недописанных временных
+  // файлов от прерванных сохранений. Без неё осиротевший `X.json.tmp` копился бы
+  // и попадал под обходы каталогов.
+  server::util::SweepStaleTemporaries(_dataPath);
+
+  nlohmann::json meta = nlohmann::json::object();
+
   std::ifstream metaFile(metaFilePath);
   if (not metaFile.is_open())
   {
-    return;
+    // ★РАНЬШЕ ЗДЕСЬ БЫЛ ТИХИЙ `return` — без единой строки в логе. Он и делал
+    // потерю мета-файла беззвучной катастрофой: все счётчики оставались нулями,
+    // следующий персонаж получал uid 1 и затирал файл старейшего игрока.
+    server::util::QuietLogError(
+      "Sequential uid metadata '{}' is missing. Uid counters will be derived from "
+      "the data on disk", metaFilePath.string());
+  }
+  else
+  {
+    try
+    {
+      meta = nlohmann::json::parse(metaFile);
+    }
+    catch (const std::exception& x)
+    {
+      // Битый мета тоже не повод падать: пол из данных сильнее любого файла.
+      server::util::QuietLogError(
+        "Sequential uid metadata '{}' is unreadable ({}). Uid counters will be "
+        "derived from the data on disk", metaFilePath.string(), x.what());
+      meta = nlohmann::json::object();
+    }
   }
 
-  const auto meta = nlohmann::json::parse(metaFile);
   _infractionSequentialUid = meta.value("infractionSequentialUid", uint32_t{0});
   _characterSequentialUid = meta.value("characterSequentialUid", uint32_t{0});
   _equipmentSequentialUid = meta.value("equipmentSequentialUid", uint32_t{0});
@@ -96,6 +223,34 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   _questSequentialId = meta.value("questSequentialId", uint32_t{0});
   _stallionSequentialUid = meta.value("stallionSequentialUid", uint32_t{0});
   _rewardSequentialUid = meta.value("rewardSequentialUid", uint32_t{0});
+
+  // ★ПОЛ СЧЁТЧИКОВ ПРИМЕНЯЕТСЯ ВСЕГДА, А НЕ ТОЛЬКО ПРИ СБОЕ РАЗБОРА.
+  // В этом и смысл: мета может быть не только потерян, но и устарел, откачен
+  // вместе с бэкапом или отстать после ручной правки. Пол из фактических имён
+  // файлов обезвреживает ВЕСЬ класс — выдать занятый uid становится нельзя.
+  const auto raiseFloor = [](std::atomic<uint32_t>& counter, const uint32_t observed)
+  {
+    if (observed > counter.load())
+      counter.store(observed);
+  };
+
+  raiseFloor(_infractionSequentialUid, HighestUidInDirectory(_infractionDataPath));
+  raiseFloor(_characterSequentialUid, HighestUidInDirectory(_characterDataPath));
+  // ★Один счётчик на ДВА каталога — лошади и предметы делят нумерацию.
+  raiseFloor(_equipmentSequentialUid, std::max(
+    HighestUidInDirectory(_horseDataPath), HighestUidInDirectory(_itemDataPath)));
+  raiseFloor(_storageItemSequentialUid, HighestUidInDirectory(_storageItemPath));
+  raiseFloor(_eggSequentialUid, HighestUidInDirectory(_eggDataPath));
+  raiseFloor(_petSequentialUid, HighestUidInDirectory(_petDataPath));
+  raiseFloor(_housingSequentialUid, HighestUidInDirectory(_housingDataPath));
+  raiseFloor(_guildSequentialId, HighestUidInDirectory(_guildDataPath));
+  raiseFloor(_settingsSequentialId, HighestUidInDirectory(_settingsDataPath));
+  raiseFloor(_dailyQuestGroupSequentialId,
+    HighestUidInDirectory(_dailyQuestGroupDataPath));
+  raiseFloor(_mailSequentialId, HighestUidInDirectory(_mailDataPath));
+  raiseFloor(_questSequentialId, HighestUidInDirectory(_questDataPath));
+  raiseFloor(_stallionSequentialUid, HighestUidInDirectory(_stallionDataPath));
+  raiseFloor(_rewardSequentialUid, HighestUidInDirectory(_rewardDataPath));
 }
 
 void server::FileDataSource::Terminate()
@@ -111,12 +266,6 @@ void server::FileDataSource::SaveMetadata()
 
   const std::filesystem::path metaFilePath = ProduceDataFilePath(
     _metaFilePath, "meta");
-
-  std::ofstream metaFile(metaFilePath);
-  if (not metaFile.is_open())
-  {
-    return;
-  }
 
   nlohmann::json meta;
   meta["infractionSequentialUid"] = _infractionSequentialUid.load();
@@ -134,7 +283,22 @@ void server::FileDataSource::SaveMetadata()
   meta["stallionSequentialUid"] = _stallionSequentialUid.load();
   meta["rewardSequentialUid"] = _rewardSequentialUid.load();
 
-  metaFile << meta.dump(2);
+  // LOA-fix (R58-3b, round58, backlog #175): мета-файл переписывается на
+  // КАЖДОМ создании сущности, то есть окно обрезания открыто постоянно. Пустой
+  // мета не даёт серверу СТАРТОВАТЬ, а отсутствующий молча обнуляет все
+  // четырнадцать счётчиков — и следующий персонаж получает uid 1, затирая файл
+  // старейшего игрока. Пишем атомарно; контракт «не бросать» сохраняем, но
+  // молчать больше нельзя.
+  try
+  {
+    server::util::WriteFileAtomically(metaFilePath, meta.dump(2), "Meta file");
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Failed to save the sequential uid metadata: {}. New uids may collide with "
+      "existing records after a restart", x.what());
+  }
 }
 
 void server::FileDataSource::CreateUser(data::User& user)
@@ -165,19 +329,15 @@ void server::FileDataSource::RetrieveUser(const std::string_view& name, data::Us
   user.infractions = json.value("infractions", std::vector<data::Uid>{});
   user.lastSeenOnline = data::Clock::time_point(std::chrono::seconds(
     json.value("lastSeenOnline", int64_t(0))));
+  // LOA-fix (#18c): хеш+соль пароля. Нет ключа → "" (старые файлы без миграции).
+  user.passwordHash = json.value("passwordHash", std::string{});
+  user.passwordSalt = json.value("passwordSalt", std::string{});
 }
 
 void server::FileDataSource::StoreUser(const std::string_view&, const data::User& user)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _userDataPath, user.name());
-
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("User file '{}' not accessible", dataFilePath.string()));
-  }
 
   nlohmann::json json;
   json["name"] = user.name();
@@ -186,8 +346,12 @@ void server::FileDataSource::StoreUser(const std::string_view&, const data::User
   json["infractions"] = user.infractions();
   json["lastSeenOnline"] = std::chrono::ceil<std::chrono::seconds>(
     user.lastSeenOnline().time_since_epoch()).count();
+  // LOA-fix (#18c): сохраняем хеш+соль пароля, иначе logout затёр бы их.
+  json["passwordHash"] = user.passwordHash();
+  json["passwordSalt"] = user.passwordSalt();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "User file");
 }
 
 bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
@@ -198,6 +362,13 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
 
   for (const auto& file : std::filesystem::directory_iterator(_userDataPath))
   {
+    // LOA-fix (R58-7, round58, backlog #175): сравнение идёт по ИМЕНИ ФАЙЛА, и
+    // без этого фильтра осиротевший `Вася.json.tmp` сделал бы имя «Вася»
+    // занятым навсегда. Это условие безопасности самой атомарной записи, а не
+    // косметика: фикс иначе породил бы дефект, которого до него не было.
+    if (not file.is_regular_file() || file.path().extension() != ".json")
+      continue;
+
     const auto existingUserName = file.path().filename().string();
     if (std::regex_match(existingUserName, rg))
       return false;
@@ -208,7 +379,7 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
 
 void server::FileDataSource::CreateInfraction(data::Infraction& infraction)
 {
-  infraction.uid = ++_infractionSequentialUid;
+  infraction.uid = NextUid(_infractionSequentialUid, "infraction");
   SaveMetadata();
 }
 
@@ -239,13 +410,6 @@ void server::FileDataSource::StoreInfraction(data::Uid uid, const data::Infracti
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _infractionDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Infraction file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = infraction.uid();
   json["description"] = infraction.description();
@@ -254,7 +418,8 @@ void server::FileDataSource::StoreInfraction(data::Uid uid, const data::Infracti
   json["createdAt"] = std::chrono::duration_cast<std::chrono::seconds>(
     infraction.createdAt().time_since_epoch()).count();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Infraction file");
 }
 
 void server::FileDataSource::DeleteInfraction(data::Uid uid)
@@ -266,7 +431,7 @@ void server::FileDataSource::DeleteInfraction(data::Uid uid)
 
 void server::FileDataSource::CreateCharacter(data::Character& character)
 {
-  character.uid = ++_characterSequentialUid;
+  character.uid = NextUid(_characterSequentialUid, "character");
   SaveMetadata();
 }
 
@@ -363,6 +528,202 @@ void server::FileDataSource::RetrieveCharacter(data::Uid uid, data::Character& c
 
   character.isRanchLocked = json.value("isRanchLocked", bool{});
 
+  // LOA-fix (R45-3, #58/R2): чтение достижений.
+  //
+  // ★ПЕРВОЕ: персонаж, созданный ДО этого раунда, обязан грузиться как раньше —
+  // все три блока под `contains`, отсутствие ключей = пустые поля. Миграция
+  // данных не нужна, и это проверено control-армом на СТАРОМ прод-профиле, а не
+  // принято на веру (урок арки «Полёт»).
+  //
+  // ★ВТОРОЕ (находка ревью R45): `contains` говорит лишь о НАЛИЧИИ ключа, а не о
+  // его пригодности. Файл персонажа пишет асинхронный тик, и он же правится
+  // руками при разборах — то есть встретить null, строку вместо числа, массив
+  // не той длины или оборванную запись вполне реально. Любая такая кривизна НЕ
+  // должна делать персонажа незагружаемым: проверяем тип, длину и диапазон, а
+  // при несоответствии оставляем поле пустым и пишем предупреждение. Потерять
+  // пустые достижения безопаснее, чем потерять персонажа целиком.
+  {
+    //! Верхняя граница на число записей: массив приходит из файла, и раздутый
+    //! файл не должен превращаться в неограниченное выделение памяти.
+    constexpr std::size_t kMaxAchievementEntries = 4096;
+    //! Книг всего девять (0..8).
+    constexpr uint64_t kMaxBookId = 8;
+    //! Секунды epoch, за которыми момент взятия тира считаем мусором:
+    //! 4102444800 = 2100-01-01 UTC. Отрицательные — тоже мусор.
+    constexpr int64_t kMaxTierSeconds = 4102444800;
+
+    // Беззнаковое число в заданных границах; всё прочее (null, строка, дробь,
+    // отрицательное, слишком большое) отвергается.
+    const auto readBounded = [](const nlohmann::json& value,
+                                const uint64_t limit,
+                                uint64_t& out) -> bool
+    {
+      if (not value.is_number_unsigned())
+        return false;
+      const auto number = value.get<uint64_t>();
+      if (number > limit)
+        return false;
+      out = number;
+      return true;
+    };
+
+    if (json.contains("keyAchievements"))
+    {
+      const auto& value = json["keyAchievements"];
+      std::array<uint16_t, 3> slots{};
+      bool valid = value.is_array() and value.size() == slots.size();
+      for (std::size_t index = 0; valid and index < slots.size(); ++index)
+      {
+        uint64_t number = 0;
+        if (readBounded(value[index],
+              std::numeric_limits<uint16_t>::max(), number))
+          slots[index] = static_cast<uint16_t>(number);
+        else
+          valid = false;
+      }
+
+      if (valid)
+        character.keyAchievements = slots;
+      else
+        server::util::QuietLogWarn(
+          "Character '{}' has a malformed 'keyAchievements' field, ignoring it",
+          uid);
+    }
+
+    if (json.contains("achievements") and json["achievements"].is_array())
+    {
+      std::vector<data::Character::AchievementEntry> entries;
+      for (const auto& entry : json["achievements"])
+      {
+        if (entries.size() >= kMaxAchievementEntries)
+        {
+          server::util::QuietLogWarn(
+            "Character '{}' has more than {} achievements, ignoring the rest",
+            uid,
+            kMaxAchievementEntries);
+          break;
+        }
+
+        uint64_t tid = 0;
+        if (not entry.is_object()
+          or not entry.contains("tid")
+          or not readBounded(entry["tid"],
+                std::numeric_limits<uint16_t>::max(), tid)
+          or tid == 0)
+        {
+          // Запись без пригодного tid не описывает ничего — пропускаем её, а не
+          // роняем загрузку персонажа.
+          continue;
+        }
+
+        // Один tid не может иметь два прогресса; побеждает первая запись.
+        const auto duplicate = std::ranges::find(
+          entries, static_cast<uint16_t>(tid),
+          &data::Character::AchievementEntry::tid);
+        if (duplicate != entries.end())
+          continue;
+
+        data::Character::AchievementEntry achievement{
+          .tid = static_cast<uint16_t>(tid)};
+
+        uint64_t progress = 0;
+        if (entry.contains("progress")
+          and readBounded(entry["progress"],
+                std::numeric_limits<uint32_t>::max(), progress))
+        {
+          achievement.progress = static_cast<uint32_t>(progress);
+        }
+
+        if (entry.contains("tierEarnedAt"))
+        {
+          const auto& tiers = entry["tierEarnedAt"];
+          if (tiers.is_array()
+            and tiers.size() == achievement.tierEarnedAt.size())
+          {
+            for (std::size_t tier = 0; tier < tiers.size(); ++tier)
+            {
+              uint64_t seconds = 0;
+              if (not readBounded(tiers[tier], kMaxTierSeconds, seconds)
+                or seconds == 0)
+              {
+                // Ноль = тир не взят; мусор трактуем так же — это ровно то
+                // значение, которое поле имеет по умолчанию.
+                continue;
+              }
+              achievement.tierEarnedAt[tier] = data::Clock::time_point{
+                std::chrono::seconds{static_cast<int64_t>(seconds)}};
+            }
+          }
+          else
+          {
+            server::util::QuietLogWarn(
+              "Character '{}' has a malformed 'tierEarnedAt' on achievement "
+              "{}, treating every tier as not earned",
+              uid,
+              tid);
+          }
+        }
+
+        entries.push_back(achievement);
+      }
+      character.achievements = std::move(entries);
+    }
+
+    if (json.contains("achievementBooks") and json["achievementBooks"].is_array())
+    {
+      std::vector<data::Character::AchievementBookEntry> books;
+      for (const auto& entry : json["achievementBooks"])
+      {
+        if (books.size() > kMaxBookId)
+          break;
+
+        uint64_t bookId = 0;
+        if (not entry.is_object()
+          or not entry.contains("bookId")
+          or not readBounded(entry["bookId"], kMaxBookId, bookId))
+        {
+          continue;
+        }
+
+        const auto duplicate = std::ranges::find(
+          books, static_cast<uint8_t>(bookId),
+          &data::Character::AchievementBookEntry::bookId);
+        if (duplicate != books.end())
+          continue;
+
+        data::Character::AchievementBookEntry book{
+          .bookId = static_cast<uint8_t>(bookId)};
+
+        if (entry.contains("tierRewardClaimed"))
+        {
+          const auto& claimed = entry["tierRewardClaimed"];
+          if (claimed.is_array()
+            and claimed.size() == book.tierRewardClaimed.size())
+          {
+            for (std::size_t tier = 0; tier < claimed.size(); ++tier)
+            {
+              uint64_t number = 0;
+              if (readBounded(claimed[tier],
+                    std::numeric_limits<uint32_t>::max(), number))
+                book.tierRewardClaimed[tier] = static_cast<uint32_t>(number);
+            }
+          }
+          else
+          {
+            server::util::QuietLogWarn(
+              "Character '{}' has a malformed 'tierRewardClaimed' on book {}, "
+              "treating every tier reward as unclaimed",
+              uid,
+              bookId);
+          }
+        }
+
+        books.push_back(book);
+      }
+      character.achievementBooks = std::move(books);
+    }
+  }
+
   character.settingsUid = json.value("settingsUid", data::Uid{});
 
   const auto readSkills = [](data::Character::Skills::Sets& sets, const nlohmann::json& json)
@@ -389,19 +750,40 @@ void server::FileDataSource::RetrieveCharacter(data::Uid uid, data::Character& c
   character.mailbox.sent = mailbox.value("sent", std::vector<data::Uid>{});
 
   character.quests = json.value("quests", std::vector<data::Uid>{});
+
+  // LOA (batch2): care-skill state. Zero-touch migration — old files lack the
+  // "careSkills" object and load as all-zero / empty.
+  const auto& careSkills = json.value("careSkills", nlohmann::json::object());
+  character.careSkills.carePoints = careSkills.value("carePoints", uint32_t{});
+  character.careSkills.careClassLevel = careSkills.value("careClassLevel", uint8_t{});
+  character.careSkills.careProgress = careSkills.value("careProgress", uint32_t{});
+  std::vector<data::Character::CareSkills::LearnedSkill> learnedRanks;
+  for (const auto& learnedJson : careSkills.value("learnedRanks", nlohmann::json::array()))
+  {
+    data::Character::CareSkills::LearnedSkill learned{};
+    learned.id = learnedJson.value("id", uint8_t{});
+    learned.rank = learnedJson.value("rank", uint8_t{});
+    learnedRanks.push_back(learned);
+  }
+  character.careSkills.learnedRanks = learnedRanks;
+
+  // LOA (R65, backlog #175): карантин снятых ссылок. Тот же нулевой перенос,
+  // что у careSkills — старый файл ключа не имеет и читается как пустой.
+  std::vector<data::Character::DamagedReference> damagedReferences;
+  for (const auto& damagedJson : json.value("damagedReferences", nlohmann::json::array()))
+  {
+    data::Character::DamagedReference damaged{};
+    damaged.uid = damagedJson.value("uid", data::InvalidUid);
+    damaged.kind = damagedJson.value("kind", std::string{});
+    damagedReferences.push_back(damaged);
+  }
+  character.damagedReferences = damagedReferences;
 }
 
 void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character& character)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
-
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Character file '{}' not accessible", dataFilePath.string()));
-  }
 
   nlohmann::json json;
   json["uid"] = character.uid();
@@ -477,6 +859,48 @@ void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character
 
   json["isRanchLocked"] = character.isRanchLocked();
 
+  // LOA-fix (R45-4, #58/R2): запись достижений. Моменты взятия тиров кладём
+  // СЕКУНДАМИ epoch — тем же представлением, что и остальные времена в наших
+  // файлах, чтобы запись читалась глазами и не зависела от разрядности
+  // Clock::duration.
+  json["keyAchievements"] = character.keyAchievements();
+
+  {
+    auto achievementsJson = nlohmann::json::array();
+    for (const auto& entry : character.achievements())
+    {
+      std::array<int64_t, 4> tierEarnedAt{};
+      for (size_t tier = 0; tier < tierEarnedAt.size(); ++tier)
+      {
+        // ★Гранулярность хранения — СЕКУНДА (находка ревью R45): часы идут в
+        // наносекундах, поэтому запись усечёт долю секунды, и обратное чтение
+        // даст момент чуть раньше исходного. Для достижений это безразлично —
+        // клиенту показывается ДАТА взятия тира, — но знать об этом надо: после
+        // первого сохранения значение уже секундное и дальше round-trip точен.
+        // Отрицательное (момент до 1970) записываем нулём: ноль по нашей же
+        // схеме означает «тир не взят», а до-эпошного взятия не бывает.
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+          entry.tierEarnedAt[tier].time_since_epoch()).count();
+        tierEarnedAt[tier] = seconds > 0 ? seconds : 0;
+      }
+
+      achievementsJson.push_back({{"tid", entry.tid},
+        {"progress", entry.progress},
+        {"tierEarnedAt", tierEarnedAt}});
+    }
+    json["achievements"] = std::move(achievementsJson);
+  }
+
+  {
+    auto booksJson = nlohmann::json::array();
+    for (const auto& entry : character.achievementBooks())
+    {
+      booksJson.push_back({{"bookId", entry.bookId},
+        {"tierRewardClaimed", entry.tierRewardClaimed}});
+    }
+    json["achievementBooks"] = std::move(booksJson);
+  }
+
   json["settingsUid"] = character.settingsUid();
 
   // Construct game mode skills from skill sets
@@ -511,7 +935,42 @@ void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character
 
   json["quests"] = character.quests();
 
-  dataFile << json.dump(2);
+  // LOA (batch2): persist care-skill state.
+  nlohmann::json careSkills;
+  careSkills["carePoints"] = character.careSkills.carePoints();
+  careSkills["careClassLevel"] = character.careSkills.careClassLevel();
+  careSkills["careProgress"] = character.careSkills.careProgress();
+  nlohmann::json learnedRanksJson = nlohmann::json::array();
+  for (const auto& learned : character.careSkills.learnedRanks())
+  {
+    learnedRanksJson.push_back({
+      {"id", learned.id},
+      {"rank", learned.rank}
+    });
+  }
+  careSkills["learnedRanks"] = learnedRanksJson;
+  json["careSkills"] = careSkills;
+
+  // LOA (R65, backlog #175): карантин пишется ТОЛЬКО когда он непуст.
+  // ★Условие здесь не ради красоты файла, а ради радиуса раунда: у здорового
+  // персонажа (а это все) сохранённый файл обязан остаться ПОБАЙТОВО тем же,
+  // что и до раунда. Безусловный `json["damagedReferences"] = []` изменил бы
+  // каждый файл в проде ради поля, которое почти всегда пусто.
+  if (not character.damagedReferences().empty())
+  {
+    nlohmann::json damagedReferencesJson = nlohmann::json::array();
+    for (const auto& damaged : character.damagedReferences())
+    {
+      damagedReferencesJson.push_back({
+        {"uid", damaged.uid},
+        {"kind", damaged.kind}
+      });
+    }
+    json["damagedReferences"] = damagedReferencesJson;
+  }
+
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Character file");
 }
 
 void server::FileDataSource::DeleteCharacter(data::Uid uid)
@@ -529,18 +988,38 @@ server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::
 
   for (const auto& file : std::filesystem::directory_iterator(_characterDataPath))
   {
-    if (file.is_directory())
+    // LOA-fix (R58-8, round58, backlog #175): фильтр расширения (иначе временный
+    // файл станет едой для разбора) и ПЕРЕХВАТ разбора. Раньше один битый файл
+    // ломал поиск по имени и создание персонажа У ВСЕХ — бросок улетал наружу из
+    // цикла. Образец взят у соседней `IsGuildNameUnique` в этом же файле.
+    if (not file.is_regular_file() || file.path().extension() != ".json")
       continue;
 
     std::ifstream dataFile(file.path());
     if (not dataFile.is_open())
       continue;
 
-    const auto json = nlohmann::json::parse(dataFile);
-    const auto existingCharacterName = json["name"].get<std::string>();
+    std::string existingCharacterName;
+    data::Uid existingCharacterUid = data::InvalidUid;
+    try
+    {
+      const auto json = nlohmann::json::parse(dataFile);
+      existingCharacterName = json.value("name", std::string{});
+      existingCharacterUid = json.value("uid", data::InvalidUid);
+    }
+    catch (const std::exception& x)
+    {
+      server::util::QuietLogWarn(
+        "Character file '{}' is unreadable ({}) and was skipped while looking up "
+        "a character by name", file.path().string(), x.what());
+      continue;
+    }
+
+    if (existingCharacterName.empty() || existingCharacterUid == data::InvalidUid)
+      continue;
 
     if (std::regex_match(existingCharacterName, rg))
-      return json["uid"].get<data::Uid>();
+      return existingCharacterUid;
   }
 
   return data::InvalidUid;
@@ -553,7 +1032,7 @@ bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
 
 void server::FileDataSource::CreateHorse(data::Horse& horse)
 {
-  horse.uid = ++_equipmentSequentialUid;
+  horse.uid = NextUid(_equipmentSequentialUid, "equipment");
   SaveMetadata();
 }
 
@@ -673,13 +1152,6 @@ void server::FileDataSource::StoreHorse(data::Uid uid, const data::Horse& horse)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _horseDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Horse file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = horse.uid();
   json["tid"] = horse.tid();
@@ -779,7 +1251,8 @@ void server::FileDataSource::StoreHorse(data::Uid uid, const data::Horse& horse)
 
   json["lineage"] = horse.lineage();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Horse file");
 }
 
 void server::FileDataSource::DeleteHorse(data::Uid uid)
@@ -791,7 +1264,7 @@ void server::FileDataSource::DeleteHorse(data::Uid uid)
 
 void server::FileDataSource::CreateItem(data::Item& item)
 {
-  item.uid = ++_equipmentSequentialUid;
+  item.uid = NextUid(_equipmentSequentialUid, "equipment");
   SaveMetadata();
 }
 
@@ -822,13 +1295,6 @@ void server::FileDataSource::StoreItem(data::Uid uid, const data::Item& item)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _itemDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Item file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = item.uid();
   json["tid"] = item.tid();
@@ -837,7 +1303,8 @@ void server::FileDataSource::StoreItem(data::Uid uid, const data::Item& item)
   json["createdAt"] = std::chrono::ceil<std::chrono::seconds>(
     item.createdAt().time_since_epoch()).count();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Item file");
 }
 
 void server::FileDataSource::DeleteItem(data::Uid uid)
@@ -849,7 +1316,7 @@ void server::FileDataSource::DeleteItem(data::Uid uid)
 
 void server::FileDataSource::CreateStorageItem(data::StorageItem& item)
 {
-  item.uid = ++_storageItemSequentialUid;
+  item.uid = NextUid(_storageItemSequentialUid, "storageItem");
   SaveMetadata();
 }
 
@@ -897,13 +1364,6 @@ void server::FileDataSource::StoreStorageItem(data::Uid uid, const data::Storage
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _storageItemPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Storage item file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = storageItem.uid();
   json["sender"] = storageItem.sender();
@@ -930,7 +1390,8 @@ void server::FileDataSource::StoreStorageItem(data::Uid uid, const data::Storage
   json["goodsSq"] = storageItem.goodsSq();
   json["priceId"] = storageItem.priceId();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Storage item file");
 }
 
 void server::FileDataSource::DeleteStorageItem(data::Uid uid)
@@ -942,7 +1403,7 @@ void server::FileDataSource::DeleteStorageItem(data::Uid uid)
 
 void server::FileDataSource::CreateEgg(data::Egg& egg)
 {
-  egg.uid = ++_eggSequentialUid;
+  egg.uid = NextUid(_eggSequentialUid, "egg");
   SaveMetadata();
 }
 
@@ -976,13 +1437,6 @@ void server::FileDataSource::StoreEgg(data::Uid uid, const data::Egg& egg)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _eggDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Egg file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = egg.uid();
   json["itemUid"] = egg.itemUid();
@@ -991,7 +1445,8 @@ void server::FileDataSource::StoreEgg(data::Uid uid, const data::Egg& egg)
     egg.incubatedAt().time_since_epoch()).count();
   json["incubatorSlot"] = egg.incubatorSlot();
   json["boostsUsed"] = egg.boostsUsed();
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Egg file");
 }
 
 void server::FileDataSource::DeleteEgg(data::Uid uid)
@@ -1003,7 +1458,7 @@ void server::FileDataSource::DeleteEgg(data::Uid uid)
 
 void server::FileDataSource::CreatePet(data::Pet& pet)
 {
-  pet.uid = ++_petSequentialUid;
+  pet.uid = NextUid(_petSequentialUid, "pet");
   SaveMetadata();
 }
 
@@ -1034,13 +1489,6 @@ void server::FileDataSource::StorePet(data::Uid uid, const data::Pet& pet)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _petDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Pet file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = pet.uid();
   json["itemUid"] = pet.itemUid();
@@ -1049,7 +1497,8 @@ void server::FileDataSource::StorePet(data::Uid uid, const data::Pet& pet)
   json["birthDate"] = std::chrono::duration_cast<std::chrono::seconds>(
     pet.birthDate().time_since_epoch()).count();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Pet file");
 }
 
 void server::FileDataSource::DeletePet(data::Uid uid)
@@ -1061,7 +1510,7 @@ void server::FileDataSource::DeletePet(data::Uid uid)
 
 void server::FileDataSource::CreateHousing(data::Housing& housing)
 {
-  housing.uid = ++_housingSequentialUid;
+  housing.uid = NextUid(_housingSequentialUid, "housing");
   SaveMetadata();
 }
 
@@ -1090,13 +1539,6 @@ void server::FileDataSource::StoreHousing(data::Uid uid, const data::Housing& ho
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _housingDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Housing file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = housing.uid();
   json["housingId"] = housing.housingId();
@@ -1104,7 +1546,8 @@ void server::FileDataSource::StoreHousing(data::Uid uid, const data::Housing& ho
     housing.expiresAt().time_since_epoch()).count();
   json["durability"] = housing.durability();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Housing file");
 }
 
 void server::FileDataSource::DeleteHousing(data::Uid uid)
@@ -1116,7 +1559,7 @@ void server::FileDataSource::DeleteHousing(data::Uid uid)
 
 void server::FileDataSource::CreateGuild(data::Guild& guild)
 {
-  guild.uid = ++_guildSequentialId;
+  guild.uid = NextUid(_guildSequentialId, "guild");
   SaveMetadata();
 }
 
@@ -1153,13 +1596,6 @@ void server::FileDataSource::StoreGuild(data::Uid uid, const data::Guild& guild)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _guildDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Guild file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = guild.uid();
   json["name"] = guild.name();
@@ -1174,7 +1610,8 @@ void server::FileDataSource::StoreGuild(data::Uid uid, const data::Guild& guild)
   json["seasonalWins"] = guild.seasonalWins();
   json["seasonalLosses"] = guild.seasonalLosses();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Guild file");
 }
 
 void server::FileDataSource::DeleteGuild(data::Uid uid)
@@ -1198,7 +1635,9 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
 
   for (const auto& file : std::filesystem::directory_iterator(_guildDataPath))
   {
-    if (file.is_directory())
+    // LOA-fix (R58-9, round58, backlog #175): перехват разбора здесь уже есть, а
+    // фильтра расширения не было — временный файл разбирался бы наравне с данными.
+    if (not file.is_regular_file() || file.path().extension() != ".json")
       continue;
 
     std::ifstream dataFile(file.path());
@@ -1225,7 +1664,7 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
 
 void server::FileDataSource::CreateSettings(data::Settings& settings)
 {
-  settings.uid = ++_settingsSequentialId;
+  settings.uid = NextUid(_settingsSequentialId, "settings");
   SaveMetadata();
 }
 
@@ -1297,13 +1736,6 @@ void server::FileDataSource::StoreSettings(data::Uid uid, const data::Settings& 
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _settingsDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Settings file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = settings.uid();
 
@@ -1350,7 +1782,8 @@ void server::FileDataSource::StoreSettings(data::Uid uid, const data::Settings& 
     json["macros"] = settings.macros().value();
   }
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Settings file");
 }
 
 void server::FileDataSource::DeleteSettings(data::Uid uid)
@@ -1362,7 +1795,7 @@ void server::FileDataSource::DeleteSettings(data::Uid uid)
 
 void server::FileDataSource::CreateDailyQuestGroup(data::DailyQuestGroup& group)
 {
-  group.uid = ++_dailyQuestGroupSequentialId;
+  group.uid = NextUid(_dailyQuestGroupSequentialId, "dailyQuestGroup");
   SaveMetadata();
 }
 
@@ -1383,6 +1816,32 @@ void server::FileDataSource::RetrieveDailyQuestGroup(data::Uid uid, data::DailyQ
   group.rewardId     = json.value("rewardId", uint8_t{});
   group.rewardType   = json.value("rewardType", uint8_t{});
   group.rewardPoints = json.value("rewardPoints", uint32_t{0});
+  // LOA-fix (batch1 task3): день последнего сброса дейликов; старые файлы без
+  // ключа → 0 (никогда) → первый вход после деплоя сбросит квесты и carrotsClaimed.
+  group.lastResetDate = json.value("lastResetDate", uint32_t{0});
+  // LOA-fix (R17-cap, quest-batch-2, #8): daily class-exp cap counter. Old files
+  // without the key load as 0 (uncapped start after deploy — one-time, self-heals on
+  // the first daily reset).
+  group.dailyClassExpGranted = json.value("dailyClassExpGranted", uint32_t{0});
+  // ★МИГРАЦИЯ (Codex-CHANGES #8 iter2): для legacy-записи (ключа нет) сидируем
+  // dailyClassExpResetDate из ПЕРСИСТНУТОГО lastResetDate ПРЯМО ЗДЕСЬ, при
+  // десериализации — ДО того как любой runtime quest-reset (login/ранч-вход)
+  // продвинет lastResetDate. Под старой системой счётчик сбрасывался вместе с
+  // lastResetDate, поэтому lastResetDate из ЭТОГО ЖЕ json = истинная as-of-дата
+  // счётчика. Runtime-seed сломался бы: счётчик теперь переживает quest-reset
+  // (R42-7/8), значит к первому spend'у lastResetDate мог уже стать today при
+  // counter=вчерашний 6650 → underpay. Load-seed это исключает (одна точка,
+  // до всякого runtime-мутатора). Sync после этого — простой rollover-чек.
+  group.dailyClassExpResetDate = json.value(
+    "dailyClassExpResetDate", json.value("lastResetDate", uint32_t{0}));
+  // LOA-fix (F2, quest-batch-1): «награда дня выдана». Старые файлы без ключа →
+  // false (награда за сегодня ещё не забрана). Принимаем и bool, и легаси-int,
+  // ровно как carrotsClaimed выше.
+  if (const auto claimedIt = json.find("dailyRewardClaimed"); claimedIt != json.end())
+    group.dailyRewardClaimed =
+      claimedIt->is_boolean() ? claimedIt->get<bool>() : (claimedIt->get<int>() != 0);
+  else
+    group.dailyRewardClaimed = false;
   // Support both boolean `true`/`false` and legacy integer `1`/`0` representations.
   if (const auto it = json.find("carrotsClaimed"); it != json.end())
     group.carrotsClaimed = it->is_boolean() ? it->get<bool>() : (it->get<int>() != 0);
@@ -1404,18 +1863,15 @@ void server::FileDataSource::StoreDailyQuestGroup(data::Uid uid, const data::Dai
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _dailyQuestGroupDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Daily quest group file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"]          = group.uid();
   json["rewardId"]     = group.rewardId();
   json["rewardType"]   = group.rewardType();
   json["rewardPoints"] = group.rewardPoints();
+  json["lastResetDate"] = group.lastResetDate();
+  json["dailyRewardClaimed"] = static_cast<bool>(group.dailyRewardClaimed());
+  json["dailyClassExpGranted"] = group.dailyClassExpGranted();
+  json["dailyClassExpResetDate"] = group.dailyClassExpResetDate();
   json["carrotsClaimed"] = static_cast<bool>(group.carrotsClaimed());
 
   nlohmann::json questsJson = nlohmann::json::array();
@@ -1427,7 +1883,8 @@ void server::FileDataSource::StoreDailyQuestGroup(data::Uid uid, const data::Dai
     });
   }
   json["quests"] = questsJson;
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Daily quest group file");
 }
 
 void server::FileDataSource::DeleteDailyQuestGroup(data::Uid uid)
@@ -1439,7 +1896,7 @@ void server::FileDataSource::DeleteDailyQuestGroup(data::Uid uid)
 
 void server::FileDataSource::CreateMail(data::Mail& mail)
 {
-  mail.uid = ++_mailSequentialId;
+  mail.uid = NextUid(_mailSequentialId, "mail");
   SaveMetadata();
 }
 
@@ -1477,13 +1934,6 @@ void server::FileDataSource::StoreMail(data::Uid uid, const data::Mail& mail)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _mailDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Mail file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = mail.uid();
   json["from"] = mail.from();
@@ -1500,7 +1950,8 @@ void server::FileDataSource::StoreMail(data::Uid uid, const data::Mail& mail)
       mail.createdAt().time_since_epoch()).count();
   json["body"] = mail.body();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Mail file");
 }
 
 void server::FileDataSource::DeleteMail(data::Uid uid)
@@ -1512,7 +1963,7 @@ void server::FileDataSource::DeleteMail(data::Uid uid)
 
 void server::FileDataSource::CreateQuest(data::Quest& quest)
 {
-  quest.uid = ++_questSequentialId;
+  quest.uid = NextUid(_questSequentialId, "quest");
   SaveMetadata();
 }
 
@@ -1540,20 +1991,14 @@ void server::FileDataSource::StoreQuest(data::Uid uid, const data::Quest& quest)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _questDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Quest file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"]         = quest.uid();
   json["questId"]     = quest.questId();
   json["isCompleted"] = static_cast<uint32_t>(quest.isCompleted());
   json["progress"]    = quest.progress();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Quest file");
 }
 
 void server::FileDataSource::DeleteQuest(data::Uid uid)
@@ -1565,7 +2010,7 @@ void server::FileDataSource::DeleteQuest(data::Uid uid)
 
 void server::FileDataSource::CreateStallion(data::Stallion& stallion)
 {
-  stallion.uid = ++_stallionSequentialUid;
+  stallion.uid = NextUid(_stallionSequentialUid, "stallion");
   SaveMetadata();
 }
 
@@ -1598,13 +2043,6 @@ void server::FileDataSource::StoreStallion(data::Uid uid, const data::Stallion& 
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _stallionDataPath, std::format("{}", uid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Stallion file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["uid"] = stallion.uid();
   json["horseUid"] = stallion.horseUid();
@@ -1616,7 +2054,8 @@ void server::FileDataSource::StoreStallion(data::Uid uid, const data::Stallion& 
   json["expiresAt"] = std::chrono::duration_cast<std::chrono::seconds>(
     stallion.expiresAt().time_since_epoch()).count();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Stallion file");
 }
 
 void server::FileDataSource::DeleteStallion(data::Uid uid)
@@ -1657,7 +2096,7 @@ std::vector<server::data::Uid> server::FileDataSource::ListRegisteredStallions()
 
 void server::FileDataSource::CreateReward(data::Reward& reward)
 {
-  reward.claimUid = ++_rewardSequentialUid;
+  reward.claimUid = NextUid(_rewardSequentialUid, "reward");
   SaveMetadata();
 }
 
@@ -1690,13 +2129,6 @@ void server::FileDataSource::StoreReward(data::Uid claimUid, const data::Reward&
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _rewardDataPath, std::format("{}", claimUid));
 
-  std::ofstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Reward file '{}' not accessible", dataFilePath.string()));
-  }
-
   nlohmann::json json;
   json["claimUid"] = reward.claimUid();
   json["characterUid"] = reward.characterUid();
@@ -1708,7 +2140,8 @@ void server::FileDataSource::StoreReward(data::Uid claimUid, const data::Reward&
   json["claimedAt"] = std::chrono::duration_cast<std::chrono::seconds>(
     reward.claimedAt().time_since_epoch()).count();
 
-  dataFile << json.dump(2);
+  server::util::WriteFileAtomically(
+    dataFilePath, json.dump(2), "Reward file");
 }
 
 void server::FileDataSource::DeleteReward(data::Uid claimUid)

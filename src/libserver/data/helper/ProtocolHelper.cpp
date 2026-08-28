@@ -346,11 +346,17 @@ void BuildProtocolEgg(
   protocolEgg.itemTid = eggRecord.itemTid();
 
   const auto totalHatchingDuration = std::chrono::system_clock::now() - eggRecord.incubatedAt();
-  const auto totalBoostedDuration = eggRecord.boostsUsed() * std::chrono::hours(8);
+  // LOA-fix (R22-6, round22, backlog #92): clamp boostsUsed before the *8h so inflated
+  // legacy data cannot overflow the signed int64 nanosecond duration below.
+  const auto totalBoostedDuration = std::min<uint32_t>(eggRecord.boostsUsed(), 100000u) * std::chrono::hours(8);
   const auto hatchTimeRemaining = hatchDuration - totalHatchingDuration - totalBoostedDuration;
 
   const auto totalHatchingProgress = totalHatchingDuration + totalBoostedDuration;
-  const auto remainingHatchingProgress = hatchDuration - totalHatchingProgress;
+  auto remainingHatchingProgress = hatchDuration - totalHatchingProgress;
+  // LOA-fix (R22-6, round22, backlog #92): clamp — an over-boosted/overdue egg makes this
+  // negative, and the static_cast<uint32_t> below would wrap it to a huge bogus countdown.
+  if (remainingHatchingProgress < decltype(remainingHatchingProgress)::zero())
+    remainingHatchingProgress = decltype(remainingHatchingProgress)::zero();
 
   protocolEgg.remainingHatchingTime = static_cast<uint32_t>(
     std::chrono::duration_cast<std::chrono::seconds>(remainingHatchingProgress).count());

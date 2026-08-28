@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/data/DataRepair.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "libserver/data/DataDirector.hpp"
 #include "libserver/registry/HorseRegistry.hpp"
@@ -76,31 +77,94 @@ bool AreAnyDamaged(Storage& storage, const Container& uids)
   return anyDamaged;
 }
 
+//! Кладёт снятую ссылку в карантин персонажа (LOA-fix, R65-5, backlog #175).
+//!
+//! ★СНЯТИЕ БЕЗ ЗАПИСИ В КАРАНТИН БЫЛО БЫ ТЕМ ЖЕ ДЕФЕКТОМ. Поэтому карантин
+//! пополняется В ТОЙ ЖЕ мутации персонажа, что и удаление из живой коллекции:
+//! либо на диск уезжает и то и другое, либо ничего.
+//!
+//! ★ДУБЛЬ ОПРЕДЕЛЯЕТСЯ ПАРОЙ (uid, вид), А НЕ ОДНИМ uid — исправлено по ревью.
+//! Пространства идентификаторов у видов НЕЗАВИСИМЫ, и это не теория: в живом
+//! прод-снимке у ПЯТИ персонажей из девяти `settingsUid` совпадает с
+//! `dailyQuestGroupUid` (у ClaudeRU оба равны 5). Дедуп по одному uid означал бы,
+//! что при отказе обеих записей обе ссылки снимаются, а в карантин попадает
+//! ТОЛЬКО ОДНА — то есть раунд своими руками теряет имущество ровно так, как
+//! теряло то, что он чинит.
+inline void Quarantine(
+  data::Character& character,
+  const data::Uid uid,
+  const std::string_view referenceName)
+{
+  auto& quarantined = character.damagedReferences();
+
+  const auto alreadyQuarantined = std::ranges::any_of(
+    quarantined,
+    [uid, referenceName](const data::Character::DamagedReference& damaged)
+    {
+      return damaged.uid == uid && damaged.kind == referenceName;
+    });
+  if (alreadyQuarantined)
+    return;
+
+  quarantined.emplace_back(
+    data::Character::DamagedReference{uid, std::string(referenceName)});
+}
+
 //! Drops the references to damaged data from a collection of references.
 //! @param storage Storage owning the data.
 //! @param uids UIDs of the referenced data.
 //! @param referenceName Name of the reference, used for logging.
 //! @param characterUid UID of the character holding the references.
+//! @param character Character holding the references, receives the quarantine.
 template <typename Storage, typename Container>
 void DropDamagedReferences(
   Storage& storage,
   Container& uids,
   const std::string_view referenceName,
-  const data::Uid characterUid)
+  const data::Uid characterUid,
+  data::Character& character)
 {
+  // ★ТРИ ПРОХОДА ВМЕСТО ОДНОГО, И ЭТО НЕ ПРО КРАСОТУ — исправлено по ревью.
+  // Раньше карантин пополнялся ВНУТРИ предиката `std::erase_if`. Предикат,
+  // выделяющий память, может бросить ПОСРЕДИ уплотнения вектора и оставить
+  // коллекцию в частично уплотнённом состоянии, откатить которое некому, — а
+  // выключение потом сохранит её на диск. Это порча ХУЖЕ исходного дефекта.
+  //
+  // Поэтому: сначала СМОТРИМ (коллекция не тронута), потом ВЫДЕЛЯЕМ (коллекция
+  // всё ещё цела — бросок здесь не портит ничего), и только потом стираем
+  // предикатом, который не умеет бросить.
+  std::vector<data::Uid> damaged;
+  for (const auto uid : uids)
+  {
+    // Посещается КАЖДЫЙ uid: посещение ставит в очередь и повторную попытку чтения.
+    if (IsDamaged(storage, uid))
+      damaged.push_back(uid);
+  }
+
+  if (damaged.empty())
+    return;
+
+  for (const auto uid : damaged)
+  {
+    Quarantine(character, uid, referenceName);
+
+    // ★ТЕКСТ ПЕРЕПИСАН ВМЕСТЕ С ПОВЕДЕНИЕМ. Раньше строка говорила «dropping» и
+    // была правдой: ссылка исчезала навсегда. Теперь она уходит в карантин, и
+    // старый текст врал бы оператору ровно в тот момент, когда он решает,
+    // спасать ли данные (класс #223 — лживый комментарий живёт дольше кода).
+    server::util::QuietLogError(
+      "Quarantined the damaged {} {} of character {}; the reference is kept in "
+      "damagedReferences and can be restored once the datum is readable again",
+      referenceName,
+      uid,
+      characterUid);
+  }
+
   std::erase_if(
     uids,
-    [&storage, referenceName, characterUid](const data::Uid uid)
+    [&damaged](const data::Uid uid) noexcept
     {
-      if (not IsDamaged(storage, uid))
-        return false;
-
-      spdlog::error(
-        "Dropping the reference to the damaged {} {} of character {}",
-        referenceName,
-        uid,
-        characterUid);
-      return true;
+      return std::ranges::find(damaged, uid) != damaged.end();
     });
 }
 
@@ -109,18 +173,23 @@ void DropDamagedReferences(
 //! @param uid Reference to the datum.
 //! @param referenceName Name of the reference, used for logging.
 //! @param characterUid UID of the character holding the reference.
+//! @param character Character holding the reference, receives the quarantine.
 template <typename Storage>
 void ClearDamagedReference(
   Storage& storage,
   dao::Field<data::Uid>& uid,
   const std::string_view referenceName,
-  const data::Uid characterUid)
+  const data::Uid characterUid,
+  data::Character& character)
 {
   if (not IsDamaged(storage, uid()))
     return;
 
-  spdlog::error(
-    "Dropping the reference to the damaged {} {} of character {}",
+  Quarantine(character, uid(), referenceName);
+
+  server::util::QuietLogError(
+    "Quarantined the damaged {} {} of character {}; the reference is kept in "
+    "damagedReferences and can be restored once the datum is readable again",
     referenceName,
     uid(),
     characterUid);
@@ -250,12 +319,15 @@ bool repair::CleanseCharacterReferences(
       VisitCharacterReferences(
         dataDirector,
         character,
-        [characterUid](auto& storage, const std::string_view referenceName, auto& reference)
+        [characterUid, &character](
+          auto& storage, const std::string_view referenceName, auto& reference)
         {
+          // LOA-fix (R65-5, backlog #175): персонаж передаётся вниз, чтобы
+          // снятие ссылки и запись в карантин произошли в ОДНОЙ мутации.
           if constexpr (IsSingleReference<decltype(reference)>)
-            ClearDamagedReference(storage, reference, referenceName, characterUid);
+            ClearDamagedReference(storage, reference, referenceName, characterUid, character);
           else
-            DropDamagedReferences(storage, reference, referenceName, characterUid);
+            DropDamagedReferences(storage, reference, referenceName, characterUid, character);
         });
 
       if (not isMountDamaged)
@@ -265,15 +337,22 @@ bool repair::CleanseCharacterReferences(
       // so leave the damaged mount in place rather than make the character worse off.
       if (replacementMountUid == data::InvalidUid)
       {
-        spdlog::error(
+        server::util::QuietLogError(
           "Character {} has the damaged mount {}, for which no replacement could be built",
           characterUid,
           character.mountUid());
         return;
       }
 
-      spdlog::error(
-        "Dropping the reference to the damaged mount {} of character {}, replaced by mount {}",
+      // LOA-fix (R65-5, backlog #175): маунт — единственная ссылка, которая не
+      // просто снимается, а ПОДМЕНЯЕТСЯ (персонаж без маунта не грузится). Тем
+      // важнее сохранить снятый uid: без него подмена дефолтной коричневой
+      // лошадью необратима так же, как раньше была необратима ампутация.
+      Quarantine(character, character.mountUid(), "mount");
+
+      server::util::QuietLogError(
+        "Quarantined the damaged mount {} of character {}, replaced by mount {}; the "
+        "reference is kept in damagedReferences and can be restored",
         character.mountUid(),
         characterUid,
         replacementMountUid);
@@ -314,7 +393,7 @@ bool repair::CleanseUserReferences(
           if (not IsDamaged(dataDirector.GetInfractionCache(), uid))
             return false;
 
-          spdlog::error(
+          server::util::QuietLogError(
             "Dropping the reference to the damaged infraction {} of user '{}'",
             uid,
             userName);
