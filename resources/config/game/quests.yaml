@@ -436,6 +436,20 @@ quests:
       exp: 0
       keyNpcDress: 7
       items: []
+    # LOA-fix (F6, quest-batch-1): награда 170 отсутствовала в quests.yaml —
+    # единственная висячая ссылка в файле. На неё ссылается квест 14032
+    # («[겨울 이벤트] 목장 식구들의 겨울 의상 Ⅴ», финал зимней цепочки), поэтому
+    # финал не выдавал ничего. Значения восстановлены из клиентской таблицы
+    # QuestReward (alicia-local/quests/quests-client.json, Quest 14032 →
+    # reward.reward_table): предмет 30160 × 360, keyNpcDress 8, морковок нет.
+    - id: 170
+      desc: '14032 퀘스트 남자 보상'
+      carrots: 0
+      exp: 0
+      keyNpcDress: 8
+      items:
+        - tid: 30160
+          count: 360
     - id: 1000
       desc: '트리 모양 바꾸기 테스트'
       carrots: 100
@@ -1087,7 +1101,7 @@ quests:
       startNpcId: 1
       endNpcId: 1
       preceding:
-        - 11031
+        - 12010
       successType: 0
       successValue: 1
       function: 'ClearMission'
@@ -1106,7 +1120,7 @@ quests:
       startNpcId: 1
       endNpcId: 1
       preceding:
-        - 14014
+        - 11032
       successType: 0
       successValue: 1
       function: 'ClearMission'
@@ -1240,7 +1254,7 @@ quests:
       startNpcId: 1
       endNpcId: 1
       preceding:
-        - 12017
+        - 13010
       successType: 1
       successValue: 3
       function: 'RunMap'
@@ -1315,9 +1329,8 @@ quests:
       level: 1
       gameModeFlag: 0
       startNpcId: 2
-      endNpcId: 3
-      preceding:
-        - 11030
+      endNpcId: 4
+      preceding: []
       successType: 0
       successValue: 1
       function: 'TRUE'
@@ -1525,10 +1538,10 @@ quests:
       difficult: 1
       level: 1
       gameModeFlag: 35
-      startNpcId: 3
-      endNpcId: 3
+      startNpcId: 4
+      endNpcId: 4
       preceding:
-        - 11032
+        - 11033
       successType: 1
       successValue: 20
       function: 'PerfectJump'
@@ -1544,10 +1557,10 @@ quests:
       difficult: 2
       level: 3
       gameModeFlag: 111
-      startNpcId: 3
-      endNpcId: 3
+      startNpcId: 4
+      endNpcId: 4
       preceding:
-        - 14014
+        - 11041
       successType: 0
       successValue: 800
       function: 'GlidingDistanceValue'
@@ -1602,10 +1615,10 @@ quests:
       difficult: 2
       level: 11
       gameModeFlag: 111
-      startNpcId: 3
-      endNpcId: 3
+      startNpcId: 4
+      endNpcId: 4
       preceding:
-        - 12010
+        - 13011
       successType: 1
       successValue: 5
       function: 'RunMap'

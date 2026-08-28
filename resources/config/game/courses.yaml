@@ -89,6 +89,35 @@ courses:
         perfectSpurCheckTime: 0
         spurConsumeStarPoints: 40000
         starPointsMax: 100000
+      # Tutorial game mode (type 6) — обучающие заезды (планирование, прыжки и т.п.).
+      # Без него сервер бросает "Invalid course game mode" и заезд не стартует.
+      # Параметры базовые (по образцу Speed), без спавна предметов.
+      - type: 6
+        goodJumpStarPoints: 12000
+        itemSpawners:
+          collection: {}
+        mapPool:
+          collection:
+            - mapBlockId: 1
+            - mapBlockId: 13
+            - mapBlockId: 41
+            - mapBlockId: 46
+            - mapBlockId: 14
+            - mapBlockId: 21
+            - mapBlockId: 20
+            - mapBlockId: 18
+            - mapBlockId: 15
+            - mapBlockId: 16
+            # LOA-fix (R63-окно, backlog #219): обучающий заезд «Планирование»
+            # запрашивает эту карту; без неё сервер отклонял запрос и оставлял
+            # предыдущую, а клиент рисовал сцену 67 — отсюда «полёт в текстурах».
+            - mapBlockId: 67
+        perfectJumpStarPoints: 12000
+        perfectJumpUnitStarPoints: 1000
+        perfectJumpMaxBonusCombo: 5
+        perfectSpurCheckTime: 600
+        spurConsumeStarPoints: 40000
+        starPointsMax: 120000
   # A deck represents a set of items spawnable on a track.
   # Originates from
   # This should be called `decks`
@@ -149,6 +178,273 @@ courses:
         magicSlot: 18
       - id: 412
         magicSlot: 27
+  # LOA-fix (R68, backlog #5/#99): ДЕКИ СПАВНА КВЕСТОВЫХ ПРЕДМЕТОВ.
+  # Перенос клиентской таблицы `QuestItemDeckInfo` (23 записи) один-в-один.
+  #   questDeckId — QDeckID таблицы (нумерация с пропусками 10 и 15 — как в игре);
+  #   questItemId — QTemID предмета. ЭТО ЖЕ число стоит в Quest::functionValue
+  #                 у квестов класса CollectDropItem (сверено по всем 17);
+  #   spawnCount  — SpawnCnt: сколько предметов получает ОДИН гонщик за заезд;
+  #   spawnPoints — клиентский формат «карта(дека)»: координаты берутся из
+  #                 deckItems ЭТОЙ карты по этому deckId, а сам deckId уходит
+  #                 клиенту как itemType (внешний вид, таблица DeckItemParam).
+  # ★ДЕКА 701 (записи 6 и 100-104, ивентовые квесты 1035-1039) НАМЕРЕННО
+  # ОСТАВЛЕНА: в mapBlockInfo НЕТ НИ ОДНОЙ её координаты, поэтому спавн по ней
+  # физически пуст. Держим строки, чтобы таблица совпадала с клиентской, а не
+  # выглядела «почти как в игре».
+  questItemDeckInfo:
+    collection:
+      # QDeckID 1: Мискант с полей Побеа (QTemID 4)
+      - questDeckId: 1
+        questItemId: 4
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 1001
+      # QDeckID 2: Плод пальмы пустыни Акинз (QTemID 5)
+      - questDeckId: 2
+        questItemId: 5
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 1002
+      # QDeckID 3: Клок овечьей шерсти (QTemID 6)
+      - questDeckId: 3
+        questItemId: 6
+        spawnCount: 4
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 1002
+            - mapBlockId: 3
+              deckId: 1002
+            - mapBlockId: 13
+              deckId: 1002
+            - mapBlockId: 40
+              deckId: 1002
+            - mapBlockId: 46
+              deckId: 1002
+      # QDeckID 4: Загадочный осколок кристалла (QTemID 1)
+      - questDeckId: 4
+        questItemId: 1
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 1003
+      # QDeckID 5: Руда эльдрина (QTemID 7)
+      - questDeckId: 5
+        questItemId: 7
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 1001
+      # QDeckID 6: Мискант с полей Побеа (QTemID 4)
+      - questDeckId: 6
+        questItemId: 4
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 7: Осколок семенного кристалла (QTemID 3)
+      - questDeckId: 7
+        questItemId: 3
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 13
+              deckId: 1004
+      # QDeckID 8: Осколок семенного кристалла (QTemID 3)
+      - questDeckId: 8
+        questItemId: 3
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 12
+              deckId: 1003
+            - mapBlockId: 10
+              deckId: 1003
+      # QDeckID 9: Осколок семенного кристалла (QTemID 3)
+      - questDeckId: 9
+        questItemId: 3
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 18
+              deckId: 1003
+            - mapBlockId: 9
+              deckId: 1003
+      # QDeckID 11: Плод пальмы пустыни Акинз (QTemID 5)
+      - questDeckId: 11
+        questItemId: 5
+        spawnCount: 4
+        spawnPoints:
+          collection:
+            - mapBlockId: 42
+              deckId: 1006
+            - mapBlockId: 41
+              deckId: 1006
+      # QDeckID 12: Плод пальмы пустыни Акинз (QTemID 5)
+      - questDeckId: 12
+        questItemId: 5
+        spawnCount: 4
+        spawnPoints:
+          collection:
+            - mapBlockId: 24
+              deckId: 1006
+      # QDeckID 13: Осколок семенного кристалла (QTemID 3)
+      - questDeckId: 13
+        questItemId: 3
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 13
+              deckId: 1008
+            - mapBlockId: 3
+              deckId: 1008
+      # QDeckID 14: Листовка торгового ряда (QTemID 8)
+      - questDeckId: 14
+        questItemId: 8
+        spawnCount: 4
+        spawnPoints:
+          collection:
+            - mapBlockId: 8
+              deckId: 1007
+            - mapBlockId: 11
+              deckId: 1007
+      # QDeckID 16: Осколок семенного кристалла (QTemID 3)
+      - questDeckId: 16
+        questItemId: 3
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 15
+              deckId: 1008
+            - mapBlockId: 4
+              deckId: 1008
+      # QDeckID 17: Красный ёлочный шар (QTemID 15)
+      - questDeckId: 17
+        questItemId: 15
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 46
+              deckId: 2001
+      # QDeckID 18: Зелёный ёлочный шар (QTemID 16)
+      - questDeckId: 18
+        questItemId: 16
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 46
+              deckId: 2001
+      # QDeckID 19: Синий ёлочный шар (QTemID 17)
+      - questDeckId: 19
+        questItemId: 17
+        spawnCount: 3
+        spawnPoints:
+          collection:
+            - mapBlockId: 46
+              deckId: 2001
+      # QDeckID 100: Ивент: клейкий рис (QTemID 9)
+      - questDeckId: 100
+        questItemId: 9
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 101: Ивент: полынь (QTemID 10)
+      - questDeckId: 101
+        questItemId: 10
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 102: Ивент: зелёные бобы (QTemID 11)
+      - questDeckId: 102
+        questItemId: 11
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 103: Ивент: кунжут и сахар (QTemID 12)
+      - questDeckId: 103
+        questItemId: 12
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 104: Ивент: сосновая хвоя (QTemID 13)
+      - questDeckId: 104
+        questItemId: 13
+        spawnCount: 1
+        spawnPoints:
+          collection:
+            - mapBlockId: 0
+              deckId: 701
+      # QDeckID 105: Шоколадные палочки (QTemID 14)
+      - questDeckId: 105
+        questItemId: 14
+        spawnCount: 2
+        spawnPoints:
+          collection:
+            - mapBlockId: 1
+              deckId: 2000
+            - mapBlockId: 2
+              deckId: 2000
+            - mapBlockId: 3
+              deckId: 2000
+            - mapBlockId: 4
+              deckId: 2000
+            - mapBlockId: 5
+              deckId: 2000
+            - mapBlockId: 6
+              deckId: 2000
+            - mapBlockId: 7
+              deckId: 2000
+            - mapBlockId: 8
+              deckId: 2000
+            - mapBlockId: 9
+              deckId: 2000
+            - mapBlockId: 10
+              deckId: 2000
+            - mapBlockId: 11
+              deckId: 2000
+            - mapBlockId: 12
+              deckId: 2000
+            - mapBlockId: 13
+              deckId: 2000
+            - mapBlockId: 14
+              deckId: 2000
+            - mapBlockId: 15
+              deckId: 2000
+            - mapBlockId: 16
+              deckId: 2000
+            - mapBlockId: 18
+              deckId: 2000
+            - mapBlockId: 19
+              deckId: 2000
+            - mapBlockId: 20
+              deckId: 2000
+            - mapBlockId: 21
+              deckId: 2000
+            - mapBlockId: 22
+              deckId: 2000
+            - mapBlockId: 24
+              deckId: 2000
+            - mapBlockId: 40
+              deckId: 2000
+            - mapBlockId: 41
+              deckId: 2000
+            - mapBlockId: 42
+              deckId: 2000
   mapBlockInfo:
     collection:
       - id:  1
