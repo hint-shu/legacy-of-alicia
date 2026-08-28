@@ -18,6 +18,7 @@
  **/
 
 #include "server/Config.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include <libserver/util/Util.hpp>
 
@@ -64,7 +65,7 @@ void Config::LoadFromEnvironment()
     }
     catch (const std::exception&)
     {
-      spdlog::error(" Couldn't resolve the host for '{}'", addressVariableName);
+      server::util::QuietLogError(" Couldn't resolve the host for '{}'", addressVariableName);
     }
 
     // Get the port.
@@ -77,7 +78,7 @@ void Config::LoadFromEnvironment()
         port);
       if (result.ec != std::errc{})
       {
-        spdlog::error("Couldn't resolve the port for '{}'.", portVariableName);
+        server::util::QuietLogError("Couldn't resolve the port for '{}'.", portVariableName);
       }
     }
   };
@@ -152,7 +153,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
 
   if (not file.is_open())
   {
-    spdlog::error(
+    server::util::QuietLogError(
       "Could not open configuration file at '{}'",
       filePath.string());
     return;
@@ -169,7 +170,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Failed parsing address or port: {}", e.what());
+      server::util::QuietLogError("Failed parsing address or port: {}", e.what());
     }
 
     return Listen{};
@@ -190,7 +191,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the general config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the general config: {}", e.what());
     }
 
     // Authentication config
@@ -202,7 +203,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the authentication config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the authentication config: {}", e.what());
     }
 
     // Metrics config
@@ -215,7 +216,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the metrics config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the metrics config: {}", e.what());
     }
 
     // Lobby config
@@ -235,7 +236,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the lobby config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the lobby config: {}", e.what());
     }
 
     // Ranch config
@@ -247,7 +248,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the ranch config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the ranch config: {}", e.what());
     }
 
     // Race config
@@ -259,7 +260,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the race config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the race config: {}", e.what());
     }
 
     // Messenger config
@@ -271,7 +272,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the messenger config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the messenger config: {}", e.what());
     }
 
     // All chat config
@@ -283,7 +284,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the all chat config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the all chat config: {}", e.what());
     }
 
     // Private chat config
@@ -295,7 +296,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the private chat config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the private chat config: {}", e.what());
     }
 
     // UDP race relay config
@@ -307,7 +308,7 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the udp race relay config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the udp race relay config: {}", e.what());
     }
 
     // Messenger config
@@ -323,17 +324,17 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
       }
       else
       {
-        spdlog::error("Unsupported data source type: {}", dataSourceName);
+        server::util::QuietLogError("Unsupported data source type: {}", dataSourceName);
       }
     }
     catch (const std::exception& e)
     {
-      spdlog::error("Unhandled exception parsing the dat config: {}", e.what());
+      server::util::QuietLogError("Unhandled exception parsing the dat config: {}", e.what());
     }
   }
   catch (const std::exception& e)
   {
-    spdlog::error("Unhandled exception parsing the config: {}", e.what());
+    server::util::QuietLogError("Unhandled exception parsing the config: {}", e.what());
   }
 }
 

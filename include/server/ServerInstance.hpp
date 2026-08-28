@@ -21,6 +21,7 @@
 #define INSTANCE_HPP
 
 #include "authentication/AuthenticationService.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "server/chat/AllChatDirector.hpp"
 #include "server/chat/PrivateChatDirector.hpp"
 #include "server/Config.hpp"
@@ -33,6 +34,7 @@
 #include "server/system/ChatSystem.hpp"
 #include "server/system/HorseSystem.hpp"
 #include "server/system/InfractionSystem.hpp"
+#include "server/system/AchievementSystem.hpp"
 #include "server/system/ItemSystem.hpp"
 #include "server/system/MatchmakingSystem.hpp"
 #include "server/system/ModerationSystem.hpp"
@@ -50,6 +52,8 @@
 #include <libserver/registry/ItemRegistry.hpp>
 #include <libserver/registry/MagicRegistry.hpp>
 #include <libserver/registry/PetRegistry.hpp>
+#include <libserver/registry/AchievementRegistry.hpp>
+#include <libserver/registry/CareSkillRegistry.hpp>
 #include <libserver/registry/QuestRegistry.hpp>
 #include <libserver/registry/SystemContentRegistry.hpp>
 
@@ -130,6 +134,18 @@ public:
   //! @returns Reference to the Quest registry.
   registry::QuestRegistry& GetQuestRegistry();
 
+  //! Returns reference to the CareSkill registry.
+  //! @returns Reference to the CareSkill registry.
+  registry::CareSkillRegistry& GetCareSkillRegistry();
+
+  //! Returns reference to the achievement registry.
+  //! @returns Reference to the achievement registry.
+  registry::AchievementRegistry& GetAchievementRegistry();
+
+  //! Returns reference to the achievement system.
+  //! @returns Reference to the achievement system.
+  AchievementSystem& GetAchievementSystem();
+
   //! Returns reference to the Magic registry.
   //! @returns Reference to the Magic registry.
   registry::MagicRegistry& GetMagicRegistry();
@@ -198,6 +214,17 @@ public:
   //! @returns Reference to the settings.
   Config& GetSettings();
 
+  //! Returns the server resource directory — the base path whose `data/`
+  //! subtree FileDataSource reads (users, characters, horses, ...).
+  //! LOA-fix (#18b): поле _resourceDirectory приватное и геттера НЕ имело.
+  //! Auth-бэкенд обязан строить каталог users из ЭТОГО источника
+  //! (resourceDirectory/"data"/"users") — тем же, что DataDirector, — а НЕ из
+  //! data.file.basePath, который относителен cwd процесса и указывает не туда.
+  [[nodiscard]] const std::filesystem::path& GetResourceDirectory() const
+  {
+    return _resourceDirectory;
+  }
+
 private:
 
   template<typename T>
@@ -232,7 +259,7 @@ private:
       }
       catch (const std::exception& x)
       {
-        spdlog::error("Exception in tick loop: {}", x.what());
+        server::util::QuietLogError("Exception in tick loop: {}", x.what());
       }
     }
   }
@@ -299,6 +326,10 @@ private:
   registry::PetRegistry _petRegistry;
   //! A registry of quests.
   registry::QuestRegistry _questRegistry;
+  //! A registry of care skills.
+  registry::CareSkillRegistry _careSkillRegistry;
+  //! A registry of achievements.
+  registry::AchievementRegistry _achievementRegistry;
   //! The system content registry.
   registry::SystemContentRegistry _systemContentRegistry;
   //! A registry of breeding config data.
@@ -318,6 +349,8 @@ private:
   ModerationSystem _moderationSystem;
   //! A quest system.
   QuestSystem _questSystem;
+  //! Достижения: продвигает их по СЕРВЕРНЫМ событиям.
+  AchievementSystem _achievementSystem;
   //! A room system.
   RoomSystem _roomSystem;
   //! A matchmaking system.

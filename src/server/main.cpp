@@ -18,6 +18,7 @@
  **/
 
 #include "Version.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "server/ServerInstance.hpp"
 #include <libserver/util/Util.hpp>
 
@@ -26,6 +27,7 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <iostream>
@@ -44,6 +46,12 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 std::atomic_bool shouldProgramRun = true;
+// LOA-fix (R65-1, backlog #200): запись в atomic из обработчика сигнала законна
+// только если он БЕЗ ЗАМКА. Утверждение проверяет КОМПИЛЯТОР, а не память
+// читающего: комментарий «здесь всё в порядке» не умеет провалиться.
+static_assert(
+  std::atomic_bool::is_always_lock_free,
+  "the shutdown flag is written from a signal handler and has to be lock-free");
 std::condition_variable shouldProgramRunCv;
 
 std::shared_ptr<spdlog::logger> g_logger;
@@ -59,7 +67,7 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
     case CTRL_C_EVENT:
     case CTRL_CLOSE_EVENT:
       {
-        spdlog::debug("Shutting down because of CTRL+C");
+        server::util::QuietLogDebug("Shutting down because of CTRL+C");
         shouldProgramRun.store(false, std::memory_order::relaxed);
         shouldProgramRunCv.notify_all();
         return TRUE;
@@ -75,9 +83,16 @@ void handler(int sig, siginfo_t*, void*)
 {
   if (sig == SIGTERM)
   {
-    spdlog::debug("Shutting down because of SIGTERM");
+    // LOA-fix (R65-1, backlog #200): обработчик сигнала делает РОВНО ОДНО —
+    // выставляет флаг. Раньше он ещё писал в лог и будил условную переменную, и
+    // ОБА действия не сигнало-безопасны: spdlog берёт мьютекс и выделяет память,
+    // notify_all трогает внутренности condition_variable. Сигнал приходит в
+    // ПРОИЗВОЛЬНЫЙ поток в ПРОИЗВОЛЬНЫЙ момент — в том числе когда прерванный
+    // поток уже держит этот же мьютекс. Тогда выключение ЗАВИСАЕТ, docker stop
+    // добивает SIGKILL, и запись, шедшая в этот момент, остаётся обрезанной.
+    // ★Наши собственные деплой-раунды останавливают сервер постоянно, так что
+    // это путь, по которому ходим чаще всех мы сами.
     shouldProgramRun.store(false, std::memory_order::relaxed);
-    shouldProgramRunCv.notify_all();
   }
 }
 
@@ -122,7 +137,7 @@ int main(int argc, char** argv)
   // Register the control handler.
   if (SetConsoleCtrlHandler(CtrlHandler, TRUE) == FALSE)
   {
-    spdlog::error(
+    server::util::QuietLogError(
       "Failed to set the console control handler. Windows error: 0x{:x}",
       GetLastError());
     return 1;
@@ -135,7 +150,7 @@ int main(int argc, char** argv)
   act.sa_sigaction = &handler;
   if (sigaction(SIGTERM, &act, nullptr) == -1)
   {
-    spdlog::error("Failed to change the signal action handler for SIGTERM");
+    server::util::QuietLogError("Failed to change the signal action handler for SIGTERM");
     return 1;
   }
 #endif
@@ -161,16 +176,16 @@ int main(int argc, char** argv)
   // Set is as the default logger for the application.
   spdlog::set_default_logger(g_logger);
 
-  spdlog::info("Running dedicated Alicia server v{}.", server::BuildVersion);
+  server::util::QuietLogInfo("Running dedicated Alicia server v{}.", server::BuildVersion);
   if (not baseDirectory.empty())
-    spdlog::info("Base directory: {}", baseDirectory.string());
+    server::util::QuietLogInfo("Base directory: {}", baseDirectory.string());
   else
-    spdlog::info("Base directory is the working directory");
+    server::util::QuietLogInfo("Base directory is the working directory");
 
   server::ServerInstance serverInstance(baseDirectory);
   serverInstance.Initialize();
 
-  spdlog::info(
+  server::util::QuietLogInfo(
     "Server started up in {}ms",
     std::chrono::duration_cast<std::chrono::milliseconds>(
       Clock::now() - serverStartupTime)
@@ -181,22 +196,35 @@ int main(int argc, char** argv)
   #ifndef WIN32
   if (not isatty(STDIN_FILENO))
   {
-    spdlog::info("TTY not available");
+    server::util::QuietLogInfo("TTY not available");
     interactiveMode = false;
   }
   #endif
 
   if (not interactiveMode)
   {
-    spdlog::info("Not running in an interactive mode");
+    server::util::QuietLogInfo("Not running in an interactive mode");
 
     std::mutex threadMtx;
     std::unique_lock threadLock(threadMtx);
 
+    // LOA-fix (R65-2, backlog #200): ждём С ТАЙМАУТОМ, а не бессрочно.
+    // ★Дело не только в сигнало-безопасности. Прежняя пара «флаг + notify из
+    // обработчика» вместе с бессрочным wait давала ПОТЕРЮ ПРОБУЖДЕНИЯ: сигнал,
+    // пришедший ПОСЛЕ проверки условия, но ДО входа в wait, будил условную
+    // переменную, которую ещё никто не слушает, — и уведомление пропадало
+    // насовсем. Флаг при этом уже false, но прочитать его некому: поток спит
+    // вечно. Снаружи это ровно «сервер не выключается», а дальше SIGKILL.
+    // С таймаутом потерянное уведомление стоит одну задержку вместо вечности,
+    // и будить из обработчика больше не нужно вовсе.
     while (shouldProgramRun)
     {
-      shouldProgramRunCv.wait(threadLock);
+      shouldProgramRunCv.wait_for(threadLock, std::chrono::milliseconds(200));
     }
+
+    // ★Причина выключения печатается ЗДЕСЬ, в обычном потоке, а не в
+    // обработчике сигнала. Диагностика сохранена, сигнальный контекст чист.
+    server::util::QuietLogInfo("Shutting down, the shutdown flag was cleared");
   }
   else
   {

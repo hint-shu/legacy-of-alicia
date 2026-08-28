@@ -18,6 +18,7 @@
  **/
 
 #include "server/telemetry/Telemetry.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/ServerInstance.hpp"
 
@@ -50,12 +51,12 @@ void Telemetry::Initialize()
 
   if (settings.telemetry.backend == "none")
   {
-    spdlog::info("Telemetry is not using any backend");
+    server::util::QuietLogInfo("Telemetry is not using any backend");
     ScheduleCollectData();
   }
   if (settings.telemetry.backend == "postgres")
   {
-    spdlog::info("Telemetry is using PostgreSQL backend");
+    server::util::QuietLogInfo("Telemetry is using PostgreSQL backend");
 
     ConnectPostgresBackend();
 
@@ -64,10 +65,10 @@ void Telemetry::Initialize()
   }
   else
   {
-    spdlog::warn("Telemetry is using an unknown backend");
+    server::util::QuietLogWarn("Telemetry is using an unknown backend");
   }
 
-  spdlog::info("Telemetry is collecting metrics");
+  server::util::QuietLogInfo("Telemetry is collecting metrics");
 }
 
 void Telemetry::Terminate()
@@ -95,12 +96,12 @@ void Telemetry::ConnectPostgresBackend()
 
     const auto time = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - timerBegin);
-    spdlog::info("Connection to telemetry backend established in {}ms", time.count());
+    server::util::QuietLogInfo("Connection to telemetry backend established in {}ms", time.count());
   }
   catch (const std::exception& x)
   {
-    spdlog::warn("Telemetry backend exception: {}", x.what());
-    spdlog::error("Telemetry backend is not functional, data are not synchronized");
+    server::util::QuietLogWarn("Telemetry backend exception: {}", x.what());
+    server::util::QuietLogError("Telemetry backend is not functional, data are not synchronized");
   }
 }
 
@@ -125,7 +126,7 @@ void Telemetry::ScheduleCollectData()
       }
       catch (const std::exception& x)
       {
-        spdlog::error("Exception occurred while collecting metrics: {}", x.what());
+        server::util::QuietLogError("Exception occurred while collecting metrics: {}", x.what());
       }
     },
     Scheduler::Clock::now() + std::chrono::seconds(1));
@@ -174,7 +175,7 @@ void Telemetry::SynchronizeData()
   }
   catch (const pqxx::broken_connection&)
   {
-    spdlog::warn("Lost connection to telemetry backend, attempting to perform a reconnect");
+    server::util::QuietLogWarn("Lost connection to telemetry backend, attempting to perform a reconnect");
     ConnectPostgresBackend();
   }
 }
@@ -191,7 +192,7 @@ void Telemetry::ScheduleSynchronizeData()
       }
       catch (const std::exception& x)
       {
-        spdlog::error("Exception occurred while synchronizing data with telemetry backend: {}", x.what());
+        server::util::QuietLogError("Exception occurred while synchronizing data with telemetry backend: {}", x.what());
       }
     },
     Scheduler::Clock::now() + std::chrono::minutes(1));
