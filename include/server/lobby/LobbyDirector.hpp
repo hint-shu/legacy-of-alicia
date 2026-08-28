@@ -25,6 +25,8 @@
 #include "server/system/MatchmakingSystem.hpp"
 #include "server/lobby/shop/Shop.hpp"
 
+#include <shared_mutex>
+
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/network/NetworkDefinitions.hpp>
 #include <libserver/util/Scheduler.hpp>
@@ -98,8 +100,23 @@ public:
     const std::string& userName);
 
   bool IsUserOnline(const std::string& userName);
-  UserInstance& GetUser(const std::string& userName);
-  const UserInstance& GetUserByCharacterUid(data::Uid characterUid);
+
+  //! ★ВОЗВРАТ ПО ЗНАЧЕНИЮ, А НЕ ПО ССЫЛКЕ (R59, #209). Ссылка внутрь карты
+  //! переживала бы любой замок: пока вызывающий ей пользуется, чужой поток
+  //! волен вставить, перестроить карту и сделать её висячей. Копия у
+  //! `UserInstance` дешёвая — четыре числа и имя.
+  UserInstance GetUser(const std::string& userName);
+  UserInstance GetUserByCharacterUid(data::Uid characterUid);
+
+  //! Снимок всех вошедших (R59, #209) — замена `GetUsers`, отдававшего карту
+  //! наружу по ссылке. Имя пользователя лежит внутри `UserInstance`, поэтому
+  //! перебиравшим пары ключ-значение ничего не теряется.
+  [[nodiscard]] std::vector<UserInstance> SnapshotUsers();
+
+  //! Единственный способ поменять привязку персонажа (R59, #209). Раньше это
+  //! делали присваиванием через ссылку из `GetUser`; теперь запись происходит
+  //! ВНУТРИ директора, под исключительным замком.
+  void SetUserCharacterUid(const std::string& userName, data::Uid characterUid);
 
   void SetUserRoom(const std::string& userName, data::Uid roomUid);
 
@@ -136,7 +153,9 @@ public:
 
   //! Get users
   //! @return Get users.
-  [[nodiscard]] std::unordered_map<std::string, UserInstance>& GetUsers();
+  // ★`GetUsers` УДАЛЁН ЦЕЛИКОМ (R59, #209), а не оставлен без вызовов.
+  // Объявление, отдающее карту наружу по ссылке, — приглашение вернуть дыру
+  // следующей же правкой. Замена — `SnapshotUsers` выше.
   //! Get user count.
   //! @return User count.
   [[nodiscard]] size_t GetUserCount();
@@ -179,6 +198,11 @@ private:
 
   std::unordered_map<network::ClientId, QueuedLogin> _clientLogins;
 
+  //! ★Замок именно `shared_mutex`, а не обычный: читателей у этой карты
+    //! много и они на разных потоках (ранчо, гонка, чат, all-chat, лобби-сеть),
+    //! а писателей два — вход и выход игрока. Критическая секция при этом
+    //! короткая, поэтому выигрыш проверяется замером, а не принимается на веру.
+  mutable std::shared_mutex _userInstancesMutex;
   std::unordered_map<std::string, UserInstance> _userInstances;
   std::unordered_map<data::Uid, GuildInstance> _guildInstances;
   std::unordered_set<data::Uid> _charactersForcedIntoCreator;

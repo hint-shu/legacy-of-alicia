@@ -18,7 +18,9 @@
  **/
 
 #include "server/lobby/LobbyNetworkHandler.hpp"
+#include "libserver/util/QuietLog.hpp"
 
+#include "libserver/util/Cleanup.hpp"
 #include "server/ServerInstance.hpp"
 
 #include <libserver/data/helper/ProtocolHelper.hpp>
@@ -269,25 +271,25 @@ void LobbyNetworkHandler::Initialize()
 {
   const auto& lobbyConfig = _serverInstance.GetLobbyDirector().GetConfig();
 
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Lobby is advertising ranch server on {}:{}",
     lobbyConfig.advertisement.ranch.address.to_string(),
     lobbyConfig.advertisement.ranch.port);
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Lobby is advertising race server on {}:{}",
     lobbyConfig.advertisement.race.address.to_string(),
     lobbyConfig.advertisement.race.port);
 
   if (_serverInstance.GetMessengerDirector().GetConfig().enabled)
   {
-    spdlog::debug(
+    server::util::QuietLogDebug(
       "Lobby is advertising messenger server on {}:{}",
       lobbyConfig.advertisement.messenger.address.to_string(),
       lobbyConfig.advertisement.messenger.port);
 
     if (_serverInstance.GetAllChatDirector().GetConfig().enabled)
     {
-      spdlog::debug(
+      server::util::QuietLogDebug(
         "Lobby is advertising all chat server on {}:{}",
         lobbyConfig.advertisement.allChat.address.to_string(),
         lobbyConfig.advertisement.allChat.port);
@@ -295,14 +297,14 @@ void LobbyNetworkHandler::Initialize()
 
     if (_serverInstance.GetPrivateChatDirector().GetConfig().enabled)
     {
-      spdlog::debug(
+      server::util::QuietLogDebug(
         "Lobby is advertising private chat server on {}:{}",
         lobbyConfig.advertisement.privateChat.address.to_string(),
         lobbyConfig.advertisement.privateChat.port);
     }
   }
 
-  spdlog::debug(
+  server::util::QuietLogDebug(
     "Lobby server listening on {}:{}",
     lobbyConfig.listen.address.to_string(),
     lobbyConfig.listen.port);
@@ -321,9 +323,22 @@ void LobbyNetworkHandler::AcceptLogin(
 {
   try
   {
-    auto& clientContext = GetClientContext(clientId, false);
-
-    clientContext.isAuthenticated = true;
+    // LOA-fix (R64-3, round64, backlog #215): мутация под замком, вызовы наружу —
+    // после него. ★Именно здесь ревью R59 поймало самозахват: `AcceptLogin`
+    // возвращается в тот же директор, и замок, дотянутый до `SendLoginOK`
+    // ниже, положил бы вход в игру целиком (0 успешных заходов из 24).
+    // ★Семантику «клиента нет → бросок» сохраняем: прежний `GetClientContext`
+    // бросал, снаружи стоит `catch`. `MutateClientContext` возвращает false,
+    // поэтому бросаем сами — иначе отсутствие клиента прошло бы молча.
+    if (not MutateClientContext(
+          clientId,
+          [](ClientContext& clientContext)
+          {
+            clientContext.isAuthenticated = true;
+          }))
+    {
+      throw std::runtime_error("Lobby client is not available");
+    }
 
     if (sendToCharacterCreator)
     {
@@ -348,7 +363,11 @@ void LobbyNetworkHandler::RejectLogin(
 {
   try
   {
-    [[maybe_unused]] auto& clientContext = GetClientContext(clientId, false);
+    // LOA-fix (R64-3, round64, backlog #215): контекст здесь не используется —
+    // вызов нужен ТОЛЬКО ради проверки существования клиента (он бросает, если
+    // клиента нет, и снаружи стоит `catch`). Метод теперь возвращает копию, так
+    // что и проверка, и отсутствие ссылки в карту получаются даром.
+    [[maybe_unused]] const auto clientContext = GetClientContext(clientId, false);
 
     SendLoginCancel(clientId, reason);
   }
@@ -409,8 +428,19 @@ void LobbyNetworkHandler::SetCharacterVisitPreference(
   try
   {
     const auto clientId = GetClientIdByCharacterUid(characterUid);
-    auto& clientContext = GetClientContext(clientId);
-    clientContext.rancherVisitPreference = rancherUid;
+    // LOA-fix (R64-3, round64, backlog #215): запись предпочтения визита — под
+    // замком. ★Этот метод зовёт ЛОББИ-ДИРЕКТОР, то есть чужой поток: без замка
+    // он писал в структуру, которую сетевой поток мог в этот момент
+    // перестраивать вставкой.
+    if (not MutateClientContext(
+          clientId,
+          [rancherUid](ClientContext& clientContext)
+          {
+            clientContext.rancherVisitPreference = rancherUid;
+          }))
+    {
+      throw std::runtime_error("Lobby client is not available");
+    }
   }
   catch (const std::exception&)
   {
@@ -503,7 +533,28 @@ void LobbyNetworkHandler::NotifyMatchmakeResult(
   const data::Uid characterUid,
   const MatchmakingSystem::Result& result)
 {
-  const ClientId characterClientId = GetClientIdByCharacterUid(characterUid);
+  // LOA-fix (R38-5, round38, backlog #90a-B4): клиент мог отвалиться, пока шёл
+  // подбор комнаты. GetClientIdByCharacterUid в этом случае БРОСАЕТ, а зовут нас
+  // из лямбды планировщика (MatchmakingSystem::Search через
+  // LobbyDirector::NotifyMatchmakeResult): исключение уходит в Scheduler::Tick,
+  // тот его ловит и пишет в лог — сервер НЕ падает, но остаток задания
+  // обрывается, и в логе прода копится шум на каждом уходе игрока из подбора.
+  // Саму очередь чистит R38-4.
+  // Смысл ровно тот же, что у соседних Notify*-методов этого файла, и они уже
+  // оформлены так же: «клиента нет — уведомлять некого».
+  // ★ГАСИМ ТОЛЬКО ПОИСК КЛИЕНТА. Бросок из-за нереализованного вердикта
+  // (R37-1/R37-2) обязан и дальше подниматься наверх: это дефект сервера, а не
+  // штатный уход игрока. Поэтому try оборачивает одну строку, а не switch.
+  ClientId characterClientId{};
+  try
+  {
+    characterClientId = GetClientIdByCharacterUid(characterUid);
+  }
+  catch (const std::exception&)
+  {
+    // We really don't care if the user disconnected.
+    return;
+  }
 
   switch (result.verdict)
   {
@@ -516,7 +567,16 @@ void LobbyNetworkHandler::NotifyMatchmakeResult(
     }
     case MatchmakingSystem::Result::Verdict::MakeRoom:
     {
-      throw new std::runtime_error("Matchmaking system verdict make room not implemented");
+      // LOA-fix (R37-1, round37, backlog #90a-B1): было `throw new` — бросался
+      // УКАЗАТЕЛЬ std::runtime_error*, который НЕ ловится ни одним
+      // `catch (const std::exception&)` в дереве. Любой заход сюда давал не
+      // запись в логе, а std::terminate — падение всего сервера.
+      // ★ЧЕСТНО: ветка сегодня НЕДОСТИЖИМА — Result::verdict нигде не
+      // выставляется в MakeRoom (MatchmakingSystem::Search выдаёт только NoRoom
+      // и FoundRoom). Это разминирование на будущее, а не живой баг.
+      // ★Бинарное доказательство фикса: в PRE-объекте перед __cxa_throw стоит
+      // вызов operator new, в POST его нет (objdump -dC).
+      throw std::runtime_error("Matchmaking system verdict make room not implemented");
 
       // This response is partial, you also need to create a room on the serverside and then
       // enter room. The client does not send a make room request with some random details.
@@ -539,7 +599,9 @@ void LobbyNetworkHandler::NotifyMatchmakeResult(
     }
     default:
     {
-      throw new std::runtime_error("Unrecognised matchmaking system result verdict");
+      // LOA-fix (R37-2, round37, backlog #90a-B1): близнец R37-1 — бросок
+      // указателя вместо объекта, мимо всех catch-ов, прямо в std::terminate.
+      throw std::runtime_error("Unrecognised matchmaking system result verdict");
     }
   }
 }
@@ -553,6 +615,20 @@ ClientId LobbyNetworkHandler::GetClientIdByUserName(
   const std::string& userName,
   const bool requiresAuthorization)
 {
+  // LOA-fix (R64-3, round64, backlog #215): перебор — под общим замком.
+  //
+  // ★ПЕРЕБОР ОПАСНЕЕ ОДИНОЧНОГО ПОИСКА. `find` под чужой вставкой рискует
+  // прочитать перестроенную корзину; обход же держит итератор всё время цикла,
+  // и достаточно ОДНОГО удаления, чтобы итератор стал недействительным прямо
+  // посреди прохода. А удаление здесь двухпоточное: директор зовёт
+  // `DisconnectCharacter` → `Client::End()`, и тот СИНХРОННО доходит до
+  // `HandleClientDisconnected`, который запись снимает.
+  //
+  // ★Замок общий (`shared_lock`), потому что читателей может быть много и они
+  // друг другу не мешают; исключительный нужен только тем, кто пишет.
+  // Вызовов наружу в теле нет — иначе замок ушёл бы в чужой код.
+  const std::shared_lock lock(_clientsMutex);
+
   for (const auto& [clientId, clientContext] : _clients)
   {
     if (clientContext.userName != userName)
@@ -572,6 +648,13 @@ ClientId LobbyNetworkHandler::GetClientIdByCharacterUid(
   const data::Uid characterUid,
   const bool requiresAuthorization)
 {
+  // LOA-fix (R64-3, round64, backlog #215): зеркало предыдущего метода.
+  // ★Этот перебор вызывается в том числе из `DisconnectCharacter`, то есть с
+  // потока ДИРЕКТОРА — ровно с той стороны, откуда приходит удаление. Без
+  // замка поток мог обходить карту, которую сам же вот-вот начнёт менять на
+  // следующем шаге вызова.
+  const std::shared_lock lock(_clientsMutex);
+
   for (const auto& [clientId, clientContext] : _clients)
   {
     if (clientContext.characterUid != characterUid)
@@ -587,10 +670,22 @@ ClientId LobbyNetworkHandler::GetClientIdByCharacterUid(
       characterUid));
 }
 
-LobbyNetworkHandler::ClientContext& LobbyNetworkHandler::GetClientContext(
+// LOA-fix (R64-3, round64, backlog #215): доступ к карте клиентов лобби
+// сериализован. Разбор — RESULTS-R64.md; коротко: два потока (сетевой лобби и
+// лобби-директор), директор и читает, и ПИШЕТ поля, а удаление записи вдобавок
+// исполняется на ЕГО потоке через синхронный `Client::End()`.
+
+LobbyNetworkHandler::ClientContext&
+LobbyNetworkHandler::GetClientContextLocked(
   const ClientId clientId,
   bool requireAuthentication)
 {
+  // ★ВНУТРЕННИЙ ПУТЬ: замок ОБЯЗАН быть уже взят вызывающим. Существует
+  // ровно затем, чтобы уборка соединения (которая держит исключительный
+  // замок через страж удаления) не звала публичный метод и не пыталась
+  // взять `shared_mutex` повторно: он НЕ рекурсивный, и такой самозахват —
+  // это не падение на ревью, а тихий дедлок в проде под нагрузкой.
+  // Ровно этим был убит вход в игру в R59 (0 успешных заходов из 24).
   auto clientContextIter = _clients.find(clientId);
   if (clientContextIter == _clients.end())
     throw std::runtime_error("Lobby client is not available");
@@ -602,12 +697,148 @@ LobbyNetworkHandler::ClientContext& LobbyNetworkHandler::GetClientContext(
   return clientContext;
 }
 
+LobbyNetworkHandler::ClientContext LobbyNetworkHandler::GetClientContext(
+  const ClientId clientId,
+  bool requireAuthentication)
+{
+  // ★КОПИЯ, А НЕ ССЫЛКА. Замок снимается на выходе, поэтому наружу нельзя
+  // отдавать ничего, что указывает внутрь карты.
+  const std::shared_lock lock(_clientsMutex);
+  return GetClientContextLocked(clientId, requireAuthentication);
+}
+
+bool LobbyNetworkHandler::MutateClientContext(
+  const ClientId clientId,
+  const std::function<void(ClientContext&)>& mutator)
+{
+  const std::unique_lock lock(_clientsMutex);
+
+  const auto clientContextIter = _clients.find(clientId);
+  if (clientContextIter == _clients.end())
+    return false;
+
+  // ★В лямбде допустимы ТОЛЬКО присваивания полей. Любой вызов наружу отсюда
+  // уводит замок в чужой код — а именно так рождается перекрёстный дедлок
+  // лобби↔ранчо (`IsCharacterActiveOnRanch` и соседи ходят в другой директор).
+  mutator(clientContextIter->second);
+  return true;
+}
+
+bool LobbyNetworkHandler::MutateClientContextIfSame(
+  const ClientId clientId,
+  const data::Uid expectedCharacterUid,
+  const std::function<void(ClientContext&)>& mutator)
+{
+  const std::unique_lock lock(_clientsMutex);
+
+  const auto clientContextIter = _clients.find(clientId);
+  if (clientContextIter == _clients.end())
+    return false;
+
+  // ★ПРОВЕРКА ТОЖДЕСТВА, А НЕ ТОЛЬКО ПРИСУТСТВИЯ. Решение сюда приходит из
+  // работы ПО СНИМКУ, снятому вне замка: за это время клиент мог отключиться,
+  // а его `ClientId` — достаться новому подключению. Тогда `find` найдёт
+  // запись, и без сверки мы применили бы чужое решение к постороннему игроку
+  // (например, отключили бы только что зашедшего). Сверяем по `characterUid` —
+  // он стабилен в пределах жизни записи и меняется только вместе с ней.
+  if (clientContextIter->second.characterUid != expectedCharacterUid)
+    return false;
+
+  mutator(clientContextIter->second);
+  return true;
+}
+
+// LOA-fix (R37-4, round37, backlog #123): ★ФУНКЦИОНАЛЬНЫЙ try-БЛОК НА ВЕСЬ
+// ТИК. Нас зовут из Server::TickLoop(), помеченного noexcept
+// (Server.cpp:463) — любое улетевшее отсюда исключение это не строка в логе, а
+// std::terminate всего процесса. А бросающие вызовы в теле есть: сам слив
+// `_commandServer.DisconnectClient` уходит в Server::GetClient с
+// `throw std::runtime_error("Invalid client")`, плюс межпотоковые запросы к
+// директорам ранчо/гонки. noexcept у TickLoop мы НЕ СНИМАЕМ — безопасным
+// делаем ТЕЛО, ровно как RanchDirector::HandleNetworkTick (тот же catch, тот
+// же spdlog::error) и RunDirectorTaskLoop. Молча не глотаем: пишем в лог.
+// Форма — функциональный try-блок, чтобы не сдвигать ~270 строк тела на два
+// пробела; для не-конструктора он эквивалентен обычному try вокруг тела.
 void LobbyNetworkHandler::HandleNetworkTick()
+try
 {
   const auto now = std::chrono::steady_clock::now();
 
-  std::vector<ClientId> clientsToDisconnect;
-  for (const auto& [clientId, clientContext] : _clients)
+  // LOA-fix (R21-4g, round21, backlog #95): ПЕРИОДИЧЕСКАЯ УБОРКА реестра
+  // активности ранчо — та самая верхняя граница его памяти. Быстрая уборка на
+  // выходах с ранча (R21-2b/2c/2d) закрывает общий случай, но teardown клиента
+  // умеет бежать на ЭТОМ, лобби-потоке (Client::End() зовёт OnClientDisconnected
+  // синхронно; ★с раунда 34 RanchDirector::Disconnect ниже сокет УЖЕ НЕ рвёт —
+  // он только ставит UID в очередь ранч-сетевого потока, см. R34), поэтому
+  // редкая гонка enter-vs-disconnect способна оставить запись-сироту, которую не
+  // подберёт ни один выходной путь. Разбор — в шапке раунда 21.
+  //
+  // ПОРОГ 90 c ЗАВЕДОМО БОЛЬШЕ ОКНА СВЕЖЕСТИ 30 c. Живой игрок переставляет
+  // метку каждые ≤8.5 c, поэтому под уборку не попадает НИКОГДА; запись
+  // возрастом 30-90 c уже не свежая (грейса не даёт, вреда не несёт) и просто
+  // ждёт ближайшей уборки. Направление отказа безопасное: потерянная запись —
+  // это отсутствие отсрочки в это окно (обычный таймаут 60 c) и самолечение на
+  // следующем входе на ранчо, а НЕ бессмертная сессия.
+  //
+  // Раз в минуту, а не каждый тик: обход O(n) секунда в секунду — пустая
+  // нагрузка, записи живут минутами. Сам метод межпотоково безопасен (берёт
+  // только свой ЛИСТОВОЙ мьютекс, к _clients ранчо не прикасается).
+  constexpr auto RanchActivitySweepInterval = std::chrono::seconds(60);
+  constexpr auto RanchActivityMaxAge = std::chrono::seconds(90);
+
+  if (now - _lastRanchActivitySweep >= RanchActivitySweepInterval)
+  {
+    _lastRanchActivitySweep = now;
+    _serverInstance.GetRanchDirector().SweepRanchActivity(RanchActivityMaxAge);
+  }
+  // LOA-fix (R64-3, round64, backlog #215): ТИК РАБОТАЕТ ПО КОПИЯМ, А НЕ ПО КАРТЕ.
+  //
+  // ★ЗАЧЕМ. Прежний цикл шёл прямо по `_clients` и держал итератор всё время
+  // прохода. Удаление записи здесь ДВУХПОТОЧНОЕ: директор зовёт
+  // `DisconnectCharacter` → `Client::End()`, а тот СИНХРОННО доходит до
+  // `HandleClientDisconnected`, который запись снимает. Одного такого удаления
+  // достаточно, чтобы итератор обхода стал недействительным посреди тика.
+  //
+  // ★ПОЧЕМУ НЕ «ВЗЯТЬ ЗАМОК НА ВЕСЬ ЦИКЛ». В теле — ТРИ вызова в чужие
+  // директоры (`IsCharacterActiveOnRanch`, `IsCharacterLoadingRace`, и пара
+  // `Disconnect`/`DisconnectCharacter` в ветке кика). Замок, дотянутый до них,
+  // ушёл бы в чужой код, а `Disconnect*` синхронно возвращается в нашу же
+  // уборку за тем же нерекурсивным мьютексом — это самозахват, то есть тихий
+  // дедлок под нагрузкой, а не падение на ревью. ★Их именно три: посчитано
+  // грепом, а не замечено взглядом — с первого раза я насчитала один.
+  //
+  // ★ПОЧЕМУ КОПИИ, А НЕ ПЕРЕПИСЫВАНИЕ ТЕЛА. Тело — двести строк выверенной
+  // логики отсрочек (грейс гонки R12-5, грейс ранчо R21-4b, решётка
+  // 0/61/122/183/244 c, одноразовый хендофф). Работая по копии, оно остаётся
+  // ДОСЛОВНЫМ и целиком уезжает из-под замка вместе со всеми тремя вызовами —
+  // меняются только вход в цикл и применение результата.
+  //
+  // ★ОТБОР ДЕШЁВЫЙ И ОБЫЧНО ПУСТОЙ. В кандидаты попадает лишь тот, у кого уже
+  // истёк порог пульса; в норме таких НОЛЬ, и тогда ни исключительный замок, ни
+  // единая копия не берутся вовсе — при 50 тиках в секунду это важно.
+  // Буфер — член класса: `clear()` сохраняет ёмкость, поэтому после первого
+  // тика аллокаций нет.
+  std::vector<std::pair<ClientId, data::Uid>> clientsToDisconnect;
+
+  _tickSnapshot.clear();
+  {
+    const std::shared_lock lock(_clientsMutex);
+    for (const auto& [clientId, clientContext] : _clients)
+    {
+      // Тот же порог, что и в теле ниже: клиент в создателе персонажа законно
+      // молчит дольше (клиентский баг с пульсом).
+      const auto timeout = clientContext.isInCharacterCreator
+        ? std::chrono::seconds(15 * 60)
+        : std::chrono::seconds(60);
+      if (now - clientContext.lastHeartbeat > timeout)
+        _tickSnapshot.emplace_back(clientId, clientContext);
+    }
+  }
+
+  // LOA-fix (R12-4a, round12, backlog #85): было `const auto&` — грейс ниже
+  // пишет в контекст клиента (lastHeartbeat + метка начала грейса).
+  // ★Теперь пишет В КОПИЮ; изменения возвращаются в карту после цикла.
+  for (auto& [clientId, clientContext] : _tickSnapshot)
   {
     // There's a bug in a client, where if the client is in the character creator,
     // they'll withdraw from sending heartbeats. Because of this we have to
@@ -620,32 +851,304 @@ void LobbyNetworkHandler::HandleNetworkTick()
     if (not hasReachedTimeout)
       continue;
 
-    spdlog::warn(
+    // LOA-fix (R21-4b, round21, backlog #95): ОТСРОЧКА ПО ЖИВОМУ РАНЧ-СОКЕТУ.
+    // У игрока четыре независимых сокета. Осев на ранчо, реальный клиент
+    // перестаёт качать ЛОББИ-пульс, продолжая говорить по ранч-каналу
+    // (:10031) — снапшоты положения, чат, уход за лошадью. Тишина одного
+    // сокета не означает мёртвого игрока, а кик отсюда рвёт ему и ранчо, и
+    // гонку. Поэтому перед киком спрашиваем директора ранчо, говорил ли этот
+    // персонаж по ранч-каналу за последние 30 c.
+    //
+    // ★ЗАПРОС МЕЖПОТОКОВЫЙ (та же дисциплина, что в R12): ранчо живёт на
+    // другом потоке, его _clients ничем не защищён, поэтому лобби НЕ читает
+    // состояние ранчо напрямую. IsCharacterActiveOnRanch трогает только свой
+    // ЛИСТОВОЙ мьютекс и реестр активности — вложенных локов нет, deadlock
+    // ранчо↔лобби невозможен.
+    //
+    // ★ПОТОЛКА НЕТ — И ЭТО НАМЕРЕННО. R12 ждал КОНЕЧНОГО события (загрузка
+    // карты) и обязан был иметь потолок 210 c. Здесь состояние нормальное и
+    // длительное: на ранчо стоят часами. Ограничитель — не время, а УСЛОВИЕ:
+    // свежесть 30 c. Упавший клиент (полумёртвый TCP без FIN) перестаёт слать
+    // пакеты, запись стареет, ветка перестаёт срабатывать, и кик доводится до
+    // конца — призрачная сессия не живёт.
+    //
+    // ★ПОРЯДОК ВЕТОК: стоим ПЕРЕД веткой R12 и делаем `continue`, НЕ трогая
+    // raceLoadingGraceSince — эпизодный инвариант R12 (метка живёт только
+    // внутри одной загрузки карты) остаётся ровно таким, каким его завёл R12.
+    // Обратная интерференция тоже безопасна: во время загрузки карты клиент не
+    // качает и ранч-сокет, запись стареет за 30 c, управление уходит в R12.
+    if (clientContext.isAuthenticated
+      && _serverInstance.GetRanchDirector().IsCharacterActiveOnRanch(
+        clientContext.characterUid,
+        std::chrono::seconds(30)))
+    {
+      if (clientContext.ranchGraceSince
+        == std::chrono::steady_clock::time_point{})
+      {
+        clientContext.ranchGraceSince = now;
+
+        server::util::QuietLogInfo(
+          "Client {} ('{}') is settled on a ranch (ranch socket active); "
+          "lobby timeout DEFERRED",
+          clientId,
+          clientContext.userName);
+      }
+      else
+      {
+        server::util::QuietLogDebug(
+          "Client {} ('{}') is still active on a ranch; "
+          "lobby timeout deferred ({}s so far)",
+          clientId,
+          clientContext.userName,
+          std::chrono::duration_cast<std::chrono::seconds>(
+            now - clientContext.ranchGraceSince).count());
+      }
+
+      // Как и в R12: не «пропустить кик один раз», а признать клиента живым —
+      // иначе накопленная тишина убьёт его на следующем же тике.
+      clientContext.lastHeartbeat = now;
+      continue;
+    }
+
+    // LOA-fix (R12-4b, round12, backlog #85): ОТСРОЧКА НА ВРЕМЯ ЗАГРУЗКИ КАРТЫ.
+    // Клиент однопоточный: загружая тяжёлую карту заезда, он перестаёт качать
+    // ВСЕ свои сокеты, в том числе лобби-пульс. Единственный в сервере таймер
+    // простоя живёт здесь (у ранчо/гонки/мессенджера таймаутов нет вообще), и
+    // он же рвёт игроку ранчо и гонку строками ниже — то есть на карте, которая
+    // грузится дольше ~60 c, игрока выкидывало ДО того, как поднятый в R11
+    // бюджет загрузки (LoadingStageTimeout, 150 c, задача #22) успевал сработать.
+    // Живой случай: SmileMarlboro, старт 12:00:51.577, кик 12:02:04.257 (72.7 c).
+    //
+    // ПОЧЕМУ ГРЕЙС ОСВЕЖАЕТ lastHeartbeat (это не косметика, а суть ремонта 1).
+    // Реальная каденция лобби-пульса клиента, снятая с прода, — НЕ «раз в
+    // несколько секунд», а ~40 c, причём с дырами: наблюдалась пауза 57 c между
+    // соседними пульсами, и дыра длиной 18.8 c приходилась ровно на момент
+    // окончания загрузки. Если грейс только пропускает кик, не трогая
+    // lastHeartbeat, то накопленная за загрузку тишина никуда не девается:
+    // клиент рапортует LoadingComplete, гонщик мгновенно переходит в Racing
+    // (RaceNetworkHandler.cpp, HandleLoadingComplete), запрос ниже начинает
+    // возвращать false — и уже на СЛЕДУЮЩЕМ тике игрока убивает по старой
+    // тишине, до того как успеет прийти первый послезагрузочный пульс. Поэтому
+    // в грейсе мы ЯВНО двигаем lastHeartbeat. Одного этого, впрочем, мало:
+    // движение происходит на редкой решётке (см. ниже), поэтому полное окно на
+    // первый послезагрузочный пульс выдаёт отдельный одноразовый хендофф.
+    //
+    // ПОТОЛОК ЖИВЁТ НА ОТДЕЛЬНОЙ МЕТКЕ. Раз lastHeartbeat теперь двигается, по
+    // нему нельзя мерить, сколько клиент уже сидит в грейсе. Для этого заведено
+    // поле raceLoadingGraceSince (R12-5): ставится один раз при входе в грейс и
+    // гаснет на реальном пульсе (R12-6), на хендоффе (ниже) либо при
+    // переиспользовании контекста (R12-7/R12-8) — то есть каждая загрузка
+    // получает свежий потолок, а не остаток от прошлой.
+    //
+    // ПОЧЕМУ НЕ ГЛОБАЛЬНО. Порог 60 c — единственная уборка мёртвых сессий:
+    // повторный логин того же пользователя отбивается как Duplicated
+    // (LobbyDirector.cpp:437-448), а зависший игрок держит слот в комнате и
+    // никогда не станет ready. Глобальные 210 c означали бы «после краша клиента
+    // не зайти 3.5 минуты» и мёртвые слоты в комнатах. Отсрочка адресная.
+    //
+    // РЕШЁТКА ПРОВЕРОК (ремонт 2; без этого цифры ниже врут). Грейс
+    // переоценивается НЕ раз в секунду: он живёт ПОД гардом
+    // `if (not hasReachedTimeout) continue;`, а каждое освежение lastHeartbeat
+    // отодвигает следующее срабатывание таймаута ровно на 61 c (порог 60 c +
+    // тик 1 c). Поэтому счётчик grace-elapsed принимает не любые значения, а
+    // только 0 / 61 / 122 / 183 / 244 c.
+    //
+    // ОДНОРАЗОВЫЙ ХЕНДОФФ (★суть ремонта 2, ветка else ниже). Загрузка
+    // кончается в произвольный момент МЕЖДУ точками решётки. Если на ближайшей
+    // точке просто увидеть «клиент больше не грузит» и провалиться в кик, игрок
+    // умирает уже ПОСЛЕ успешного LoadingComplete — в окне [0, 60] c после
+    // него; две независимые симуляции дали так до 57% убитых на тяжёлых картах.
+    // Поэтому, увидев погашенную загрузку при ещё живой метке грейса, мы ОДИН
+    // раз выдаём клиенту полное штатное окно (двигаем lastHeartbeat) и гасим
+    // метку. Тем же закрыт второй дефект: при штатном выходе из грейса метка
+    // раньше вообще не сбрасывалась и доживала до первого пульса.
+    //
+    // ЧЕМ ОГРАНИЧЕНА (бессмертных зомби нет):
+    //   1) клиент, залипший в стадии Loading навсегда: потолок 210 c впервые НЕ
+    //      проходит на решётке при grace-elapsed 244 c — кик примерно на 305 c
+    //      стены от последнего реального пульса;
+    //   2) реалистичный случай — стадию Loading принудительно закрывает
+    //      TickLoading по дедлайну R11 (150 c): таймаут после этого впервые
+    //      срабатывает на ~183 c стены, там тратится одноразовый хендофф, и
+    //      по-настоящему мёртвый клиент умирает на следующей точке решётки;
+    //   3) реальный обрыв TCP идёт мимо этой ветки (HandleClientDisconnected).
+    //
+    // ПРИНЯТАЯ ЦЕНА. Зависший игрок держит слот в комнате дольше: дедлайн
+    // загрузки 150 c плюс до 60 c смещения между его последним пульсом и
+    // стартом загрузки — worst case ~211 c (раньше случайный кик на 60 c
+    // освобождал слот быстрее). Осознанный размен: неслучившийся кик живого
+    // игрока на медленной карте важнее пары минут занятого слота.
+    constexpr auto RaceLoadingHeartbeatTimeout = std::chrono::seconds(210);
+
+    const bool isLoadingRaceMap = clientContext.isAuthenticated
+      && _serverInstance.GetRaceDirector().IsCharacterLoadingRace(
+        clientContext.characterUid);
+
+    if (isLoadingRaceMap)
+    {
+      if (clientContext.raceLoadingGraceSince
+        == std::chrono::steady_clock::time_point{})
+      {
+        clientContext.raceLoadingGraceSince = now;
+
+        server::util::QuietLogInfo(
+          "Client {} ('{}') is loading a race map; lobby timeout grace engaged",
+          clientId,
+          clientContext.userName);
+      }
+
+      const auto graceElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - clientContext.raceLoadingGraceSince);
+
+      if (graceElapsed <= RaceLoadingHeartbeatTimeout)
+      {
+        // Прогресс-лог на КАЖДОЙ переоценке грейса, кроме первой (её печатает
+        // spdlog::info выше). Спама нет по построению: соседние переоценки
+        // отстоят на 61 c (см. «РЕШЁТКА ПРОВЕРОК»), то есть за весь потолок
+        // 210 c клиент даёт максимум четыре строки. Прежнее условие
+        // `graceElapsed % 15 == 0` было мёртвым кодом: 61/122/183/244 на 15 не
+        // делятся, лог не мог напечататься НИ РАЗУ.
+        if (graceElapsed.count() > 0)
+        {
+          server::util::QuietLogDebug(
+            "Client {} ('{}') is still loading a race map ({}s of grace used)",
+            clientId,
+            clientContext.userName,
+            graceElapsed.count());
+        }
+
+        // Ключевая строка ремонта: пока клиент грузит карту, сервер считает
+        // его живым НА САМОМ ДЕЛЕ, а не «пропускает кик один раз».
+        clientContext.lastHeartbeat = now;
+        continue;
+      }
+
+      server::util::QuietLogWarn(
+        "Client {} ('{}') exhausted the race-loading grace ({}s); "
+        "falling through to the network timeout",
+        clientId,
+        clientContext.userName,
+        graceElapsed.count());
+    }
+    else if (clientContext.raceLoadingGraceSince
+      != std::chrono::steady_clock::time_point{})
+    {
+      // ХЕНДОФФ ПОСЛЕ ЗАГРУЗКИ (одноразовый). Мы здесь потому, что таймаут
+      // сработал, клиент УЖЕ не грузит карту, но метка грейса ещё горит — то
+      // есть загрузка закончилась где-то между двумя точками решётки, и
+      // накопленная за неё тишина сейчас убила бы игрока через считанные
+      // секунды после успешного LoadingComplete. Отдаём ему ровно одно полное
+      // штатное окно (60 c) на первый послезагрузочный пульс и ГАСИМ метку:
+      // окно выдаётся один раз, следующая проверка будет уже обычной.
+      const auto graceElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - clientContext.raceLoadingGraceSince);
+
+      server::util::QuietLogInfo(
+        "Client {} ('{}') is no longer loading a race map after {}s of grace; "
+        "granting one full heartbeat window before the timeout applies again",
+        clientId,
+        clientContext.userName,
+        graceElapsed.count());
+
+      clientContext.lastHeartbeat = now;
+      clientContext.raceLoadingGraceSince = {};
+      continue;
+    }
+
+    server::util::QuietLogWarn(
        "Client {} ('{}') has reached a network timeout and is being disconnected",
        clientId,
        clientContext.userName);
 
-    clientsToDisconnect.emplace_back(clientId);
-
-    _serverInstance.GetRanchDirector().Disconnect(
-      clientContext.characterUid);
-    _serverInstance.GetRaceDirector().DisconnectCharacter(
-      clientContext.characterUid);
+    clientsToDisconnect.emplace_back(clientId, clientContext.characterUid);
   }
 
-  for (const ClientId& clientId : clientsToDisconnect)
+  // LOA-fix (R64-3, round64, backlog #215): ИЗМЕНЕНИЯ ИЗ КОПИЙ — ОБРАТНО В КАРТУ.
+  //
+  // Тело выше писало в копию; сюда возвращаются ровно те три поля, которые оно
+  // могло изменить (метки пульса и двух отсрочек). Остальные поля не трогаем —
+  // их владелец другой код, и слепое копирование всей структуры затёрло бы
+  // чужие изменения, случившиеся, пока замок был отпущен.
+  //
+  // ★ПРОВЕРКА ТОЖДЕСТВА ОБЯЗАТЕЛЬНА. Между снятием копий и этой строкой замок
+  // был отпущен — клиент мог отключиться, а его `ClientId` достаться новому
+  // подключению. `MutateClientContextIfSame` сверяет `characterUid` и молча
+  // ничего не делает, если запись уже не та: иначе мы применили бы решение о
+  // старом игроке к только что вошедшему.
+  for (const auto& [clientId, snapshotContext] : _tickSnapshot)
   {
-    _commandServer.DisconnectClient(clientId);
+    MutateClientContextIfSame(
+      clientId,
+      snapshotContext.characterUid,
+      [&snapshotContext](ClientContext& liveContext)
+      {
+        liveContext.lastHeartbeat = snapshotContext.lastHeartbeat;
+        liveContext.ranchGraceSince = snapshotContext.ranchGraceSince;
+        liveContext.raceLoadingGraceSince = snapshotContext.raceLoadingGraceSince;
+      });
   }
+
+  // ★ОТКЛЮЧЕНИЯ — ПОСЛЕ ЦИКЛА И ВНЕ ЗАМКА. Прежде `Disconnect` и
+  // `DisconnectCharacter` стояли ВНУТРИ тела; там они уехали бы под замок
+  // вместе с ним. Здесь же замок не удерживается, а `DisconnectClient` ниже
+  // синхронно доходит до нашей уборки, которой нужен исключительный замок, —
+  // держать его в этот момент значило бы устроить самозахват.
+  for (const auto& [clientId, characterUid] : clientsToDisconnect)
+  {
+    _serverInstance.GetRanchDirector().Disconnect(characterUid);
+    _serverInstance.GetRaceDirector().DisconnectCharacter(characterUid);
+    // LOA-fix (R37-5, round37, backlog #123): ПОКЛИЕНТНЫЙ ГАРД. DisconnectClient
+    // доходит до Server::GetClient, а тот БРОСАЕТ «Invalid client», если реестр
+    // сетевого сервера и реестр лобби разъехались. Без этой обёртки первая же
+    // осечка съедала бы остаток списка — прочие таймаутнутые клиенты остались бы
+    // висеть. Зеркало ранчёвого DrainPendingDisconnects (R34-2/R34-4).
+    try
+    {
+      _commandServer.DisconnectClient(clientId);
+    }
+    catch (const std::exception& x)
+    {
+      server::util::QuietLogWarn(
+        "Failed to disconnect the timed-out lobby client {}: {}",
+        clientId,
+        x.what());
+    }
+  }
+}
+catch (const std::exception& x)
+{
+  // Обработчик функционального try-блока R37-4. Выход за его конец у
+  // void-функции равнозначен `return;` — тик просто заканчивается, сервер
+  // продолжает жить, а причина остаётся в логе.
+  server::util::QuietLogError("Exception in a network tick of lobby handler: {}", x.what());
 }
 
 void LobbyNetworkHandler::HandleClientConnected(
   const ClientId clientId)
 {
-  const auto iter = _clients.try_emplace(clientId).first;
-  iter->second.lastHeartbeat = std::chrono::steady_clock::now();
+  // LOA-fix (R64-3, round64, backlog #215): вставка и первичное заполнение —
+  // под исключительным замком, одним блоком.
+  //
+  // ★ЗАМОК ЗАКРЫВАЕТСЯ ДО ВЫЗОВОВ НАРУЖУ, И ЭТО НЕ КОСМЕТИКА. Ниже идут
+  // `GetClientAddress` и постановка задачи в планировщик директора — то есть
+  // выход в чужой код. Замок, дотянутый до них, превращает локальную вставку в
+  // заявку на перекрёстный дедлок; поэтому область явная, а не «до конца
+  // функции».
+  {
+    const std::unique_lock lock(_clientsMutex);
 
-  spdlog::debug(
+    const auto iter = _clients.try_emplace(clientId).first;
+    iter->second.lastHeartbeat = std::chrono::steady_clock::now();
+    // LOA-fix (R12-7, round12, backlog #85): вместе с пульсом гасим и метку
+    // грейса (R12-5) — ClientId переиспользуются, чужой недоеденный потолок
+    // не должен достаться новому подключению.
+    iter->second.raceLoadingGraceSince = {};
+    // LOA-fix (R21-4d, round21, backlog #95): и логовую метку ранч-отсрочки —
+    // ClientId переиспользуются (зеркало R12-7).
+    iter->second.ranchGraceSince = {};
+  }
+
+  server::util::QuietLogDebug(
     "Client {} connected to the lobby server from {}",
     clientId,
     _commandServer.GetClientAddress(clientId).to_string());
@@ -659,23 +1162,118 @@ void LobbyNetworkHandler::HandleClientConnected(
 
 void LobbyNetworkHandler::HandleClientDisconnected(ClientId clientId)
 {
-    const auto& clientContext = GetClientContext(clientId, false);
+    // LOA-fix (R50-4, round50, backlog #180): УБОРКА ЛОББИ ДОХОДИТ ДО КОНЦА.
+    // Запись реестра снималась ПОСЛЕДНЕЙ строкой, то есть только на успешном
+    // пути, а до неё стояла бросающая работа (чтение контекста, снятие с
+    // очереди подбора, постановка задачи с копией имени — аллокация).
+    // ★ЦЕНА УТЕЧКИ ЗДЕСЬ ВИДНА ИГРОКУ: `HandleLogin` отказывает с `Duplicated`,
+    // если в реестре найдётся аутентифицированная запись с тем же логином.
+    // Осиротевшая запись = аккаунт, который НЕ МОЖЕТ ВОЙТИ В ИГРУ до
+    // перезапуска сервера. Повторить уборку некому: гард `Client::End()` уже
+    // снят, сокет закрыт, событий asio по нему больше не будет.
+    // Страж снимает запись на выходе из функции — ровно там, где стоял `erase`,
+    // то есть порядок операций прежний.
+    // LOA-fix (R64-3, round64, backlog #215): СНЯТИЕ ЗАПИСИ — ПОД ЗАМКОМ,
+    // РАБОТА НИЖЕ — БЕЗ НЕГО.
+    //
+    // ★ПОЧЕМУ НЕ ПРЕЖНИЙ `util::RegistryEraser`: он ничего не знает о замке и
+    // удалил бы запись из карты голыми руками, ровно в тот момент, когда её
+    // может перебирать тик. Гарантию R50 («уборка доходит до конца при любом
+    // исходе») сохраняем — страж остаётся RAII и снимает запись на выходе, — но
+    // теперь он делает это под исключительным замком.
+    struct LockedContextEraser final
+    {
+      LobbyNetworkHandler& handler;
+      ClientId clientId;
 
-    _serverInstance.GetLobbyDirector().GetScheduler().Queue(
-      [this, isAuthenticated = clientContext.isAuthenticated, clientId, userName = clientContext.userName]()
+      ~LockedContextEraser() noexcept
       {
-        if (isAuthenticated)
-        {
-          _serverInstance.GetLobbyDirector().QueueClientLogout(
-            clientId,
-            userName);
-        }
+        const std::unique_lock lock(handler._clientsMutex);
+        handler._clients.erase(clientId);
+      }
+    } const eraser{*this, clientId};
 
-        _serverInstance.GetLobbyDirector().QueueClientDisconnect(clientId);
+    // ★КОПИЯ ПОД ЗАМКОМ, А ДАЛЬШЕ РАБОТА ПО КОПИИ. Ниже по функции идут выходы
+    // в чужой код (снятие с очереди подбора, планировщик директора), и держать
+    // через них замок нельзя. А ссылку в карту держать нельзя тем более: запись
+    // вот-вот снимет наш же страж.
+    // ★Публичный `GetClientContext` здесь НЕ зовём намеренно: он берёт замок
+    // сам, а `shared_mutex` не рекурсивный — вложенный захват дал бы тихий
+    // дедлок в проде (класс R59, там это стоило 24 входов из 24).
+    ClientContext clientContext;
+    {
+      const std::shared_lock lock(_clientsMutex);
+      clientContext = GetClientContextLocked(clientId, false);
+    }
+
+    // LOA-fix (R38-4, round38, backlog #90a-B4): СНИМАЕМ ПЕРСОНАЖА С ОЧЕРЕДИ
+    // БЫСТРОГО СТАРТА. Выход из игры «в поиске комнаты» запись в
+    // MatchmakingSystem::_matchmakingQueue НЕ убирал: её подбирал только
+    // собственный таймаут подбора, MatchmakingQueueTimeoutMs = 30 c.
+    // ★ЧЕСТНО: запись НЕ вечная, окно ограничено этими 30 c. Но внутри окна
+    // видны два дефекта:
+    //   (1) ДЕТЕРМИНИРОВАННЫЙ СИМПТОМ (он же A/B-плечо приёмки): игрок
+    //       перезаходит в пределах 30 c и жмёт «быстрый старт» — Queue видит
+    //       старую запись, возвращает false, клиент получает
+    //       AcCmdCLEnterRoomQuickCancel. «Быстрый старт не работает после
+    //       релога» — это ровно оно;
+    //   (2) осиротевшая цепочка Search продолжает тикать раз в секунду и
+    //       ключуется по characterUid — то есть если она найдёт комнату уже
+    //       ПОСЛЕ релога, свежий клиент будет затащен в комнату, которую не
+    //       просил.
+    // Dequeue сам берёт _matchmakingQueueMutex (после R36-2 это уже честный
+    // замок) и молча возвращает false, если персонаж в очереди не стоял, —
+    // звать безусловно безопасно, в том числе для неаутентифицированного
+    // клиента с characterUid == data::InvalidUid. Возврат намеренно не
+    // проверяем: false здесь — норма, а метод не [[nodiscard]].
+    util::RunCleanupStep(
+      "lobby matchmaking dequeue",
+      clientId,
+      [&]()
+      {
+        _serverInstance.GetMatchmakingSystem().Dequeue(clientContext.characterUid);
       });
 
-  _clients.erase(clientId);
-  spdlog::debug("Client {} disconnected from the lobby server", clientId);
+    // Шаг НЕЗАВИСИМЫЙ от предыдущего: осечка снятия с очереди подбора не имеет
+    // права отменить выход из игры. Раньше отменяла — и персонаж оставался
+    // «в сети» для лобби-директора.
+    util::RunCleanupStep(
+      "lobby logout scheduling",
+      clientId,
+      [&]()
+      {
+        _serverInstance.GetLobbyDirector().GetScheduler().Queue(
+          [this, isAuthenticated = clientContext.isAuthenticated, clientId, userName = clientContext.userName]()
+          {
+            // LOA-fix (R50-10, round50, backlog #180): ОТЛОЖЕННАЯ ПОЛОВИНА ТОЙ
+            // ЖЕ УБОРКИ, и у неё повтора нет ровно так же. Задача исполняется
+            // планировщиком через секунду и одна на два шага: выход из игры и
+            // снятие клиента с очередей входа. Бросок первого шага съедал
+            // второй — а планировщик к этому моменту уже вынул задачу из
+            // списка, то есть никто её не повторит.
+            if (isAuthenticated)
+            {
+              util::RunCleanupStep(
+                "lobby user logout",
+                clientId,
+                [&]()
+                {
+                  _serverInstance.GetLobbyDirector().QueueClientLogout(
+                    clientId,
+                    userName);
+                });
+            }
+
+            util::RunCleanupStep(
+              "lobby login queue cleanup",
+              clientId,
+              [&]()
+              {
+                _serverInstance.GetLobbyDirector().QueueClientDisconnect(clientId);
+              });
+          });
+      });
+  server::util::QuietLogDebug("Client {} disconnected from the lobby server", clientId);
 }
 
 void LobbyNetworkHandler::HandleLogin(
@@ -694,17 +1292,53 @@ void LobbyNetworkHandler::HandleLogin(
     return;
   }
 
-  for (const auto& clientContext : _clients | std::views::values)
+  // LOA-fix (R64-3, round64, backlog #215): гард повторного входа — под замком,
+  // но ОТВЕТ клиенту уже без него.
+  //
+  // ★НАЙДЕНО РЕВЬЮ, А НЕ МОИМИ ГЕЙТАМИ, и это важно записать. Мои сканеры
+  // искали переборы вида `for (auto& [id, ctx] : _clients)` и вызовы наружу
+  // под уже взятым замком — а здесь форма другая (`| std::views::values`), и
+  // замка тут не было вовсе. Проверка ключилась на ФОРМУ обращения к карте
+  // вместо СВОЙСТВА «любое обращение к `_clients` обязано быть под замком».
+  //
+  // ★Обернуть цикл замком целиком нельзя: `SendLoginCancel` внутри — выход в
+  // чужой код. Поэтому под замком принимается РЕШЕНИЕ, а отправка идёт после.
+  bool duplicateLogin = false;
   {
-    if (clientContext.userName != command.loginId || not clientContext.isAuthenticated)
-      continue;
+    const std::shared_lock lock(_clientsMutex);
 
+    for (const auto& clientContext : _clients | std::views::values)
+    {
+      if (clientContext.userName != command.loginId
+        || not clientContext.isAuthenticated)
+      {
+        continue;
+      }
+
+      duplicateLogin = true;
+      break;
+    }
+  }
+
+  if (duplicateLogin)
+  {
     SendLoginCancel(clientId, protocol::AcCmdCLLoginCancel::Reason::Duplicated);
     return;
   }
 
-  auto& clientContext = GetClientContext(clientId, false);
-  clientContext.userName = command.loginId;
+  // LOA-fix (R64-3, round64, backlog #215): имя пользователя — под замком.
+  // ★По нему ищет `GetClientIdByUserName`, перебирающий карту с ЧУЖОГО потока:
+  // запись строки в контекст во время такого перебора — это гонка на самой
+  // строке, а не только на структуре карты.
+  if (not MutateClientContext(
+        clientId,
+        [&command](ClientContext& clientContext)
+        {
+          clientContext.userName = command.loginId;
+        }))
+  {
+    throw std::runtime_error("Lobby client is not available");
+  }
 
   _serverInstance.GetLobbyDirector().GetScheduler().Queue(
     [this, clientId, userName = command.loginId, userToken = command.authKey]()
@@ -720,7 +1354,11 @@ void LobbyNetworkHandler::HandleLogin(
 
 void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
 {
-  auto& clientContext = GetClientContext(clientId);
+  // LOA-fix (R64-3, round64, backlog #215): КОПИЯ для чтения имени; запись
+  // characterUid ниже — отдельной мутацией под замком. Между ними идут выходы
+  // в чужой код (кэш пользователей, конфиг директора), поэтому ссылку в карту
+  // здесь держать нельзя: за это время карта может быть перестроена вставкой.
+  const auto clientContext = GetClientContext(clientId);
 
   const auto userRecord = _serverInstance.GetDataDirector().GetUserCache().Get(
     clientContext.userName);
@@ -738,7 +1376,16 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
       userCharacterUid = user.characterUid();
     });
 
-  clientContext.characterUid = userCharacterUid;
+  // LOA-fix (R64-3, round64, backlog #215): привязка персонажа к сессии — под
+  // замком. ★По этому полю ищет `GetClientIdByCharacterUid`, который зовут с
+  // ЧУЖОГО потока (в том числе из `DisconnectCharacter`), так что запись сюда
+  // обязана быть сериализована с тем перебором.
+  MutateClientContext(
+    clientId,
+    [userCharacterUid](ClientContext& clientContext)
+    {
+      clientContext.characterUid = userCharacterUid;
+    });
 
   // Promote any foals that matured while the player was offline before their
   // horses are sent, so the client shows them as adults from the start rather
@@ -751,6 +1398,18 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
     userCharacterUid);
   if (not characterRecord)
     throw std::runtime_error("Character record unavailable");
+
+  // LOA-fix (R10-1, round10): СУТОЧНЫЙ СБРОС ДЕЙЛИКОВ ДЕЛАЕМ ЗДЕСЬ, НА ЛОГИНЕ.
+  // Раньше он жил в RanchDirector::HandleEnterRanch — то есть срабатывал ПОСЛЕ
+  // того, как клиент уже получил и закешировал список дневных целей ответом
+  // AcCmdCLRequestDailyQuestListOK (0x357). Протокол не умеет сказать клиенту
+  // «набор сброшен» (0x35c/0x35d двигают ОДИН квест), поэтому игрок весь день
+  // смотрел на вчерашние цели, которые сервером уже стёрты: прогресс не
+  // капает, «Взять цель дня» молчит. Здесь снапшота ещё не было ни одного —
+  // это первая точка после логина, где персонаж уже известен.
+  // Тот же класс бага и то же лечение, что у PromoteMaturedFoals выше:
+  // приводим данные в актуальное состояние ДО первой отправки клиенту.
+  _serverInstance.GetRanchDirector().ResetDailyQuestsIfNeeded(userCharacterUid);
 
   protocol::LobbyCommandLoginOK response{
     .lobbyTime = util::TimePointToFileTime(util::Clock::now()),
@@ -884,6 +1543,21 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
         response.character,
         character);
 
+      // LOA (batch2): populate care-skill state from the character so learned
+      // skills + class/points survive relog. Mirrors the login model
+      // ManagementSkills{val0=class, progress, points} + SkillRanks{{id,rank}}.
+      response.managementSkills.val0 = character.careSkills.careClassLevel();
+      response.managementSkills.progress = character.careSkills.careProgress();
+      response.managementSkills.points = static_cast<uint16_t>(
+        character.careSkills.carePoints());
+      response.skillRanks.values.clear();
+      for (const auto& learned : character.careSkills.learnedRanks())
+      {
+        auto& skill = response.skillRanks.values.emplace_back();
+        skill.id = learned.id;
+        skill.rank = learned.rank;
+      }
+
       if (character.guildUid() != data::InvalidUid)
       {
         const auto guildRecord = _serverInstance.GetDataDirector().GetGuild(
@@ -979,7 +1653,7 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
       placeholder,
       PlayersOnlinePlaceholder.length(),
       std::format(
-        "{}", _serverInstance.GetLobbyDirector().GetUsers().size()));
+        "{}", _serverInstance.GetLobbyDirector().GetUserCount()));
   }
 
   if (!notice.empty())
@@ -1152,15 +1826,34 @@ void LobbyNetworkHandler::HandleRoomList(
 void LobbyNetworkHandler::HandleHeartbeat(
   const ClientId clientId)
 {
-  auto& clientContext = GetClientContext(clientId);
-  clientContext.lastHeartbeat = std::chrono::steady_clock::now();
+  // LOA-fix (R64-3, round64, backlog #215): три поля — ОДНОЙ мутацией под
+  // замком. ★Их важно применять вместе: обе метки гаснут именно потому, что
+  // пришёл реальный пульс, и разрыв этой тройки между отдельными захватами
+  // оставил бы окно, где пульс уже засчитан, а эпизоды отсрочек ещё открыты.
+  // ★Если клиента уже нет — молча ничего не делаем: пульс от исчезнувшего
+  // клиента не повод бросать, прежний код бросал лишь потому, что иначе не умел.
+  MutateClientContext(
+    clientId,
+    [](ClientContext& clientContext)
+    {
+      clientContext.lastHeartbeat = std::chrono::steady_clock::now();
+
+      // LOA-fix (R12-6, round12, backlog #85): реальный пульс закрывает эпизод
+      // грейса — следующая загрузка карты получит свежий потолок 210 c (R12-4b).
+      clientContext.raceLoadingGraceSince = {};
+
+      // LOA-fix (R21-4c, round21, backlog #95): тем же движением закрываем эпизод
+      // РАНЧ-отсрочки. Поле логовое, ничего не ограничивает: сброс нужен, чтобы
+      // следующий эпизод снова напечатался info, а не потерялся в debug.
+      clientContext.ranchGraceSince = {};
+    });
 }
 
 void LobbyNetworkHandler::HandleMakeRoom(
   ClientId clientId,
   const protocol::AcCmdCLMakeRoom& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   uint32_t createdRoomUid{0};
 
   const auto moderationVerdict = _serverInstance.GetModerationSystem().Moderate(
@@ -1209,7 +1902,7 @@ void LobbyNetworkHandler::HandleMakeRoom(
           room.GetRoomDetails().gameMode = Room::GameMode::Tutorial;
           break;
         default:
-          spdlog::error("Unknown game mode '{}'", static_cast<uint32_t>(command.gameMode));
+          server::util::QuietLogError("Unknown game mode '{}'", static_cast<uint32_t>(command.gameMode));
       }
 
       switch (command.teamMode)
@@ -1224,7 +1917,7 @@ void LobbyNetworkHandler::HandleMakeRoom(
           room.GetRoomDetails().teamMode = Room::TeamMode::Single;
           break;
         default:
-          spdlog::error("Unknown team mode '{}'", static_cast<uint32_t>(command.gameMode));
+          server::util::QuietLogError("Unknown team mode '{}'", static_cast<uint32_t>(command.gameMode));
       }
 
       room.GetRoomDetails().npcDifficulty = command.unk3;
@@ -1255,7 +1948,7 @@ void LobbyNetworkHandler::HandleMakeRoom(
     {
       const auto userName = _serverInstance.GetLobbyDirector().GetUserByCharacterUid(
         character.uid()).userName;
-      spdlog::info("Room {} created by '{}' with the name '{}'", createdRoomUid, userName, command.name);
+      server::util::QuietLogInfo("Room {} created by '{}' with the name '{}'", createdRoomUid, userName, command.name);
     });
 
   size_t identityHash = std::hash<uint32_t>()(clientContext.characterUid);
@@ -1290,7 +1983,7 @@ void LobbyNetworkHandler::HandleEnterRoom(
   const ClientId clientId,
   const protocol::AcCmdCLEnterRoom& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Whether the room is valid.
   bool isRoomValid = true;
@@ -1356,7 +2049,7 @@ void LobbyNetworkHandler::HandleEnterRoom(
         response.status = protocol::AcCmdCLEnterRoomCancel::Status::ShowRoomPassword;
         break;
       default:
-        spdlog::warn(
+        server::util::QuietLogWarn(
           "Unknown AcCmdCLEnterRoom::EnterRoomType type '{}'",
           static_cast<uint32_t>(command.enterRoomType));
         break;
@@ -1434,7 +2127,7 @@ void LobbyNetworkHandler::HandleEnterRoom(
 void LobbyNetworkHandler::HandleLeaveRoom(
   const ClientId clientId)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   _serverInstance.GetLobbyDirector().GetScheduler().Queue(
     [this, userName = clientContext.userName]()
     {
@@ -1479,8 +2172,17 @@ void LobbyNetworkHandler::SendCreateNicknameNotify(ClientId clientId)
 {
   protocol::LobbyCommandCreateNicknameNotify notify{};
 
-  auto& clientContext = GetClientContext(clientId);
-  clientContext.isInCharacterCreator = true;
+  // LOA-fix (R64-3, round64, backlog #215): флаг создателя персонажа — под
+  // замком, а отправка уведомления ниже — уже без него.
+  // ★Этот флаг читает ТИК (он даёт молчащему в создателе клиенту 15 минут
+  // вместо 60 секунд), то есть его пишет один поток, а читает другой — ровно
+  // тот стык, ради которого раунд и делается.
+  MutateClientContext(
+    clientId,
+    [](ClientContext& clientContext)
+    {
+      clientContext.isInCharacterCreator = true;
+    });
 
   _commandServer.QueueCommand<decltype(notify)>(
     clientId,
@@ -1494,13 +2196,16 @@ void LobbyNetworkHandler::HandleCreateNickname(
   const ClientId clientId,
   const protocol::AcCmdCLCreateNickname& command)
 {
-  auto& clientContext = GetClientContext(clientId);
+  // LOA-fix (R64-3, round64, backlog #215): КОПИЯ для чтения; мутации ниже —
+  // отдельной операцией под замком. Между ними идут выходы в чужой код
+  // (модерация никнейма), поэтому единой ссылки здесь быть не должно.
+  const auto clientContext = GetClientContext(clientId);
 
   constexpr uint32_t DefaultHorseTid = 20001;
 
   if (command.requestedHorseTid != DefaultHorseTid)
   {
-    spdlog::warn("Client {} ('{}') requested to create a character with an invalid horse TID '{}'",
+    server::util::QuietLogWarn("Client {} ('{}') requested to create a character with an invalid horse TID '{}'",
       clientId,
       clientContext.userName,
       command.requestedHorseTid);
@@ -1511,7 +2216,7 @@ void LobbyNetworkHandler::HandleCreateNickname(
     return;
   }
 
-  if (not locale::IsNameValid(command.nickname, 16)
+  if (not locale::IsNameValid(command.nickname, 18)
     || _serverInstance.GetModerationSystem().Moderate(command.nickname).isPrevented)
   {
     SendCreateNicknameCancel(
@@ -1520,12 +2225,29 @@ void LobbyNetworkHandler::HandleCreateNickname(
     return;
   }
 
-  clientContext.justCreatedCharacter = true;
+  // LOA-fix (R64-3, round64, backlog #215): пять полей — ОДНОЙ мутацией под
+  // замком, уже ПОСЛЕ выходов в чужой код (модерация никнейма выше).
+  // ★Тройку «пульс + две метки» разрывать нельзя по той же причине, что в
+  // HandleHeartbeat: они закрывают один логический эпизод, и раздельные захваты
+  // оставили бы окно, где создатель персонажа уже покинут, а отсрочки открыты.
+  MutateClientContext(
+    clientId,
+    [](ClientContext& clientContext)
+    {
+      clientContext.justCreatedCharacter = true;
 
-  // We update the last heartbeat too, so that the client does not get
-  // kicked immediately after `isInCharacterCreator` immunity is withdrawn.
-  clientContext.lastHeartbeat = std::chrono::steady_clock::now();
-  clientContext.isInCharacterCreator = false;
+      // We update the last heartbeat too, so that the client does not get
+      // kicked immediately after `isInCharacterCreator` immunity is withdrawn.
+      clientContext.lastHeartbeat = std::chrono::steady_clock::now();
+      // LOA-fix (R12-8, round12, backlog #85): пульс штампуется — гасим и метку
+      // грейса (R12-5), чтобы инвариант «метка живёт только внутри эпизода
+      // загрузки» держался во всех точках, а не только в HandleHeartbeat.
+      clientContext.raceLoadingGraceSince = {};
+      // LOA-fix (R21-4e, round21, backlog #95): и метку ранч-отсрочки — выход из
+      // создателя персонажа штампует пульс, эпизод логически закрыт (зеркало R12-8).
+      clientContext.ranchGraceSince = {};
+      clientContext.isInCharacterCreator = false;
+    });
 
   const auto userRecord = _serverInstance.GetDataDirector().GetUserCache().Get(
     clientContext.userName);
@@ -1614,7 +2336,11 @@ void LobbyNetworkHandler::HandleCreateNickname(
     _serverInstance.GetLobbyDirector().GetScheduler().Queue(
       [this, userCharacterUid, userName = clientContext.userName]()
       {
-        _serverInstance.GetLobbyDirector().GetUser(userName).characterUid = userCharacterUid;
+        // ★ЕДИНСТВЕННОЕ МЕСТО, КОТОРОЕ ПИСАЛО ЧЕРЕЗ ВОЗВРАЩЁННУЮ ССЫЛКУ.
+        // Возврат копии молча потерял бы эту запись, поэтому запись переехала
+        // внутрь директора, под исключительный замок.
+        _serverInstance.GetLobbyDirector().SetUserCharacterUid(
+          userName, userCharacterUid);
       });
   }
   else
@@ -1645,7 +2371,7 @@ void LobbyNetworkHandler::HandleCreateNickname(
     });
 
   // Log for moderation
-  spdlog::info("User '{}' created a character ({}) with the name '{}'",
+  server::util::QuietLogInfo("User '{}' created a character ({}) with the name '{}'",
     clientContext.userName,
     userCharacterUid,
     command.nickname);
@@ -1668,7 +2394,7 @@ void LobbyNetworkHandler::HandleShowInventory(
   const ClientId clientId,
   const protocol::AcCmdCLShowInventory&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -1684,6 +2410,14 @@ void LobbyNetworkHandler::HandleShowInventory(
       constexpr uint32_t ItemsPerResponse = 250;
       const auto itemRecords = _serverInstance.GetDataDirector().GetItemCache().Get(
         character.inventory());
+      const auto horseRecords = _serverInstance.GetDataDirector().GetHorseCache().Get(
+        character.horses());
+      // LOA-fix (R23, backlog #98): a cold/unavailable cache returns nullopt; the
+      // std::views::chunk(*itemRecords)/(*horseRecords) derefs below would crash on a
+      // disengaged optional. Check BOTH up front so a cold cache yields an EMPTY
+      // response, never a partial one (item chunks are built before the horse section).
+      if (not itemRecords || not horseRecords)
+        return;
 
       // Produce chunked responses, by ItemsPerResponse
       const auto itemChunks = std::views::chunk(
@@ -1707,9 +2441,6 @@ void LobbyNetworkHandler::HandleShowInventory(
       // Create a separate response for horses
       // 0x0A (10) is the protocol max per response
       constexpr uint32_t HorsesPerResponse = 10;
-      const auto horseRecords = _serverInstance.GetDataDirector().GetHorseCache().Get(
-        character.horses());
-
       // Produce chunked responses, by HorsesPerResponse
       const auto horseChunks = std::views::chunk(
         *horseRecords,
@@ -1752,7 +2483,7 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
   const ClientId clientId,
   const protocol::AcCmdCLUpdateUserSettings& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
    clientContext.characterUid);
 
@@ -1845,7 +2576,7 @@ void LobbyNetworkHandler::HandleEnterRoomQuick(
   const ClientId clientId,
   const protocol::AcCmdCLEnterRoomQuick& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   const bool hasQueued = _serverInstance.GetMatchmakingSystem().Queue(
     clientContext.characterUid,
@@ -1896,7 +2627,7 @@ void LobbyNetworkHandler::HandleGoodsShopList(
   // Check if the total size of chunked parts exceed the size of limit defined in command handler
   if (chunkedPartsSize > MaxShopDataSize)
   {
-    spdlog::error("Shop data chunking with {} chunks, totalling {} bytes, exceeds max game shop data size of {} bytes.",
+    server::util::QuietLogError("Shop data chunking with {} chunks, totalling {} bytes, exceeds max game shop data size of {} bytes.",
       chunkCount,
       chunkedPartsSize,
       MaxShopDataSize);
@@ -1948,24 +2679,153 @@ void LobbyNetworkHandler::HandleAchievementCompleteList(
   const ClientId clientId,
   const protocol::AcCmdCLAchievementCompleteList&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
   protocol::AcCmdCLAchievementCompleteListOK response{};
 
+  uint32_t characterLevel = 0;
+  // LOA-fix (R69, backlog #58): СНИМОК ЗАРАБОТАННЫХ ДОСТИЖЕНИЙ.
+  //
+  // Снимается ПОД ЗАМКОМ записи, а разбирается снаружи: под замком копируются
+  // ровно два числа на запись, а обращение к реестру и сборка ответа идут уже
+  // без него.
+  struct EarnedAchievement
+  {
+    uint16_t tid;
+    uint32_t progress;
+  };
+  std::vector<EarnedAchievement> earnedAchievements;
+
   characterRecord.Immutable(
-    [&response](const data::Character& character)
+    [&response, &characterLevel, &earnedAchievements](const data::Character& character)
     {
       response.unk0 = character.uid();
+      characterLevel = character.level();
+
+      // ★ПРИЗНАК «ПОЛУЧЕНО» — ВЗЯТЫЙ ТИР, А НЕ НЕНУЛЕВОЙ ПРОГРЕСС. Запись в
+      // `character.achievements()` заводится при ПЕРВОМ же событии и живёт с
+      // нулевым тиром до первого порога: судить по `progress > 0` значило бы
+      // объявить полученным то, что только начато. Сам тир нигде не хранится —
+      // он выводится из числа непустых отметок `tierEarnedAt` (см.
+      // `data::Character::AchievementEntry`), поэтому «хотя бы одна отметка
+      // непустая» и есть «хотя бы один тир взят». Пустая отметка = эпоха: так
+      // её пишет и читает `FileDataSource` (ноль в json = тир не взят).
+      for (const auto& achievementEntry : character.achievements())
+      {
+        bool anyTierEarned = false;
+        for (const auto& tierEarnedAt : achievementEntry.tierEarnedAt)
+        {
+          if (tierEarnedAt != data::Clock::time_point{})
+          {
+            anyTierEarned = true;
+            break;
+          }
+        }
+
+        if (not anyTierEarned)
+          continue;
+
+        earnedAchievements.push_back(
+          {.tid = achievementEntry.tid, .progress = achievementEntry.progress});
+      }
     });
 
-  // These are the level-up achievements from the `Achievement` table with the event id 75.
-  response.achievements.emplace_back().tid = 20008;
-  response.achievements.emplace_back().tid = 20009;
-  response.achievements.emplace_back().tid = 20010;
-  response.achievements.emplace_back().tid = 20011;
-  response.achievements.emplace_back().tid = 20012;
+  // LOA-fix (achievements, вариант A): level-up достижения 20008-20012 из таблицы
+  // Achievement (event id 75). Раньше слались БЕЗУСЛОВНО всем — клиент считал их
+  // все полученными. Гейтим по уровню персонажа (level уже персистится): tid
+  // добавляется, только если его порог уровня достигнут. Полный T6 (246 условий
+  // с реальным начислением/попапом) — отдельный проект; это документированный
+  // минимум, делающий список корректным по уровню.
+  struct LevelUpAchievement { uint16_t tid; uint32_t requiredLevel; };
+  static constexpr LevelUpAchievement kLevelUpAchievements[] = {
+    {20008, 2}, {20009, 5}, {20010, 12}, {20011, 8}, {20012, 10}};
+  for (const auto& achievement : kLevelUpAchievements)
+  {
+    if (characterLevel >= achievement.requiredLevel)
+    {
+      // LOA-fix (R44-1, #58/R0): статус ОБЯЗАН быть Finished. По умолчанию
+      // protocol::Quest::status == InProgress(0), поэтому выданные достижения
+      // уезжали клиенту как «в процессе»: список формально приходил, но ни одно
+      // достижение не читалось как закрытое — а это единственное место во всей
+      // игре, где достижение у нас реально что-то включает (диалоги NPC по
+      // уровню). Значения enum: InProgress=0, ReadyToClaim=1, Finished=3.
+      auto& completedAchievement = response.achievements.emplace_back();
+      completedAchievement.tid = achievement.tid;
+      completedAchievement.status = protocol::Quest::Status::Finished;
+    }
+  }
+
+  // LOA-fix (R69, backlog #58): ЗАРАБОТАННЫЕ ДОСТИЖЕНИЯ — В СПИСОК.
+  //
+  // ДЕФЕКТ, КОТОРЫЙ ЭТО ЗАКРЫВАЕТ. Ответ 0xe6 состоял РОВНО из пяти уровневых
+  // tid'ов и больше ни из чего. При этом подсистема достижений (R46/R47) уже
+  // считает прогресс и проставляет тиры в `character.achievements()` — по проду
+  // это ОДИННАДЦАТЬ разных tid'ов, до восьми у одного персонажа, — а окно
+  // достижений показывало пять. Список врал: сервер знал больше, чем говорил.
+  //
+  // ★ЗАГЛУШКУ `neverAward` НЕ ОТДАЁМ НИКОГДА. Это заведомо невыполнимое
+  // достижение (tid 20000): попади оно в список, клиент считал бы системную
+  // книгу закрытой навсегда. `AchievementSystem` его тоже не двигает, но
+  // правило здесь ВТОРОЕ и независимое: список строится из данных на диске, а
+  // они переживут любую смену логики начисления.
+  //
+  // ★ДЕДУП ПО tid. Уровневая пятёрка выше и запись в данных умеют назвать один
+  // и тот же tid; задвоенная строка — ложь о числе достижений.
+  //
+  // ★ПОТОЛОК ДЛИНЫ — ПРОТИВ ИСПОРЧЕННЫХ ДАННЫХ, А НЕ ПРОТИВ ИГРОКА. Тело
+  // команды у клиента ограничено `protocol::BufferSize` за вычетом magic, одна
+  // запись `Quest` весит на проводе 13 байт, шапка ответа — 6 (`unk0` +
+  // счётчик). Каталог достижений — 246 записей, честный список в потолок не
+  // упрётся никогда. Но читатель персиста принимает до 4096 записей, и такой
+  // файл дал бы кадр в полсотни килобайт: переполнение вылезло бы НЕ ЗДЕСЬ, а
+  // броском в потоке отправки (`CommandServer::SendCommand`) — класс #178.
+  constexpr std::size_t kAchievementListHeaderSize = 6;
+  constexpr std::size_t kAchievementListEntrySize = 13;
+  constexpr std::size_t kMaxListedAchievements =
+    (protocol::BufferSize - sizeof(protocol::MessageMagic)
+      - kAchievementListHeaderSize) / kAchievementListEntrySize;
+
+  const auto& achievementRegistry = _serverInstance.GetAchievementRegistry();
+  for (const auto& earnedAchievement : earnedAchievements)
+  {
+    if (response.achievements.size() >= kMaxListedAchievements)
+      break;
+
+    // Запись, которой нет в каталоге, отдаётся как есть: каталог — серверное
+    // зеркало клиентской таблицы, и его неполнота не отменяет того, что
+    // достижение реально взято. Скрыть такую запись значило бы соврать в ту же
+    // сторону, от которой раунд и лечит. Признак `neverAward` живёт В каталоге,
+    // поэтому отсутствие записи в нём никогда не прячет заглушку.
+    const auto* const achievementInfo = achievementRegistry.GetAchievement(
+      earnedAchievement.tid);
+    if (achievementInfo != nullptr and achievementInfo->neverAward)
+      continue;
+
+    bool alreadyListed = false;
+    for (const auto& listedAchievement : response.achievements)
+    {
+      if (listedAchievement.tid == earnedAchievement.tid)
+      {
+        alreadyListed = true;
+        break;
+      }
+    }
+
+    if (alreadyListed)
+      continue;
+
+    auto& earnedEntry = response.achievements.emplace_back();
+    earnedEntry.tid = earnedAchievement.tid;
+    // Статус тот же, что у уровневых, и по той же причине (R44-1): список
+    // 0xe6 — про ПОЛУЧЕННОЕ, а `InProgress` по умолчанию читался бы клиентом
+    // как «ещё не закрыто».
+    earnedEntry.status = protocol::Quest::Status::Finished;
+    // Прогресс отдаём честный: клиент для `Finished` его не рисует, но врать
+    // в поле, которое мы всё равно заполняем, незачем.
+    earnedEntry.progress = earnedAchievement.progress;
+  }
 
   _commandServer.QueueCommand<decltype(response)>(
     clientId,
@@ -2033,7 +2893,7 @@ void LobbyNetworkHandler::HandleEnterRanch(
   const ClientId clientId,
   const protocol::AcCmdCLEnterRanch& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto rancherRecord = _serverInstance.GetDataDirector().GetCharacter(
     command.rancherUid);
 
@@ -2068,16 +2928,35 @@ void LobbyNetworkHandler::HandleEnterRanchRandomly(
   const ClientId clientId,
   const protocol::AcCmdCLEnterRanchRandomly&)
 {
-  auto& clientContext = GetClientContext(clientId);
-  const auto requestingCharacterUid = clientContext.characterUid;
-
+  // LOA-fix (R64-3, round64, backlog #215 + #225): ЧТЕНИЕ И ПОТРЕБЛЕНИЕ
+  // ПРЕДПОЧТЕНИЯ — ОДНОЙ АТОМАРНОЙ ОПЕРАЦИЕЙ.
+  //
+  // ★ЗДЕСЬ НЕЛЬЗЯ «КОПИЯ + ОТДЕЛЬНАЯ МУТАЦИЯ», И ЭТО ГЛАВНОЕ В ЭТОМ МЕСТЕ.
+  // Пара «прочитал предпочтение → погасил его» — классический read-modify-write:
+  // разложи её на два захвата замка, и между ними откроется окно, в котором
+  // второй поток прочитает то же ненулевое значение до сброса. Тогда визит
+  // сработает ДВАЖДЫ.
+  // ★Пара неатомарна и СЕЙЧАС, до раунда (карта вообще без синхронизации) —
+  // то есть это латентный дефект #225, а не поведение, которое надо сохранить.
+  // Простой путь «как у всех остальных мест» аккуратно перенёс бы его в новую
+  // обёртку; поэтому здесь чтение и запись живут под ОДНИМ захватом.
+  data::Uid requestingCharacterUid = data::InvalidUid;
   data::Uid rancherUid = data::InvalidUid;
 
-  // If the user has a visit preference apply it.
-  if (clientContext.rancherVisitPreference != data::InvalidUid)
+  if (not MutateClientContext(
+        clientId,
+        [&requestingCharacterUid, &rancherUid](ClientContext& clientContext)
+        {
+          requestingCharacterUid = clientContext.characterUid;
+
+          if (clientContext.rancherVisitPreference != data::InvalidUid)
+          {
+            rancherUid = clientContext.rancherVisitPreference;
+            clientContext.rancherVisitPreference = data::InvalidUid;
+          }
+        }))
   {
-    rancherUid = clientContext.rancherVisitPreference;
-    clientContext.rancherVisitPreference = data::InvalidUid;
+    throw std::runtime_error("Lobby client is not available");
   }
 
   // If the rancher's uid is invalid randomize it.
@@ -2091,6 +2970,13 @@ void LobbyNetworkHandler::HandleEnterRanchRandomly(
     for (const auto& randomRancherUid : characterKeys)
     {
       const auto character = characters.Get(randomRancherUid);
+      // LOA-fix (R13-5, round13, backlog #86): ГАРД ХОЛОДНОГО КЛЮЧА.
+      // GetKeys() отдаёт все известные хранилищу ключи, включая незагруженные
+      // (Get на первом касании возвращает nullopt) и те, чей retrieve упал
+      // навсегда. Разыменование пустого optional здесь — UB в лобби-потоке.
+      if (not character)
+        continue;
+
       character->Immutable([&availableRanches, requestingCharacterUid](const data::Character& character)
       {
         // Only consider ranches that are unlocked and that
@@ -2105,7 +2991,11 @@ void LobbyNetworkHandler::HandleEnterRanchRandomly(
     // There must be at least the ranch the requesting character is the owner of.
     if (availableRanches.empty())
     {
-      availableRanches.emplace_back(clientContext.characterUid);
+      // LOA-fix (R64-3, round64, backlog #215): берём уже снятое значение, а не
+      // поле контекста. ★Ссылки на контекст здесь больше нет — она жила бы через
+      // выходы в чужой код ниже; `requestingCharacterUid` снят под тем же
+      // замком, что и потребление предпочтения, то есть это ТО ЖЕ значение.
+      availableRanches.emplace_back(requestingCharacterUid);
     }
 
     // Pick a random character from the available list to join the ranch of.
@@ -2120,7 +3010,7 @@ void LobbyNetworkHandler::SendEnterRanchOK(
   const ClientId clientId,
   const data::Uid rancherUid)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   const auto& lobbyConfig = _serverInstance.GetLobbyDirector().GetConfig();
 
@@ -2142,7 +3032,7 @@ void LobbyNetworkHandler::HandleFeatureCommand(
   const ClientId,
   const protocol::AcCmdCLFeatureCommand& command)
 {
-  spdlog::warn("Feature command: {}", command.command);
+  server::util::QuietLogWarn("Feature command: {}", command.command);
 }
 
 void LobbyNetworkHandler::HandleRequestFestivalResult(
@@ -2156,7 +3046,7 @@ void LobbyNetworkHandler::HandleSetIntroduction(
   const ClientId clientId,
   const protocol::AcCmdCLSetIntroduction& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -2174,7 +3064,7 @@ void LobbyNetworkHandler::HandleGetMessengerInfo(
   const ClientId clientId,
   const protocol::AcCmdCLGetMessengerInfo&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Get messenger config and check if messenger is enabled
   const auto& messengerConfig = _serverInstance.GetMessengerDirector().GetConfig();
@@ -2241,7 +3131,7 @@ void LobbyNetworkHandler::HandleUpdateSystemContent(
   const ClientId clientId,
   const protocol::AcCmdCLUpdateSystemContent& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -2261,7 +3151,21 @@ void LobbyNetworkHandler::HandleUpdateSystemContent(
   protocol::AcCmdLCUpdateSystemContent notify{};
   notify.systemContent.values = {{command.key, command.value}};
 
-  for (const auto& connectedClientId : _clients | std::views::keys)
+  // LOA-fix (R64-3, round64, backlog #215): рассылка по всем клиентам — СПИСОК
+  // под замком, отправка после него.
+  // ★Второе место той же формы (`| std::views::keys`), которое мои сканеры не
+  // видели: они проверяли известные виды перебора, а не свойство «каждое
+  // обращение к `_clients` под замком». Здесь вдобавок `QueueCommand` внутри
+  // цикла — то есть замок, накинутый на цикл целиком, ушёл бы в чужой код.
+  std::vector<ClientId> notifyTargets;
+  {
+    const std::shared_lock lock(_clientsMutex);
+    notifyTargets.reserve(_clients.size());
+    for (const auto& connectedClientId : _clients | std::views::keys)
+      notifyTargets.emplace_back(connectedClientId);
+  }
+
+  for (const auto& connectedClientId : notifyTargets)
   {
     _commandServer.QueueCommand<decltype(notify)>(
       connectedClientId,
@@ -2276,7 +3180,7 @@ void LobbyNetworkHandler::HandleEnterRoomQuickStop(
   const ClientId clientId,
   const protocol::AcCmdCLEnterRoomQuickStop&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   const bool dequeued = _serverInstance.GetMatchmakingSystem().Dequeue(
     clientContext.characterUid);
@@ -2358,17 +3262,22 @@ void LobbyNetworkHandler::HandleRequestMountInfo(
         horse.mountInfo.winsMagicSingle());
       mountInfo.winsMagicTeam = static_cast<uint16_t>(
         horse.mountInfo.winsMagicTeam());
-      mountInfo.totalDistance = static_cast<uint16_t>(
+      // LOA-fix (R24, #14 фаза 1): эти протокол-поля uint32 (LobbyMessageDefinitions),
+      // но read-back резал их до uint16 → totalDistance оборачивался за ~19 заездов
+      // (одометр «назад»); те же грабли ждали carnival participated/cumulativePrize/
+      // biggestPrize (тоже uint32, Ф2). Расширяем ВСЕ шесть. Касты на winsSpeed*/
+      // boostsInARow НЕ трогаем — те wire-поля реально uint16.
+      mountInfo.totalDistance = static_cast<uint32_t>(
         horse.mountInfo.totalDistance());
-      mountInfo.topSpeed = static_cast<uint16_t>(
+      mountInfo.topSpeed = static_cast<uint32_t>(
         horse.mountInfo.topSpeed());
-      mountInfo.longestGlideDistance = static_cast<uint16_t>(
+      mountInfo.longestGlideDistance = static_cast<uint32_t>(
         horse.mountInfo.longestGlideDistance());
-      mountInfo.participated = static_cast<uint16_t>(
+      mountInfo.participated = static_cast<uint32_t>(
         horse.mountInfo.participated());
-      mountInfo.cumulativePrize = static_cast<uint16_t>(
+      mountInfo.cumulativePrize = static_cast<uint32_t>(
         horse.mountInfo.cumulativePrize());
-      mountInfo.biggestPrize = static_cast<uint16_t>(
+      mountInfo.biggestPrize = static_cast<uint32_t>(
         horse.mountInfo.biggestPrize());
     });
   }
@@ -2385,7 +3294,7 @@ void LobbyNetworkHandler::HandleInquiryTreecash(
   const ClientId clientId,
   const protocol::AcCmdCLInquiryTreecash&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -2411,7 +3320,7 @@ void LobbyNetworkHandler::HandleAcceptInviteToGuild(
 {
   // TODO: command data check
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Pending invites for guild
   auto& pendingGuildInvites = _serverInstance.GetLobbyDirector().GetGuilds()[command.guild.uid].invites;
@@ -2429,7 +3338,7 @@ void LobbyNetworkHandler::HandleAcceptInviteToGuild(
   else
   {
     // Character tried to join guild but has no pending (online) invite
-    spdlog::warn("Character {} tried to join a guild {} but does not have a valid invite",
+    server::util::QuietLogWarn("Character {} tried to join a guild {} but does not have a valid invite",
       clientContext.characterUid, command.guild.uid);
     return;
   }
@@ -2451,7 +3360,7 @@ void LobbyNetworkHandler::HandleAcceptInviteToGuild(
           std::ranges::contains(guild.officers(), inviteeCharacterUid) ||
           guild.owner() == inviteeCharacterUid)
       {
-        spdlog::warn("Character {} tried to join guild {} that they are already a part of",
+        server::util::QuietLogWarn("Character {} tried to join guild {} that they are already a part of",
           inviteeCharacterUid, guild.uid());
         return;
       }
@@ -2492,14 +3401,14 @@ void LobbyNetworkHandler::HandleClientNotify(
 {
   // todo: reset roll code?
   if (command.val0 != 1)
-    spdlog::error("Client error notification: state[{}], value[{}]", command.val0, command.val1);
+    server::util::QuietLogError("Client error notification: state[{}], value[{}]", command.val0, command.val1);
 }
 
 void LobbyNetworkHandler::HandleChangeRanchOption(
   const ClientId clientId,
   const protocol::AcCmdCLChangeRanchOption& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
   protocol::AcCmdCLChangeRanchOptionOK response{
@@ -2523,7 +3432,19 @@ void LobbyNetworkHandler::HandleRequestDailyQuestList(
   const ClientId clientId,
   const protocol::AcCmdCLRequestDailyQuestList&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
+
+  // LOA-fix (R10-2, round10): страховка «reset-on-read». Основной сброс стоит в
+  // SendLoginOK (R10-1), но этот пакет — ЕДИНСТВЕННОЕ место, где клиент берёт
+  // набор целей на день, и обновить его потом нечем. Поэтому сбрасываем ещё и
+  // прямо перед сборкой ответа: если сессия почему-то пережила границу игрового
+  // дня без нового логина (долгий онлайн, переоткрытие окна квестов), клиент
+  // получит сегодняшнее состояние, а не вчерашнее.
+  // Дублирования нет: сброс идемпотентен по lastResetDate — второй вызов в тот
+  // же игровой день выходит по `if (group.lastResetDate() >= today) return;`.
+  _serverInstance.GetRanchDirector().ResetDailyQuestsIfNeeded(
+    clientContext.characterUid);
+
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -2642,7 +3563,7 @@ void LobbyNetworkHandler::HandleRequestQuestList(
   const ClientId clientId,
   const protocol::AcCmdCLRequestQuestList&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 
@@ -2673,7 +3594,7 @@ void LobbyNetworkHandler::HandleRequestSpecialEventList(
   const ClientId clientId,
   const protocol::AcCmdCLRequestSpecialEventList&)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 

@@ -18,6 +18,7 @@
  **/
 
 #include "server/lobby/LobbyDirector.hpp"
+#include "libserver/util/QuietLog.hpp"
 
 #include "server/lobby/LobbyNetworkHandler.hpp"
 #include "server/ServerInstance.hpp"
@@ -135,7 +136,29 @@ void LobbyDirector::QueueClientLogout(
   [[maybe_unused]] network::ClientId clientId,
   const std::string& userName)
 {
-  spdlog::info("User '{}' (client {}) logged out", userName, clientId);
+  server::util::QuietLogInfo("User '{}' (client {}) logged out", userName, clientId);
+
+  // LOA-fix (R50-9, round50, backlog #180): ВТОРАЯ ЗАЩЁЛКА, КОТОРАЯ БЛОКИРУЕТ
+  // АККАУНТ. Отметка «пользователь в игре» снималась ПОСЛЕДНЕЙ строкой, а перед
+  // ней стоит настоящая работа с данными (получение записи пользователя и
+  // запись времени последнего входа) — она бросает по природе. Уцелевшая
+  // отметка означает, что `try_emplace` на следующем входе не вставит запись и
+  // игрок получит `Duplicated` — навсегда, до перезапуска сервера.
+  //
+  // ★СНИМАЕМ ПЕРВЫМ ДЕЙСТВИЕМ, А НЕ СТРАЖЕМ НА ВЫХОДЕ. Разница не
+  // стилистическая: страж хранит КОПИЮ ключа, а ключ здесь строковый, то есть
+  // его копия умеет бросить — и тогда не установится само обязательство, а
+  // запись уже существует (её завёл вход в игру). Обязательство, которое умеет
+  // не установиться, гарантией не является. `erase` по ключу ничего не
+  // выделяет, поэтому снятие отметки первой строкой не может не состояться, и
+  // всё, что ниже, вольно бросать сколько угодно.
+  // Ниже отметка не нужна ни одной строчке, а потерянное время последнего входа
+  // — приемлемая цена: сокета уже нет, и «в игре» пользователь числиться не
+  // должен ни при каком исходе.
+  {
+    const std::unique_lock usersLock(_userInstancesMutex);
+    _userInstances.erase(userName);
+  }
 
   const auto userRecord = _serverInstance.GetDataDirector().GetUser(userName);
   if (userRecord.IsAvailable())
@@ -145,18 +168,19 @@ void LobbyDirector::QueueClientLogout(
       user.lastSeenOnline() = data::Clock::now();
     });
   }
-
-  _userInstances.erase(userName);
 }
 
 bool LobbyDirector::IsUserOnline(const std::string& userName)
 {
+  const std::shared_lock usersLock(_userInstancesMutex);
   return _userInstances.contains(userName);
 }
 
-LobbyDirector::UserInstance& LobbyDirector::GetUser(
+LobbyDirector::UserInstance LobbyDirector::GetUser(
   const std::string& userName)
 {
+  const std::shared_lock usersLock(_userInstancesMutex);
+
   const auto iter = _userInstances.find(userName);
   if (iter == _userInstances.cend())
   {
@@ -169,9 +193,13 @@ LobbyDirector::UserInstance& LobbyDirector::GetUser(
   return iter->second;
 }
 
-const LobbyDirector::UserInstance& LobbyDirector::GetUserByCharacterUid(
+LobbyDirector::UserInstance LobbyDirector::GetUserByCharacterUid(
   data::Uid characterUid)
 {
+  // ★ЗДЕСЬ ДЕТЕКТОР И ЛОВИЛ ГОНКУ: этот обход шёл с сетевого потока, пока поток
+  // лобби вставлял нового вошедшего.
+  const std::shared_lock usersLock(_userInstancesMutex);
+
   for (const auto& userInstance : _userInstances | std::views::values)
   {
     if (userInstance.characterUid == characterUid)
@@ -186,6 +214,8 @@ const LobbyDirector::UserInstance& LobbyDirector::GetUserByCharacterUid(
 
 void LobbyDirector::SetUserRoom(const std::string& userName, data::Uid roomUid)
 {
+  const std::unique_lock usersLock(_userInstancesMutex);
+
   const auto userIter = _userInstances.find(userName);
   if (userIter == _userInstances.cend())
     return;
@@ -264,13 +294,40 @@ void LobbyDirector::NotifyMatchmakeResult(
     result);
 }
 
-std::unordered_map<std::string, LobbyDirector::UserInstance>& LobbyDirector::GetUsers()
+std::vector<LobbyDirector::UserInstance> LobbyDirector::SnapshotUsers()
 {
-  return _userInstances;
+  const std::shared_lock usersLock(_userInstancesMutex);
+
+  std::vector<UserInstance> snapshot;
+  snapshot.reserve(_userInstances.size());
+  for (const auto& userInstance : _userInstances | std::views::values)
+    snapshot.push_back(userInstance);
+
+  return snapshot;
+}
+
+void LobbyDirector::SetUserCharacterUid(
+  const std::string& userName,
+  const data::Uid characterUid)
+{
+  const std::unique_lock usersLock(_userInstancesMutex);
+
+  const auto iter = _userInstances.find(userName);
+  if (iter == _userInstances.cend())
+  {
+    // ★МОЛЧА НЕ УХОДИМ. Раньше здесь стоял `GetUser`, который БРОСАЛ, если
+    // пользователя нет; проглотить это молча значило бы потерять привязку
+    // персонажа и оставить игрока в игре без неё.
+    throw std::runtime_error(
+      std::format("User instance '{}' not available", userName));
+  }
+
+  iter->second.characterUid = characterUid;
 }
 
 size_t LobbyDirector::GetUserCount()
 {
+  const std::shared_lock usersLock(_userInstancesMutex);
   return _userInstances.size();
 }
 
@@ -307,9 +364,17 @@ void LobbyDirector::ProcessLoginRequest()
   // Request authentication of the user if not yet requested.
   if (not loginContext.userAuthenticationRequested)
   {
-    _serverInstance.GetAuthenticationService().QueueAuthentication(
+    // LOA-fix (R51-4b, round51, backlog #179): отметка «просьба отправлена»
+    // ставится ТОЛЬКО если её действительно приняли. Иначе вход считался бы
+    // отправленным, ответа не пришло бы никогда, и клиент висел бы на экране
+    // входа до собственного таймаута. Очередь входов обрабатывается каждый
+    // тик — значит отказ просто приводит к повторной попытке.
+    if (not _serverInstance.GetAuthenticationService().QueueAuthentication(
       loginContext.userName,
-      loginContext.userToken);
+      loginContext.userToken))
+    {
+      return;
+    }
 
     loginContext.userAuthenticationRequested = true;
     return;
@@ -321,7 +386,7 @@ void LobbyDirector::ProcessLoginRequest()
 
   if (not loginContext.isAuthenticated.value())
   {
-    spdlog::info("User '{}' failed authentication", loginContext.userName);
+    server::util::QuietLogInfo("User '{}' failed authentication", loginContext.userName);
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::InvalidUser);
@@ -348,11 +413,11 @@ void LobbyDirector::ProcessLoginRequest()
 
   if (not _serverInstance.GetDataDirector().AreUserDataLoaded(loginContext.userName))
   {
-    spdlog::error("User data for '{}' are not available", loginContext.userName);
+    server::util::QuietLogError("User data for '{}' are not available", loginContext.userName);
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::Generic);
-    spdlog::warn("Rejected login of user '{}' because of a server error", loginContext.userName);
+    server::util::QuietLogWarn("Rejected login of user '{}' because of a server error", loginContext.userName);
     return;
   }
 
@@ -369,11 +434,11 @@ void LobbyDirector::ProcessLoginRequest()
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::DisconnectYourself);
-    spdlog::info("Rejected login of user '{}' because of an infraction", loginContext.userName);
+    server::util::QuietLogInfo("Rejected login of user '{}' because of an infraction", loginContext.userName);
   }
   else
   {
-    spdlog::info("Accepted login of user '{}'", loginContext.userName);
+    server::util::QuietLogInfo("Accepted login of user '{}'", loginContext.userName);
     // Queue the user response.
     _loginResponseQueue.emplace_back(clientId);
   }
@@ -426,22 +491,48 @@ void LobbyDirector::ProcesLoginResponse()
   if (characterUid != data::InvalidUid && not _serverInstance.GetDataDirector().AreCharacterDataLoaded(
     loginContext.userName))
   {
-    spdlog::error("User character data for '{}' not available", clientId);
+    server::util::QuietLogError("User character data for '{}' not available", clientId);
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::Generic);
-    spdlog::warn("Rejected login of user '{}' because of a server error", loginContext.userName);
+    server::util::QuietLogWarn("Rejected login of user '{}' because of a server error", loginContext.userName);
     return;
   }
 
-  const auto& [iter, inserted] = _userInstances.try_emplace(
-    loginContext.userName);
+  // ★ЗДЕСЬ БЫЛ ПИШУЩИЙ КОНЕЦ ГОНКИ, И ЗАМОК СТОИТ РОВНО ВОКРУГ РАБОТЫ С
+  // КАРТОЙ, А НЕ ШИРЕ. Первая моя редакция брала исключительный замок и
+  // держала его до конца функции — то есть и через `AcceptLogin`, который
+  // возвращается в этот же директор. Получился самозахват нерекурсивного
+  // замка: поток лобби вставал намертво, вход переставал работать целиком
+  // (стенд показал 0 удачных заходов из 24). Ирония в том, что ровно про этот
+  // риск я предупреждал для ПЕРЕБОРА и не применил к ЗАПИСИ.
+  bool inserted = false;
+  {
+    const std::unique_lock usersLock(_userInstancesMutex);
+
+    const auto [iter, insertedNow] = _userInstances.try_emplace(
+      loginContext.userName);
+    inserted = insertedNow;
+
+    // ★ЗАПИСЬ ЗАПОЛНЯЕТСЯ ВНУТРИ ЗАМКА, А НЕ ПОСЛЕ. Раньше поля проставлялись
+    // уже после `AcceptLogin`, и между вставкой и заполнением существовало
+    // окно, в котором чужие потоки видели ПОЛУПУСТУЮ запись: имя пустое,
+    // персонаж `InvalidUid`. Заполнение под тем же замком это окно закрывает —
+    // наружу запись становится видна сразу целой.
+    if (inserted)
+    {
+      auto& userInstance = iter->second;
+      userInstance.userName = loginContext.userName;
+      userInstance.characterUid = characterUid;
+    }
+  }
+
   if (not inserted)
   {
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::Duplicated);
-    spdlog::warn(
+    server::util::QuietLogWarn(
       "Rejected login of user '{}' because the user is already logged in from different location",
       loginContext.userName);
     return;
@@ -452,10 +543,7 @@ void LobbyDirector::ProcesLoginResponse()
 
   _networkHandler->AcceptLogin(clientId, requiresCharacterCreator);
 
-  auto& userInstance = iter->second;
-  userInstance.userName = loginContext.userName;
-  userInstance.characterUid = characterUid;
-  spdlog::info(
+  server::util::QuietLogInfo(
     "User '{}' (client {}) logged in from {}",
     loginContext.userName,
     clientId,

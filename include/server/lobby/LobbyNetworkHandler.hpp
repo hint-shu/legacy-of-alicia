@@ -86,6 +86,28 @@ private:
     //! A time point of the last heartbeat.
     std::chrono::steady_clock::time_point lastHeartbeat{};
 
+    //! LOA-fix (R12-5, round12, backlog #85): момент, когда лобби-таймауту
+    //! впервые отсрочили кик из-за загрузки карты заезда. Значение по умолчанию
+    //! (эпоха steady_clock) = «грейс не активен». Отдельная метка нужна потому,
+    //! что сам грейс освежает `lastHeartbeat` (R12-4b) — по нему потолок жизни
+    //! зомби посчитать уже нельзя. Метка живёт от входа в грейс до одного из
+    //! трёх событий: реальный пульс клиента (R12-6), одноразовый хендофф сразу
+    //! после окончания загрузки (R12-4b) и переиспользование контекста
+    //! (подключение — R12-7, выход из создателя персонажа — R12-8). То есть
+    //! каждая загрузка карты получает свежий потолок, а не остаток от прошлой.
+    std::chrono::steady_clock::time_point raceLoadingGraceSince{};
+
+    //! LOA-fix (R21-4a, round21, backlog #95): момент, когда лобби-таймауту
+    //! впервые отсрочили кик из-за АКТИВНОГО РАНЧ-СОКЕТА. ★ЭТО ПОЛЕ — ТОЛЬКО
+    //! ДЛЯ ЛОГА: в отличие от raceLoadingGraceSince (R12-5) оно НИЧЕГО НЕ
+    //! ограничивает. У ранч-отсрочки потолка нет и быть не должно — игрок
+    //! законно стоит на ранчо часами, а роль ограничителя играет свежесть
+    //! записи активности (30 c) на стороне директора ранчо. Метка нужна ровно
+    //! затем, чтобы вход в отсрочку печатался info один раз, а продолжение —
+    //! debug'ом, и чтобы в логе было видно длительность эпизода. Гаснет на
+    //! реальном пульсе (R21-4c) и при переиспользовании контекста (R21-4d/4e).
+    std::chrono::steady_clock::time_point ranchGraceSince{};
+
     std::string userName{};
     data::Uid characterUid = data::InvalidUid;
     data::Uid rancherVisitPreference = data::InvalidUid;
@@ -98,9 +120,39 @@ private:
   ClientId GetClientIdByCharacterUid(
     data::Uid characterUid,
     bool requiresAuthorization = true);
-  ClientContext& GetClientContext(
+
+  // LOA-fix (R64-3, round64, backlog #215): КОНТРАКТ СМЕНЁН — НАРУЖУ УХОДИТ
+  // КОПИЯ, А НЕ ССЫЛКА В КАРТУ.
+  //
+  // ★ПОЧЕМУ ЗАМКА ВНУТРИ ПРЕЖНЕГО МЕТОДА БЫЛО БЫ НЕДОСТАТОЧНО. Он возвращал
+  // `ClientContext&` — замок отпустился бы на выходе, а ссылка ушла бы наружу и
+  // пережила бы и rehash при вставке, и удаление записи. Защищать надо не
+  // момент поиска, а всё время использования; единственный способ это
+  // гарантировать, не растягивая замок на чужой код, — не выпускать ссылку.
+  //
+  // ★Копия дёшева и это проверено, а не предположено: три `bool`, три
+  // `time_point`, короткий `userName` (обычно в SSO, без аллокации) и два uid.
+  [[nodiscard]] ClientContext GetClientContext(
     ClientId clientId,
     bool requireAuthentication = true);
+
+  // ★МУТАЦИЯ — ТОЛЬКО ЧЕРЕЗ ЭТО. Лямбда исполняется ПОД исключительным замком,
+  // поэтому в ней допустимы ровно присваивания полей: любой вызов наружу из-под
+  // замка — это заявка на дедлок лобби↔ранчо (и на самозахват нерекурсивного
+  // `shared_mutex`, которым уже был убит вход в игру в R59: 0 успешных из 24).
+  // Возвращает false, если клиента уже нет — вызывающий обязан это учитывать.
+  bool MutateClientContext(
+    ClientId clientId,
+    const std::function<void(ClientContext&)>& mutator);
+
+  // ★ТОТ ЖЕ МУТАТОР, НО С ПРОВЕРКОЙ ТОЖДЕСТВА. Нужен там, где решение принято
+  // по СНИМКУ, вне замка: за это время клиент мог отключиться, а его id —
+  // достаться новому подключению. Мутация применяется, только если запись всё
+  // ещё та же (сверяется `characterUid`), иначе no-op.
+  bool MutateClientContextIfSame(
+    ClientId clientId,
+    data::Uid expectedCharacterUid,
+    const std::function<void(ClientContext&)>& mutator);
 
   void HandleNetworkTick() override;
   void HandleClientConnected(ClientId clientId) override;
@@ -275,11 +327,52 @@ private:
     const protocol::AcCmdCLRequestSpecialEventList& command);
 
   //! A server instance.
+  // LOA-fix (R64-3, round64, backlog #215): ВНУТРЕННИЙ путь к контексту —
+  // только для тех, кто УЖЕ держит `_clientsMutex`. Имя обязано кричать об
+  // этом: контракт «замок берёт вызывающий» нельзя оставлять в памяти автора,
+  // иначе первый же невнимательный вызов даст самозахват нерекурсивного
+  // мьютекса, а это тихий дедлок в проде, а не падение на ревью.
+  ClientContext& GetClientContextLocked(
+    ClientId clientId,
+    bool requireAuthentication = true);
+
   ServerInstance& _serverInstance;
   //! A command server.
   CommandServer _commandServer;
-  //! A map of clients.
+
+  // LOA-fix (R64-3, round64, backlog #215): КАРТА ПОД ЗАМКОМ.
+  //
+  // ★ГОНКА ЗДЕСЬ НЕ ГИПОТЕЗА — её поймал детектор на стенде R61 (чтение под
+  // чужой записью, стеки обоих потоков). Потоков два: сетевой поток лобби
+  // (подключение, разрыв, тик, обработчики команд) и поток лобби-директора,
+  // который лезет сюда через десять методов (`AcceptLogin`, `RejectLogin`,
+  // `DisconnectCharacter`, `NotifyCharacter`, …) и как минимум два из них
+  // ПИШУТ в поля.
+  //
+  // ★И удаление записи ДВУХПОТОЧНОЕ, хотя выглядит сетевым: директор зовёт
+  // `DisconnectCharacter` → `CommandServer::DisconnectClient` → `Client::End()`,
+  // а тот СИНХРОННО доходит до `HandleClientDisconnected` — то есть стирает
+  // запись НА ПОТОКЕ ДИРЕКТОРА. Именно поэтому перебор карты в тике опасен:
+  // `erase` инвалидирует итератор обхода.
+  mutable std::shared_mutex _clientsMutex;
+  //! A map of clients. ★Трогать ТОЛЬКО под `_clientsMutex` и только через
+  //! методы доступа — прямых обращений в файле не должно оставаться.
   std::unordered_map<ClientId, ClientContext> _clients;
+
+  // ★ПЕРЕИСПОЛЬЗУЕМЫЙ БУФЕР СНИМКА, а не локальный вектор на каждый тик.
+  // Тик идёт 50 раз в секунду (`TicksPerSecond = 50`), и аллокация на каждом
+  // была бы платой в горячем пути. `clear()` сохраняет ёмкость, поэтому после
+  // первого тика аллокаций нет. Живёт только внутри тика сетевого потока.
+  std::vector<std::pair<ClientId, ClientContext>> _tickSnapshot;
+
+  //! LOA-fix (R21-4f, round21, backlog #95): момент последней периодической
+  //! уборки реестра активности ранчо (RanchDirector::SweepRanchActivity).
+  //! Уборка глобальная, поэтому метка живёт у хендлера, а не у клиента. Гейт по
+  //! ВРЕМЕНИ, а не по числу тиков: сетевой тик перезаряжается таймером и на
+  //! загруженном сервере дрейфует. Значение по умолчанию (эпоха steady_clock)
+  //! означает «ещё ни разу» — первая уборка случится на первом же тике и
+  //! пройдёт по пустому реестру.
+  std::chrono::steady_clock::time_point _lastRanchActivitySweep{};
 };
 
 } // namespace server
