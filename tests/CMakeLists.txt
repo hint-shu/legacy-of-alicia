@@ -67,7 +67,15 @@ target_link_libraries(ranch_test_genetics
 target_compile_definitions(ranch_test_genetics
         PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
 
+# LOA (R70, backlog #58): потолок доступных тиров + фильтр режима/состава.
+add_executable(registry_test_achievement_tiers)
+target_sources(registry_test_achievement_tiers PRIVATE
+        src/registry/TestAchievementTiers.cpp)
+target_link_libraries(registry_test_achievement_tiers
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
+
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
 add_test(NAME UtilTestLocale COMMAND util_test_locale)
@@ -77,6 +85,7 @@ add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
 add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
 add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
 add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
+add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
