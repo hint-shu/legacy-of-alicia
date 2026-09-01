@@ -5837,6 +5837,36 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     return;
   }
 
+  // LOA-fix (R71-5, находка ревью W1): ГАРД, КОТОРЫЙ ОБХОДИТСЯ СОСЕДНИМ ПОЛЕМ ТОГО ЖЕ
+  // ПАКЕТА, — не гард.
+  //
+  // `MagicRegistry::GetSlotInfoByEffectId` на неизвестном id БРОСАЕТ
+  // (MagicRegistry.cpp:200-208). Бросок ловится в CommandServer.cpp:515-527 и печатает
+  // `QuietLogError("Unhandled exception handling command …")` — ОДНУ СТРОКУ НА КАЖДЫЙ
+  // ПАКЕТ, без дросселя. То есть после R71-4 читеру достаточно перестать подделывать
+  // `targetOid` (тихо отброшено) и начать слать `effectId = 0xDEADBEEF` на частоте тика,
+  // чтобы получить ровно тот лог-флуд, ради которого заведён `LogThrottle` (R57: 15 350
+  // строк за час). Цель раунда побеждалась полем, лежащим в том же пакете.
+  //
+  // ★ПРОВЕРКА ТОЙ ЖЕ ВЕЛИЧИНОЙ, ЧТО И БРОСОК. `GetSlotInfoByEffectId` линейно ищет
+  // `skillEffectId == effectId` по всей карте (25 записей); здесь тот же поиск, только
+  // без исключения. Не «похожая» проверка по своему списку — иначе она разошлась бы с
+  // реестром при первом же изменении `magic.yaml`.
+  const auto& magicSlotInfoMap = GetServerInstance().GetMagicRegistry().GetSlotInfoMap();
+  if (std::ranges::none_of(
+        magicSlotInfoMap,
+        [&command](const auto& entry) { return entry.second.skillEffectId == command.effectId; }))
+  {
+    uint64_t suppressed = 0;
+    if (_skillEffectIdThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} activated unknown skill effect id {} (suppressed {})",
+        targetRacer.oid,
+        command.effectId,
+        suppressed);
+    return;
+  }
+
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfoByEffectId(command.effectId);
   // If the target has a DarkFire effect active and the magic crits by dark fire, use the critical type instead
   if ((targetRacer.effects[12] || targetRacer.effects[13]) && magicSlotInfo.criticalByDarkFire)
