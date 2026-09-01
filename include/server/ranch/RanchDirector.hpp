@@ -338,10 +338,28 @@ private:
   //! @returns Client ID.
   [[nodiscard]] ClientId GetClientIdByCharacterUid(data::Uid characterUid);
 
-  //! Get the client context by the character's unique ID.
-  //! @param characterUid UID of the character.
-  //! @returns Client context.
-  [[nodiscard]] ClientContext& GetClientContextByCharacterUid(data::Uid characterUid);
+  //! LOA-fix (R72-2, round72, backlog #170-item-28): ПОИСК, КОТОРЫЙ УМЕЕТ НЕ
+  //! НАЙТИ.
+  //!
+  //! Прежний `GetClientContextByCharacterUid` бросал «Character not associated
+  //! with any client» на ШТАТНОМ состоянии «персонаж не на ранчо», а его
+  //! единственный вызывающий (`BroadcastSetIntroductionNotify`) — путь,
+  //! управляемый клиентом: одна строка [error] на каждый пакет 0x171.
+  //!
+  //! ★ОТДАЁТ И ClientId. Не удобство: skip-self обязан сравнивать ClientId с
+  //! ClientId, а взять его иначе значило бы ЕЩЁ РАЗ перебирать `_clients` —
+  //! ту самую чужепоточную карту, число обращений к которой раунд обязан не
+  //! увеличивать.
+  //!
+  //! @param characterUid UID искомого персонажа.
+  //! @param clientId Получает ClientId найденного клиента; не трогается, если
+  //!        клиент не найден.
+  //! @returns nullptr, если аутентифицированного ранч-клиента у персонажа нет.
+  //! ★Указатель действителен ровно до следующей мутации `_clients`; звать и
+  //! использовать только на РАНЧ-СЕТЕВОМ потоке.
+  [[nodiscard]] ClientContext* TryGetClientContextByCharacterUid(
+    data::Uid characterUid,
+    ClientId& clientId);
 
   //! Handles the ranch enter command.
   //! @param clientId ID of the client
