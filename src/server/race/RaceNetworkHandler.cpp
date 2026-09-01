@@ -4994,6 +4994,41 @@ void RaceNetworkHandler::HandleUseMagicItem(
     return;
   }
 
+  // LOA-fix (R71-1, backlog #129-S2): КАСТУЕТСЯ ТО, ЧТО ЛЕЖИТ НА РУКАХ.
+  //
+  // Предмет выдаёт СЕРВЕР — двумя путями, и оба сообщают клиенту точный номер:
+  // `HandleRequestMagicItem` (:4565 `racer.magicItem.emplace(...)`, ответ :4580-4583) и
+  // подбор из деки (:5081-5086). Значит честный клиент физически не может назвать
+  // другой номер. До этой строки `GetSlotInfo(command.magicItemId)` (:4640) брал
+  // КЛИЕНТСКОЕ число как есть, и весь эффект строился из него: гонщик, держащий
+  // самый дешёвый предмет, кастовал любое заклинание из `magic.yaml`.
+  //
+  // ★ЗАОДНО ЗАКРЫВАЕТСЯ БРОСОК. `MagicRegistry::GetSlotInfo` на неизвестном номере
+  // бросает `std::runtime_error` (MagicRegistry.cpp:192-198), а бросок из хендлера
+  // ловится в CommandServer.cpp:515-527 и печатает строку `[error]` НА КАЖДЫЙ ПАКЕТ
+  // без всякого дросселя. После этой проверки до :4640 доходит только номер, который
+  // сервер сам и выдал, — то есть заведомо существующий.
+  //
+  // ★СРАВНЕНИЕ ВЕРНО И ДЛЯ КРИТА. Крит-подмену делает СЕРВЕР строкой ниже (:4642-4652)
+  // по своим эффектам 18/19; клиент всегда присылает БАЗОВЫЙ номер. А если сервер выдал
+  // крит-вариант сразу (`RandomMagicItem` умеет вернуть `criticalType`,
+  // MagicSystem.cpp:130-133), то он же его и назвал — сравнение снова сходится.
+  //
+  // ★ГАРДА «а вдруг это бот» здесь НЕ НУЖНО: пакет за бота уже отсечён выше (:4610-4618,
+  // R57-5), сюда доходит только собственный oid отправителя.
+  if (command.magicItemId != racer.magicItem.value())
+  {
+    uint64_t suppressed = 0;
+    if (_magicOwnershipThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} tried to cast magic {} while holding {} (suppressed {})",
+        racer.oid,
+        command.magicItemId,
+        racer.magicItem.value(),
+        suppressed);
+    return;
+  }
+
   auto targetList = command.targetList;
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(command.magicItemId);
