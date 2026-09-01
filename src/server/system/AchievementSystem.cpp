@@ -55,7 +55,9 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
   const data::Uid characterUid,
   const uint16_t event,
   const uint32_t increment,
-  const std::span<const std::string_view> provenConditions)
+  const std::span<const std::string_view> provenConditions,
+  const std::optional<EventContext> context)
+
 {
   std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies;
   if (increment == 0)
@@ -72,7 +74,8 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
     return notifies;
 
   characterRecord.Mutable(
-    [&notifies, &matching, &provenConditions, characterUid, increment](
+    [&notifies, &matching, &provenConditions, &context, characterUid, increment](
+
       data::Character& character)
     {
       for (const auto* const info : matching)
@@ -103,6 +106,17 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
         // половину класса.
         if (info->resetEvent != 0 or not info->resetFunction.empty())
           continue;
+        // ★ФИЛЬТР РЕЖИМА И СОСТАВА (R70). Поля `gameModeFlag`/`numPlayer` в
+        // каталоге были всегда, но не проверялись НИГДЕ — и до сих пор это было
+        // безвредно, потому что у всех 20 записей живых шин оба нуля.
+        // На событии 2 ненулевой `gameModeFlag` у подавляющего большинства
+        // записей: без фильтра «победа в магическом соло» (10226) засчиталась бы
+        // после скоростного заезда, а мастерство — после обучающего.
+        // Контекста нет (все ранчевые вызовы) — фильтр не применяется.
+        if (context.has_value()
+          and not info->CountsInMode(context->modeBit, context->playerCount))
+          continue;
+
 
         // ★УСЛОВИЕ ИСПОЛНЯЕТ ТОТ, У КОГО ЕСТЬ ДАННЫЕ. Система умеет сама только
         // «просто считай событие» (Function = TRUE). Всё прочее требует данных
@@ -123,10 +137,14 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
         }
 
         const auto tiersBefore = info->GetReachedTierCount(entry->progress);
-        // Все тиры уже взяты — дальше считать нечего, и лишний пакет клиенту
-        // не нужен.
-        if (tiersBefore >= entry->tierEarnedAt.size())
+        // Все ДОСТУПНЫЕ тиры уже взяты — дальше считать нечего, и лишний пакет
+        // клиенту не нужен. Мерить ёмкостью массива отметок (всегда 4) нельзя:
+        // у записи без порогов доступный тир ровно один, и сравнение с
+        // четвёркой не срабатывало бы никогда → бесконечный рост прогресса и
+        // 0xe4 на КАЖДОМ событии. См. AchievementInfo::GetAvailableTierCount.
+        if (tiersBefore >= info->GetAvailableTierCount())
           continue;
+
 
         entry->progress += increment;
         const auto tiersAfter = info->GetReachedTierCount(entry->progress);
