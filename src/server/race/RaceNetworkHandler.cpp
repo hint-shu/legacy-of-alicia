@@ -4810,7 +4810,44 @@ void RaceNetworkHandler::HandleRelay(
 
   std::scoped_lock lock(_raceInstancesMutex);
   // Get the room instance for this client
-  const auto& raceInstance = GetRaceInstance(clientContext);
+  // ★НЕконстантная ссылка (LOA-fix, R71-6a): гарду нужен `GetTracker().GetRacer(...)`,
+  // а у него нет const-перегрузки (RaceTracker.hpp:364). `GetRaceInstance` и так
+  // возвращает `RaceInstance&` — снятие const ничего не расширяет.
+  auto& raceInstance = GetRaceInstance(clientContext);
+
+  // LOA-fix (R71-6a, backlog #31 пререквизит): РЕТРАНСЛЯЦИЯ НЕСЁТ ТОЛЬКО СВОЙ oid.
+  //
+  // Конверт `AcCmdCRRelayNotify` уходит всем в комнате с `fromOid` ИЗ ПАКЕТА (:4363,
+  // :4446; запись — RaceMessageDefinitions.cpp:1325-1338).
+  //
+  // ★ЭТОГО ОДНОГО ГАРДА МАЛО, И ЭТО ГЛАВНАЯ ПОПРАВКА РЕДАКЦИИ 2 СПЕКИ. Настоящее
+  // авторство лежит ВНУТРИ нагрузки (см. R71-6b) — конверт закрывается здесь только
+  // потому, что он тоже уходит наружу, а не потому, что он что-то решает.
+  //
+  // ★`GetRacer` здесь БЕЗОПАСЕН: `GetRaceInstance` вызван с `checkRacer = true`
+  // (умолчание, RaceNetworkHandler.hpp:199-201) и уже бросил бы, не будь отправитель
+  // гонщиком (:779-783).
+  //
+  // ★oid БОТА — ЗАКОННЫЙ ВХОД, НО РЕТРАНСЛИРОВАТЬ ЕГО НЕЧЕГО. Ботов ведёт клиент, и он
+  // шлёт за них relay. Боты существуют ТОЛЬКО в соло-заезде (`isSoloRace` = ровно один
+  // гонщик в трекере, :2362-2367), а `BroadcastExceptCharacterUid` в соло не доходит ни
+  // до кого — то есть отбрасывание таких кадров не меняет ни одного экрана. Выход
+  // ТИХИЙ: жалоба на законное поведение и есть тот самый флуд, который лечил R57.
+  const auto& senderRacer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
+  if (command.fromOid != senderRacer.oid)
+  {
+    if (raceInstance.IsAiRacerOid(command.fromOid))
+      return;
+
+    uint64_t suppressed = 0;
+    if (_relayEnvelopeThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Relay from racer {} claimed foreign oid {} in the envelope (suppressed {})",
+        senderRacer.oid,
+        command.fromOid,
+        suppressed);
+    return;
+  }
 
   // Relay the command to all other clients in the room
 
