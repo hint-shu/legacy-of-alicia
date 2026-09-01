@@ -18,17 +18,34 @@
 #   A property beats a list of sites — a new file with a raw call is caught the same
 #   way an old one is.
 #
+# WHY `--binary-files=text` AND THE FILE-COUNT GUARD (do not remove them)
+#   With the previous `--binary-files=without-match`, a single NUL byte anywhere in
+#   a source file made grep declare that file binary and report it as having no
+#   matches at all — an injected raw spdlog::error() next to that byte was invisible
+#   and the gate printed "ЧИСТО ✓" with EXIT 0 (proven on fixture verify/qtree4,
+#   R70-prep). Text mode fixes the blindness; the count guard proves grep actually
+#   opened every file, because "0 offenders" is only good news when the scan is
+#   known to have been complete.
+#
 # USAGE
 #   bash tools/check_quiet_logging.sh
 #   ROOT=/tmp/some/other/checkout bash tools/check_quiet_logging.sh
 #
+# ENV
+#   ROOT             default: the repository this script lives in
+#   QUIET_MIN_FILES  default 100 — refuse to run against fewer source files than
+#                    this (today src/ + include/ hold 156). Raise it deliberately;
+#                    never lower it to make a run go green.
+#
 # EXIT CODES
 #   0 no raw calls · 1 raw calls found (they are printed) · 2 the tree is not
-#     scannable (missing src/ or include/, or the exclusion file is gone — in which
-#     case a zero count would be meaningless rather than good news)
+#     scannable (missing src/ or include/, the exclusion file is gone, too few
+#     files, or grep did not open every file — in which case a zero count would be
+#     meaningless rather than good news)
 set -uo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+QUIET_MIN_FILES="${QUIET_MIN_FILES:-100}"
 EXCLUDE_REL="include/libserver/util/QuietLog.hpp"
 PATTERN='spdlog::(trace|debug|info|warn|error|critical)\('
 
@@ -36,20 +53,38 @@ for d in src include; do
   [ -d "$ROOT/$d" ] || { echo "ОСТАНОВ: нет каталога $ROOT/$d — считать нечего"; exit 2; }
 done
 
-# Blindness guard: if the wrapper header itself disappeared or stopped containing the
-# raw calls it is supposed to be the only home of, then "0 offenders" would be a
+# Blindness guard #1: if the wrapper header itself disappeared or stopped containing
+# the raw calls it is supposed to be the only home of, then "0 offenders" would be a
 # false green produced by a broken scan rather than by a clean tree.
 if [ ! -f "$ROOT/$EXCLUDE_REL" ]; then
   echo "ОСТАНОВ: нет $EXCLUDE_REL — проверка не может доказать, что она вообще что-то видит"
   exit 2
 fi
-WRAPPED="$(grep -cE "$PATTERN" "$ROOT/$EXCLUDE_REL" || true)"
+WRAPPED="$(grep -acE "$PATTERN" "$ROOT/$EXCLUDE_REL" || true)"
 if [ "$WRAPPED" -eq 0 ]; then
   echo "ОСТАНОВ: в $EXCLUDE_REL нет ни одного '$PATTERN' — регекс или файл сломаны, ноль читать нельзя"
   exit 2
 fi
 
-OFFENDERS="$(cd "$ROOT" && grep -rnE --binary-files=without-match "$PATTERN" src include \
+# Blindness guard #2: how many files exist vs how many grep actually opened.
+# `grep -rc --binary-files=text ''` emits exactly one "<file>:<n>" line per file it
+# reads, so the two numbers must agree; if grep skipped anything (binary, unreadable,
+# a truncated walk), the offender count below is measured on less than the whole tree.
+FOUND="$(cd "$ROOT" && find src include -type f | wc -l)"
+SCANNED="$(cd "$ROOT" && grep -rac --binary-files=text '' src include 2>/dev/null | wc -l)"
+
+if [ "$FOUND" -lt "$QUIET_MIN_FILES" ]; then
+  echo "ОСТАНОВ: под src/ и include/ найдено $FOUND файлов, ожидалось не меньше $QUIET_MIN_FILES"
+  echo "         ноль нарушителей на неполном дереве — это не «чисто», это слепота."
+  exit 2
+fi
+if [ "$SCANNED" -ne "$FOUND" ]; then
+  echo "ОСТАНОВ: grep открыл $SCANNED файлов из $FOUND — часть дерева не просканирована,"
+  echo "         поэтому «0 нарушителей» ничего не доказывает."
+  exit 2
+fi
+
+OFFENDERS="$(cd "$ROOT" && grep -rnE --binary-files=text "$PATTERN" src include \
              | grep -v "^$EXCLUDE_REL:" || true)"
 
 if [ -z "$OFFENDERS" ]; then
@@ -61,6 +96,7 @@ fi
 echo "=== quiet-logging gate ==="
 echo "дерево          : $ROOT"
 echo "исключение      : $EXCLUDE_REL (в нём $WRAPPED вызовов — так и задумано)"
+echo "просканировано  : $SCANNED файлов из $FOUND найденных (минимум $QUIET_MIN_FILES)"
 echo "сырых spdlog::  : $COUNT (ожидалось 0)"
 
 if [ "$COUNT" -ne 0 ]; then
