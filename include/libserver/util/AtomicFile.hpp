@@ -38,6 +38,22 @@
 namespace server::util
 {
 
+//! КЛАСС КОНФИДЕНЦИАЛЬНОСТИ ФАЙЛА (LOA-fix, R73-1, backlog #206).
+//!
+//! ★ПАРАМЕТР БЕЗ ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ, И ЭТО ВЕСЬ СМЫСЛ ПРАВКИ. Дефолт означал
+//! бы «список мест»: 19 существующих вызовов остались бы прежними, а ДВАДЦАТЫЙ,
+//! написанный через полгода для файла с токеном, молча унаследовал бы 0644.
+//! Обязательный параметр делает вопрос «а этот файл несёт секрет?» условием
+//! КОМПИЛЯЦИИ, то есть тотальным инвариантом, а не перечнем сайтов.
+enum class FileSensitivity
+{
+  //! Файл несёт секрет (хеш и соль пароля). Ни одного бита group/other —
+  //! НИКОГДА: ни на созданном файле, ни на унаследованном, ни на временном.
+  Secret,
+  //! Обычная игровая запись. Режим ровно тот, что был до раунда.
+  Public,
+};
+
 //! ЗАПИСЬ, КОТОРАЯ ЛИБО СОСТОЯЛАСЬ ЦЕЛИКОМ, ЛИБО НЕ ТРОНУЛА ФАЙЛ
 //! (LOA-fix, round58, backlog #175).
 //!
@@ -93,10 +109,13 @@ namespace server::util
 //!        броски обязаны случиться ДО вызова, иначе окно порчи просто переедет
 //!        на временный файл.
 //! @param what Название сущности для сообщения об ошибке («Character file»).
+//! @param sensitivity Несёт ли файл секрет. ★Без значения по умолчанию намеренно
+//!        (см. `FileSensitivity`): двадцатый вызов обязан ответить на вопрос.
 inline void WriteFileAtomically(
   const std::filesystem::path& path,
   const std::string_view payload,
-  const std::string_view what)
+  const std::string_view what,
+  const FileSensitivity sensitivity)
 {
   // ★ВРЕМЕННЫЙ ФАЙЛ — В ТОМ ЖЕ КАТАЛОГЕ, и это условие корректности, а не стиль.
   // Два имени в одной директории физически не могут оказаться на разных файловых
@@ -181,9 +200,24 @@ inline void WriteFileAtomically(
 #ifndef WIN32
     // `O_EXCL` здесь тоже не украшение: он не даёт подсунуть на место
     // временного файла символьную ссылку или чужой файл.
-    const mode_t mode = hadPreviousFile
+    // ★СУЖЕНИЕ, А НЕ НАЗНАЧЕНИЕ, и разница здесь принципиальна. Унаследованный
+    // режим приходит от РЕАЛЬНОГО файла прода: 12 аккаунтов лежат 0644, один
+    // (`nmax.json`) — 0664. Если бы секрет получал жёстко 0600, правка молча
+    // расширила бы права там, где владелец их сузил вручную. Маска снимает
+    // group/other и не трогает ничего больше, поэтому «починка на первой же
+    // записи» не зависит от того, каким режим был.
+    mode_t mode = hadPreviousFile
       ? static_cast<mode_t>(previousStat.st_mode & 07777)
       : static_cast<mode_t>(0666);   // новый файл — прежнее поведение, по umask
+
+    if (sensitivity == FileSensitivity::Secret)
+    {
+      mode &= ~static_cast<mode_t>(S_IRWXG | S_IRWXO);
+      // ★И ПОЛ ДЛЯ ВЛАДЕЛЬЦА. Файл с режимом 0000 (ручная правка, чужой umask)
+      // после сужения остался бы нечитаемым для самого сервера, то есть защита
+      // данных обернулась бы их потерей.
+      mode |= static_cast<mode_t>(S_IRUSR | S_IWUSR);
+    }
 
     const int descriptor = ::open(
       temporaryPath.c_str(), O_CREAT | O_EXCL | O_WRONLY, mode);
@@ -248,11 +282,30 @@ inline void WriteFileAtomically(
       // Порядок целиком: владелец → запись → режим → закрытие. Владелец первым
       // потому, что смена владельца тоже гасит эти биты (итерация 1); режим
       // последним потому, что их гасит и запись.
-      if (hadPreviousFile && ::fchmod(descriptor, mode) != 0)
+      // ★РЕЖИМ СТАВИТСЯ И ДЛЯ НОВОГО СЕКРЕТА, а не только при наследовании.
+      // `open(…, 0600)` уже даёт 0600 при любом РАЗУМНОМ umask (umask умеет
+      // только ГАСИТЬ биты), но при враждебном umask вида 0200 владелец потерял
+      // бы запись. Честно: на стенде этот пояс провалиться НЕ УМЕЕТ (umask
+      // контейнера 0022) — он объявлен поясом, а не доказанным гейтом.
+      const bool mustApplyMode = hadPreviousFile
+        || sensitivity == FileSensitivity::Secret;
+      if (mustApplyMode && ::fchmod(descriptor, mode) != 0)
       {
         ::close(descriptor);
+        // ★ДВА РАЗНЫХ СООБЩЕНИЯ, А НЕ ОДНО НА ОБА СЛУЧАЯ. Прежний текст
+        // «could not inherit the permissions of the file it replaces» ТЕПЕРЬ
+        // достижим и для файла, который ничего не заменяет, — оператор во время
+        // инцидента прочитал бы неправду. Старая строка сохранена ДОСЛОВНО
+        // (она — не-убывающий маркер лесенки прошлых раундов), новая добавлена
+        // рядом.
+        if (hadPreviousFile)
+        {
+          abandon(std::format(
+            "{} '{}' could not inherit the permissions of the file it replaces",
+            what, path.string()));
+        }
         abandon(std::format(
-          "{} '{}' could not inherit the permissions of the file it replaces",
+          "{} '{}' could not be secured with the intended permissions",
           what, path.string()));
       }
 
@@ -264,6 +317,10 @@ inline void WriteFileAtomically(
         abandon(std::format("{} '{}' failed to flush", what, path.string()));
     }
 #else
+    // Под Windows режима в POSIX-смысле нет — класс конфиденциальности здесь
+    // ничего изменить не может (см. `FileSensitivity`), но параметр обязан
+    // остаться «использованным», чтобы сборка MSVC не сыпала предупреждениями.
+    (void)sensitivity;
     std::ofstream file(temporaryPath, std::ios::binary | std::ios::trunc);
     if (not file.is_open())
     {
@@ -305,6 +362,44 @@ inline void WriteFileAtomically(
     abandon(std::format(
       "{} '{}' failed to replace: {}", what, path.string(), error.message()));
   }
+}
+
+//! Приводит режим СУЩЕСТВУЮЩЕГО каталога к заданному (LOA-fix, R73-2, #206).
+//!
+//! ★ПОЧЕМУ НЕ ХВАТАЕТ `create_directories`. Каталог `data/users` на проде уже
+//! существует (0755, `dev:dev`) и создан задолго до этого раунда — создание с
+//! правами его не тронет вовсе. Чинить надо СУЩЕСТВУЮЩИЙ, на каждом старте.
+//!
+//! ★НЕ ЛОГИРУЕТ САМ, А ВОЗВРАЩАЕТ ВЕРДИКТ. Заголовок сознательно НЕ тянет
+//! `QuietLog.hpp` (а с ним spdlog) в каждую единицу трансляции, которая
+//! включает `AtomicFile.hpp`: лишняя зависимость сдвинула бы inline-бюджет
+//! `FileDataSource.cpp` и сделала бы неотличимыми «контроль лесенки шевельнулся
+//! от нашей правки» и «шевельнулся от нового include».
+//!
+//! ★НЕ FAIL-CLOSED, И ЭТО ОСОЗНАННО. Несущая гарантия раунда — режим ФАЙЛА
+//! (0600); режим каталога прячет только СПИСОК аккаунтов. Останавливать сервер
+//! из-за не поставленного бита каталога значило бы обменять реальный простой на
+//! эшелонированную защиту.
+//!
+//! @return `false` ТОЛЬКО если `chmod` существующего каталога провалился.
+//!         Отсутствие каталога — не ошибка: `create_directories` зовётся строкой
+//!         выше, и «его нет» здесь означает гонку, а не дефект прав.
+[[nodiscard]] inline bool EnsureDirectoryMode(
+  const std::filesystem::path& path,
+  const unsigned int mode) noexcept
+{
+#ifndef WIN32
+  struct ::stat directoryStat{};
+  if (::stat(path.c_str(), &directoryStat) != 0)
+    return true;                              // каталога нет — не наша забота
+  if ((directoryStat.st_mode & 07777) == static_cast<mode_t>(mode))
+    return true;                              // уже как надо, syscall не нужен
+  return ::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0;
+#else
+  // Под Windows понятия режима в этом смысле нет — ветка пустая осознанно.
+  (void)path; (void)mode;
+  return true;
+#endif
 }
 
 //! Убирает недописанные временные файлы, оставшиеся от прерванных сохранений
