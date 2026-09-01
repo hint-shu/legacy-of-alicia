@@ -34,8 +34,19 @@ struct EggInfo
 {
   //! The egg item TID (key in the registry).
   data::Tid tid{};
+  // LOA-fix (R72-5, round72, backlog #174): ВТОРОЕ ПОЛЕ БЕЗ ЗНАЧЕНИЯ, И ОНО НА
+  // ВЕРХНЕМ УРОВНЕ.
+  //
+  // Причина пропуска — не вложенность, а ПСЕВДОНИМ: `data::Tid` → `uint32_t`,
+  // причём определён он ВНЕ сканируемого набора (libserver/data/), поэтому
+  // наивный скан реестров не мог признать его скаляром. Гард
+  // tools/check_field_init.py собирает таблицу псевдонимов и из
+  // DataDefinitions.hpp именно поэтому.
+  //
+  // Живого дефекта нет: поле присваивается при построении реестра. Закрывается
+  // инвариант, а не симптом.
   //! A deck item ID of the egg.
-  data::Tid deckItemId;
+  data::Tid deckItemId{0};
   //! A region this egg belongs to.
   Region region{Region::Unknown};
   //! Relative probability of obtaining this egg.
