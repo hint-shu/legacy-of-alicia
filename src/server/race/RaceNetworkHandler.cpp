@@ -441,6 +441,27 @@ void RaceNetworkHandler::SendDailyQuestNotificationToCharacter(
   }
 }
 
+void RaceNetworkHandler::SendAchievementNotificationToCharacter(
+  const uint32_t characterUid,
+  const protocol::AcCmdRCAchievementUpdateNotify& notify)
+{
+  try
+  {
+    const ClientId clientId = GetClientIdByCharacterUid(characterUid);
+    _commandServer.QueueCommand<protocol::AcCmdRCAchievementUpdateNotify>(
+      clientId,
+      [notify]()
+      {
+        return notify;
+      });
+  }
+  catch (const std::exception&)
+  {
+    // Ignore: игрок уже отключился. Прогресс к этому моменту ЗАПИСАН — потеряна
+    // только нотификация, и достижение будет видно в списке 0xe6 (R69).
+  }
+}
+
 void RaceNetworkHandler::HandleClientConnected(ClientId clientId)
 {
   _clients.try_emplace(clientId);

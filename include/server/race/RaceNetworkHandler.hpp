@@ -72,6 +72,24 @@ public:
     protocol::QuestRewardType rewardType,
     uint32_t unk2,
     uint32_t mountExp);
+  //! Отправляет персонажу нотификацию достижения ГОНОЧНЫМ сокетом.
+  //!
+  //! ★ПОЧЕМУ ВТОРАЯ ТОЧКА ОТПРАВКИ, А НЕ `RanchDirector::SendAchievementEvent`.
+  //! `RaceInstance::Stop()` исполняется на потоке гоночного директора
+  //! (`RaceNetworkHandler::Tick` обходит `_raceInstances` под
+  //! `_raceInstancesMutex` → `RaceInstance::Tick` → `TickFinishing` → `Stop`).
+  //! Ранчевый отправитель читает `RanchDirector::_clients` — карту РАНЧЕВОГО
+  //! потока, не защищённую ничем; звать её отсюда значило бы завести гонку
+  //! класса #96/R34. `_clients` ЭТОГО обработчика трогает тот же поток, что и
+  //! `Stop()`.
+  //! ★Форма — дословная копия `SendDailyQuestNotificationToCharacter`: тот же
+  //! `try` вокруг `GetClientIdByCharacterUid` (он БРОСАЕТ, если игрок уже ушёл),
+  //! тот же `QueueCommand`, тот же глухой перехват. Путь «из Stop() в сокет
+  //! заезда» этим методом уже проложен и обкатан.
+  void SendAchievementNotificationToCharacter(
+    uint32_t characterUid,
+    const protocol::AcCmdRCAchievementUpdateNotify& notify);
+
 
   void HandleClientConnected(ClientId clientId) override;
   void HandleClientDisconnected(ClientId clientId) override;
