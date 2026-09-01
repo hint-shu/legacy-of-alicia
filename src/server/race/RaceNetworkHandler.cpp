@@ -5029,6 +5029,30 @@ void RaceNetworkHandler::HandleUseMagicItem(
     return;
   }
 
+  // LOA-fix (R71-2, backlog item 26): УСИЛЕНИЕ ОДНИМ ПАКЕТОМ.
+  //
+  // Ледяная стена рассылает по ОДНОМУ `AcCmdRCMagicExpire` НА ЭЛЕМЕНТ списка КАЖДОМУ
+  // в комнате (:4739-4761, `obstacleInstanceCount = command.targetList.size()`, цикл
+  // Broadcast на :4750-4759): 255 x 8 = 2040 кадров с одного клиентского пакета. Тем
+  // же числом двигается счётчик идентификаторов эффектов (:4655-4656), то есть
+  // 16-битный счётчик выкручивается за десяток пакетов.
+  //
+  // ★ОТКАЗ, А НЕ ОБРЕЗКА. Обрезка спрятала бы попытку: честный максимум мал и известен
+  // (см. `MaxMagicTargetListSize`), поэтому список длиннее — это не «клиент прислал
+  // лишнее», а «клиент прислал невозможное».
+  if (command.targetList.size() > MaxMagicTargetListSize)
+  {
+    uint64_t suppressed = 0;
+    if (_magicTargetCountThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} named {} magic targets, max is {} (suppressed {})",
+        racer.oid,
+        command.targetList.size(),
+        MaxMagicTargetListSize,
+        suppressed);
+    return;
+  }
+
   auto targetList = command.targetList;
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(command.magicItemId);
