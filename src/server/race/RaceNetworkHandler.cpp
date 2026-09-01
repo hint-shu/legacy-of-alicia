@@ -5385,6 +5385,34 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
 
   auto& racer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
 
+  // LOA-fix (R71-7, находка ревью W2): «ПРЕДМЕТ ПОДОБРАЛ X» — ТОЛЬКО ПРО СЕБЯ.
+  //
+  // Сравнения владения здесь не было вовсе: единственной проверкой был отсев ботов
+  // (:4836, R57-11), а `command.characterOid` уходил ЭХОМ в три широковещательных
+  // кадра — `AcCmdGameRaceItemGet` на :4866-4870 (квестовая/яичная ветка) и :5132-5137
+  // (общая дека), плюс `AcCmdCRRequestMagicItemNotify` на :5116-5118. Живой чужой oid
+  // проходил насквозь: A объявлял комнате «предмет подобрал B».
+  //
+  // ★ЭТО ТО ЖЕ ПРАВИЛО РАУНДА, А НЕ СОСЕДНЕЕ. Выдача и так делается ОТПРАВИТЕЛЮ (по
+  // `clientContext.characterUid`), поэтому чинится ровно расхождение «кому выдали» и
+  // «про кого сказали». Оракул #195 УЖЕ считает этот хендлер накрытым по полю
+  // `characterOid` (oracle.py:142-143) — до этого коммита это утверждение оракула было
+  // неверным; теперь оно верно.
+  if (command.characterOid != racer.oid)
+  {
+    if (raceInstance.IsAiRacerOid(command.characterOid))
+      return;
+
+    uint64_t suppressed = 0;
+    if (_itemGetOwnershipThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} claimed an item pickup for racer {} (suppressed {})",
+        racer.oid,
+        command.characterOid,
+        suppressed);
+    return;
+  }
+
   // Check event items first (eggs, etc.)
   const auto eventItemOid = raceInstance.GetTracker().FindEventItem(
     clientContext.characterUid,
