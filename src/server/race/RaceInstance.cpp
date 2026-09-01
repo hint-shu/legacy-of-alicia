@@ -26,8 +26,13 @@
 #include <libserver/util/Util.hpp>
 
 #include <algorithm>
+#include <array>
+#include <span>
+#include <string_view>
 #include <tuple>
+#include <vector>
 #include <format>
+
 
 namespace server
 {
@@ -38,6 +43,54 @@ namespace
 constexpr registry::MapBlockId AllMapsCourseId = 10000;
 constexpr registry::MapBlockId NewMapsCourseId = 10001;
 constexpr registry::MapBlockId HotMapsCourseId = 10002;
+//! Номер шины достижений «финиш заезда» (UserAchvEvent = 2).
+constexpr uint16_t RaceAchievementEvent = 2;
+
+//! Одна карта мастерства: имя условия каталога, ИМЯ КАРТЫ и потолок времени.
+//!
+//! ★ЕДИНИЦЫ. `racer.courseTime` — МИЛЛИСЕКУНДЫ (`tracker::MinPlausibleCourseTime
+//! = 30000` = 30 с), а пороги оригинала — СЕКУНДЫ (`ach_lib.lua:15-27`,
+//! `map_mastery_impl(me, id, сек)`). Пол правдоподобия (30 с) НИЖЕ любого потолка
+//! мастерства — значит мастерство доказуемо честной ездой, а не только
+//! «мгновенным финишем», который сервер всё равно превращает в DNF.
+//! ★СВЕРКА ПО ИМЕНИ КАРТЫ, А НЕ ПО ID: см. комментарий у
+//! `Course::MapBlockInfo::name`.
+struct MasteryCourse
+{
+  std::string_view condition;
+  std::string_view mapName;
+  uint32_t courseTimeLimitMs;
+};
+
+//! Семь карт мастерства события 2. Значения — из `ach_conditions.lua:16-52`.
+constexpr std::array<MasteryCourse, 7> MasteryCourses{{
+  {"RiLand01Mastery", "ri_land01", 140000},
+  {"RiLand02Mastery", "ri_land02", 140000},
+  {"RiLand03Mastery", "ri_land03", 150000},
+  {"RiLand04Mastery", "ri_land04", 130000},
+  {"RiFore01Mastery", "ri_fore01", 140000},
+  {"RiFore02Mastery", "ri_fore02", 160000},
+  {"RiDorf04Mastery", "ri_dorf04", 150000},
+}};
+
+//! Часовое окно события 2 или пустая строка, если текущий час ни в одно не попал.
+//!
+//! ★Окна — дословно из оригинала (`ach_conditions.lua:457-497`): [8,13), [14,16),
+//! [16,18), [19,22). Они НЕ покрывают сутки целиком и НЕ пересекаются, поэтому
+//! активным может быть максимум одно.
+//! ★Час берётся в игровом часовом поясе (`server::util::CurrentGameLocalHour`),
+//! ОДИН раз на заезд: заезд, начавшийся в 15:59 и кончившийся в 16:01, попадает
+//! в окно по МОМЕНТУ ПОДВЕДЕНИЯ ИТОГОВ — ровно как `os.date` в оригинале,
+//! который вызывался при вычислении условия.
+constexpr std::string_view GoalInHourWindowCondition(const uint32_t hour)
+{
+  if (hour >= 8 and hour < 13) return "GoalIn_8h_13h";
+  if (hour >= 14 and hour < 16) return "GoalIn_14h_16h";
+  if (hour >= 16 and hour < 18) return "GoalIn_16h_18h";
+  if (hour >= 19 and hour < 22) return "GoalIn_19h_22h";
+  return {};
+}
+
 
 //! LOA-fix (R11-1, round11, backlog #22): ПОТОЛОК СТАДИИ ЗАГРУЗКИ КАРТЫ.
 //! Апстрим держал 60 c магическим числом в теле RaceInstance::Start() под
@@ -928,9 +981,225 @@ void RaceInstance::Stop()
           });
       }
     });
+
+  // === LOA (R70, backlog #58): ДОСТИЖЕНИЯ СОБЫТИЯ 2 (финиш заезда) =========
+  //
+  // МЕСТО ВЫБРАНО ДВУМЯ ПРИЧИНАМИ, И ОБЕ ОБЯЗАТЕЛЬНЫ.
+  // (1) ЛОКИ: `AchievementSystem::OnServerEvent` берёт `Mutable` того же
+  //     character-рекорда, а `Record` использует НЕрекурсивный `shared_mutex`.
+  //     Значит врезка обязана стоять ВНЕ любого `characterRecord.Mutable`;
+  //     здесь закрыты все (последний — лямбда `GetRoom` прямо выше).
+  // (2) ПОВТОРНЫЙ `Stop()`: `RaceInstance::Tick` глотает исключения,
+  //     а `_stage = Stage::Waiting` стоит ПОСЛЕ `Stop()` в `TickFinishing` —
+  //     бросок в середине `Stop()` заставляет `TickFinishing` позвать её ещё раз.
+  //     Блок, стоящий ПОСЛЕДНИМ, при таком повторе исполнится РОВНО ОДИН раз:
+  //     при первом заходе до него не дошли, при втором он отработает впервые.
+  //     ★ЭТО УТВЕРЖДЕНИЕ ДЕРЖИТСЯ НА ДВУХ ФАКТАХ, И ОБА ПРОВЕРЯЕМЫ:
+  //       (а) блок сам не может бросить — весь он обёрнут в `catch (...)` ниже;
+  //       (б) после блока в `Stop()` НЕТ НИ ОДНОГО оператора — это машинно
+  //           проверяет гейт раунда `tools/round/check_stop_tail.py`.
+  //     ЛЮБОЙ будущий раунд, дописывающий что-то в конец `Stop()` (в очереди
+  //     такие есть: R75 и R76 планируют врезки в `Stop()`, R76 — явно «самым
+  //     последним шагом»), обязан либо встать ПЕРЕД этим блоком, либо доказать,
+  //     что его код не бросает, либо завести здесь эпоху-гард по `_raceEpoch`.
+  //     Гейт упадёт и заставит принять решение явно.
+  try
+  {
+    auto& racers = _tracker.GetRacers();
+
+    // --- состав ------------------------------------------------------------
+    // ★ЛЮДИ СЧИТАЮТСЯ ПО ТРЕКЕРУ — той же величиной, которой гейтится спавн
+    // ботов (`RaceNetworkHandler`: `GetRacers().size() == 1`).
+    // Отсюда инвариант приёмки: «боты есть» ⟺ «людей ровно один» ⟺ «ранговые
+    // условия подавлены» — три утверждения, посчитанные ОДНИМ числом, разойтись
+    // не могут. Ростер стабилен от старта до `Stop()`: `RaceTracker::RemoveRacer`
+    // в дереве не вызывается НИГДЕ (только определение), а отключение лишь
+    // ставит `state = Disconnected`.
+    // ★ОТКЛЮЧИВШИЕСЯ СЧИТАЮТСЯ. Решение принято явно, с ценой — §7.2 спеки.
+    const uint32_t humanCount = static_cast<uint32_t>(racers.size());
+
+    // --- режим -------------------------------------------------------------
+    // Та же величина, что у квестов: маски достижений и квестов приходят из
+    // одной клиентской таблицы. Второе отображение разошлось бы молча.
+    // Обучение и всё вне четвёрки дают 0 → ни одна запись с ненулевой маской
+    // не засчитается (инвариант I10).
+    const uint32_t modeBit = static_cast<uint32_t>(
+      QuestSystem::ToGameModeFlag(_parameters.gameMode, _parameters.teamMode));
+
+    const uint32_t localHour = server::util::CurrentGameLocalHour();
+    const std::string_view hourWindow = GoalInHourWindowCondition(localHour);
+    const std::string_view mapName = _mapBlockInfo.name;
+
+    // --- финишеры, места и сходы -------------------------------------------
+    // ★СЧИТАЕМ ЗАНОВО, А НЕ ПО `raceResult.scores`, и это ПРЕЦЕДЕНТ, а не
+    // самодеятельность: тот же приём и по той же причине стоит у дейликов
+    // выше. Сортировка табло ставит первой ПОБЕДИВШУЮ КОМАНДУ, а не
+    // лучшее время, и «мгновенный финиш» с табло не отсеян.
+    // ★ПОРЯДОК СТРОГИЙ: ключ (courseTime, characterUid). При равных временах
+    // «1 + число строго меньших» дало бы ДВА первых места; лексикографический
+    // ключ даёт ровно одно.
+    struct Finisher { uint32_t courseTime; data::Uid uid; Team team; };
+    std::vector<Finisher> finishers;
+    uint32_t retireCount = 0;
+
+    const auto isPlausibleFinish = [](const tracker::RaceTracker::Racer& racer)
+    {
+      return racer.courseTime != tracker::InvalidCourseTime
+        and racer.courseTime >= tracker::MinPlausibleCourseTime;
+    };
+
+    for (const auto& [characterUid, racer] : racers)
+    {
+      // Отвалившийся не финишировал и НЕ считается сходом: иначе «чистую
+      // победу» (PerfectWin) можно было бы напечатать вторым аккаунтом,
+      // который заходит в заезд и тут же выходит.
+      if (racer.state == State::Disconnected)
+        continue;
+      if (isPlausibleFinish(racer))
+        finishers.push_back({racer.courseTime, characterUid, racer.team});
+      else
+        ++retireCount;
+    }
+
+    std::ranges::sort(finishers, [](const Finisher& a, const Finisher& b)
+    {
+      return std::tie(a.courseTime, a.uid) < std::tie(b.courseTime, b.uid);
+    });
+
+    // ★СВОЙ победитель команды, а не `winningTeam` табло. Табло считает первым
+    // финишировавшего с ЛЮБЫМ временем — то есть «мгновенный финиш»
+    // второго аккаунта короновал бы команду. Табло мы не трогаем (байт-паритет
+    // рассылки — гейт приёмки), а награду считаем по СЕРВЕРНОМУ замеру.
+    const Team achievementWinningTeam =
+      (_parameters.teamMode == protocol::TeamMode::Team and not finishers.empty())
+        ? finishers.front().team
+        : Team::Solo;
+
+    // --- пер-гонщик ---------------------------------------------------------
+    for (const auto& [characterUid, racer] : racers)
+    {
+      if (racer.state == State::Disconnected)
+        continue;
+
+      std::vector<std::string_view> conditions;
+      conditions.reserve(8);
+
+      if (not isPlausibleFinish(racer))
+      {
+        // Retire: `TimeRecord == 0` (ach_conditions.lua:1346-1350).
+        conditions.emplace_back("Retire");
+      }
+      else
+      {
+        // GoalIn: `TimeRecord > 0` (:451-455). Сегодня потребителей БЕЗ
+        // reset-гарда у него нет — все десять записей `GoalIn` события 2
+        // сбрасываемые, и система их не двигает. Условие всё равно называется:
+        // оно верно по смыслу, оно же — предмет негатива negD, и когда сброс
+        // будет реализован, проводка уже стоит.
+        conditions.emplace_back("GoalIn");
+
+        if (not hourWindow.empty())
+          conditions.emplace_back(hourWindow);
+
+        for (const auto& mastery : MasteryCourses)
+        {
+          if (mapName == mastery.mapName
+            and racer.courseTime <= mastery.courseTimeLimitMs)
+            conditions.emplace_back(mastery.condition);
+        }
+
+        // ★ГАРД ЭКСПЛОЙТА. В соло-заезде табло состоит из ОДНОЙ строки, поэтому
+        // место равно единице ВСЕГДА — и с семью ботами, и без них; ехать для
+        // этого не нужно вовсе. Поэтому гард звучит не «не верить ботам», а
+        // «условия, опирающиеся на МЕСТО, не выдаются, пока людей меньше двух».
+        if (humanCount >= 2)
+        {
+          const bool isFirst =
+            not finishers.empty() and finishers.front().uid == characterUid;
+
+          if (isFirst)
+          {
+            // Win и MyFirstWin — оба `Rank == 1` (:1047-1051, :56-58).
+            conditions.emplace_back("Win");
+            conditions.emplace_back("MyFirstWin");
+            // PerfectWin — `Rank == 1 && RetireCount > 0` (:72-80).
+            // ★РАДИУС ГАРДА: при ОДНОМ человеке PerfectWin недостижим и БЕЗ
+            // этого гарда — единственный гонщик либо финишировал (тогда
+            // retireCount == 0), либо не финишировал (тогда finishers пуст и
+            // isFirst ложно). Гард здесь ради Win/MyFirstWin; предикат стенда
+            // это отражает (§4.3, P_rank_guard судит только 10003).
+            if (retireCount > 0)
+              conditions.emplace_back("PerfectWin");
+          }
+
+          // TeamWin — `TeamRank == 1` (:1056-1060).
+          if (_parameters.teamMode == protocol::TeamMode::Team
+            and racer.team == achievementWinningTeam)
+            conditions.emplace_back("TeamWin");
+        }
+      }
+
+      // Revenge — `RevengeSuccess > 0` (:932-937). Не зависит от финиша:
+      // отомстить можно и сойдя после этого с дистанции. `revengeCredits`
+      // набирается ТОЛЬКО в командном заезде (гард G7 в `RaceNetworkHandler`),
+      // поэтому наблюдается ровно в командной арке A10.
+      if (racer.revengeCredits > 0)
+        conditions.emplace_back("Revenge");
+
+      // ★ПЕРЕХВАТ ВОКРУГ КАЖДОГО ГОНЩИКА, а не только вокруг всего блока: сбой
+      // у одного не имеет права стоить достижений остальным. И значок не имеет
+      // права стоить игроку результата заезда (R48-11).
+      try
+      {
+        const auto notifies = _raceNetworkHandler.GetServerInstance()
+          .GetAchievementSystem().OnServerEvent(
+            characterUid,
+            RaceAchievementEvent,
+            1,
+            conditions,
+            AchievementSystem::EventContext{
+              .modeBit = modeBit, .playerCount = humanCount});
+
+        for (const auto& notify : notifies)
+          _raceNetworkHandler.SendAchievementNotificationToCharacter(
+            characterUid, notify);
+      }
+      catch (const std::exception& x)
+      {
+        server::util::QuietLogError(
+          "Race achievements for character {} were not processed: {}",
+          characterUid, x.what());
+      }
+      catch (...)
+      {
+        server::util::QuietLogError(
+          "Race achievements for character {} were not processed: {}",
+          characterUid, "unknown exception");
+      }
+    }
+  }
+  // ★ВНЕШНИЙ ПЕРЕХВАТ — НЕ ДУБЛЬ ВНУТРЕННЕГО. Пролог блока стоит ВНЕ
+  // пер-гонщикового `try`: чтение трекера, `std::vector<Finisher>` (push_back →
+  // bad_alloc), `std::ranges::sort`, `std::vector<std::string_view>` с reserve(8).
+  // Бросок оттуда вылетел бы из `Stop()`, стадия осталась бы `Finishing`,
+  // `TickFinishing` позвала бы `Stop()` заново — и ПОВТОРИЛОСЬ БЫ ВСЁ, включая
+  // выплату 2500 морковок. Цена этого перехвата — ноль, а без него
+  // утверждение «исполнится ровно один раз» почти истинно, то есть неверно.
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Race achievements block failed for room {}: {}", GetRoomUid(), x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Race achievements block failed for room {}: {}", GetRoomUid(),
+      "unknown exception");
+  }
 }
 
 void RaceInstance::Tick()
+
 {
   try
   {
