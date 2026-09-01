@@ -630,6 +630,20 @@ constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
     && now >= raceInstance.GetRaceStartTimePoint();
 }
 
+//! LOA-fix (R71-3): «координаты стены — числа, а не мусор?»
+//!
+//! Границы карты сервер не знает (в `courses.yaml` геометрии трасс нет вообще — об
+//! этом прямо написано в RaceTracker.hpp:49-52), поэтому проверяется РОВНО то, что
+//! можно проверить, не выдумывая порогов: конечность. NaN/Inf, разосланные каждому
+//! клиенту как позиция препятствия, — это не «странное значение», это порча
+//! состояния у всех сразу.
+[[nodiscard]] bool IsFiniteIceWallPlacement(
+  const protocol::AcCmdCRUseMagicItem::IceWallProperties& properties) noexcept
+{
+  return std::ranges::all_of(properties.member1, [](const float axis) { return std::isfinite(axis); })
+    && std::ranges::all_of(properties.member2, [](const float axis) { return std::isfinite(axis); });
+}
+
 } // namespace
 
 bool RaceNetworkHandler::AcquireAiP2dIds(const size_t count)
@@ -5070,6 +5084,45 @@ void RaceNetworkHandler::HandleUseMagicItem(
   }
 
   const bool isIceWall = magicSlotInfo.type == 10 || magicSlotInfo.type == 11;
+
+  // LOA-fix (R71-3, SYNTHESIS item 10 + item 26): ОТВЕТ СОБИРАЕТСЯ ИЗ ДВУХ РАЗНЫХ ЧИСЕЛ.
+  //
+  // `iceWallProperties` ЧИТАЕТСЯ по сырому `command.magicItemId`
+  // (RaceMessageDefinitions.cpp:1457-1474), а ПИШЕТСЯ по `magicSlotInfo.type`,
+  // положенному в ответ (:1538-1546 для OK, :1766-1775 для Notify) — и там стоит
+  // `assert(command.iceWallProperties.has_value())`, который в боевом образе выключен
+  // (`Dockerfile` собирает RelWithDebInfo -> -DNDEBUG). Разойдись эти два числа —
+  // `.value()` бросит `std::bad_optional_access` ИЗ ПОСТАВЩИКА ЗАПИСИ, а бросок оттуда
+  // роняет соединение (Server.cpp:191-212): воспроизводимый кик игрока.
+  //
+  // ★ЧЕСТНО: СЕГОДНЯ РАСХОЖДЕНИЕ ОПЦИОНАЛА НЕДОСТИЖИМО, И ЭТО ДОКАЗАНО СТРУКТУРНО.
+  // После R71-1 клиент называет только выданный сервером номер, а при ЛЮБОЙ
+  // крит-подмене base->crit обе половины switch совпадают: 2<->3, 12<->13, 14<->15,
+  // 16<->17, 18<->19 читают и пишут targetList; 4<->5, 6<->7, 8<->9, 20<->21, 22<->23,
+  // 24<->25 — ни одна; 10<->11 — обе со стеной (сверено по `magic.yaml`, 25 записей;
+  // `criticalType == 11` стоит ТОЛЬКО у типа 10 — рекон приводил обратный пример как
+  // живой, он неверен). Гард стоит не «на баг», а на ИНВАРИАНТ: `magic.yaml` — конфиг,
+  // он лежит на прод-хосте bind-mount'ом и правится отдельно от кода. Поставщик записи
+  // не имеет права бросать — проверяем ДО очереди.
+  //
+  // Вторая половина того же вопроса — числовой мусор в координатах: они уходят каждому
+  // клиенту как есть, серверной проверки размещения нет нигде (item 26). Эта половина
+  // достижима СЕГОДНЯ и именно она судится на стенде.
+  if (isIceWall != command.iceWallProperties.has_value()
+    || (isIceWall && not IsFiniteIceWallPlacement(command.iceWallProperties.value())))
+  {
+    uint64_t suppressed = 0;
+    if (_magicPayloadThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} sent an ice-wall payload inconsistent with resolved magic type {} "
+        "(payload present: {}, suppressed {})",
+        racer.oid,
+        magicSlotInfo.type,
+        command.iceWallProperties.has_value(),
+        suppressed);
+    return;
+  }
+
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
     isIceWall ? static_cast<uint16_t>(command.targetList.size()) : 1u);
 
