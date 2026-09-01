@@ -25,6 +25,7 @@ Plain-language summary of the gameplay and reliability work we built on top of t
 - **Crash and stability fixes** — the server no longer crashes on malformed or unexpected client data; it logs and keeps running.
 - **Reliable saving** — player progress is written to disk atomically, so a crash can't corrupt your data.
 - **Configurable content** — quests, items, achievements, magic, pets, breeding and more are loaded from readable config files.
+- **Russian localization of the item catalog** — item, package and set names are translated into Russian.
 
 ## License
 

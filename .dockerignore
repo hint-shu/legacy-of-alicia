@@ -1,3 +1,16 @@
+# Build-output directories only.
+#
+# Do NOT add `.git` here, however tempting the 358 MB of history looks.
+# The Dockerfile copies the whole build context and then runs, inside the image:
+#     RUN git init
+#     RUN git submodule update --init --recursive
+# That second step only sees submodules that exist as gitlink entries in the index,
+# i.e. it needs the repository that `.git` carries. Verified behaviour without it:
+# `git init` makes an empty repo, `git submodule update --init --recursive` finds no
+# gitlink entries, populates nothing and STILL EXITS 0 — so the build would not stop,
+# it would just carry whatever `3rd-party/*` happened to be in the context, with each
+# submodule's `.git` file pointing at a gitdir that no longer exists in the image.
+# A silent wrong build is worse than a slow one.
 build/
 out/
 cmake-build-*/
