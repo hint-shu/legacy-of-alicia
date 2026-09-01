@@ -4849,6 +4849,45 @@ void RaceNetworkHandler::HandleRelay(
     return;
   }
 
+  // LOA-fix (R71-6b, находка ревью R1, backlog #31): АВТОРСТВО ЖИВЁТ В НАГРУЗКЕ.
+  //
+  // Сервер разбирает вложенный идентификатор (RaceMessageDefinitions.cpp:1211-1320) и
+  // ВЫБРАСЫВАЕТ разбор: наружу уходят те же байты (`:1325-1338`), и принимающий клиент
+  // читает oid ИЗ НАГРУЗКИ. Поэтому гард на конверте закрывает только вывеску:
+  // `fromOid = свой` + `snapshot.racerOid = чужой` телепортирует чужую лошадь на всех
+  // экранах, `syncGoalIn.racerOid = чужой` объявляет чужой финиш, и так по всем
+  // самоотчётным типам.
+  //
+  // ★ПРАВИЛО ТОТАЛЬНО ПО ТИПАМ, А НЕ ПО СПИСКУ МЕСТ: классификация — в
+  // `race::GetRelayActor` (RelayAuthz.hpp), её полноту доказывает
+  // `tools/check_relay_authz.sh` (каждый элемент перечисления назван) и юнит-тест
+  // (взято ТО поле). Неизвестный тип нагрузки сервер не разбирал вовсе — сверять
+  // нечего, кадр идёт дальше с уже проверенным конвертом.
+  const auto relayActor = race::GetRelayActor(command);
+  const bool relayActorMismatch =
+    (relayActor.kind == race::RelayActorKind::RacerOid
+      && relayActor.claimedId != senderRacer.oid)
+    || (relayActor.kind == race::RelayActorKind::CharacterUid
+      && relayActor.claimedId != clientContext.characterUid);
+
+  if (relayActorMismatch)
+  {
+    // oid бота — тот же законный вход, что и в конверте, и так же нечего вещать.
+    if (relayActor.kind == race::RelayActorKind::RacerOid
+      && raceInstance.IsAiRacerOid(static_cast<tracker::Oid>(relayActor.claimedId)))
+      return;
+
+    uint64_t suppressed = 0;
+    if (_relayActorThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Relay from racer {} carried payload type {:#04x} acting as {} (suppressed {})",
+        senderRacer.oid,
+        static_cast<uint16_t>(command.payloadType),
+        relayActor.claimedId,
+        suppressed);
+    return;
+  }
+
   // Relay the command to all other clients in the room
 
   // TODO: potential improvement - instead of blindly broadcasting to room,

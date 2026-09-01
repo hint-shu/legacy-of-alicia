@@ -35,6 +35,7 @@
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/util/Scheduler.hpp"
 #include "libserver/util/LogThrottle.hpp"
+#include "server/race/RelayAuthz.hpp"
 
 #include <random>
 #include <unordered_map>
