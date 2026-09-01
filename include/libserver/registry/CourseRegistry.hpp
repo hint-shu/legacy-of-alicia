@@ -26,6 +26,7 @@
 #include <array>
 #include <cstdint>
 
+#include <string>
 #include <unordered_map>
 #include <filesystem>
 #include <vector>
@@ -79,6 +80,23 @@ struct Course
 
   struct MapBlockInfo
   {
+    //! Имя карты из конфига (`ri_land01`, `ri_fore02`, …).
+    //!
+    //! ★ЗАЧЕМ ИМЯ, ЕСЛИ ЕСТЬ ID. Условия «мастерство карты» в оригинале
+    //! адресуются ЧУЖИМИ номерами (`RiFore01Mastery(me, 57, …)`, а id 57 в
+    //! нашем `courses.yaml` нет вовсе; `RiLand04Mastery(me, 7, …)`, а наш id 7 —
+    //! это ri_fore01), совпадают только 1/2/3. У нас же почти каждое имя
+    //! раскатано на ДВА id (измерено по конфигу): ri_land01 = {1,67},
+    //! ri_land02 = {2,14}, ri_land03 = {3,13}, ri_land04 = {4,15},
+    //! ri_fore02 = {5,16}, ri_dorf04 = {9,18}. Сверка по одному id тихо сделала
+    //! бы половину карт мастерства недостижимой, а список id в коде разошёлся бы
+    //! с конфигом молча. Имя — ТОТАЛЬНЫЙ признак: любой id, несущий это имя,
+    //! засчитывается, и поддерживать нечего.
+    //! ★ВНИМАНИЕ: id 67 (то же имя ri_land01) стоит ТОЛЬКО в mapPool режима
+    //! type 6 (обучение) и требует уровня 1000. От выдачи мастерства в обучении
+    //! спасает НЕ имя, а маска режима — инвариант I10.
+    std::string name;
+
     //! A region this map belongs to.
     Region region{Region::Unknown};
     //! A required level to play the map.
