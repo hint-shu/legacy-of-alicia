@@ -19,6 +19,7 @@
 
 #include "server/authentication/LocalAuthenticationBackend.hpp"
 #include "libserver/util/AtomicFile.hpp"
+#include "libserver/util/NameGuard.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include <array>
@@ -98,7 +99,11 @@ bool WriteUserJsonAtomic(const std::filesystem::path& path, const nlohmann::json
   // незаписанным паролем.
   try
   {
-    server::util::WriteFileAtomically(path, json.dump(2), "User file");
+    // ★ЭТОТ ФАЙЛ НЕСЁТ ХЕШ И СОЛЬ ПАРОЛЯ — единственный класс `Secret` здесь
+    // (LOA-fix R73-1, #206). Один вызов обслуживает ОБЕ ветки записи аккаунта:
+    // регистрацию при первом входе и «дедовскую» ветку старых файлов.
+    server::util::WriteFileAtomically(
+      path, json.dump(2), "User file", server::util::FileSensitivity::Secret);
     return true;
   }
   catch (const std::exception& x)
@@ -125,17 +130,11 @@ std::optional<bool> LocalAuthenticationBackend::Authenticate(
   // инсталляторе/лаунчере). Разом закрывает path traversal (нет '/', '\\',
   // '.', '..'), NUL/control-байты и unicode-трюки → имя ВСЕГДА безопасное имя
   // файла в каталоге users. Сервер не доверяет клиенту — проверяет сам.
-  if (userName.empty() || userName.size() > 48)
+  // ★ОПРЕДЕЛЕНИЕ КЛАССА ПЕРЕЕХАЛО В `util::IsLoginNameSafe` (R73-3): та же
+  // проверка была нужна `FileDataSource::IsUserNameUnique`, а два независимых
+  // определения одного класса умеют разъехаться молча.
+  if (not server::util::IsLoginNameSafe(userName))
     return false;
-  for (const char nameChar : userName)
-  {
-    const bool allowed = (nameChar >= 'A' && nameChar <= 'Z')
-      || (nameChar >= 'a' && nameChar <= 'z')
-      || (nameChar >= '0' && nameChar <= '9')
-      || nameChar == '_' || nameChar == '-';
-    if (not allowed)
-      return false;
-  }
 
   // #18c: userToken == authKey из settings.json == ПАРОЛЬ. Пустой пароль не
   // регистрируем и не пускаем (HandleLogin уже отсекает пустой authKey — дубль).

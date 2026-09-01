@@ -95,7 +95,8 @@ void SystemContentRegistry::Save() const
     // ★Здесь YAML, а не JSON: `root` — это `YAML::Node`, и содержимое собирается
     // тем же способом, каким его писал `operator<<`.
     server::util::WriteFileAtomically(
-      _configPath, YAML::Dump(root), "System content file");
+      _configPath, YAML::Dump(root), "System content file",
+      server::util::FileSensitivity::Public);
   }
   catch (const std::exception& x)
   {
