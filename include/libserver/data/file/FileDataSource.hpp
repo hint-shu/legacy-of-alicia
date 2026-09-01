@@ -23,6 +23,11 @@
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/data/DataSource.hpp>
 
+#include <atomic>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+
 namespace server
 {
 
@@ -190,6 +195,29 @@ private:
   std::atomic_uint32_t _stallionSequentialUid = 0;
   //! Sequential UID for rewards.
   std::atomic_uint32_t _rewardSequentialUid = 0;
+
+  //! ИНДЕКС «имя персонажа (нижний ASCII-регистр) -> uid» (LOA-fix R73-4, #130-C8).
+  //! Строится один раз на `Initialize`, поддерживается на `StoreCharacter` и
+  //! `DeleteCharacter`. Заменяет обход ВСЕХ файлов персонажей на КАЖДЫЙ поиск.
+  std::unordered_map<std::string, data::Uid> _characterNameToUid;
+  //! Обратный индекс uid -> КЛЮЧ (не отображаемое имя). Без него ПЕРЕИМЕНОВАНИЕ
+  //! оставило бы старое имя занятым навсегда — то есть индекс завёл бы дефект,
+  //! которого без него нет.
+  std::unordered_map<data::Uid, std::string> _characterUidToName;
+  //! Индекс читается сетевыми потоками (лобби/ранчо/мессенджер/гонка) и пишется
+  //! потоком тика DataDirector'а через `StoreCharacter`.
+  mutable std::shared_mutex _characterNameIndexMutex;
+  //! Сколько обращений отбито структурным гейтом имени. Читается РОВНО ОДИН раз,
+  //! на `Terminate` — счётчик существует затем, чтобы гейт был проверкой, чей
+  //! вердикт кто-то читает, и при этом не давал строку на пакет.
+  std::atomic_uint64_t _rejectedNameLookups{0};
+
+  //! Перестроить индекс имён с диска. Зовётся только из `Initialize`.
+  void RebuildCharacterNameIndex();
+  //! Внести/переписать одну запись индекса (создание и переименование).
+  void IndexCharacterName(data::Uid uid, const std::string& name);
+  //! Убрать запись индекса.
+  void ForgetCharacterName(data::Uid uid);
 };
 
 } // namespace server

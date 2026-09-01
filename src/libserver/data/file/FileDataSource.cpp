@@ -23,16 +23,19 @@
 #include <limits>
 #include <ranges>
 #include "libserver/util/AtomicFile.hpp"
+// LOA-fix (R73-3, #130-C8): структурный гейт имени и ASCII-сравнение вместо
+// регулярного выражения, собиравшегося из присланного клиентом имени. ★Само
+// слово-токен здесь не пишется: гейт `tools/no_name_regex_gate.sh` ищет его по
+// всему `src/libserver/data/`, и упоминание в комментарии сделало бы гейт
+// красным на честном коде.
+#include "libserver/util/NameGuard.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <format>
-#include <limits>
 
 #include <spdlog/spdlog.h>
 #include <fstream>
-#include <regex>
 
 #include <nlohmann/json.hpp>
 
@@ -147,31 +150,43 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   _dataPath = path;
   _metaFilePath = _dataPath;
 
-  const auto prepareDataPath = [this](const std::filesystem::path& folder)
+  const auto prepareDataPath = [this](
+    const std::filesystem::path& folder, const unsigned int mode)
   {
     const auto path = _dataPath / folder;
     create_directories(path);
+    // ★СУЖЕНИЕ СУЩЕСТВУЮЩЕГО, а не только создание с правами: `data/users` на
+    // проде создан давно и стоит 0755 — создание его не тронет (LOA-fix R73-2).
+    if (not server::util::EnsureDirectoryMode(path, mode))
+    {
+      server::util::QuietLogError(
+        "Data directory '{}': could not restrict the directory permissions to {:o}",
+        path.string(), mode);
+    }
 
     return path;
   };
 
   // Prepare the data paths.
-  _userDataPath = prepareDataPath("users");
-  _infractionDataPath = prepareDataPath("infractions");
-  _characterDataPath = prepareDataPath("characters");
-  _itemDataPath = prepareDataPath("characters/equipment/items");
-  _horseDataPath = prepareDataPath("characters/equipment/horses");
-  _storageItemPath = prepareDataPath("storage");
-  _eggDataPath = prepareDataPath("eggs");
-  _petDataPath = prepareDataPath("pets");
-  _housingDataPath = prepareDataPath("housing");
-  _guildDataPath = prepareDataPath("guilds");
-  _settingsDataPath = prepareDataPath("settings");
-  _dailyQuestGroupDataPath = prepareDataPath("dailyQuestGroups");
-  _mailDataPath = prepareDataPath("mails");
-  _questDataPath = prepareDataPath("quests");
-  _stallionDataPath = prepareDataPath("stallions");
-  _rewardDataPath = prepareDataPath("rewards");
+  // ★ЕДИНСТВЕННЫЙ КАТАЛОГ С СЕКРЕТОМ — `users`: в нём лежат `passwordHash` и
+  // `passwordSalt` (StoreUser ниже). Остальные ПЯТНАДЦАТЬ несут игровые записи и
+  // остаются 0755 — раунд не меняет их ни на бит.
+  _userDataPath = prepareDataPath("users", 0700);
+  _infractionDataPath = prepareDataPath("infractions", 0755);
+  _characterDataPath = prepareDataPath("characters", 0755);
+  _itemDataPath = prepareDataPath("characters/equipment/items", 0755);
+  _horseDataPath = prepareDataPath("characters/equipment/horses", 0755);
+  _storageItemPath = prepareDataPath("storage", 0755);
+  _eggDataPath = prepareDataPath("eggs", 0755);
+  _petDataPath = prepareDataPath("pets", 0755);
+  _housingDataPath = prepareDataPath("housing", 0755);
+  _guildDataPath = prepareDataPath("guilds", 0755);
+  _settingsDataPath = prepareDataPath("settings", 0755);
+  _dailyQuestGroupDataPath = prepareDataPath("dailyQuestGroups", 0755);
+  _mailDataPath = prepareDataPath("mails", 0755);
+  _questDataPath = prepareDataPath("quests", 0755);
+  _stallionDataPath = prepareDataPath("stallions", 0755);
+  _rewardDataPath = prepareDataPath("rewards", 0755);
 
   // Read the meta-data file and parse the sequential UIDs.
   const std::filesystem::path metaFilePath = ProduceDataFilePath(
@@ -251,11 +266,24 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   raiseFloor(_questSequentialId, HighestUidInDirectory(_questDataPath));
   raiseFloor(_stallionSequentialUid, HighestUidInDirectory(_stallionDataPath));
   raiseFloor(_rewardSequentialUid, HighestUidInDirectory(_rewardDataPath));
+
+  // LOA-fix (R73-4, #130-C8): индекс имён строится ОДИН раз, здесь. После
+  // `raiseFloor` намеренно: обход каталога персонажей уже прогрет, и порядок
+  // «сперва счётчики, потом индекс» держит стартовые инварианты в одном месте.
+  RebuildCharacterNameIndex();
 }
 
 void server::FileDataSource::Terminate()
 {
   SaveMetadata();
+  // ★ПРОВЕРКА, ЧЕЙ ВЕРДИКТ КТО-ТО ЧИТАЕТ. Структурный гейт имени молчит на
+  // каждом пакете НАМЕРЕННО (иначе клиент сам себе делает поток строк в лог —
+  // ровно дефект R57: HandleRaceUserPos дал 15 350 строк/час). Но гейт, о
+  // котором нельзя узнать, работал ли он, — это не гейт; поэтому счётчик один
+  // и печатается один раз.
+  server::util::QuietLogInfo(
+    "Name lookup guard: rejected {} out-of-class name lookups",
+    _rejectedNameLookups.load(std::memory_order::relaxed));
 }
 
 void server::FileDataSource::SaveMetadata()
@@ -291,7 +319,8 @@ void server::FileDataSource::SaveMetadata()
   // молчать больше нельзя.
   try
   {
-    server::util::WriteFileAtomically(metaFilePath, meta.dump(2), "Meta file");
+    server::util::WriteFileAtomically(
+      metaFilePath, meta.dump(2), "Meta file", server::util::FileSensitivity::Public);
   }
   catch (const std::exception& x)
   {
@@ -350,15 +379,29 @@ void server::FileDataSource::StoreUser(const std::string_view&, const data::User
   json["passwordHash"] = user.passwordHash();
   json["passwordSalt"] = user.passwordSalt();
 
+  // ★ЕДИНСТВЕННЫЙ ФАЙЛ, В КОТОРЫЙ ЭТОТ КЛАСС ПИШЕТ ХЕШ ПАРОЛЯ (см. выше,
+  // `passwordHash`/`passwordSalt`).
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "User file");
+    dataFilePath, json.dump(2), "User file",
+    server::util::FileSensitivity::Secret);
 }
 
 bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
 {
-  const std::regex rg(
-    std::format("{}.*", name),
-    std::regex_constants::ECMAScript | std::regex_constants::icase);
+  // ★СНАЧАЛА КЛАСС ИМЕНИ, ПОТОМ ДИСК. Прежняя редакция СОБИРАЛА РЕГУЛЯРНОЕ
+  // ВЫРАЖЕНИЕ из присланного имени (`std::format("{}.*", name)`) до всякой
+  // проверки. Имя вида `(a{200}){200}` разворачивает автомат libstdc++ в
+  // миллионы состояний ещё на КОНСТРУКЦИИ, а имя `[` бросает `regex_error`
+  // наружу — то есть строка `[error]` на КАЖДЫЙ пакет.
+  if (not server::util::IsLoginNameSafe(name))
+  {
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    // Имя, которого не может существовать, «уникально»: вызывающий (staff-
+    // команда `//infraction`, ChatSystem.cpp) ответит «пользователя нет», а не
+    // наоборот. Регистрации через этот путь нет — `LocalAuthenticationBackend`
+    // проверяет имя сам.
+    return true;
+  }
 
   for (const auto& file : std::filesystem::directory_iterator(_userDataPath))
   {
@@ -369,8 +412,12 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
     if (not file.is_regular_file() || file.path().extension() != ".json")
       continue;
 
-    const auto existingUserName = file.path().filename().string();
-    if (std::regex_match(existingUserName, rg))
+    // ★СРАВНЕНИЕ ТОЧНОЕ И С ОСНОВОЙ ИМЕНИ, А НЕ С ПОЛНЫМ. Апстримный шаблон
+    // `name.*` матчился против ПОЛНОГО `nikross.json`, поэтому «nik»
+    // отчитывался как ЗАНЯТОЕ имя, а `//infraction add nik` отвечал «временно
+    // недоступен» вместо «нет такого». Оба ответа отказывают, но врал только
+    // первый.
+    if (server::util::EqualsAsciiIgnoreCase(file.path().stem().string(), name))
       return false;
   }
 
@@ -419,7 +466,8 @@ void server::FileDataSource::StoreInfraction(data::Uid uid, const data::Infracti
     infraction.createdAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Infraction file");
+    dataFilePath, json.dump(2), "Infraction file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteInfraction(data::Uid uid)
@@ -1040,7 +1088,13 @@ void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character
   }
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Character file");
+    dataFilePath, json.dump(2), "Character file",
+    server::util::FileSensitivity::Public);
+
+  // ★ИНДЕКС ОБНОВЛЯЕТСЯ ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, а не до неё. Бросок из
+  // `WriteFileAtomically` оставляет на диске СТАРОЕ имя — индекс обязан остаться
+  // согласованным с диском, а не с намерением.
+  IndexCharacterName(uid, character.name());
 }
 
 void server::FileDataSource::DeleteCharacter(data::Uid uid)
@@ -1048,51 +1102,157 @@ void server::FileDataSource::DeleteCharacter(data::Uid uid)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
   std::filesystem::remove(dataFilePath);
+  ForgetCharacterName(uid);
 }
 
-server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::string_view& name)
+void server::FileDataSource::RebuildCharacterNameIndex()
 {
-  const std::regex rg(
-    std::format("{}", name),
-    std::regex_constants::icase);
+  const std::unique_lock indexLock(_characterNameIndexMutex);
+  _characterNameToUid.clear();
+  _characterUidToName.clear();
 
-  for (const auto& file : std::filesystem::directory_iterator(_characterDataPath))
+  std::size_t skipped = 0;
+  std::size_t duplicates = 0;
+
+  std::error_code error;
+  if (not std::filesystem::is_directory(_characterDataPath, error) || error)
   {
-    // LOA-fix (R58-8, round58, backlog #175): фильтр расширения (иначе временный
-    // файл станет едой для разбора) и ПЕРЕХВАТ разбора. Раньше один битый файл
-    // ломал поиск по имени и создание персонажа У ВСЕХ — бросок улетал наружу из
-    // цикла. Образец взят у соседней `IsGuildNameUnique` в этом же файле.
+    server::util::QuietLogError(
+      "Character name index: '{}' is not a directory, lookups by name will find "
+      "nothing", _characterDataPath.string());
+    return;
+  }
+
+  for (const auto& file :
+    std::filesystem::directory_iterator(_characterDataPath, error))
+  {
+    if (error)
+      break;
+    // Тот же фильтр, что у прежнего обхода (R58-8): `.json` и только он.
     if (not file.is_regular_file() || file.path().extension() != ".json")
       continue;
 
     std::ifstream dataFile(file.path());
     if (not dataFile.is_open())
-      continue;
+    { ++skipped; continue; }
 
-    std::string existingCharacterName;
-    data::Uid existingCharacterUid = data::InvalidUid;
+    std::string existingName;
+    data::Uid existingUid = data::InvalidUid;
     try
     {
       const auto json = nlohmann::json::parse(dataFile);
-      existingCharacterName = json.value("name", std::string{});
-      existingCharacterUid = json.value("uid", data::InvalidUid);
+      existingName = json.value("name", std::string{});
+      existingUid = json.value("uid", data::InvalidUid);
     }
     catch (const std::exception& x)
     {
+      // ★ПЕРЕХВАТ СОХРАНЁН ПО СМЫСЛУ (R58-8): один битый файл не имеет права
+      // сломать поиск по имени и создание персонажа У ВСЕХ. Текст строки НОВЫЙ
+      // намеренно — старая строка «skipped while looking up a character by
+      // name» ОБЯЗАНА исчезнуть из бинаря, это маркер лесенки.
       server::util::QuietLogWarn(
-        "Character file '{}' is unreadable ({}) and was skipped while looking up "
-        "a character by name", file.path().string(), x.what());
+        "Character file '{}' is unreadable ({}) and was skipped while building "
+        "the character name index", file.path().string(), x.what());
+      ++skipped;
       continue;
     }
 
-    if (existingCharacterName.empty() || existingCharacterUid == data::InvalidUid)
-      continue;
+    if (existingName.empty() || existingUid == data::InvalidUid)
+    { ++skipped; continue; }
 
-    if (std::regex_match(existingCharacterName, rg))
-      return existingCharacterUid;
+    auto key = server::util::AsciiLowerKey(existingName);
+    const auto [position, inserted] =
+      _characterNameToUid.try_emplace(key, existingUid);
+    if (not inserted)
+    {
+      // ★СТОЛКНОВЕНИЕ РЕШАЕТСЯ ДЕТЕРМИНИРОВАННО, И ЭТО УЛУЧШЕНИЕ. Прежний обход
+      // возвращал того, кто раньше попался `directory_iterator`, то есть порядок
+      // был не определён стандартом. Оставляем МЕНЬШИЙ uid — старшую запись — и
+      // говорим об этом вслух.
+      ++duplicates;
+      const data::Uid kept = std::min(position->second, existingUid);
+      const data::Uid shadowed = std::max(position->second, existingUid);
+      server::util::QuietLogWarn(
+        "Duplicate character name '{}' in the data directory: uid {} kept, "
+        "uid {} shadowed", existingName, kept, shadowed);
+      position->second = kept;
+      if (shadowed != kept)
+        _characterUidToName.erase(shadowed);
+      _characterUidToName[kept] = std::move(key);
+      continue;
+    }
+    _characterUidToName[existingUid] = std::move(key);
   }
 
-  return data::InvalidUid;
+  server::util::QuietLogInfo(
+    "Character name index: {} names indexed, {} files skipped, {} duplicates",
+    _characterNameToUid.size(), skipped, duplicates);
+}
+
+void server::FileDataSource::IndexCharacterName(
+  const data::Uid uid, const std::string& name)
+{
+  // ★ПУСТОЕ ИМЯ СНИМАЕТ ЗАПИСЬ, А НЕ ЗАВОДИТ КЛЮЧ "". `RebuildCharacterNameIndex`
+  // пропускает записи с пустым именем, и без этой строки персонаж, сохранённый
+  // с пустым именем, занимал бы ключ "" в рантайме и исчезал бы после рестарта —
+  // ровно тот класс «состояние живёт дольше рестарта и расходится с диском»,
+  // который раунд и убирает.
+  if (name.empty())
+  {
+    ForgetCharacterName(uid);
+    return;
+  }
+
+  auto key = server::util::AsciiLowerKey(name);
+  const std::unique_lock indexLock(_characterNameIndexMutex);
+  const auto previous = _characterUidToName.find(uid);
+  if (previous != _characterUidToName.end())
+  {
+    if (previous->second == key)
+      return;                                   // имя не менялось
+    // ★СТАРОЕ ИМЯ СНИМАЕТСЯ ТОЛЬКО ЕСЛИ ОНО ВЕДЁТ НА НАС. Если его перехватил
+    // кто-то другой (столкновение регистров), стирать чужую запись нельзя.
+    const auto stale = _characterNameToUid.find(previous->second);
+    if (stale != _characterNameToUid.end() && stale->second == uid)
+      _characterNameToUid.erase(stale);
+  }
+  _characterNameToUid[key] = uid;
+  _characterUidToName[uid] = std::move(key);
+}
+
+void server::FileDataSource::ForgetCharacterName(const data::Uid uid)
+{
+  const std::unique_lock indexLock(_characterNameIndexMutex);
+  const auto previous = _characterUidToName.find(uid);
+  if (previous == _characterUidToName.end())
+    return;
+  const auto stale = _characterNameToUid.find(previous->second);
+  if (stale != _characterNameToUid.end() && stale->second == uid)
+    _characterNameToUid.erase(stale);
+  _characterUidToName.erase(previous);
+}
+
+server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::string_view& name)
+{
+  // ★СТРУКТУРНЫЙ ГЕЙТ ДО ВСЕГО — до аллокации ключа, до хеша, до диска. Провод
+  // отдаёт до ~8190 байт (Stream.cpp при потолке CommandServer.cpp
+  // `MaxCommandDataSize`), а хранимое имя не длиннее 36 байт UTF-8 (вывод — в
+  // NameGuard.hpp).
+  if (not server::util::IsStorableNameShaped(name))
+  {
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    return data::InvalidUid;
+  }
+
+  // ★ИНДЕКС ВМЕСТО ОБХОДА. Прежняя редакция открывала и РАЗБИРАЛА КАЖДЫЙ файл
+  // персонажа на КАЖДЫЙ вызов, а зовут её шесть аутентифицированных хендлеров:
+  // подарок (RanchDirector), вызов персонажа, приглашение в гонку
+  // (RaceNetworkHandler), добавление друга и письмо (MessengerDirector). Один
+  // пакет = O(все персонажи) обращений к диску.
+  const auto key = server::util::AsciiLowerKey(name);
+  const std::shared_lock indexLock(_characterNameIndexMutex);
+  const auto found = _characterNameToUid.find(key);
+  return found == _characterNameToUid.end() ? data::InvalidUid : found->second;
 }
 
 bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
@@ -1322,7 +1482,8 @@ void server::FileDataSource::StoreHorse(data::Uid uid, const data::Horse& horse)
   json["lineage"] = horse.lineage();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Horse file");
+    dataFilePath, json.dump(2), "Horse file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteHorse(data::Uid uid)
@@ -1374,7 +1535,8 @@ void server::FileDataSource::StoreItem(data::Uid uid, const data::Item& item)
     item.createdAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Item file");
+    dataFilePath, json.dump(2), "Item file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteItem(data::Uid uid)
@@ -1461,7 +1623,8 @@ void server::FileDataSource::StoreStorageItem(data::Uid uid, const data::Storage
   json["priceId"] = storageItem.priceId();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Storage item file");
+    dataFilePath, json.dump(2), "Storage item file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteStorageItem(data::Uid uid)
@@ -1516,7 +1679,8 @@ void server::FileDataSource::StoreEgg(data::Uid uid, const data::Egg& egg)
   json["incubatorSlot"] = egg.incubatorSlot();
   json["boostsUsed"] = egg.boostsUsed();
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Egg file");
+    dataFilePath, json.dump(2), "Egg file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteEgg(data::Uid uid)
@@ -1568,7 +1732,8 @@ void server::FileDataSource::StorePet(data::Uid uid, const data::Pet& pet)
     pet.birthDate().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Pet file");
+    dataFilePath, json.dump(2), "Pet file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeletePet(data::Uid uid)
@@ -1617,7 +1782,8 @@ void server::FileDataSource::StoreHousing(data::Uid uid, const data::Housing& ho
   json["durability"] = housing.durability();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Housing file");
+    dataFilePath, json.dump(2), "Housing file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteHousing(data::Uid uid)
@@ -1681,7 +1847,8 @@ void server::FileDataSource::StoreGuild(data::Uid uid, const data::Guild& guild)
   json["seasonalLosses"] = guild.seasonalLosses();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Guild file");
+    dataFilePath, json.dump(2), "Guild file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteGuild(data::Uid uid)
@@ -1853,7 +2020,8 @@ void server::FileDataSource::StoreSettings(data::Uid uid, const data::Settings& 
   }
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Settings file");
+    dataFilePath, json.dump(2), "Settings file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteSettings(data::Uid uid)
@@ -1954,7 +2122,8 @@ void server::FileDataSource::StoreDailyQuestGroup(data::Uid uid, const data::Dai
   }
   json["quests"] = questsJson;
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Daily quest group file");
+    dataFilePath, json.dump(2), "Daily quest group file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteDailyQuestGroup(data::Uid uid)
@@ -2021,7 +2190,8 @@ void server::FileDataSource::StoreMail(data::Uid uid, const data::Mail& mail)
   json["body"] = mail.body();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Mail file");
+    dataFilePath, json.dump(2), "Mail file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteMail(data::Uid uid)
@@ -2068,7 +2238,8 @@ void server::FileDataSource::StoreQuest(data::Uid uid, const data::Quest& quest)
   json["progress"]    = quest.progress();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Quest file");
+    dataFilePath, json.dump(2), "Quest file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteQuest(data::Uid uid)
@@ -2125,7 +2296,8 @@ void server::FileDataSource::StoreStallion(data::Uid uid, const data::Stallion& 
     stallion.expiresAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Stallion file");
+    dataFilePath, json.dump(2), "Stallion file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteStallion(data::Uid uid)
@@ -2211,7 +2383,8 @@ void server::FileDataSource::StoreReward(data::Uid claimUid, const data::Reward&
     reward.claimedAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Reward file");
+    dataFilePath, json.dump(2), "Reward file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteReward(data::Uid claimUid)
