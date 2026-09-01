@@ -19,9 +19,28 @@
 #   not in git. Exits 1 if ANY difference is not covered by the allowlists below.
 #
 # ALLOWLIST (deliberate, reviewed — see PLAN-MARATHON-2026-08-28 lead decision 3)
-#   server/config.yaml     host-owned advertised addresses. Only lines whose key is
-#                          `address:` (or `host:`) may differ; a changed port, name
-#                          or anything else FAILS.
+#   server/config.yaml     host-owned ADVERTISED addresses — and nothing else. The
+#                          six waived fields are named one by one, by full YAML path:
+#                            server.lobby.advertisement.ranch.address
+#                            server.lobby.advertisement.race.address
+#                            server.lobby.advertisement.messenger.address
+#                            server.lobby.advertisement.all_chat.address
+#                            server.lobby.advertisement.private_chat.address
+#                            server.lobby.advertisement.udp_race_relay.address
+#                          Those are the addresses the lobby hands to clients, so the
+#                          host owns them (127.0.0.1 in git, the public IP on prod).
+#                          A LISTEN/bind address (server.<svc>.listen.address, seven of
+#                          them, all "0.0.0.0") is NOT waived: 0.0.0.0 -> 127.0.0.1
+#                          would make the whole server unreachable and must stop a
+#                          deploy. Neither is any port, name, flag or added/removed key.
+#                          The check is structural, not a key-name regex: `address:`
+#                          appears under BOTH `listen:` and `advertisement:`, so an
+#                          `^ *address:` regex waives the bind address too (measured
+#                          false green on fixture A6, verify-tools §1.4). Instead both
+#                          sides are rewritten with the VALUE of exactly those six
+#                          paths blanked out, and the rewritten files must be byte
+#                          identical — that is literally "only these keys, only their
+#                          values".
 #   server/bullied.yaml    dead config; prod keeps two legacy nicknames. Fully waived.
 #   game/achievements.yaml comment-only differences (lines whose first non-blank
 #   game/care_skills.yaml  character is `#`). Any body change FAILS.
@@ -97,6 +116,45 @@ list_host_files() {
   sed 's|^\./||' "$raw" | LC_ALL=C sort > "$1"
 }
 
+# The full YAML paths whose VALUE the production host is allowed to own.
+# One line per path. Adding a path here is a reviewed decision, not a fix for a red run.
+ADVERTISED_PATHS='server.lobby.advertisement.ranch.address
+server.lobby.advertisement.race.address
+server.lobby.advertisement.messenger.address
+server.lobby.advertisement.all_chat.address
+server.lobby.advertisement.private_chat.address
+server.lobby.advertisement.udp_race_relay.address'
+
+# waive_advertised <file>  -> the same file on stdout, with the value of each path in
+# ADVERTISED_PATHS replaced by <WAIVED>. Every other byte, including indentation, key
+# order, comments and blank lines, is passed through untouched.
+#
+# The path is derived from the indentation stack, not from the key name, because the
+# key name alone cannot tell `listen.address` from `advertisement.ranch.address`.
+# Line count is preserved exactly, so the caller can prove the rewriter ran at all.
+waive_advertised() {
+  awk -v allow="$ADVERTISED_PATHS" '
+    BEGIN { n = split(allow, A, "\n"); for (i = 1; i <= n; i++) if (A[i] != "") ALLOW[A[i]] = 1; sp = 0 }
+    function parents(   i, p) { p = ""; for (i = 1; i <= sp; i++) p = (p == "" ? K[i] : p "." K[i]); return p }
+    {
+      line = $0
+      body = line; sub(/^[ \t]*/, "", body)
+      ind = length(line) - length(body)
+      if (body == "" || substr(body, 1, 1) == "#") { print line; next }
+      ci = index(body, ":")
+      if (ci == 0) { print line; next }
+      key = substr(body, 1, ci - 1)
+      if (key !~ /^[A-Za-z0-9_.-]+$/) { print line; next }
+      val = substr(body, ci + 1); sub(/^[ \t]+/, "", val)
+      while (sp > 0 && I[sp] >= ind) sp--
+      if (val == "") { sp++; I[sp] = ind; K[sp] = key; print line; next }   # mapping node
+      p = parents(); p = (p == "" ? key : p "." key)                        # scalar leaf
+      if (p in ALLOW) { printf "%s%s: <WAIVED>\n", substr(line, 1, ind), key; next }
+      print line
+    }
+  ' "$1"
+}
+
 # every changed line (both sides) must match the given extended regex.
 # -a everywhere: a NUL byte must not be able to turn this into "nothing changed".
 changed_lines_all_match() {
@@ -166,13 +224,28 @@ for rel in "${REL_LIST[@]}"; do
 
   case "$rel" in
     server/config.yaml)
-      # only advertised addresses may differ
-      if changed_lines_all_match "$repo_file" "$host_file" '^[[:space:]]*(address|host):'; then
-        printf '  %-40s РАЗРЕШЕНО: только advertised-адреса (%s строк)\n' "$rel" "$nlines"
+      # Only the six ADVERTISED address values may differ. Blank those six values on
+      # both sides; whatever still differs is drift — a port, a listen/bind address,
+      # a renamed or removed key, anything.
+      wrepo="$TMP/waived.repo"; whost="$TMP/waived.host"
+      waive_advertised "$repo_file" > "$wrepo"
+      waive_advertised "$host_file" > "$whost"
+      # Blindness guard #4: the rewriter must have produced a line for every input
+      # line. An awk that died would emit nothing on BOTH sides, the two empty files
+      # would compare equal, and the waiver would swallow the entire file.
+      lr="$(grep -ac '' "$wrepo")"; lh="$(grep -ac '' "$whost")"
+      orr="$(grep -ac '' "$repo_file")"; ohh="$(grep -ac '' "$host_file")"
+      if [ "$lr" -ne "$orr" ] || [ "$lh" -ne "$ohh" ]; then
+        printf '  %-40s ОСТАНОВ: маскировка advertised-адресов дала %s/%s строк вместо %s/%s\n' \
+          "$rel" "$lr" "$lh" "$orr" "$ohh"
+        UNREADABLE=1
+      elif cmp -s "$wrepo" "$whost"; then
+        nadv="$(grep -ac '<WAIVED>' "$wrepo")"
+        printf '  %-40s РАЗРЕШЕНО: различаются только advertised-адреса (%s строк, %s замаскированных полей)\n' \
+          "$rel" "$nlines" "$nadv"
       else
-        printf '  %-40s ДРЕЙФ: изменены не только адреса\n' "$rel"
-        diff -a -u "$repo_file" "$host_file" | grep -aE '^[-+]' | grep -aEv '^(\+\+\+|---)' \
-          | grep -aEv '^[-+][[:space:]]*(address|host):' | sed 's/^/      /'
+        printf '  %-40s ДРЕЙФ: изменено не только значение advertised-адреса\n' "$rel"
+        diff -a -u "$wrepo" "$whost" | grep -aE '^[-+]' | grep -aEv '^(\+\+\+|---)' | sed 's/^/      /'
         DRIFTED=1
       fi
       ;;

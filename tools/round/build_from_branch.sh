@@ -135,6 +135,10 @@ BIN_SIZE="$(stat -c%s "$BIN_TMP/alicia-server")"
 BIN_MD5="$(md5sum "$BIN_TMP/alicia-server" | cut -d' ' -f1)"
 rm -rf "$BIN_TMP"
 [ "$BIN_SIZE" -gt 1000000 ] || die "бинарь подозрительно мал ($BIN_SIZE Б)"
+# md5sum runs in a pipeline, so its exit code is swallowed by `cut`. Check the VALUE:
+# an empty md5 would ride into manifest.json and every later comparison against it
+# would then be a comparison of nothing with nothing.
+[ -n "$BIN_MD5" ] || die "md5 бинаря пуст — md5sum не отработал, в манифест такое писать нельзя"
 say "  бинарь: $BIN_SIZE Б, md5 $BIN_MD5 ✓"
 
 # ---- 7. manifest -----------------------------------------------------------------

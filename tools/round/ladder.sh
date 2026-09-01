@@ -23,7 +23,9 @@
 #   CONTROL_TAG   the image the round is measured against — normally the image that is
 #                 actually running in production, carried over, never rebuilt
 #   CAND_TAG      the candidate image for this round
-#   NEG_TAG...    zero or more negative images (one removed protection each)
+#   NEG_TAG...    zero or more negative images (one removed protection each). Each must
+#                 differ from the candidate AND from the control: an arm equal to the
+#                 control is the control rebuilt, it isolates nothing (see assertion 3).
 #   --grow SYM            substring of a symbol that MUST change size in CAND vs CONTROL.
 #                         Repeatable. Matching is a plain substring of the demangled name.
 #   --control-symbol SYM  substring of a symbol that must NOT change size in ANY arm.
@@ -133,6 +135,7 @@ for ((i=0; i<${#ARM_NAMES[@]}; i++)); do
   [ "$sy" -ge "$MIN_SYMBOLS" ] || die "у арки $a всего $sy символов (< $MIN_SYMBOLS) — проверка слепа"
   [ "$st" -ge "$MIN_STRINGS" ] || die "у арки $a всего $st строк (< $MIN_STRINGS) — проверка слепа"
   echo "$md5" > "$W/$a.md5"
+  echo "$st"  > "$W/$a.stcount"
 done
 echo
 
@@ -198,19 +201,46 @@ else
 fi
 echo
 
-# ---- assertion 3: every negative arm really differs from the candidate ----------
+# ---- assertion 3: every negative arm differs from the candidate AND from the -----
+#      control.
+#      WHY BOTH. The candidate comparison catches "the negative's edit never got
+#      applied". It does NOT catch the opposite mistake: a negative that equals the
+#      CONTROL. That happens when the round's work never reached the negative at all
+#      — built from `main` instead of the round branch, or branched off the base
+#      instead of off the candidate. Such an arm is the control rebuilt a second time:
+#      it isolates nothing, yet the earlier version of this check compared it only
+#      with the candidate, found a difference (of course it did — the control differs
+#      from the candidate) and printed "ЛЕСЕНКА ЧИСТА ✓". Measured false green.
+#      Byte-equality is the loud form. The quiet form is the same tree rebuilt with a
+#      different `git describe` string: md5 differs, but not one symbol size moved and
+#      the string count is the control's to the last entry. Both are refused here.
 if [ ${#NEG_TAGS[@]} -gt 0 ]; then
-  echo "--- негативы обязаны отличаться от кандидата ---"
+  echo "--- негативы обязаны отличаться и от кандидата, и от контроля ---"
   cand_md5="$(command cat "$W/cand.md5")"
+  control_md5="$(command cat "$W/control.md5")"
+  control_st="$(command cat "$W/control.stcount")"
+  csym="$(grep -c . "$W/cand.changed")"
   for ((i=2; i<${#ARM_NAMES[@]}; i++)); do
     a="${ARM_NAMES[$i]}"
     amd5="$(command cat "$W/$a.md5")"
+    ast="$(command cat "$W/$a.stcount")"
+    nsym="$(grep -c . "$W/$a.changed")"
+    ngone="$(grep -c . "$W/$a.gone")"
+    nnew="$(grep -c . "$W/$a.new")"
+    bad=0
     if [ "$amd5" = "$cand_md5" ]; then
-      fail "$a: бинарь БАЙТ-В-БАЙТ равен кандидату — правка негатива не применилась, он ничего не проверяет"
-    else
-      nsym="$(grep -c . "$W/$a.changed")"
-      csym="$(grep -c . "$W/cand.changed")"
-      ok "$a: отличается от кандидата (md5 ${amd5:0:12} ≠ ${cand_md5:0:12}; символов сдвинуто $nsym против $csym у кандидата)"
+      fail "$a: бинарь БАЙТ-В-БАЙТ равен КАНДИДАТУ — правка негатива не применилась, он ничего не проверяет"
+      bad=1
+    fi
+    if [ "$amd5" = "$control_md5" ]; then
+      fail "$a: бинарь БАЙТ-В-БАЙТ равен КОНТРОЛЮ — работа раунда до негатива не доехала (собран не с той ветки / ответвлён от базы, а не от кандидата); такая арка и есть контроль, она ничего не изолирует"
+      bad=1
+    elif [ "$nsym" -eq 0 ] && [ "$ngone" -eq 0 ] && [ "$nnew" -eq 0 ] && [ "$ast" -eq "$control_st" ]; then
+      fail "$a: по существу равен КОНТРОЛЮ — ни один символ не сдвинулся (изменили 0 · пропало 0 · появилось 0) и строк ровно столько же ($ast): это пересобранный контроль, а не негатив"
+      bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then
+      ok "$a: отличается от кандидата (md5 ${amd5:0:12} ≠ ${cand_md5:0:12}) и от контроля (${control_md5:0:12}; символов сдвинуто $nsym против $csym у кандидата)"
     fi
   done
   echo

@@ -40,8 +40,8 @@
 # EXIT CODES
 #   0 no raw calls · 1 raw calls found (they are printed) · 2 the tree is not
 #     scannable (missing src/ or include/, the exclusion file is gone, too few
-#     files, or grep did not open every file — in which case a zero count would be
-#     meaningless rather than good news)
+#     files, a symlink under src/ or include/, or grep did not open every file — in
+#     which case a zero count would be meaningless rather than good news)
 set -uo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -81,6 +81,21 @@ fi
 if [ "$SCANNED" -ne "$FOUND" ]; then
   echo "ОСТАНОВ: grep открыл $SCANNED файлов из $FOUND — часть дерева не просканирована,"
   echo "         поэтому «0 нарушителей» ничего не доказывает."
+  exit 2
+fi
+
+# Blindness guard #3: symlinks. `find -type f` does not list them and `grep -r` does
+# not follow them, so BOTH numbers above agree while a symlinked source file — which
+# the compiler happily builds — is never opened: a raw call behind it is invisible and
+# the gate still prints "ЧИСТО ✓" (proven on a fixture, R70-prep). Refusing to run is
+# the simpler safe answer than teaching the walk to follow links: the repository holds
+# zero symlinks under src/ and include/ today, so this can only fire on a real change,
+# and it fires as "undefined" (2), never as "clean".
+LINKS="$(cd "$ROOT" && find src include -type l | wc -l)"
+if [ "$LINKS" -ne 0 ]; then
+  echo "ОСТАНОВ: под src/ и include/ найдено $LINKS символических ссылок —"
+  echo "         ни find -type f, ни grep -r их не читают, поэтому «0 нарушителей» слепо."
+  (cd "$ROOT" && find src include -type l | sed 's/^/  /')
   exit 2
 fi
 

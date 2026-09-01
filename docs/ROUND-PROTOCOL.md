@@ -48,8 +48,17 @@ Both print a verdict and a file count. **Read the count, not just the verdict**:
 gates are written so that "0 findings" is only meaningful next to "and I scanned all
 N files". If a count looks low, the scan was incomplete and the verdict means nothing.
 
+The quiet-logging gate states a *textual* property of the tree, so by design it also
+flags a `spdlog::` call that is commented out, or merely quoted in a comment: there is
+no escape hatch, and a doc line mentioning `spdlog::error(` inside `src/` or `include/`
+will stop the build. That is deliberate — a false red costs a minute, a parser that can
+be fooled into calling a real call "a comment" costs a round.
+
 `config_drift.sh` needs to reach the production host (read-only, `ssh … cat`). Point it
-somewhere else with `HOST=… HOST_ROOT=…`, or at a local directory for a dry run.
+somewhere else with `HOST=… HOST_ROOT=…`, or at a local directory for a dry run. Its
+only waiver on `server/config.yaml` is the *value* of the six advertised addresses
+(`server.lobby.advertisement.*.address`), named by full YAML path; a listen/bind
+address or any port is drift and fails the gate.
 
 ---
 
