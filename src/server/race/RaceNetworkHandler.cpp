@@ -37,6 +37,8 @@
 #include <bitset>
 #include <limits>
 #include <ranges>
+#include <algorithm> // std::ranges::all_of / none_of — сегодня приезжает транзитивно (ревью N3)
+#include <cmath>     // std::isfinite
 
 namespace server
 {

@@ -34,6 +34,7 @@
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/util/Scheduler.hpp"
+#include "libserver/util/LogThrottle.hpp"
 
 #include <random>
 #include <unordered_map>
@@ -184,6 +185,21 @@ public:
   }
 
 private:
+  //! LOA-fix (R71-2, backlog #129-S2 / item 26): ПОТОЛОК СПИСКА ЦЕЛЕЙ ОДНОГО КАСТА.
+  //!
+  //! `AcCmdCRUseMagicItem::targetList` читается счётчиком `uint8_t`
+  //! (RaceMessageDefinitions.cpp:1487-1493) — до 255 элементов. У списка два смысла,
+  //! и оба малы: цели заклинания (их не больше, чем участников комнаты) и сосульки
+  //! ледяной стены (1 у обычной, 3 у критической — комментарий там же,
+  //! RaceMessageDefinitions.hpp:1942-1944).
+  //!
+  //! ★8 — это ТОЧНАЯ вместимость, а не запас с потолка: комната клампится восемью
+  //! (`RaceNetworkHandler.cpp:1538`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
+  //! ровно восемь участников в трекере у соло-заезда (1 живой + 7 ботов, :2362-2367
+  //! + `SpawnAiRacers`). Поэтому сравнение строгое (`>`), а не `>=`. Число НЕ
+  //! зависит от данных `magic.yaml` — конфиг его сдвинуть не может.
+  static constexpr size_t MaxMagicTargetListSize = 8;
+
   enum class EffectVerdict : uint8_t
   {
     Shielded,
@@ -450,6 +466,23 @@ private:
   std::mutex _raceInstancesMutex;
   //! A map of all race instanced indexed by room UIDs.
   std::unordered_map<uint32_t, RaceInstance> _raceInstances;
+
+  //! LOA-fix (R71): по дросселю НА КАЖДУЮ ЗАЩИТУ — флуд одной не должен заглушать
+  //! другую (у каждого своё окно и свой счётчик подавленных).
+  //!
+  //! ★ПОЛЯ ДОБАВЛЕНЫ В КОНЕЦ КЛАССА НАМЕРЕННО. Смещения всех существующих полей
+  //! остаются прежними, поэтому код НЕтронутых методов кодируется так же — а значит
+  //! «неподвижный контрольный символ» лесенки остаётся честной уликой, а не
+  //! случайностью компоновки.
+  util::LogThrottle _magicOwnershipThrottle;
+  util::LogThrottle _magicTargetCountThrottle;
+  util::LogThrottle _magicPayloadThrottle;
+  util::LogThrottle _skillTargetThrottle;
+  util::LogThrottle _skillEffectIdThrottle;
+  util::LogThrottle _relayEnvelopeThrottle;
+  util::LogThrottle _relayActorThrottle;
+  util::LogThrottle _itemGetOwnershipThrottle;
+  util::LogThrottle _relayPayloadTypeThrottle;
 };
 
 } // namespace server
