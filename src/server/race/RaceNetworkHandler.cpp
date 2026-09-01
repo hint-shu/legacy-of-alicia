@@ -4799,11 +4799,21 @@ void RaceNetworkHandler::HandleRelay(
           command.fromOid,
           command.toOid);
 
-      server::util::QuietLogWarn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {:02X}",
-        clientId,
-        header,
-        static_cast<uint16_t>(command.payloadType),
-        spdlog::to_hex(command.data));
+      // LOA-fix (R71-8): ЖАЛОБА, КОТОРУЮ ЗАКАЗЫВАЕТ КЛИЕНТ, ОБЯЗАНА БЫТЬ ЗАДРОССЕЛЕНА.
+      // Строка писалась на КАЖДЫЙ пакет и несёт hex-дамп: клиент, шлющий неизвестный
+      // `payloadType` четыре раза в секунду, получал готовый лог-флуд того же класса,
+      // что R57 нашёл на проде. Аргументы и формат-строка НЕ меняются — иначе поехал
+      // бы маркер лесенки прошлого раунда.
+      // ★Эта ветка стоит ДО захвата `_raceInstancesMutex` — именно поэтому у
+      // `LogThrottle` собственный замок-лист (LogThrottle.hpp).
+      uint64_t suppressed = 0;
+      if (_relayPayloadTypeThrottle.Allow(suppressed))
+        server::util::QuietLogWarn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {:02X} (suppressed {})",
+          clientId,
+          header,
+          static_cast<uint16_t>(command.payloadType),
+          spdlog::to_hex(command.data),
+          suppressed);
       break;
     }
   }
