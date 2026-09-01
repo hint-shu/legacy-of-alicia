@@ -1,366 +1,366 @@
 collection:
 - packageId: 1001
-  packageName: 각설탕 3개
+  packageName: 'Кусковой сахар, 3 шт.'
   count: 3
-  itemName: Sugar cubes
+  itemName: 'Кусковой сахар'
   tid: 41007
 - packageId: 1002
-  packageName: 당근 3개
+  packageName: 'Морковь, 3 шт.'
   count: 3
-  itemName: Carrot
+  itemName: 'Морковь'
   tid: 41006
 - packageId: 1003
-  packageName: 옥수수 3개
+  packageName: 'Кукуруза, 3 шт.'
   count: 3
-  itemName: Corn
+  itemName: 'Кукуруза'
   tid: 41001
 - packageId: 1004
-  packageName: 보리 3개
+  packageName: 'Ячмень, 3 шт.'
   count: 3
-  itemName: Barley
+  itemName: 'Ячмень'
   tid: 41003
 - packageId: 1005
-  packageName: 건초 2개
+  packageName: 'Луговая трава, 2 шт.'
   count: 2
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1008
-  packageName: 목초 2개
+  packageName: 'Луговая трава, 2 шт.'
   count: 2
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1007
-  packageName: 콩 2개
+  packageName: 'Бобы, 2 шт.'
   count: 2
-  itemName: Beans
+  itemName: 'Бобы'
   tid: 41002
 - packageId: 1011
-  packageName: 재료용 크리스털 1개
+  packageName: 'Кристалл-материал, 1 шт.'
   count: 1
-  itemName: 재료용 크리스털
+  itemName: 'Кристалл-материал'
   tid: 45001
 - packageId: 1012
-  packageName: 성장의 비약 1개
+  packageName: 'Эликсир роста, 1 шт.'
   count: 1
-  itemName: 성장의 비약
+  itemName: 'Эликсир роста'
   tid: 43001
 - packageId: 1013
-  packageName: 근육 이완제 1개
+  packageName: 'Расслабляющая мазь, 1 шт.'
   count: 1
-  itemName: Muscle relaxant
+  itemName: 'Расслабляющая мазь'
   tid: 44001
 - packageId: 1014
-  packageName: 항균 크림 1개
+  packageName: 'Антибактериальный крем, 1 шт.'
   count: 1
-  itemName: Antibacterial cream
+  itemName: 'Антибактериальный крем'
   tid: 44003
 - packageId: 1015
-  packageName: 임시 부목 1개
+  packageName: 'Временная шина, 1 шт.'
   count: 1
-  itemName: Temporary splint
+  itemName: 'Временная шина'
   tid: 44005
 - packageId: 1016
-  packageName: 당근 낚시대 10개
+  packageName: 'Удочка с морковкой, 10 шт.'
   count: 10
-  itemName: Carrot on a stick
+  itemName: 'Удочка с морковкой'
   tid: 42001
 - packageId: 1017
-  packageName: 화살 10개
+  packageName: 'Лук, 10 шт.'
   count: 10
-  itemName: Bow
+  itemName: 'Лук'
   tid: 42002
 - packageId: 1018
-  packageName: 콩송편 1개
+  packageName: 'Сонпхён с бобами, 1 шт.'
   count: 1
-  itemName: 콩 송편
+  itemName: 'Сонпхён с бобами'
   tid: 46013
 - packageId: 1019
-  packageName: 꿀송편 1개
+  packageName: 'Сонпхён с мёдом, 1 шт.'
   count: 1
-  itemName: 꿀 송편
+  itemName: 'Сонпхён с мёдом'
   tid: 46014
 - packageId: 1020
-  packageName: 각설탕 5개
+  packageName: 'Кусковой сахар, 5 шт.'
   count: 5
-  itemName: Sugar cubes
+  itemName: 'Кусковой сахар'
   tid: 41007
 - packageId: 1021
-  packageName: 당근 5개
+  packageName: 'Морковь, 5 шт.'
   count: 5
-  itemName: Carrot
+  itemName: 'Морковь'
   tid: 41006
 - packageId: 1022
-  packageName: 옥수수 5개
+  packageName: 'Кукуруза, 5 шт.'
   count: 5
-  itemName: Corn
+  itemName: 'Кукуруза'
   tid: 41001
 - packageId: 1023
-  packageName: 보리 5개
+  packageName: 'Ячмень, 5 шт.'
   count: 5
-  itemName: Barley
+  itemName: 'Ячмень'
   tid: 41003
 - packageId: 1024
-  packageName: 건초 5개
+  packageName: 'Луговая трава, 5 шт.'
   count: 5
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1025
-  packageName: 콩 5개
+  packageName: 'Бобы, 5 шт.'
   count: 5
-  itemName: Beans
+  itemName: 'Бобы'
   tid: 41002
 - packageId: 1026
-  packageName: 목초 5개
+  packageName: 'Луговая трава, 5 шт.'
   count: 5
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1030
-  packageName: 당근 낚시대 5개
+  packageName: 'Удочка с морковкой, 5 шт.'
   count: 5
-  itemName: Carrot on a stick
+  itemName: 'Удочка с морковкой'
   tid: 42001
 - packageId: 1031
-  packageName: 화살 5개
+  packageName: 'Лук, 5 шт.'
   count: 5
-  itemName: Bow
+  itemName: 'Лук'
   tid: 42002
 - packageId: 1032
-  packageName: 할로윈 블랙 위치 햇 7일
+  packageName: 'Хэллоуинская шляпа ведьмы, 7 шт.'
   count: 7
-  itemName: 할로윈 블랙 위치 햇
+  itemName: 'Хэллоуинская шляпа ведьмы'
   tid: 10159
 - packageId: 1033
-  packageName: 잭 오 랜턴 미니 햇 7일
+  packageName: 'Мини-шляпа с тыквой Джека, 7 шт.'
   count: 7
-  itemName: 잭 오 랜턴 미니 햇
+  itemName: 'Мини-шляпа с тыквой Джека'
   tid: 10160
 - packageId: 1034
-  packageName: 할로윈 다크 위자드 햇 7일
+  packageName: 'Хэллоуинский колпак тёмного чародея, 7 шт.'
   count: 7
-  itemName: 할로윈 다크 위자드 햇
+  itemName: 'Хэллоуинский колпак тёмного чародея'
   tid: 30154
 - packageId: 1035
-  packageName: 잭 오 랜턴 체크 햇 7일
+  packageName: 'Клетчатая шляпа с тыквой Джека, 7 шт.'
   count: 7
-  itemName: 잭 오 랜턴 체크 햇
+  itemName: 'Клетчатая шляпа с тыквой Джека'
   tid: 30155
 - packageId: 1036
-  packageName: 할로윈 캔디 1일
+  packageName: 'Хэллоуинская конфета, 1 шт.'
   count: 1
-  itemName: 할로윈 캔디
+  itemName: 'Хэллоуинская конфета'
   tid: 46016
 - packageId: 1037
-  packageName: 할로윈 초콜릿 1일
+  packageName: 'Хэллоуинский шоколад, 1 шт.'
   count: 1
-  itemName: 할로윈 초콜릿
+  itemName: 'Хэллоуинский шоколад'
   tid: 46017
 - packageId: 1038
-  packageName: 관리자의 방울 1일
+  packageName: 'Колокольчик смотрителя, 1 шт.'
   count: 1
-  itemName: 관리자의 방울
+  itemName: 'Колокольчик смотрителя'
   tid: 45005
 - packageId: 1039
-  packageName: 숙련의 비약 1일
+  packageName: 'Эликсир мастерства, 1 шт.'
   count: 1
-  itemName: 숙련의 비약
+  itemName: 'Эликсир мастерства'
   tid: 46020
 - packageId: 1040
-  packageName: 퍼펙트 스타트 뱃지 1일
+  packageName: 'Значок идеального старта, 1 шт.'
   count: 1
-  itemName: 퍼펙트 스타트 뱃지
+  itemName: 'Значок идеального старта'
   tid: 46021
 - packageId: 1042
-  packageName: Dorf Fortune Egg (Lv.1)
+  packageName: 'Яйцо удачи: Дорф (ур. 1), 1 шт.'
   count: 1
-  itemName: Dorf Fortune Egg (Lv.1)
+  itemName: 'Яйцо удачи: Дорф (ур. 1)'
   tid: 90006
 - packageId: 1043
-  packageName: Dorf Fortune Egg (Lv.2)
+  packageName: 'Яйцо удачи: Дорф (ур. 2), 2 шт.'
   count: 2
-  itemName: Dorf Fortune Egg (Lv.2)
+  itemName: 'Яйцо удачи: Дорф (ур. 2)'
   tid: 90007
 - packageId: 1044
-  packageName: Dorf Fortune Egg (Lv.3)
+  packageName: 'Яйцо удачи: Дорф (ур. 3), 3 шт.'
   count: 3
-  itemName: Dorf Fortune Egg (Lv.3)
+  itemName: 'Яйцо удачи: Дорф (ур. 3)'
   tid: 90008
 - packageId: 1045
-  packageName: Dran Fortune Egg (Lv.1)
+  packageName: 'Яйцо удачи: Дрэн (ур. 1), 1 шт.'
   count: 1
-  itemName: Dran Fortune Egg (Lv.1)
+  itemName: 'Яйцо удачи: Дрэн (ур. 1)'
   tid: 90004
 - packageId: 1046
-  packageName: Dran Fortune Egg (Lv.2)
+  packageName: 'Яйцо удачи: Дрэн (ур. 2), 2 шт.'
   count: 2
-  itemName: Dran Fortune Egg (Lv.2)
+  itemName: 'Яйцо удачи: Дрэн (ур. 2)'
   tid: 90005
 - packageId: 1047
-  packageName: Dran Fortune Egg (Lv.3)
+  packageName: 'Яйцо удачи: Дрэн (ур. 3), 3 шт.'
   count: 3
-  itemName: Dran Fortune Egg (Lv.3)
+  itemName: 'Яйцо удачи: Дрэн (ур. 3)'
   tid: 90011
 - packageId: 1048
-  packageName: Tabia Fortune Egg (Lv.1)
+  packageName: 'Яйцо удачи: Табиа (ур. 1), 1 шт.'
   count: 1
-  itemName: Tabia Fortune Egg (Lv.1)
+  itemName: 'Яйцо удачи: Табиа (ур. 1)'
   tid: 90013
 - packageId: 1049
-  packageName: Tabia Fortune Egg (Lv.2)
+  packageName: 'Яйцо удачи: Табиа (ур. 2), 2 шт.'
   count: 2
-  itemName: Tabia Fortune Egg (Lv.2)
+  itemName: 'Яйцо удачи: Табиа (ур. 2)'
   tid: 90014
 - packageId: 1050
-  packageName: Tabia Fortune Egg (Lv.3)
+  packageName: 'Яйцо удачи: Табиа (ур. 3), 3 шт.'
   count: 3
-  itemName: Tabia Fortune Egg (Lv.3)
+  itemName: 'Яйцо удачи: Табиа (ур. 3)'
   tid: 90015
 - packageId: 1051
-  packageName: Foret Fortune Egg (Lv.1)
+  packageName: 'Яйцо удачи: Форе (ур. 1), 1 шт.'
   count: 1
-  itemName: Foret Fortune Egg (Lv.1)
+  itemName: 'Яйцо удачи: Форе (ур. 1)'
   tid: 90010
 - packageId: 1052
-  packageName: Foret Fortune Egg (Lv.2)
+  packageName: 'Яйцо удачи: Форе (ур. 2), 2 шт.'
   count: 2
-  itemName: Foret Fortune Egg (Lv.2)
+  itemName: 'Яйцо удачи: Форе (ур. 2)'
   tid: 90001
 - packageId: 1053
-  packageName: Foret Fortune Egg (Lv.3)
+  packageName: 'Яйцо удачи: Форе (ур. 3), 3 шт.'
   count: 3
-  itemName: Foret Fortune Egg (Lv.3)
+  itemName: 'Яйцо удачи: Форе (ур. 3)'
   tid: 90002
 - packageId: 1054
-  packageName: 펫 이름 변경권 1개
+  packageName: 'Смена имени питомца, 1 шт.'
   count: 1
-  itemName: 펫이름변경권
+  itemName: 'Смена имени питомца'
   tid: 45002
 - packageId: 1055
-  packageName: 크리스마스 말 보호구 3일
+  packageName: 'Броня Рождество, 3 шт.'
   count: 3
-  itemName: 크리스마스 보호구
+  itemName: 'Броня Рождество'
   tid: 20123
 - packageId: 1056
-  packageName: 크리스마스 말 장신구 3일
+  packageName: 'Украшение Рождество, 3 шт.'
   count: 3
-  itemName: 크리스마스 장신구
+  itemName: 'Украшение Рождество'
   tid: 20124
 - packageId: 1057
-  packageName: 크리스마스 말 편자 3일
+  packageName: 'Подковы Рождество, 3 шт.'
   count: 3
-  itemName: 크리스마스 편자
+  itemName: 'Подковы Рождество'
   tid: 20125
 - packageId: 1058
-  packageName: 크리스마스 말 보조장비 3일
+  packageName: 'Снаряжение Рождество, 3 шт.'
   count: 3
-  itemName: 크리스마스 보조장비
+  itemName: 'Снаряжение Рождество'
   tid: 20126
 - packageId: 1059
-  packageName: 루돌프 뿔 헤어밴드 3일
+  packageName: 'Ободок с рогами Рудольфа, 3 шт.'
   count: 3
-  itemName: 루돌프 뿔 헤어밴드
+  itemName: 'Ободок с рогами Рудольфа'
   tid: 30160
 - packageId: 1060
-  packageName: 루돌프 코 헤어밴드 3일
+  packageName: 'Ободок с носом Рудольфа, 3 шт.'
   count: 3
-  itemName: 루돌프 코 헤어밴드
+  itemName: 'Ободок с носом Рудольфа'
   tid: 10165
 - packageId: 1061
-  packageName: 갈기의 비약 1일
+  packageName: 'Эликсир гривы, 1 шт.'
   count: 1
-  itemName: 갈기의 비약
+  itemName: 'Эликсир гривы'
   tid: 46004
 - packageId: 1062
-  packageName: 오버 큐브 1개
+  packageName: 'Телепорт, 1 шт.'
   count: 1
-  itemName: 순간이동기
+  itemName: 'Телепорт'
   tid: 70002
 - packageId: 1063
-  packageName: 1 Purified Crystal
+  packageName: 'Очищенный кристалл, 1 шт.'
   count: 1
-  itemName: 알 탐지기
+  itemName: 'Очищенный кристалл'
   tid: 46018
 - packageId: 1064
-  packageName: 기수의 비약 1일
+  packageName: 'Эликсир наездника, 1 шт.'
   count: 1
-  itemName: 기수의 비약
+  itemName: 'Эликсир наездника'
   tid: 46003
 - packageId: 1065
-  packageName: 관리자의 방울 1일
+  packageName: 'Колокольчик смотрителя, 1 шт.'
   count: 1
-  itemName: 관리자의 방울
+  itemName: 'Колокольчик смотрителя'
   tid: 45005
 - packageId: 1066
-  packageName: 숙련의 비약 1일
+  packageName: 'Эликсир мастерства, 1 шт.'
   count: 1
-  itemName: 숙련의 비약
+  itemName: 'Эликсир мастерства'
   tid: 46020
 - packageId: 1067
-  packageName: 성장의 비약 1개
+  packageName: 'Эликсир роста, 1 шт.'
   count: 1
-  itemName: 성장의 비약
+  itemName: 'Эликсир роста'
   tid: 43001
 - packageId: 1068
-  packageName: 당근 낚시대 2개
+  packageName: 'Удочка с морковкой, 2 шт.'
   count: 2
-  itemName: Carrot on a stick
+  itemName: 'Удочка с морковкой'
   tid: 42001
 - packageId: 1069
-  packageName: 화살 2개
+  packageName: 'Лук, 2 шт.'
   count: 2
-  itemName: Bow
+  itemName: 'Лук'
   tid: 42002
 - packageId: 1070
-  packageName: 각설탕 3개
+  packageName: 'Кусковой сахар, 3 шт.'
   count: 3
-  itemName: Sugar cubes
+  itemName: 'Кусковой сахар'
   tid: 41007
 - packageId: 1071
-  packageName: 당근 3개
+  packageName: 'Морковь, 3 шт.'
   count: 3
-  itemName: Carrot
+  itemName: 'Морковь'
   tid: 41006
 - packageId: 1072
-  packageName: 옥수수 3개
+  packageName: 'Кукуруза, 3 шт.'
   count: 3
-  itemName: Corn
+  itemName: 'Кукуруза'
   tid: 41001
 - packageId: 1073
-  packageName: 보리 3개
+  packageName: 'Ячмень, 3 шт.'
   count: 3
-  itemName: Barley
+  itemName: 'Ячмень'
   tid: 41003
 - packageId: 1074
-  packageName: 건초 2개
+  packageName: 'Луговая трава, 2 шт.'
   count: 2
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1075
-  packageName: 콩 2개
+  packageName: 'Бобы, 2 шт.'
   count: 2
-  itemName: Beans
+  itemName: 'Бобы'
   tid: 41002
 - packageId: 1076
-  packageName: 목초 2개
+  packageName: 'Луговая трава, 2 шт.'
   count: 2
-  itemName: Grass
+  itemName: 'Луговая трава'
   tid: 41005
 - packageId: 1077
-  packageName: 재료용 크리스털 1개
+  packageName: 'Кристалл-материал, 1 шт.'
   count: 1
-  itemName: 재료용 크리스털
+  itemName: 'Кристалл-материал'
   tid: 45001
 - packageId: 1081
-  packageName: 근육 이완제 1개
+  packageName: 'Расслабляющая мазь, 1 шт.'
   count: 1
-  itemName: Muscle relaxant
+  itemName: 'Расслабляющая мазь'
   tid: 44001
 - packageId: 1082
-  packageName: 항균 크림 1개
+  packageName: 'Антибактериальный крем, 1 шт.'
   count: 1
-  itemName: Antibacterial cream
+  itemName: 'Антибактериальный крем'
   tid: 44003
 - packageId: 1083
-  packageName: 임시 부목 1개
+  packageName: 'Временная шина, 1 шт.'
   count: 1
-  itemName: Temporary splint
+  itemName: 'Временная шина'
   tid: 44005
