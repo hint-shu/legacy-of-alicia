@@ -5803,6 +5803,40 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
 
   auto& targetRacer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
 
+  // LOA-fix (R71-4, backlog #129-S3): ЭФФЕКТ ОБЪЯВЛЯЕТСЯ ТОЛЬКО НА СЕБЕ.
+  //
+  // Хендлер target-reported — это разобрано прямо выше (R57-12): отправитель И ЕСТЬ
+  // цель, поэтому `targetRacer` ищется по characterUid отправителя. Но
+  // `command.targetOid` уходит НЕ только в эхо: он идёт в `ScheduleSkillEffect` (:5353),
+  // который ищет жертву ПО ЭТОМУ oid (:5549-5550) и вешает эффект на найденного
+  // (:5634, `targetRacer.effects[effectId] = true`), разослав всем
+  // `AcCmdRCAddSkillEffect` с `characterOid = targetOid` (:5611-5626). До этой строки
+  // любой гонщик мог объявить «на игроке Y сработала молния» — и она реально вешалась.
+  //
+  // ★ГАРД НА `targetOid`, А НЕ НА `attackerOid` — ровно по причине R57-12: бот, ударивший
+  // игрока, законен, клиент честно о нём сообщает, и гард на `attackerOid` выбросил бы
+  // эти события (первая редакция R57 сломала именно это; арка 3 стенда это стережёт).
+  //
+  // ★ВНУТРЕННЯЯ ВЕТКА «а вдруг это бот» СЕГОДНЯ МЕРТВА: та же проверка стоит на :5330 и
+  // возвращает раньше. Она здесь намеренно, и по двум причинам: форма гарда одна на все
+  // места раунда и не должна зависеть от того, что стоит рядом (уберут ту строку — эта
+  // останется корректной), и ровно эту форму сверяет оракул #195 (`GUARDED_BRANCH`,
+  // oracle.py:354-357). Читатель, не ищи здесь обработку ботовых эффектов — её тут нет.
+  if (command.targetOid != targetRacer.oid)
+  {
+    if (raceInstance.IsAiRacerOid(command.targetOid))
+      return;
+
+    uint64_t suppressed = 0;
+    if (_skillTargetThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} declared a skill effect on foreign racer {} (suppressed {})",
+        targetRacer.oid,
+        command.targetOid,
+        suppressed);
+    return;
+  }
+
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfoByEffectId(command.effectId);
   // If the target has a DarkFire effect active and the magic crits by dark fire, use the critical type instead
   if ((targetRacer.effects[12] || targetRacer.effects[13]) && magicSlotInfo.criticalByDarkFire)
