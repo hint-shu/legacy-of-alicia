@@ -42,210 +42,243 @@ std::random_device rd;
 
 } // anon namespace
 
+// LOA-fix (R72-1, round72, backlog #129-S1): РЕШЕНИЕ ОБ АУТЕНТИФИКАЦИИ ЖИВЁТ
+// НА РЕГИСТРАЦИИ, А НЕ В ТЕЛЕ ХЕНДЛЕРА.
+//
+// Лобби отвечало ЛЮБОМУ сокету, завершившему TCP-рукопожатие: перепись по
+// дереву дала 13 командных хендлеров из 36, которые не смотрели на контекст
+// клиента вообще. Среди них `HandleRequestPersonalInfo` (имя гильдии, текст
+// представления, уровень и опыт по ПРОИЗВОЛЬНОМУ characterUid, перечислимому
+// инкрементом), подделка отказа от приглашения в гильдию от имени любого
+// персонажа и два пред-логинных лог-флуда.
+//
+// ★КОРЕНЬ — НЕ ЗАБЫТЫЙ ВЫЗОВ, А ТО, ЧТО РЕШЕНИЕ ПРИНИМАЛ КАЖДЫЙ ХЕНДЛЕР САМ.
+// Список мест обязательно отстанет от кода, поэтому решение перенесено туда,
+// где оно принимается ровно один раз на команду и физически не может быть
+// пропущено: в регистрацию.
+//
+// Арифметика этого конструктора: 36 = 33 аутентифицированных + 3
+// пред-логинных. Пред-логинных ровно три, каждая с обоснованием рядом с
+// вызовом, и весь их список виден отсюда, не собирается по файлу.
+//
+// ★Новый хендлер, зарегистрированный сырым RegisterCommandHandler, валит гард
+// tools/check_lobby_auth_gate.sh: сырых регистраций в этом файле должно быть
+// ноль, а множество пред-логинных команд сверяется ДОСЛОВНО, потому что числа
+// сходятся и у неверного множества.
 LobbyNetworkHandler::LobbyNetworkHandler(
   ServerInstance& serverInstance)
   : _serverInstance(serverInstance)
   , _commandServer(*this)
 {
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLogin>(
+  // ПРЕД-ЛОГИННАЯ #1 из ТРЁХ: это и есть сам логин. Гейт на ней означал бы,
+  // что залогиниться не может никто.
+  RegisterPreAuthHandler<protocol::AcCmdCLLogin>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleLogin(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRoomList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRoomList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRoomList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLHeartbeat>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLHeartbeat>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleHeartbeat(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLMakeRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLMakeRoom>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleMakeRoom(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoom>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoom(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLeaveRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLLeaveRoom>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleLeaveRoom(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterChannel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterChannel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterChannel(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLeaveChannel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLLeaveChannel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleLeaveChannel(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLCreateNickname>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLCreateNickname>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleCreateNickname(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLShowInventory>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLShowInventory>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleShowInventory(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLUpdateUserSettings>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLUpdateUserSettings>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleUpdateUserSettings(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoomQuick>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoomQuick>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoomQuick(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLGoodsShopList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLGoodsShopList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleGoodsShopList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLAchievementCompleteList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLAchievementCompleteList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleAchievementCompleteList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestPersonalInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestPersonalInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestPersonalInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRanch>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRanch>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRanch(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRanchRandomly>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRanchRandomly>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRanchRandomly(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLFeatureCommand>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLFeatureCommand>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleFeatureCommand(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestFestivalResult>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestFestivalResult>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestFestivalResult(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLSetIntroduction>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLSetIntroduction>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleSetIntroduction(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLGetMessengerInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLGetMessengerInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleGetMessengerInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLCheckWaitingSeqno>(
+  // ПРЕД-ЛОГИННАЯ #2 из ТРЁХ: опрос ОЧЕРЕДИ логина. Ответ строится
+  // `LobbyDirector::GetClientQueuePosition(clientId)`, то есть клиент по
+  // определению ещё не аутентифицирован — гейт сделал бы очередь невидимой.
+  RegisterPreAuthHandler<protocol::AcCmdCLCheckWaitingSeqno>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleCheckWaitingSeqno(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLUpdateSystemContent>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLUpdateSystemContent>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleUpdateSystemContent(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoomQuickStop>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoomQuickStop>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoomQuickStop(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestFestivalPrize>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestFestivalPrize>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestFestivalPrize(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLQueryServerTime>(
+  // ПРЕД-ЛОГИННАЯ #3 из ТРЁХ: отдаёт ТОЛЬКО системные часы, нулевое
+  // разглашение. Оставлена пред-логинной СОЗНАТЕЛЬНО — как якорь живости
+  // сокета для стенда и как страховка от регрессии, если клиент 2013 года
+  // спрашивает время до логина. Единственная уступка риску совместимости:
+  // не меняем успешный путь ради пути отказа.
+  RegisterPreAuthHandler<protocol::AcCmdCLQueryServerTime>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleQueryServerTime(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestMountInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestMountInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestMountInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLInquiryTreecash>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLInquiryTreecash>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleInquiryTreecash(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdLCInviteGuildJoinOK>(
+  RegisterAuthenticatedHandler<protocol::AcCmdLCInviteGuildJoinOK>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleAcceptInviteToGuild(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdLCInviteGuildJoinCancel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdLCInviteGuildJoinCancel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleDeclineInviteToGuild(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdClientNotify>(
+  RegisterAuthenticatedHandler<protocol::AcCmdClientNotify>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleClientNotify(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLChangeRanchOption>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLChangeRanchOption>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleChangeRanchOption(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestDailyQuestList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestDailyQuestList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestDailyQuestList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestLeagueInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestLeagueInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestLeagueInfo(clientId, command);
@@ -254,13 +287,13 @@ LobbyNetworkHandler::LobbyNetworkHandler(
   // todo: AcCmdCLMakeGuildParty, AcCmdCLGuildPartyList, AcCmdCLEnterGuildParty,
   //       AcCmdCLLeaveGuildParty, AcCmdCLStartGuildPartyMatch, AcCmdCLStopGuildPartyMatch
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestQuestList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestQuestList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestQuestList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestSpecialEventList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestSpecialEventList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestSpecialEventList(clientId, command);
@@ -705,6 +738,45 @@ LobbyNetworkHandler::ClientContext LobbyNetworkHandler::GetClientContext(
   // отдавать ничего, что указывает внутрь карты.
   const std::shared_lock lock(_clientsMutex);
   return GetClientContextLocked(clientId, requireAuthentication);
+}
+
+bool LobbyNetworkHandler::IsClientAuthenticated(const ClientId clientId) const
+{
+  // ★КОПИЯ ФЛАГА, А НЕ ССЫЛКА В КАРТУ: замок снимается на выходе.
+  // ★И НЕ БРОСАЕТ. Этот вопрос задаётся на КАЖДОМ входящем пакете, в том
+  // числе от сокета, который не логинился; бросок здесь означал бы строку
+  // [error] на пакет — тот самый флуд, который раунд убирает.
+  const std::shared_lock lock(_clientsMutex);
+  const auto clientContextIter = _clients.find(clientId);
+  return clientContextIter != _clients.cend()
+    && clientContextIter->second.isAuthenticated;
+}
+
+void LobbyNetworkHandler::NoteRefusedPreAuthCommand(
+  const ClientId clientId,
+  const protocol::Command command) noexcept
+{
+  uint64_t suppressed = 0;
+  uint64_t total = 0;
+  if (not _preAuthRefusalThrottle.Allow(suppressed, total))
+    return;
+
+  // ★ЛОГИРУЕМ clientId, А НЕ АДРЕС. `CommandServer::GetClientAddress` идёт в
+  // `_server.GetClient(...)` и УМЕЕТ БРОСИТЬ, а мы стоим в `noexcept` на пути
+  // пакета. clientId — тот же идентификатор, которым пользуются остальные
+  // строки лобби. Не «улучшать» это обратно на адрес.
+  // ★`total` ПЕЧАТАЕТСЯ НЕ ДЛЯ КРАСОТЫ: дроссель глушит строки, и без
+  // накопительного счёта «отказ случился и честному клиенту тоже» был бы
+  // ненаблюдаем — оракул регрессии раунда считает именно по нему.
+  server::util::QuietLogWarn(
+    "Refused a lobby command(s) from unauthenticated clients: "
+    "client {} sent '{}' (0x{:x}); {} more refusals suppressed since the "
+    "previous line; {} refusals total since start",
+    clientId,
+    protocol::GetCommandName(command),
+    static_cast<uint32_t>(command),
+    suppressed,
+    total);
 }
 
 bool LobbyNetworkHandler::MutateClientContext(

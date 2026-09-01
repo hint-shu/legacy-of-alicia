@@ -25,6 +25,7 @@
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/network/command/CommandServer.hpp>
 #include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
+#include <libserver/util/LogThrottle.hpp>
 
 namespace server
 {
@@ -336,6 +337,66 @@ private:
     ClientId clientId,
     bool requireAuthentication = true);
 
+  //! LOA-fix (R72-1, round72, backlog #129-S1): НЕБРОСАЮЩИЙ вопрос «этот
+  //! клиент залогинен?».
+  //!
+  //! Существует отдельно от `GetClientContext` потому, что ворота регистрации
+  //! спрашивают его на КАЖДОМ входящем пакете, в том числе от сокета, который
+  //! не логинился: бросок там означал бы строку [error] на пакет
+  //! (`CommandServer.cpp`, блок catch вокруг вызова хендлера) — то есть новый
+  //! флуд вместо закрытой дыры.
+  //! @param clientId ID клиента.
+  //! @returns true, если у клиента есть контекст и он аутентифицирован.
+  [[nodiscard]] bool IsClientAuthenticated(ClientId clientId) const;
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ЕДИНСТВЕННАЯ ЗАПИСЬ ОБ ОТКАЗЕ.
+  //! Дросселирована и несёт НАКОПИТЕЛЬНЫЙ счётчик, чтобы проглоченный отказ
+  //! нельзя было потерять.
+  //! @param clientId ID клиента, приславшего команду.
+  //! @param command Команда, которой отказано.
+  void NoteRefusedPreAuthCommand(
+    ClientId clientId,
+    protocol::Command command) noexcept;
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ★РЕГИСТРАЦИЯ ХЕНДЛЕРА,
+  //! ТРЕБУЮЩЕГО ЛОГИНА.
+  //!
+  //! Решение об аутентификации принимается ЗДЕСЬ, ОДИН РАЗ НА КОМАНДУ, и
+  //! хендлер физически не может его «забыть»: до тела он не доходит. Корень
+  //! дефекта #129-S1 был не в одном забытом вызове, а в том, что решение
+  //! принимал каждый хендлер сам — 13 из 36 не спрашивали контекст вовсе.
+  //! Список мест обязательно отстаёт от кода; инвариант диспетчеризации — нет.
+  //! @param handler Обработчик команды.
+  template <ReadableCommandStruct C>
+  void RegisterAuthenticatedHandler(
+    std::function<void(ClientId, const C&)> handler)
+  {
+    _commandServer.RegisterCommandHandler<C>(
+      [this, handler](const ClientId clientId, const C& command)
+      {
+        if (not IsClientAuthenticated(clientId))
+        {
+          NoteRefusedPreAuthCommand(clientId, C::GetCommand());
+          return;
+        }
+
+        handler(clientId, command);
+      });
+  }
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ★РЕГИСТРАЦИЯ ХЕНДЛЕРА,
+  //! ЗАКОННОГО ДО ЛОГИНА.
+  //!
+  //! Каждое использование обязано нести письменное обоснование рядом с
+  //! вызовом. Их ТРИ, и весь список виден в одном месте — в конструкторе.
+  //! @param handler Обработчик команды.
+  template <ReadableCommandStruct C>
+  void RegisterPreAuthHandler(
+    std::function<void(ClientId, const C&)> handler)
+  {
+    _commandServer.RegisterCommandHandler<C>(std::move(handler));
+  }
+
   ServerInstance& _serverInstance;
   //! A command server.
   CommandServer _commandServer;
@@ -373,6 +434,14 @@ private:
   //! означает «ещё ни разу» — первая уборка случится на первом же тике и
   //! пройдёт по пустому реестру.
   std::chrono::steady_clock::time_point _lastRanchActivitySweep{};
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): дроссель строк об отказе.
+  //! Окно 10 с выбрано так, чтобы сканер портов оставлял в логе след (одна
+  //! строка + счётчики), а не мегабайты. Общий на весь лобби-сервер: бороться
+  //! надо с ОБЪЁМОМ, а не обеспечивать каждой команде свою строку.
+  //! ★Полный счёт отказов дроссель ведёт САМ и не обнуляет — именно по нему
+  //! судится «честной сессии не отказано ни разу».
+  util::LogThrottle _preAuthRefusalThrottle{std::chrono::seconds(10)};
 };
 
 } // namespace server
