@@ -640,9 +640,9 @@ constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
 //! LOA-fix (R71-12, находка ревью 2 #1): «ЭФФЕКТ ЕСТЬ В РЕЕСТРЕ» И «ЭФФЕКТ МОЖНО
 //! ПОВЕСИТЬ» — РАЗНЫЕ УТВЕРЖДЕНИЯ.
 //!
-//! `Racer::effects` — массив на 24 слота (RaceTracker.hpp:259). `magic.yaml` же
+//! `Racer::effects` — массив на 24 слота (RaceTracker.hpp:261). `magic.yaml` же
 //! хранит `skillEffectId` СВОБОДНЫМ числом, и в поставляемом конфиге лежит запись
-//! `type: 27` со `skillEffectId: 99999` (magic.yaml:748) — она в реестре ЕСТЬ, но
+//! `type: 27` со `skillEffectId: 99999` (magic.yaml:745) — она в реестре ЕСТЬ, но
 //! слота под неё не существует. Отсюда две беды, и обе лечит одно предикатное имя:
 //! жалоба «out of range» на каждый пакет (лог-флуд, ради которого заведён
 //! `LogThrottle`) и индексация `effects[99999]` — чтение за границами `std::array`.
@@ -4840,7 +4840,7 @@ void RaceNetworkHandler::HandleRelay(
       // лицу ВНУТРИ нагрузки (`GetRelayClaim`), а у неразобранного типа его нет: класс
       // `Unparsed` не может быть авторизован в принципе. Значит канал оставался
       // фейл-оупен: `fromOid = свой` + неизвестный `payloadType` + до 65 535 байт
-      // (размер читается `uint16`, RaceMessageDefinitions.cpp:1201-1209) = усиление
+      // (размер читается `uint16`, RaceMessageDefinitions.cpp:1203-1205) = усиление
       // одного пакета в семь по числу соседей, с содержимым, которое сервер ни разу
       // не посмотрел.
       //
@@ -4860,14 +4860,14 @@ void RaceNetworkHandler::HandleRelay(
   std::scoped_lock lock(_raceInstancesMutex);
   // Get the room instance for this client
   // ★НЕконстантная ссылка (LOA-fix, R71-6a): гарду нужен `GetTracker().GetRacer(...)`,
-  // а у него нет const-перегрузки (RaceTracker.hpp:364). `GetRaceInstance` и так
+  // а у него нет const-перегрузки (RaceTracker.hpp:365). `GetRaceInstance` и так
   // возвращает `RaceInstance&` — снятие const ничего не расширяет.
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // LOA-fix (R71-6a, backlog #31 пререквизит): РЕТРАНСЛЯЦИЯ НЕСЁТ ТОЛЬКО СВОЙ oid.
   //
   // Конверт `AcCmdCRRelayNotify` уходит всем в комнате с `fromOid` ИЗ ПАКЕТА (:4363,
-  // :4446; запись — RaceMessageDefinitions.cpp:1325-1338).
+  // :4446; запись — RaceMessageDefinitions.cpp:1375-1388).
   //
   // ★ЭТОГО ОДНОГО ГАРДА МАЛО, И ЭТО ГЛАВНАЯ ПОПРАВКА РЕДАКЦИИ 2 СПЕКИ. Настоящее
   // авторство лежит ВНУТРИ нагрузки (см. R71-6b) — конверт закрывается здесь только
@@ -4879,7 +4879,7 @@ void RaceNetworkHandler::HandleRelay(
   //
   // ★oid БОТА — ЗАКОННЫЙ ВХОД, НО РЕТРАНСЛИРОВАТЬ ЕГО НЕЧЕГО. Ботов ведёт клиент, и он
   // шлёт за них relay. Боты существуют ТОЛЬКО в соло-заезде (`isSoloRace` = ровно один
-  // гонщик в трекере, :2362-2367), а `BroadcastExceptCharacterUid` в соло не доходит ни
+  // гонщик в трекере, :2395-2400), а `BroadcastExceptCharacterUid` в соло не доходит ни
   // до кого — то есть отбрасывание таких кадров не меняет ни одного экрана. Выход
   // ТИХИЙ: жалоба на законное поведение и есть тот самый флуд, который лечил R57.
   const auto& senderRacer = raceInstance.GetTracker().GetRacer(clientContext.characterUid);
@@ -4900,8 +4900,8 @@ void RaceNetworkHandler::HandleRelay(
 
   // LOA-fix (R71-6b, находка ревью R1, backlog #31): АВТОРСТВО ЖИВЁТ В НАГРУЗКЕ.
   //
-  // Сервер разбирает вложенный идентификатор (RaceMessageDefinitions.cpp:1211-1320) и
-  // ВЫБРАСЫВАЕТ разбор: наружу уходят те же байты (`:1325-1338`), и принимающий клиент
+  // Сервер разбирает вложенный идентификатор (RaceMessageDefinitions.cpp:1213-1338) и
+  // ВЫБРАСЫВАЕТ разбор: наружу уходят те же байты (`:1375-1388`), и принимающий клиент
   // читает oid ИЗ НАГРУЗКИ. Поэтому гард на конверте закрывает только вывеску:
   // `fromOid = свой` + `snapshot.racerOid = чужой` телепортирует чужую лошадь на всех
   // экранах, `syncGoalIn.racerOid = чужой` объявляет чужой финиш, и так по всем
@@ -5247,8 +5247,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // LOA-fix (R71-3, SYNTHESIS item 10 + item 26): ОТВЕТ СОБИРАЕТСЯ ИЗ ДВУХ РАЗНЫХ ЧИСЕЛ.
   //
   // `iceWallProperties` ЧИТАЕТСЯ по сырому `command.magicItemId`
-  // (RaceMessageDefinitions.cpp:1457-1474), а ПИШЕТСЯ по `magicSlotInfo.type`,
-  // положенному в ответ (:1538-1546 для OK, :1766-1775 для Notify) — и там стоит
+  // (RaceMessageDefinitions.cpp:1507-1524), а ПИШЕТСЯ по `magicSlotInfo.type`,
+  // положенному в ответ (:1596 для OK, :1824 для Notify) — и там стоит
   // `assert(command.iceWallProperties.has_value())`, который в боевом образе выключен
   // (`Dockerfile` собирает RelWithDebInfo -> -DNDEBUG). Разойдись эти два числа —
   // `.value()` бросит `std::bad_optional_access` ИЗ ПОСТАВЩИКА ЗАПИСИ, а бросок оттуда
@@ -6132,7 +6132,7 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // ★ДОПОЛНЕНО ПО РЕВЬЮ 2 (находка #1): «ЕСТЬ В РЕЕСТРЕ» ЕЩЁ НЕ ЗНАЧИТ «РАБОТАЕТ».
   // Первая редакция гарда спрашивала только про реестр — и пропускала
   // `effectId = 99999`, который в поставляемом `magic.yaml` РЕАЛЬНО ЛЕЖИТ (запись
-  // type 27, :748). Пакет проходил гард, доезжал до `ScheduleSkillEffect` и печатал
+  // type 27, :745). Пакет проходил гард, доезжал до `ScheduleSkillEffect` и печатал
   // там `[error] skillEffectId 99999 out of range` — на КАЖДЫЙ пакет, без дросселя.
   // То есть гард закрывал выдуманный номер и оставлял открытым настоящий: ровно тот
   // класс «обход соседним полем», ради которого он и заводился. Спрашиваем ОБА

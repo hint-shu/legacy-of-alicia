@@ -189,14 +189,14 @@ private:
   //! LOA-fix (R71-2, backlog #129-S2 / item 26): ПОТОЛОК СПИСКА ЦЕЛЕЙ ОДНОГО КАСТА.
   //!
   //! `AcCmdCRUseMagicItem::targetList` читается счётчиком `uint8_t`
-  //! (RaceMessageDefinitions.cpp:1487-1493) — до 255 элементов. У списка два смысла,
+  //! (RaceMessageDefinitions.cpp:1537-1541) — до 255 элементов. У списка два смысла,
   //! и оба малы: цели заклинания (их не больше, чем участников комнаты) и сосульки
   //! ледяной стены (1 у обычной, 3 у критической — комментарий там же,
   //! RaceMessageDefinitions.hpp:1942-1944).
   //!
   //! ★8 — это ТОЧНАЯ вместимость, а не запас с потолка: комната клампится восемью
-  //! (`RaceNetworkHandler.cpp:1538`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
-  //! ровно восемь участников в трекере у соло-заезда (1 живой + 7 ботов, :2362-2367
+  //! (`RaceNetworkHandler.cpp:1572`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
+  //! ровно восемь участников в трекере у соло-заезда (1 живой + 7 ботов, :2395-2400
   //! + `SpawnAiRacers`). Поэтому сравнение строгое (`>`), а не `>=`. Число НЕ
   //! зависит от данных `magic.yaml` — конфиг его сдвинуть не может.
   static constexpr size_t MaxMagicTargetListSize = 8;
