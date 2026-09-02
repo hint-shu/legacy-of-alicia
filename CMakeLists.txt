@@ -146,6 +146,30 @@ target_link_libraries(alicia-server PRIVATE
 target_include_directories(alicia-server PUBLIC
         "${PROJECT_BINARY_DIR}/generated")
 
+# LOA-fix (R71-16, находка ревью 2 #9): ГЕЙТ ПОЛНОТЫ КЛАССИФИКАТОРА RELAY —
+# ЧАСТЬ СБОРКИ, А НЕ СОВЕТ.
+#
+# `RelayAuthz.hpp` намеренно оставлен без `default:`, чтобы новый тип нагрузки
+# ловился `-Wswitch`. Но предупреждение на Linux сборку не останавливает (`-Werror`
+# стоит только у MSVC), поэтому забытый тип тихо стал бы неавторизованным каналом —
+# ровно та дыра, которую раунд закрывает. Гейт `tools/check_relay_authz.sh` теперь
+# ЦЕЛЬ СБОРКИ, от которой зависит `alicia-server`: не сошлось — не собралось.
+#
+# ★ЕСЛИ `bash` НЕ НАЙДЕН, ЭТО ГРОМКО. Молча пропавшая проверка — это ложно-зелёная
+# сборка; предупреждение CMake остаётся в логе и видно на любой машине. Боевой путь
+# (Dockerfile) и раундовый `tools/round/build_from_branch.sh` bash имеют всегда.
+find_program(BASH_PROGRAM bash)
+if (BASH_PROGRAM)
+    add_custom_target(relay-authz-gate ALL
+            COMMAND ${CMAKE_COMMAND} -E env "ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
+            ${BASH_PROGRAM} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_relay_authz.sh"
+            COMMENT "relay-authz gate: каждый тип relay-нагрузки классифицирован"
+            VERBATIM)
+    add_dependencies(alicia-server relay-authz-gate)
+else ()
+    message(WARNING "bash не найден: гейт relay-authz НЕ включён в сборку")
+endif ()
+
 if (BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

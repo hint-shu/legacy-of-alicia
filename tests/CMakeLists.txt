@@ -240,3 +240,13 @@ if (NOT WIN32)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()
+# LOA-fix (R71-16): тот же гейт, но как ТЕСТ — чтобы `ctest` тоже краснел, а не
+# только сборка. Две точки вызова ловят разное: цель сборки останавливает выкат,
+# тест показывает вердикт в отчёте прогонов.
+if (BASH_PROGRAM)
+    add_test(NAME RelayAuthzGate
+            COMMAND ${BASH_PROGRAM} "${CMAKE_SOURCE_DIR}/tools/check_relay_authz.sh")
+    set_tests_properties(RelayAuthzGate PROPERTIES
+            ENVIRONMENT "ROOT=${CMAKE_SOURCE_DIR}")
+endif ()
+

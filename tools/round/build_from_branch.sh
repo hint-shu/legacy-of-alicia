@@ -101,6 +101,21 @@ sed 's/^/    /' "$WORK/.gate-quiet.log"
 [ "$QRC" -eq 0 ] || die "quiet-logging gate вернул $QRC — сборка не начата"
 say "  quiet-logging gate: EXIT=0 ✓"
 
+# LOA-fix (R71-16, находка ревью 2 #9): гейт полноты relay-классификатора — там же,
+# где и остальные, и ПРОТИВ КЛОНА. В ветке, где этого файла ещё нет (старые раунды),
+# шаг пропускается — но пропуск ГРОМКИЙ, иначе «гейт не найден» читалось бы как
+# «гейт прошёл».
+RELAY_GATE="$WORK/tools/check_relay_authz.sh"
+if [ -f "$RELAY_GATE" ]; then
+  ROOT="$WORK" bash "$RELAY_GATE" > "$WORK/.gate-relay.log" 2>&1
+  RRC=$?
+  sed 's/^/    /' "$WORK/.gate-relay.log"
+  [ "$RRC" -eq 0 ] || die "relay-authz gate вернул $RRC — сборка не начата"
+  say "  relay-authz gate: EXIT=0 ✓"
+else
+  say "  relay-authz gate: файла нет в этой ветке — ПРОПУЩЕН"
+fi
+
 # ---- 4. the base image must be pinned by digest ---------------------------------
 BASE_DIGEST="$(sed -nE 's/^FROM[[:space:]]+[^[:space:]@]+@(sha256:[0-9a-f]{64}).*/\1/p' \
                 "$WORK/Dockerfile" | head -1)"
