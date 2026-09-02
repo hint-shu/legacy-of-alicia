@@ -265,7 +265,9 @@ void RaceTracker::RemoveQuestItem(data::Uid characterUid, Oid oid)
     [oid](const QuestItem& e) { return e.oid == oid; });
 }
 
-uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
+uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(
+  const Oid casterOid,
+  const uint16_t increment)
 {
   // LOA-fix (R71-22, находка ревью 3 #5): ОБОРОТА ЗДЕСЬ БОЛЬШЕ НЕ БЫВАЕТ.
   //
@@ -276,6 +278,13 @@ uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
   // оборота и маскировала бы его, случись он.
   const uint16_t nextId = _nextEffectInstanceId;
   _nextEffectInstanceId = static_cast<uint16_t>(_nextEffectInstanceId + increment);
+
+  // LOA-fix (R71-25, находка ревью 4 #2): СПИСАНИЕ С БЮДЖЕТА КАСТЕРА СТОИТ ЗДЕСЬ.
+  // Это единственная точка, где номера рождаются, поэтому здесь же они и считаются:
+  // разнеси проверку и списание по разным функциям — и они разъедутся при первой же
+  // правке ([[total-invariant-beats-list-of-sites]]).
+  _issuedEffectInstanceCounts[casterOid] += increment;
+
   return nextId;
 }
 
@@ -295,6 +304,23 @@ bool RaceTracker::CanIssueEffectInstances(
   // `_nextEffectInstanceId` после инкремента остался представимым и НИКОГДА не стал
   // нулём. Один потерянный номер из 65 536 — честная цена за то, что оборот
   // недостижим, а не «маловероятен».
+  // LOA-fix (R71-25, находка ревью 4 #2): ПЕРВЫЙ ВОПРОС — ПРО БЮДЖЕТ КАСТЕРА.
+  //
+  // Он же и единственный ДОСТИЖИМЫЙ: 8 мест в комнате x 512 = 4096 номеров, то есть
+  // домен исчерпать нельзя, пока каждый кастер сидит в своём бюджете. Отказ поэтому
+  // всегда локален — «у ТЕБЯ кончился», а не «у комнаты кончилось», и честный сосед
+  // продолжает кастовать (находка ревью 4 #2: прежний общий запрет был DoS'ом).
+  const auto issuedIter = _issuedEffectInstanceCounts.find(casterOid);
+  const uint32_t alreadyIssued =
+    issuedIter == _issuedEffectInstanceCounts.cend() ? 0u : issuedIter->second;
+  if (static_cast<uint64_t>(alreadyIssued) + count > MaxEffectInstanceIssuancePerRacer)
+    return false;
+
+  // ★ФЕЙЛ-КЛОУЗ, КОТОРЫЙ НЕДОСТИЖИМ ПО АРИФМЕТИКЕ ВЫШЕ, И ЭТО НАМЕРЕННО: если состав
+  // заезда когда-нибудь перестанет быть ограниченным восемью местами, оборот счётчика
+  // не должен вернуться тихо. Граница строгая — последний допустимый номер 0xFFFE,
+  // чтобы `_nextEffectInstanceId` после инкремента остался представимым и НИКОГДА не
+  // стал нулём.
   if (static_cast<uint32_t>(_nextEffectInstanceId) + count
       > std::numeric_limits<uint16_t>::max())
     return false;
@@ -444,6 +470,10 @@ void RaceTracker::Clear()
   // был всегда; oid'ы персонажей остаются пер-комнатными (клиент их не переназначает).
   _effectInstances.clear();
   _nextEffectInstanceId = 0;
+  // LOA-fix (R71-25, находка ревью 4 #2): бюджет выдачи — пер-заездный, как и сам
+  // счётчик. Иначе гонщик, выбравший его в первом заезде, остался бы без кастов на
+  // все следующие заезды той же комнаты.
+  _issuedEffectInstanceCounts.clear();
   _nextItemDeckOid = 1;
   firstPassItemSpawn = true;
 

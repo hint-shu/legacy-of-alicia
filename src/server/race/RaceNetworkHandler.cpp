@@ -5339,10 +5339,11 @@ void RaceNetworkHandler::HandleUseMagicItem(
     uint64_t suppressed = 0;
     if (_effectInstanceCapacityThrottle.Allow(suppressed))
       server::util::QuietLogWarn(
-        "Racer {} exhausted its effect-instance budget ({} per race), cast of magic {} "
-        "refused (suppressed {})",
+        "Racer {} exhausted its own effect-instance budget ({} live, {} issued per race), "
+        "cast of magic {} refused; other racers are unaffected (suppressed {})",
         racer.oid,
         tracker::RaceTracker::MaxEffectInstancesPerRacer,
+        tracker::RaceTracker::MaxEffectInstanceIssuancePerRacer,
         magicSlotInfo.type,
         suppressed);
     return;
@@ -5362,6 +5363,7 @@ void RaceNetworkHandler::HandleUseMagicItem(
   }
 
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
+    racer.oid,
     issuedInstanceCount);
 
   // Darkfire should only affect one target
