@@ -403,6 +403,49 @@ def scan_file(path, aliases, enums, aggregates, report):
         if scope != "agg":
             continue
 
+        # An access specifier can sit on the same statement as the first field
+        # (`public: uint32_t a;`) — strip it, do not lose the field with it.
+        text = re.sub(r"^(public|private|protected)\s*:\s*", "", text)
+
+        # The filters that throw a statement out BEFORE anything counts it as a
+        # field. They read the head of the declaration, which an inline type
+        # definition has already eaten (the statement left behind is the bare
+        # declarator), so they run on the ordinary path only.
+        if inline_type is None:
+            head = text.split(" ")[0].rstrip(":")
+            if head in DECL_SKIP_PREFIXES:
+                continue
+            # `operator==(...)`, `operator=(...)`: the `=` belongs to the NAME, so the
+            # initialiser split below would tear the declaration apart and leave
+            # `bool operator` looking like an uninitialised scalar field.
+            if re.search(r"\boperator\b", text):
+                report["methods"] += 1
+                continue
+
+        # ★НЕСКОЛЬКО ДЕКЛАРАТОРОВ В ОДНОМ ОБЪЯВЛЕНИИ — ОСТАНОВ, А НЕ ТИШИНА
+        # (R72-fix2-3, Codex finding 3, iteration 2). `uint32_t a, b;` — законное
+        # объявление ДВУХ скалярных полей; прежний разбор ловил из него в лучшем
+        # случае одно, а `uint32_t a[2], b;` не ловил ни одного и молча уходил
+        # через `continue`. Разбирать общий случай (у каждого декларатора могут
+        # быть свои `*`, `[]` и свой инициализатор) — это писать парсер
+        # деклараторов; вместо этого гард ГРОМКО требует разнести объявление по
+        # одному полю на строку. Тихо пропустить нельзя: ровно так поле и уходит
+        # из-под гарда.
+        #
+        # ★СТОИТ ПЕРЕД ВЕТКОЙ ВСТРОЕННОГО ТИПА, А НЕ ПОСЛЕ (R72-fix3-2, Codex
+        # finding 2, итерация 3). Раньше ветка встроенного типа выходила РАНЬШЕ
+        # этой остановки, и `enum class E { A } a{E::A}, b;` уходил как ОДНО
+        # инициализированное поле: ноль нарушителей, ноль неразобранных, а поле
+        # `b` — неинициализированный скаляр того самого класса #174 — исчезало
+        # молча. Порядок здесь не косметика: остановка обязана стоять перед
+        # КАЖДОЙ веткой, которая считает поле, иначе она защищает только одну из
+        # них.
+        if has_top_level_comma(text):
+            report["unparsed"].append(
+                (path, line, text,
+                 "несколько деклараторов в одном объявлении — разнеси по одному на строку"))
+            continue
+
         # ★ДЕКЛАРАТОР ПРИ ВСТРОЕННОМ ОПРЕДЕЛЕНИИ ТИПА (R72-fix2-3, Codex finding 3).
         # Тип определён прямо здесь и уже съеден закрывающей скобкой; судить
         # остаётся по ВИДУ тела: перечисление — скаляр (ровно та же дыра, что
@@ -415,33 +458,6 @@ def scan_file(path, aliases, enums, aggregates, report):
             if inline_type == "enum":
                 report["offenders"].append(
                     (path, line, text, "перечисление, объявленное на месте"))
-            continue
-        # An access specifier can sit on the same statement as the first field
-        # (`public: uint32_t a;`) — strip it, do not lose the field with it.
-        text = re.sub(r"^(public|private|protected)\s*:\s*", "", text)
-        head = text.split(" ")[0].rstrip(":")
-        if head in DECL_SKIP_PREFIXES:
-            continue
-        # `operator==(...)`, `operator=(...)`: the `=` belongs to the NAME, so the
-        # initialiser split below would tear the declaration apart and leave
-        # `bool operator` looking like an uninitialised scalar field.
-        if re.search(r"\boperator\b", text):
-            report["methods"] += 1
-            continue
-
-        # ★НЕСКОЛЬКО ДЕКЛАРАТОРОВ В ОДНОМ ОБЪЯВЛЕНИИ — ОСТАНОВ, А НЕ ТИШИНА
-        # (R72-fix2-3, Codex finding 3, iteration 2). `uint32_t a, b;` — законное
-        # объявление ДВУХ скалярных полей; прежний разбор ловил из него в лучшем
-        # случае одно, а `uint32_t a[2], b;` не ловил ни одного и молча уходил
-        # через `continue`. Разбирать общий случай (у каждого декларатора могут
-        # быть свои `*`, `[]` и свой инициализатор) — это писать парсер
-        # деклараторов; вместо этого гард ГРОМКО требует разнести объявление по
-        # одному полю на строку. Тихо пропустить нельзя: ровно так поле и уходит
-        # из-под гарда.
-        if has_top_level_comma(text):
-            report["unparsed"].append(
-                (path, line, text,
-                 "несколько деклараторов в одном объявлении — разнеси по одному на строку"))
             continue
 
         has_init = "{" in text or "=" in text
@@ -612,6 +628,10 @@ SELFTEST_EXPECTATIONS = {
     "paren_declarator_bad.hpp":    {"code": 1, "offenders": [("flags", 19)]},
     "multi_declarator_stop.hpp":   {"code": 2, "offenders": []},
     "inline_enum_bad.hpp":         {"code": 1, "offenders": [("part", 28)]},
+    # R72-fix3-2 (Codex finding 2, iteration 3): the mixed form — an inline enum whose
+    # FIRST declarator is initialised and whose second is not. It reached the judge as
+    # one initialised field, and the uninitialised one left without a trace.
+    "inline_enum_mixed_stop.hpp":  {"code": 2, "offenders": []},
 }
 
 

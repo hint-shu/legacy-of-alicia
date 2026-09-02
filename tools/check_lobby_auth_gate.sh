@@ -42,11 +42,29 @@
 #       deserializer with an undersized frame, which is one [error] line per packet;
 #     • no OTHER file in the repository registers a lobby handler (check 7).
 #
+# ★AND WHAT THE SECOND VERSION STILL COULD NOT SEE (Codex finding 1, iteration 3)
+#   Checks (7)-(9) compared FILE SETS. Two files that must be on those lists anyway —
+#   the lobby header and RanchDirector.cpp — were therefore free real estate: an inline
+#   raw registrar written into the header, or an alias-qualified foreign member
+#   (`using L = LobbyNetworkHandler; void L::SneakyMember()`) written into
+#   RanchDirector.cpp, changed no file set, changed no 33/3 count, and all three
+#   censuses stayed green. The invariant had MOVED, not closed. Sets are now gone; the
+#   census counts CONTENT per file — five numbers each, pinned by name (WANT_CENSUS),
+#   including how many registrations name a LOBBY-protocol command, which is what
+#   catches a swap that leaves the totals untouched. Alias spellings (`using`,
+#   `typedef`, `#define`) are resolved to a fixed point before the member column is
+#   counted, and the member column is BOUNDED by the include census (check 11): only a
+#   translation unit that sees the class definition can define its members at all.
+#
 # ★AND THE GATE PROVES ITSELF ON EVERY RUN
 #   Before judging the tree it parses a synthetic fixture that contains a commented-out
 #   registration, a multi-line raw registration and a multi-line authenticated one,
 #   and it stops unless the parse reports exactly 1/1/0. A checker written by form
 #   rides for free on nobody's self-check but its own; this is that self-check.
+#   The repository census has its OWN fixture (check 0b) carrying exactly the two
+#   evasions above — an inline raw registrar inside an allowlisted header and an
+#   alias-qualified foreign member inside an allowlisted .cpp — and the gate stops
+#   unless it sees both.
 #
 # USAGE
 #   bash tools/check_lobby_auth_gate.sh
@@ -71,26 +89,48 @@ WANT_PREAUTH_SET="AcCmdCLCheckWaitingSeqno AcCmdCLLogin AcCmdCLQueryServerTime"
 # The three files that are ALLOWED to name the registration wrappers: the lobby
 # header defines them, the lobby source uses them, the command server declares the
 # gated entry point they are built on.
-WANT_REGISTRAR_FILES="include/libserver/network/command/CommandServer.hpp include/server/lobby/LobbyNetworkHandler.hpp src/server/lobby/LobbyNetworkHandler.cpp"
-# ★ЧТО ЗАКРЫВАЕТ СЛЕДУЮЩИЙ СПИСОК (находка Codex 2, итерация 2).
-#   Проверка (7) искала по дереву ТОЛЬКО имена обёрток и потому не видела самого
-#   опасного обхода: `_commandServer` — приватное поле, но приватное поле доступно
-#   ЛЮБОМУ члену класса, а член класса можно определить в ДРУГОЙ единице трансляции.
-#   Такой член зовёт СЫРОЙ `RegisterCommandHandler`, имя обёртки в файле не
-#   встречается, конструктор в аудируемом `.cpp` не меняется — и все числа выше
-#   остаются зелёными. То есть тотальность инварианта из находки 3 не была
-#   достигнута, она была объявлена.
-#   Закрывается ДВУМЯ переписями по всему дереву, каждая по своему свойству:
-#     (8) файлы, где вообще есть ВЫЗОВ Register*CommandHandler, известны поимённо —
-#         новая точка регистрации где угодно в дереве обязана быть объявлена здесь;
-#     (9) файлы, где вообще упоминается `LobbyNetworkHandler::` вне комментариев,
-#         известны поимённо — член лобби, определённый в чужой TU, виден сразу,
-#         независимо от того, что он делает внутри;
-#    (10) в заголовке лобби нет ни одного `friend` — иначе приватный диспетчер
-#         доступен и не-члену.
-# Все три — перепись по свойству, а не по форме конкретной регистрации.
-WANT_HANDLER_CALL_FILES="include/libserver/network/chatter/ChatterServer.hpp include/libserver/network/command/CommandServer.hpp include/server/lobby/LobbyNetworkHandler.hpp src/server/chat/AllChatDirector.cpp src/server/chat/PrivateChatDirector.cpp src/server/messenger/MessengerDirector.cpp src/server/race/RaceNetworkHandler.cpp src/server/ranch/RanchDirector.cpp"
-WANT_LOBBY_MEMBER_FILES="src/server/lobby/LobbyNetworkHandler.cpp"
+# ★ЧТО ЗАКРЫВАЕТ СЛЕДУЮЩАЯ ПЕРЕПИСЬ (находка Codex, итерация 3 — BLOCK).
+#   Итерация 2 сравнивала НАБОРЫ ФАЙЛОВ: «в каких файлах вообще встречается вызов
+#   Register*CommandHandler» и «в каких встречается `LobbyNetworkHandler::`». Оба
+#   набора уже содержали `include/server/lobby/LobbyNetworkHandler.hpp` и
+#   `src/server/ranch/RanchDirector.cpp` — а значит внутри УЖЕ РАЗРЕШЁННОГО файла
+#   можно было завести и сырую регистрацию (встроенный регистратор прямо в
+#   заголовке лобби), и чужого члена лобби под ПСЕВДОНИМОМ
+#   (`using L = LobbyNetworkHandler; void L::SneakyMember()` в RanchDirector.cpp):
+#   набор файлов не менялся, счёт 33/3 не менялся, все три переписи оставались
+#   зелёными. Инвариант не был закрыт — он ПЕРЕЕХАЛ.
+#   Закрывается переписью НЕ ПО НАБОРУ ФАЙЛОВ, А ПО СОДЕРЖИМОМУ КАЖДОГО ФАЙЛА:
+#   для каждого файла дерева пять чисел, и все пять пиновány поимённо.
+#     REG      — вызовов/упоминаний `Register*CommandHandler` (сырой вход);
+#     REGP     — регистраций `Register*Handler<protocol::…>` (любых);
+#     LOBBYCMD — из них тех, чья КОМАНДА принадлежит лобби-протоколу
+#                (`AcCmdCL*`/`AcCmdCl*`/`AcCmdLC*`). Ловит подмену: чужой файл
+#                зарегистрировал лобби-команду вместо своей — REG и REGP те же,
+#                LOBBYCMD не тот;
+#     WRAP     — упоминаний обёрток раунда;
+#     MEM      — определений/квалификаций члена класса лобби, ★С РАЗВОРОТОМ
+#                ПСЕВДОНИМОВ: `using`, `typedef` и `#define`, до неподвижной точки.
+#                Голый грep `LobbyNetworkHandler::` не видел ни одного из трёх.
+#   Любая из двух дыр находки меняет как минимум одно число в своей строке.
+WANT_CENSUS="include/libserver/network/chatter/ChatterServer.hpp 1 0 0 0 0
+include/libserver/network/command/CommandServer.hpp 2 0 0 1 0
+include/server/lobby/LobbyNetworkHandler.hpp 2 0 0 3 0
+src/server/chat/AllChatDirector.cpp 3 3 0 0 0
+src/server/chat/PrivateChatDirector.cpp 3 3 0 0 0
+src/server/lobby/LobbyNetworkHandler.cpp 0 36 36 36 68
+src/server/messenger/MessengerDirector.cpp 17 17 0 0 0
+src/server/race/RaceNetworkHandler.cpp 39 39 0 0 0
+src/server/ranch/RanchDirector.cpp 40 40 0 0 0"
+# Пол охвата переписи: файлов со строкой в переписи не меньше этого. Ноль строк —
+# это «обход упал», а не «дерево чистое».
+MIN_CENSUS_ROWS=8
+# ★ГДЕ КЛАСС ЛОББИ ВООБЩЕ ВИДЕН. Определить член класса можно только там, где видно
+# его определение, то есть только в единице трансляции, включающей заголовок лобби.
+# Заголовок не включает НИ ОДИН другой заголовок (проверяется ниже), поэтому прямые
+# включения — это и есть полный транзитивный список. Он и делает перепись MEM
+# исчерпывающей: она считает не «по всему дереву на всякий случай», а по конечному
+# пинованному множеству TU, где чужой член физически может существовать.
+WANT_VISIBILITY="src/server/lobby/LobbyDirector.cpp src/server/lobby/LobbyNetworkHandler.cpp"
 
 for f in "$SRC" "$HDR"; do
   [ -f "$f" ] || { echo "ОСТАНОВ: нет файла $f — считать нечего"; exit 2; }
@@ -315,78 +355,216 @@ if [ "$HDR_GATED" -ne 1 ] || [ "$HDR_PLAIN" -ne 1 ]; then
   RC=1
 fi
 
-# --- (7)-(9) REPOSITORY-WIDE PROPERTIES. Sources are scanned stripped, so a mention
-# --- inside a comment never counts as code.
-scan_files() {
-  printf '%s' "$PARSE_PY" | python3 -c '
+# --- (7)-(9) REPOSITORY-WIDE CENSUS, BY CONTENT AND NOT BY FILE SET. Sources are
+# --- scanned stripped, so a mention inside a comment never counts as code. Each file
+# --- carries five numbers (see WANT_CENSUS above for what each one is and which hole
+# --- it closes); a file that scores zero on all five is not listed at all.
+CENSUS_PY=$(cat <<'PY'
 import os
 import re
 import sys
-src = sys.stdin.read()
-namespace = {}
-exec(src.split("with open(")[0], namespace)
-strip = namespace["strip_comments_and_strings"]
-root = sys.argv[1]
-names = re.compile(sys.argv[2])
-found = set()
-for base in ("src", "include"):
-    for dirpath, _, filenames in os.walk(os.path.join(root, base)):
-        for name in filenames:
-            if not name.endswith((".cpp", ".hpp", ".h", ".cc", ".cxx")):
-                continue
-            path = os.path.join(dirpath, name)
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                if names.search(strip(handle.read())):
-                    found.add(os.path.relpath(path, root))
-print(" ".join(sorted(found)))
-' "$ROOT" "$1"
+
+STRIP_SRC = sys.stdin.read()
+_ns = {}
+exec(STRIP_SRC.split("with open(")[0], _ns)
+strip = _ns["strip_comments_and_strings"]
+
+# A raw dispatcher entry point, by NAME: this is what a sneaky member would call.
+REG_RE = re.compile(r"\bRegister[A-Za-z]*CommandHandler\b")
+# An actual registration of a protocol command, whatever wrapper it goes through.
+REGP_RE = re.compile(r"\bRegister[A-Za-z]*Handler\s*<\s*protocol::")
+# ...of which the ones whose COMMAND belongs to the lobby protocol namespace.
+# Ranch/race/chat use AcCmdCR*, AcCmdRC*, AcCmdUser*, RanchCommand*, ChatCmd*, so this
+# separates "a lobby command was registered here" from "this file registers its own".
+LOBBYCMD_RE = re.compile(
+  r"\bRegister[A-Za-z]*Handler\s*<\s*protocol::AcCmd(?:C[Ll]|LC)")
+WRAP_RE = re.compile(
+  r"\bRegister(?:AuthenticatedHandler|PreAuthHandler|GatedCommandHandler)\b")
+
+# ★ALIASES ARE RESOLVED, NOT ASSUMED AWAY. `void L::SneakyMember()` in a file that
+# says `using L = LobbyNetworkHandler;` defines a MEMBER of the lobby class and has
+# access to the private dispatcher — while the plain grep for `LobbyNetworkHandler::`
+# sees nothing at all. Three spellings introduce such a name, and they chain.
+ALIAS_USING_RE = re.compile(r"\busing\s+(\w+)\s*=\s*([A-Za-z_:][\w:]*)\s*;")
+ALIAS_TYPEDEF_RE = re.compile(r"\btypedef\s+([A-Za-z_:][\w:]*)\s+(\w+)\s*;")
+ALIAS_DEFINE_RE = re.compile(
+  r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+([A-Za-z_:][\w:]*)[ \t]*$", re.M)
+
+# ★ВКЛЮЧЕНИЕ ИЩЕТСЯ ПО СЫРОМУ ТЕКСТУ, НО ПОДТВЕРЖДАЕТСЯ ПО ОЧИЩЕННОМУ. Имя файла в
+# `#include "…"` — строковый литерал, и очистка его гасит: искать включение в
+# очищенном тексте значило бы не найти НИ ОДНОГО и объявить «класс не виден нигде» —
+# ложно-зелёный ровно того вида, ради которого весь этот гард и написан. Поэтому
+# строка берётся сырой, а директивой её признаёт очищенная копия той же строки
+# (закомментированное включение включением не станет).
+INCLUDE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*include\b")
+INCLUDE_NAME_RE = re.compile(r"LobbyNetworkHandler\.hpp")
+
+
+def includes_lobby_header(raw, clean):
+    raw_lines = raw.split("\n")
+    clean_lines = clean.split("\n")
+    for index, line in enumerate(raw_lines):
+        if not INCLUDE_NAME_RE.search(line):
+            continue
+        if index < len(clean_lines) and INCLUDE_DIRECTIVE_RE.search(clean_lines[index]):
+            return True
+    return False
+
+
+def lobby_names(clean):
+    """Every name that denotes LobbyNetworkHandler in this file. Fixed point."""
+    names = {"LobbyNetworkHandler"}
+    for _ in range(8):
+        grew = False
+        for match in ALIAS_USING_RE.finditer(clean):
+            if (match.group(2).split("::")[-1] in names
+                    and match.group(1) not in names):
+                names.add(match.group(1))
+                grew = True
+        for match in ALIAS_TYPEDEF_RE.finditer(clean):
+            if (match.group(1).split("::")[-1] in names
+                    and match.group(2) not in names):
+                names.add(match.group(2))
+                grew = True
+        for match in ALIAS_DEFINE_RE.finditer(clean):
+            if (match.group(2).split("::")[-1] in names
+                    and match.group(1) not in names):
+                names.add(match.group(1))
+                grew = True
+        if not grew:
+            break
+    return names
+
+
+def census(root):
+    rows = []
+    includers = []
+    header_includers = []
+    for base in ("src", "include"):
+        for dirpath, _, filenames in os.walk(os.path.join(root, base)):
+            for name in filenames:
+                if not name.endswith((".cpp", ".hpp", ".h", ".cc", ".cxx")):
+                    continue
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, root)
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    raw = handle.read()
+                clean = strip(raw)
+                member = 0
+                for lobby in lobby_names(clean):
+                    member += len(
+                      re.findall(r"\b" + re.escape(lobby) + r"\s*::", clean))
+                counts = (
+                  len(REG_RE.findall(clean)),
+                  len(REGP_RE.findall(clean)),
+                  len(LOBBYCMD_RE.findall(clean)),
+                  len(WRAP_RE.findall(clean)),
+                  member)
+                if any(counts):
+                    rows.append("%s %s" % (rel, " ".join(str(c) for c in counts)))
+                if includes_lobby_header(raw, clean):
+                    includers.append(rel)
+                    if not rel.endswith(".cpp"):
+                        header_includers.append(rel)
+    return sorted(rows), sorted(includers), sorted(header_includers)
+
+
+rows, includers, header_includers = census(sys.argv[1])
+print("CENSUS_BEGIN")
+print("\n".join(rows))
+print("CENSUS_END")
+print("VISIBILITY=%s" % " ".join(includers))
+print("HEADER_VISIBILITY=%s" % " ".join(header_includers))
+PY
+)
+
+run_census() { printf '%s' "$PARSE_PY" | python3 -c "$CENSUS_PY" "$1"; }
+
+# --- (0b) THE CENSUS PROVES ITSELF, on a fixture holding EXACTLY the two evasions the
+# --- third review named: an inline raw registrar inside an already-allowlisted header,
+# --- and an alias-qualified foreign member of the lobby class inside an
+# --- already-allowlisted .cpp. If the census cannot see them here, it is not allowed
+# --- to say the tree is clean.
+CPROBE="$(mktemp -d)"
+trap 'rm -f "$PROBE"; rm -rf "$CPROBE"' EXIT
+mkdir -p "$CPROBE/include/decoy" "$CPROBE/src/decoy"
+cat > "$CPROBE/include/decoy/Header.hpp" <<'FIXTURE'
+class Decoy
+{
+  void InlineRegistrar()
+  {
+    // An inline raw registrar inside a file the file-set checks already allow.
+    _commandServer.RegisterCommandHandler<protocol::AcCmdCLSneaky>(
+      [this](const ClientId clientId, const auto& command) {});
+  }
+};
+FIXTURE
+cat > "$CPROBE/src/decoy/Foreign.cpp" <<'FIXTURE'
+using L = LobbyNetworkHandler;
+#define LL L
+void LL::SneakyMember()
+{
+  _commandServer.RegisterCommandHandler<protocol::AcCmdCRRanchSnack>(
+    [this](const ClientId clientId, const auto& command) {});
 }
+FIXTURE
+CPROBE_OUT="$(run_census "$CPROBE")" || { echo "ОСТАНОВ: перепись упала на своей фикстуре"; exit 2; }
+CPROBE_HDR="$(printf '%s\n' "$CPROBE_OUT" | sed -n 's|^include/decoy/Header.hpp ||p')"
+CPROBE_FRG="$(printf '%s\n' "$CPROBE_OUT" | sed -n 's|^src/decoy/Foreign.cpp ||p')"
+if [ "$CPROBE_HDR" != "1 1 1 0 0" ] || [ "$CPROBE_FRG" != "1 1 0 0 1" ]; then
+  echo "ОСТАНОВ: перепись провалила СВОЮ фикстуру."
+  echo "         встроенный регистратор в заголовке: '${CPROBE_HDR:-нет строки}' (ожидалось '1 1 1 0 0')"
+  echo "         чужой член под псевдонимом:         '${CPROBE_FRG:-нет строки}' (ожидалось '1 1 0 0 1')"
+  echo "         Это ровно те два обхода, ради которых перепись перестала сравнивать"
+  echo "         НАБОРЫ ФАЙЛОВ и стала считать содержимое. Считать дерево ею нельзя."
+  exit 2
+fi
 
-REGISTRAR_FILES="$(scan_files '\bRegister(?:AuthenticatedHandler|PreAuthHandler|GatedCommandHandler)\b')" \
-  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
+# --- (7) THE TREE ITSELF, file by file, number by number.
+TREE_OUT="$(run_census "$ROOT")" || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
+CENSUS="$(printf '%s\n' "$TREE_OUT" | sed -n '/^CENSUS_BEGIN$/,/^CENSUS_END$/p' | sed '1d;$d')"
+VISIBILITY="$(printf '%s\n' "$TREE_OUT" | sed -n 's/^VISIBILITY=//p')"
+HEADER_VISIBILITY="$(printf '%s\n' "$TREE_OUT" | sed -n 's/^HEADER_VISIBILITY=//p')"
+CENSUS_ROWS="$(printf '%s\n' "$CENSUS" | grep -c .)"
 
-echo "файлы-регистраторы   : $REGISTRAR_FILES"
-echo "ожидались            : $WANT_REGISTRAR_FILES"
-if [ "$REGISTRAR_FILES" != "$WANT_REGISTRAR_FILES" ]; then
-  echo "  ✗ имена обёрток регистрации встречаются НЕ ТАМ, где раунд их оставил."
-  echo "    Свойство «решение об авторизации принимается ровно в одном месте» доказуемо"
-  echo "    только пока список файлов известен поимённо."
+echo
+echo "перепись по файлам (REG REGP LOBBYCMD WRAP MEM), строк: $CENSUS_ROWS (пол: >= $MIN_CENSUS_ROWS)"
+printf '%s\n' "$CENSUS" | sed 's/^/  /'
+if [ "$CENSUS_ROWS" -lt "$MIN_CENSUS_ROWS" ]; then
+  echo "ОСТАНОВ: строк переписи $CENSUS_ROWS при поле $MIN_CENSUS_ROWS — обход поехал,"
+  echo "         «нигде ничего лишнего» на пустой переписи это слепота, а не новость"
+  echo "=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ==="
+  exit 2
+fi
+if [ "$CENSUS" != "$WANT_CENSUS" ]; then
+  echo "  ✗ перепись разошлась с ожидаемой. Расхождение (< дерево / > ожидание):"
+  diff <(printf '%s\n' "$CENSUS") <(printf '%s\n' "$WANT_CENSUS") \
+    | sed 's/^/      /' || true
+  echo "    Числа пиновány поимённо ИМЕННО потому, что набора файлов мало: внутри уже"
+  echo "    разрешённого файла помещаются и встроенный сырой регистратор, и чужой член"
+  echo "    лобби под псевдонимом. Изменилось число — изменилось содержимое, и новая"
+  echo "    точка регистрации обязана быть объявлена здесь вместе с решением об"
+  echo "    авторизации."
   RC=1
 fi
 
-# --- (8) EVERY registration site in the tree is declared by name. A lobby member
-# --- defined in another translation unit would call the RAW RegisterCommandHandler —
-# --- no wrapper name in the file, no change in the audited constructor, and check (7)
-# --- stays green. This one sees it, because it keys on the CALL, not on the wrapper.
-HANDLER_CALL_FILES="$(scan_files '\bRegister[A-Za-z]*CommandHandler\b')" \
-  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
-
-echo "файлы с регистрацией : $HANDLER_CALL_FILES"
-echo "ожидались            : $WANT_HANDLER_CALL_FILES"
-if [ "$HANDLER_CALL_FILES" != "$WANT_HANDLER_CALL_FILES" ]; then
-  echo "  ✗ вызов Register*CommandHandler появился в файле, которого раунд не знает."
-  echo "    Пока список известен поимённо, «в лобби нет сырых регистраций» — свойство"
-  echo "    ДЕРЕВА, а не одного прочитанного файла. Новая точка регистрации обязана"
-  echo "    быть объявлена здесь вместе с решением об авторизации."
+# --- (11) AND THE CENSUS OF MEMBERS IS BOUNDED, not hopeful. A member of the lobby
+# --- class can only be defined where the class definition is VISIBLE — that is, in a
+# --- translation unit that includes the lobby header. No header includes it, so the
+# --- direct includers are the whole transitive list, and the MEM column above is
+# --- exhaustive over a finite pinned set rather than over a regex's imagination.
+echo "видят класс лобби    : $VISIBILITY"
+echo "ожидались            : $WANT_VISIBILITY"
+if [ "$VISIBILITY" != "$WANT_VISIBILITY" ]; then
+  echo "  ✗ заголовок лобби включён не там, где раунд его оставил. Каждая такая единица"
+  echo "    трансляции МОЖЕТ определить член класса и достать приватный диспетчер."
   RC=1
 fi
-
-# --- (9) NO LOBBY MEMBER LIVES OUTSIDE THE AUDITED FILE. `_commandServer` is private,
-# --- and private means "members and friends"; a member defined elsewhere is exactly
-# --- the hole. This check is blind to WHAT such a member does — which is the point.
-LOBBY_MEMBER_FILES="$(scan_files '\bLobbyNetworkHandler\s*::')" \
-  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
-
-echo "файлы с членами лобби: $LOBBY_MEMBER_FILES"
-echo "ожидались            : $WANT_LOBBY_MEMBER_FILES"
-if [ "$LOBBY_MEMBER_FILES" != "$WANT_LOBBY_MEMBER_FILES" ]; then
-  echo "  ✗ имя LobbyNetworkHandler:: встречается в коде вне единственного .cpp,"
-  echo "    который читает этот гард. Член класса, определённый в другой единице"
-  echo "    трансляции, имеет доступ к приватному _commandServer и может завести"
-  echo "    регистрацию там, куда гард не смотрит."
+if [ -n "$HEADER_VISIBILITY" ]; then
+  echo "  ✗ заголовок лобби включён из ЗАГОЛОВКА ($HEADER_VISIBILITY) — видимость класса"
+  echo "    расползается транзитивно, и список выше перестаёт быть полным."
   RC=1
 fi
-
 # --- (10) AND NOBODY IS A FRIEND. A friend declaration hands the private dispatcher
 # --- to a non-member, and then check (9) is not enough either.
 HDR_FRIENDS="$(printf '%s' "$HDR_CLEAN" | grep -c '\bfriend\b')"
