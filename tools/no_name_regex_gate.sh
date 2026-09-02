@@ -53,14 +53,33 @@ for d in $SCOPE; do
 done
 
 # Blindness guard #1: the pattern must be able to match something.
-CANARY="$(mktemp)"
+# ★СОЗДАНИЕ И ЗАПИСЬ КАНАРЕЙКИ ПРОВЕРЯЮТСЯ (правка ревью, итерация 1). Прежняя
+# редакция брала `$(mktemp)` без проверки: при недоступном каталоге временных
+# файлов CANARY оставался пустым, `grep` не давал числа, числовое сравнение
+# падало с ошибкой — и скрипт, не имея `set -e`, шёл дальше и печатал «ЧИСТО ✓».
+# Проверка, которая сама умеет молча ослепнуть, хуже отсутствующей.
+CANARY="$(mktemp 2>/dev/null)" || CANARY=""
+if [ -z "$CANARY" ] || [ ! -f "$CANARY" ]; then
+  echo "ОСТАНОВ: не удалось создать канареечный файл (mktemp) — проверить нечем,"
+  echo "         а «ноль нарушителей» без канарейки читать нельзя."
+  exit 2
+fi
 trap 'rm -f "$CANARY"' EXIT
-{
+if ! {
   echo '#include <regex>'
   echo 'const std::regex rg(name);'
   echo 'std::basic_regex<char> other(name);'
-} > "$CANARY"
+} > "$CANARY"; then
+  echo "ОСТАНОВ: не удалось записать канареечный файл '$CANARY'."
+  exit 2
+fi
 CANARY_HITS="$(grep -acE "$PATTERN" "$CANARY" || true)"
+case "$CANARY_HITS" in
+  ''|*[!0-9]*)
+    echo "ОСТАНОВ: канарейка вернула не число ('$CANARY_HITS') — grep не отработал."
+    exit 2
+    ;;
+esac
 if [ "$CANARY_HITS" -lt 3 ]; then
   echo "ОСТАНОВ: канарейка дала $CANARY_HITS совпадений из 3 — регекс или grep сломаны,"
   echo "         ноль нарушителей читать нельзя."

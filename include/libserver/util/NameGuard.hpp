@@ -71,9 +71,14 @@ inline constexpr std::size_t kMaxLoginNameBytes = 48;
 //! написана внутри `LocalAuthenticationBackend::Authenticate` (:128-138) — и
 //! ровно поэтому КАЖДОЕ имя файла в `data/users` принадлежит этому классу по
 //! построению. Пока определений было два, они умели разъехаться молча.
-[[nodiscard]] inline bool IsLoginNameSafe(const std::string_view name) noexcept
+//!
+//! ★ПОТОЛОК — ПАРАМЕТР, А НЕ КОНСТАНТА В ТЕЛЕ (правка ревью, итерация 1). См.
+//! пояснение у `IsStorableNameShaped`: имя, СОХРАНЁННОЕ до появления проверки
+//! #18b, может быть длиннее сегодняшнего потолка, и адресовать его надо уметь.
+[[nodiscard]] inline bool IsLoginNameSafe(
+  const std::string_view name, const std::size_t maxBytes) noexcept
 {
-  if (name.empty() || name.size() > kMaxLoginNameBytes)
+  if (name.empty() || name.size() > maxBytes)
     return false;
   return std::ranges::all_of(name, [](const char symbol)
     {
@@ -82,6 +87,12 @@ inline constexpr std::size_t kMaxLoginNameBytes = 48;
         || (symbol >= '0' && symbol <= '9')
         || symbol == '_' || symbol == '-';
     });
+}
+
+//! Тот же гейт с потолком по умолчанию — для вызывающих без индекса.
+[[nodiscard]] inline bool IsLoginNameSafe(const std::string_view name) noexcept
+{
+  return IsLoginNameSafe(name, kMaxLoginNameBytes);
 }
 
 //! Структурный гейт имени персонажа/гильдии/питомца: «это ВООБЩЕ может быть
@@ -94,15 +105,33 @@ inline constexpr std::size_t kMaxLoginNameBytes = 48;
 //! неадресуемым — обменять путь успеха на путь отказа. Здесь проверяется только
 //! то, что имя ФИЗИЧЕСКИ не может быть именем на диске: пустое, длиннее
 //! потолка, с управляющим байтом или с разделителем пути.
-[[nodiscard]] inline bool IsStorableNameShaped(const std::string_view name) noexcept
+//!
+//! ★ПОТОЛОК ПРИХОДИТ ПАРАМЕТРОМ, И ЭТО ПРАВКА РЕВЬЮ (итерация 1). Константа в
+//! теле создавала расхождение между тем, что ИНДЕКСИРУЕТСЯ, и тем, что можно
+//! СПРОСИТЬ: индекс принимал любое имя из JSON, а поиск отбивал всё длиннее 64
+//! байт ещё до обращения к индексу. Персонаж, сохранённый ДО появления
+//! `IsNameValid` с 65-байтовым ASCII-именем, оказывался проиндексирован и при
+//! этом вечно неадресуем — хотя прежний точный поиск его находил. Потолок
+//! обязан меряться тем, что провод исторически МОГ адресовать, а не сегодняшним
+//! валидатором; вызывающий поднимает его до длины самого длинного имени,
+//! которое реально лежит в индексе (`FileDataSource::RebuildCharacterNameIndex`),
+//! и граница остаётся конечной — но уже не режет живых.
+[[nodiscard]] inline bool IsStorableNameShaped(
+  const std::string_view name, const std::size_t maxBytes) noexcept
 {
-  if (name.empty() || name.size() > kMaxStoredNameBytes)
+  if (name.empty() || name.size() > maxBytes)
     return false;
   return std::ranges::none_of(name, [](const char symbol)
     {
       const auto byte = static_cast<unsigned char>(symbol);
       return byte < 0x20 || byte == 0x7f || byte == '/' || byte == '\\';
     });
+}
+
+//! Тот же гейт с потолком по умолчанию — для вызывающих без индекса.
+[[nodiscard]] inline bool IsStorableNameShaped(const std::string_view name) noexcept
+{
+  return IsStorableNameShaped(name, kMaxStoredNameBytes);
 }
 
 //! Сравнение имён без учёта регистра ПО ASCII.

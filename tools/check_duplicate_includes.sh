@@ -55,13 +55,22 @@ duplicates_in() {
 }
 
 # Blindness guard #1: the canary must come back dirty.
-CANARY="$(mktemp)"
+# Создание и запись канарейки проверяются по тому же правилу, что и в
+# `no_name_regex_gate.sh`: непроверенный `mktemp` — это класс, а не сайт.
+CANARY="$(mktemp 2>/dev/null)" || CANARY=""
+if [ -z "$CANARY" ] || [ ! -f "$CANARY" ]; then
+  echo "ОСТАНОВ: не удалось создать канареечный файл (mktemp) — проверить нечем."
+  exit 2
+fi
 trap 'rm -f "$CANARY"' EXIT
-{
+if ! {
   echo '#include <string>'
   echo '#include <vector>'
   echo '#include <string>'
-} > "$CANARY"
+} > "$CANARY"; then
+  echo "ОСТАНОВ: не удалось записать канареечный файл '$CANARY'."
+  exit 2
+fi
 if [ -z "$(duplicates_in "$CANARY")" ]; then
   echo "ОСТАНОВ: канарейка с заведомым дублем прочиталась как чистая —"
   echo "         конвейер сломан, ноль нарушителей читать нельзя."

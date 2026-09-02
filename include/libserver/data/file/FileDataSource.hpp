@@ -24,9 +24,12 @@
 #include <libserver/data/DataSource.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace server
 {
@@ -196,10 +199,19 @@ private:
   //! Sequential UID for rewards.
   std::atomic_uint32_t _rewardSequentialUid = 0;
 
-  //! ИНДЕКС «имя персонажа (нижний ASCII-регистр) -> uid» (LOA-fix R73-4, #130-C8).
-  //! Строится один раз на `Initialize`, поддерживается на `StoreCharacter` и
-  //! `DeleteCharacter`. Заменяет обход ВСЕХ файлов персонажей на КАЖДЫЙ поиск.
-  std::unordered_map<std::string, data::Uid> _characterNameToUid;
+  //! ИНДЕКС «имя персонажа (нижний ASCII-регистр) -> ВСЕ uid с этим именем»
+  //! (LOA-fix R73-4, #130-C8). Строится один раз на `Initialize`,
+  //! поддерживается на `StoreCharacter` и `DeleteCharacter`. Заменяет обход
+  //! ВСЕХ файлов персонажей на КАЖДЫЙ поиск.
+  //!
+  //! ★ХРАНИТСЯ ВЕСЬ СПИСОК, А НЕ ОДИН ПОБЕДИТЕЛЬ, и это правка ревью (итерация
+  //! 1). Прежняя редакция при столкновении имён ВЫБРАСЫВАЛА проигравшие uid;
+  //! после переименования или удаления победителя имя переставало разрешаться
+  //! вовсе — до перезапуска, хотя второй персонаж с этим именем на диске никуда
+  //! не девался. Вектор отсортирован по возрастанию, поэтому «меньший uid —
+  //! старшая запись» держится и на старте, и в рантайме, а снятие победителя
+  //! ДЕТЕРМИНИРОВАННО поднимает следующего.
+  std::unordered_map<std::string, std::vector<data::Uid>> _characterNameToUid;
   //! Обратный индекс uid -> КЛЮЧ (не отображаемое имя). Без него ПЕРЕИМЕНОВАНИЕ
   //! оставило бы старое имя занятым навсегда — то есть индекс завёл бы дефект,
   //! которого без него нет.
@@ -207,6 +219,29 @@ private:
   //! Индекс читается сетевыми потоками (лобби/ранчо/мессенджер/гонка) и пишется
   //! потоком тика DataDirector'а через `StoreCharacter`.
   mutable std::shared_mutex _characterNameIndexMutex;
+
+  //! ИНДЕКС СУЩЕСТВОВАНИЯ ИМЁН АККАУНТОВ (LOA-fix R73-4b, #130-C8). Только
+  //! ключи: `IsUserNameUnique` спрашивает «есть ли такой», а не «кто это».
+  //!
+  //! ★ЗАЧЕМ, ЕСЛИ ЕСТЬ ГЕЙТ ИМЕНИ. Гейт снял РЕГУЛЯРКУ, но не снял ОБХОД:
+  //! staff-команда с любым именем из класса `[A-Za-z0-9_-]` всё ещё открывала
+  //! каталог `data/users` целиком, то есть стоимость пакета росла как O(число
+  //! аккаунтов). Найдено ревью (итерация 1). Класс закрывается тем же способом,
+  //! что и на стороне персонажей, — индексом, а не вторым частным случаем.
+  std::unordered_set<std::string> _userNameKeys;
+  mutable std::shared_mutex _userNameIndexMutex;
+
+  //! Потолки длины имени для СТРУКТУРНОГО ГЕЙТА, поднятые до самой длинной
+  //! записи, которая реально лежит в индексе (правка ревью, итерация 1).
+  //! Ниже `kMaxStoredNameBytes`/`kMaxLoginNameBytes` не опускаются никогда:
+  //! это пол, а не значение.
+  //! ★ЛИТЕРАЛЫ, А НЕ `kMaxStoredNameBytes`/`kMaxLoginNameBytes`: этот заголовок
+  //! намеренно не тянет `NameGuard.hpp` (инлайн-бюджет TU — см. лесенку).
+  //! Расхождение ловится `static_assert` в `FileDataSource.cpp`, то есть
+  //! КОМПИЛЯЦИЕЙ, а не внимательностью.
+  std::atomic_size_t _characterNameCeiling{64};
+  std::atomic_size_t _loginNameCeiling{48};
+
   //! Сколько обращений отбито структурным гейтом имени. Читается РОВНО ОДИН раз,
   //! на `Terminate` — счётчик существует затем, чтобы гейт был проверкой, чей
   //! вердикт кто-то читает, и при этом не давал строку на пакет.
@@ -218,6 +253,10 @@ private:
   void IndexCharacterName(data::Uid uid, const std::string& name);
   //! Убрать запись индекса.
   void ForgetCharacterName(data::Uid uid);
+  //! Перестроить индекс имён аккаунтов с диска. Зовётся только из `Initialize`.
+  void RebuildUserNameIndex();
+  //! Внести одну запись индекса аккаунтов (регистрация и любое сохранение).
+  void IndexUserName(const std::string& name);
 };
 
 } // namespace server

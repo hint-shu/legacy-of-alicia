@@ -28,6 +28,7 @@
   #include <unistd.h>
 #endif
 
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -381,9 +382,14 @@ inline void WriteFileAtomically(
 //! из-за не поставленного бита каталога значило бы обменять реальный простой на
 //! эшелонированную защиту.
 //!
-//! @return `false` ТОЛЬКО если `chmod` существующего каталога провалился.
-//!         Отсутствие каталога — не ошибка: `create_directories` зовётся строкой
-//!         выше, и «его нет» здесь означает гонку, а не дефект прав.
+//! @return `false` если `chmod` существующего каталога провалился ИЛИ если режим
+//!         каталога вообще не удалось узнать. ★ТОЛЬКО `ENOENT` ЧИТАЕТСЯ КАК
+//!         УСПЕХ, и это правка ревью (итерация 1). Прежняя редакция отвечала
+//!         `true` на ЛЮБОЙ отказ `stat`: при `EACCES`/`EIO` режим каталога с
+//!         аккаунтами оставался неизвестным, а вызывающий не печатал ни строки —
+//!         проверка, которая умеет только соглашаться, проверкой не является.
+//!         Отсутствие каталога успехом остаётся: `create_directories` зовётся
+//!         строкой выше, и «его нет» здесь означает гонку, а не дефект прав.
 [[nodiscard]] inline bool EnsureDirectoryMode(
   const std::filesystem::path& path,
   const unsigned int mode) noexcept
@@ -391,7 +397,7 @@ inline void WriteFileAtomically(
 #ifndef WIN32
   struct ::stat directoryStat{};
   if (::stat(path.c_str(), &directoryStat) != 0)
-    return true;                              // каталога нет — не наша забота
+    return errno == ENOENT;                   // нет каталога — не наша забота
   if ((directoryStat.st_mode & 07777) == static_cast<mode_t>(mode))
     return true;                              // уже как надо, syscall не нужен
   return ::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0;
@@ -400,6 +406,95 @@ inline void WriteFileAtomically(
   (void)path; (void)mode;
   return true;
 #endif
+}
+
+//! Итог сужения режимов у СУЩЕСТВУЮЩИХ файлов с секретом (LOA-fix, R73-2b, #206).
+struct SecretFileHardening
+{
+  //! Сколько обычных файлов удалось осмотреть.
+  std::size_t examined = 0;
+  //! Сколько из них несли биты group/other и были сужены.
+  std::size_t narrowed = 0;
+  //! Сколько не удалось ни осмотреть, ни сузить.
+  std::size_t failed = 0;
+};
+
+//! Снимает биты group/other со ВСЕХ обычных файлов каталога (R73-2b, #206).
+//!
+//! ★ПОЧЕМУ НЕ ХВАТАЕТ ОБЯЗАТЕЛЬНОГО `FileSensitivity`. Класс конфиденциальности
+//! чинит файл НА ПЕРВОЙ ЗАПИСИ. Аккаунт, в который сервер не пишет (игрок не
+//! заходил), первой записи не дождётся НИКОГДА — на проде такие есть, и они
+//! остались бы 0644 бессрочно. Найдено ревью (итерация 1): каталог сузили, а
+//! инод — нет.
+//!
+//! ★СОДЕРЖИМОЕ НЕ ПЕРЕПИСЫВАЕТСЯ. Только `fchmod` уже открытого дескриптора:
+//! «починка» через перезапись означала бы риск потерять данные ради бита прав.
+//!
+//! ★`O_NOFOLLOW`, А НЕ `chmod` ПО ПУТИ. Символическая ссылка в каталоге
+//! аккаунтов увела бы `chmod` на чужой файл. Открываем без перехода по ссылке и
+//! правим ДЕСКРИПТОР — тогда цель правки не может подмениться между проверкой и
+//! действием. Ссылки и всё, что не обычный файл, просто пропускаются: они не
+//! аккаунты.
+//!
+//! ★НЕ ЛОГИРУЕТ САМ (та же причина, что у `EnsureDirectoryMode`) — возвращает
+//! числа, а строку печатает вызывающий.
+[[nodiscard]] inline SecretFileHardening HardenSecretFilesInDirectory(
+  const std::filesystem::path& directory) noexcept
+{
+  SecretFileHardening result;
+#ifndef WIN32
+  std::error_code error;
+  if (not std::filesystem::is_directory(directory, error) || error)
+    return result;
+
+  for (const auto& entry :
+    std::filesystem::directory_iterator(directory, error))
+  {
+    if (error)
+      break;
+
+    const int descriptor = ::open(
+      entry.path().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (descriptor < 0)
+    {
+      // ELOOP = это символическая ссылка; она не аккаунт, это не отказ.
+      if (errno != ELOOP)
+        ++result.failed;
+      continue;
+    }
+
+    struct ::stat fileStat{};
+    if (::fstat(descriptor, &fileStat) != 0)
+    {
+      ++result.failed;
+      ::close(descriptor);
+      continue;
+    }
+    if (not S_ISREG(fileStat.st_mode))
+    {
+      ::close(descriptor);
+      continue;
+    }
+
+    ++result.examined;
+    if ((fileStat.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+    {
+      // Та же арифметика, что у `Secret` в `WriteFileAtomically`: сужение маской
+      // плюс пол для владельца, а не жёсткое назначение 0600.
+      mode_t narrowed = static_cast<mode_t>(fileStat.st_mode & 07777);
+      narrowed &= ~static_cast<mode_t>(S_IRWXG | S_IRWXO);
+      narrowed |= static_cast<mode_t>(S_IRUSR | S_IWUSR);
+      if (::fchmod(descriptor, narrowed) == 0)
+        ++result.narrowed;
+      else
+        ++result.failed;
+    }
+    ::close(descriptor);
+  }
+#else
+  (void)directory;
+#endif
+  return result;
 }
 
 //! Убирает недописанные временные файлы, оставшиеся от прерванных сохранений

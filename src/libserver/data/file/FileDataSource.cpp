@@ -42,6 +42,58 @@
 namespace
 {
 
+//! Вносит uid в отсортированный список имени (LOA-fix R73-4, правка ревью 1).
+//!
+//! ★СПИСОК, А НЕ ЕДИНСТВЕННЫЙ ПОБЕДИТЕЛЬ. Столкновение имён на диске возможно
+//! (ext4 регистрозависим, а ключ индекса — ASCII-нижний регистр), и прежняя
+//! редакция проигравшие uid ТЕРЯЛА. Стоило победителю переименоваться или
+//! удалиться — и имя переставало разрешаться до перезапуска, хотя второй файл с
+//! этим именем лежал на месте. Порядок по возрастанию делает правило «меньший
+//! uid — старшая запись» одинаковым при старте и в рантайме и превращает снятие
+//! победителя в ДЕТЕРМИНИРОВАННОЕ повышение следующего.
+//!
+//! @return размер списка ПОСЛЕ вставки: 1 — имя уникально, больше — столкновение.
+std::size_t AttachNameKey(
+  std::unordered_map<std::string, std::vector<server::data::Uid>>& index,
+  const std::string& key,
+  const server::data::Uid uid)
+{
+  auto& bucket = index[key];
+  const auto position = std::ranges::lower_bound(bucket, uid);
+  // Повторная вставка того же uid — не столкновение, а тот же самый персонаж.
+  if (position == bucket.end() || *position != uid)
+    bucket.insert(position, uid);
+  return bucket.size();
+}
+
+//! Снимает uid со списка имени; пустой список убирает ключ целиком.
+void DetachNameKey(
+  std::unordered_map<std::string, std::vector<server::data::Uid>>& index,
+  const std::string& key,
+  const server::data::Uid uid)
+{
+  const auto entry = index.find(key);
+  if (entry == index.end())
+    return;
+  auto& bucket = entry->second;
+  const auto position = std::ranges::lower_bound(bucket, uid);
+  if (position != bucket.end() && *position == uid)
+    bucket.erase(position);
+  if (bucket.empty())
+    index.erase(entry);
+}
+
+//! Поднимает потолок длины имени, никогда его не опуская.
+void RaiseNameCeiling(std::atomic_size_t& ceiling, const std::size_t candidate)
+{
+  std::size_t current = ceiling.load(std::memory_order::relaxed);
+  while (candidate > current
+    && not ceiling.compare_exchange_weak(
+      current, candidate, std::memory_order::relaxed))
+  {
+  }
+}
+
 std::filesystem::path ProduceDataFilePath(
   const std::filesystem::path& root,
   const std::string& filename)
@@ -145,48 +197,77 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
 
 } // anon namespace
 
+// ★ПОЛЫ ПОТОЛКОВ ОБЪЯВЛЕНЫ В ЗАГОЛОВКЕ ЛИТЕРАЛАМИ (он не включает NameGuard.hpp).
+// Расхождение с самим гейтом обязано быть ошибкой КОМПИЛЯЦИИ, а не сюрпризом в
+// рантайме: разъехавшись, они сделали бы часть живых имён неадресуемыми.
+static_assert(server::util::kMaxStoredNameBytes == 64,
+  "FileDataSource.hpp initialises _characterNameCeiling with the literal 64");
+static_assert(server::util::kMaxLoginNameBytes == 48,
+  "FileDataSource.hpp initialises _loginNameCeiling with the literal 48");
+
 void server::FileDataSource::Initialize(const std::filesystem::path& path)
 {
   _dataPath = path;
   _metaFilePath = _dataPath;
 
-  const auto prepareDataPath = [this](
-    const std::filesystem::path& folder, const unsigned int mode)
+  const auto prepareDataPath = [this](const std::filesystem::path& folder)
   {
     const auto path = _dataPath / folder;
     create_directories(path);
-    // ★СУЖЕНИЕ СУЩЕСТВУЮЩЕГО, а не только создание с правами: `data/users` на
-    // проде создан давно и стоит 0755 — создание его не тронет (LOA-fix R73-2).
-    if (not server::util::EnsureDirectoryMode(path, mode))
-    {
-      server::util::QuietLogError(
-        "Data directory '{}': could not restrict the directory permissions to {:o}",
-        path.string(), mode);
-    }
-
     return path;
   };
 
   // Prepare the data paths.
-  // ★ЕДИНСТВЕННЫЙ КАТАЛОГ С СЕКРЕТОМ — `users`: в нём лежат `passwordHash` и
-  // `passwordSalt` (StoreUser ниже). Остальные ПЯТНАДЦАТЬ несут игровые записи и
-  // остаются 0755 — раунд не меняет их ни на бит.
-  _userDataPath = prepareDataPath("users", 0700);
-  _infractionDataPath = prepareDataPath("infractions", 0755);
-  _characterDataPath = prepareDataPath("characters", 0755);
-  _itemDataPath = prepareDataPath("characters/equipment/items", 0755);
-  _horseDataPath = prepareDataPath("characters/equipment/horses", 0755);
-  _storageItemPath = prepareDataPath("storage", 0755);
-  _eggDataPath = prepareDataPath("eggs", 0755);
-  _petDataPath = prepareDataPath("pets", 0755);
-  _housingDataPath = prepareDataPath("housing", 0755);
-  _guildDataPath = prepareDataPath("guilds", 0755);
-  _settingsDataPath = prepareDataPath("settings", 0755);
-  _dailyQuestGroupDataPath = prepareDataPath("dailyQuestGroups", 0755);
-  _mailDataPath = prepareDataPath("mails", 0755);
-  _questDataPath = prepareDataPath("quests", 0755);
-  _stallionDataPath = prepareDataPath("stallions", 0755);
-  _rewardDataPath = prepareDataPath("rewards", 0755);
+  // ★РЕЖИМ ПРИНУДИТЕЛЬНО СУЖАЕТСЯ РОВНО У ОДНОГО КАТАЛОГА — `users`: только в
+  // нём лежат `passwordHash` и `passwordSalt` (StoreUser ниже). Остальные
+  // ПЯТНАДЦАТЬ создаются как создавались и их режим НЕ ТРОГАЕТСЯ ВОВСЕ.
+  //
+  // ★ПРАВКА РЕВЬЮ (итерация 1): прежняя редакция ставила всем пятнадцати ТОЧНЫЙ
+  // 0755. Это не «оставить как было», а НАЗНАЧИТЬ: у оператора, который сузил
+  // `mails` или `infractions` вручную либо поставил на каталог setgid, каждый
+  // старт сервера молча возвращал бы права ШИРЕ. Правка, взявшаяся сужать, не
+  // имеет права расширять.
+  _userDataPath = prepareDataPath("users");
+  _infractionDataPath = prepareDataPath("infractions");
+  _characterDataPath = prepareDataPath("characters");
+  _itemDataPath = prepareDataPath("characters/equipment/items");
+  _horseDataPath = prepareDataPath("characters/equipment/horses");
+  _storageItemPath = prepareDataPath("storage");
+  _eggDataPath = prepareDataPath("eggs");
+  _petDataPath = prepareDataPath("pets");
+  _housingDataPath = prepareDataPath("housing");
+  _guildDataPath = prepareDataPath("guilds");
+  _settingsDataPath = prepareDataPath("settings");
+  _dailyQuestGroupDataPath = prepareDataPath("dailyQuestGroups");
+  _mailDataPath = prepareDataPath("mails");
+  _questDataPath = prepareDataPath("quests");
+  _stallionDataPath = prepareDataPath("stallions");
+  _rewardDataPath = prepareDataPath("rewards");
+
+  // ★СУЖЕНИЕ СУЩЕСТВУЮЩЕГО, а не только создание с правами: `data/users` на
+  // проде создан давно и стоит 0755 — создание его не тронет (LOA-fix R73-2).
+  if (not server::util::EnsureDirectoryMode(_userDataPath, 0700))
+  {
+    server::util::QuietLogError(
+      "Data directory '{}': could not restrict the directory permissions to {:o}",
+      _userDataPath.string(), 0700);
+  }
+
+  // ★И САМИ ИНОДЫ, А НЕ ТОЛЬКО КАТАЛОГ (LOA-fix R73-2b, правка ревью 1).
+  // Обязательный `FileSensitivity` чинит режим НА ПЕРВОЙ ЗАПИСИ, но аккаунт, в
+  // который сервер больше не пишет (игрок не заходит), первой записи не
+  // дождётся никогда и остался бы 0644 бессрочно. Один проход на старте, без
+  // единой перезаписи содержимого.
+  const auto hardening =
+    server::util::HardenSecretFilesInDirectory(_userDataPath);
+  if (hardening.narrowed > 0 || hardening.failed > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account files in '{}': {} of {} examined were group/other-readable and "
+      "were narrowed to owner-only, {} could not be secured",
+      _userDataPath.string(), hardening.narrowed, hardening.examined,
+      hardening.failed);
+  }
 
   // Read the meta-data file and parse the sequential UIDs.
   const std::filesystem::path metaFilePath = ProduceDataFilePath(
@@ -271,6 +352,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   // `raiseFloor` намеренно: обход каталога персонажей уже прогрет, и порядок
   // «сперва счётчики, потом индекс» держит стартовые инварианты в одном месте.
   RebuildCharacterNameIndex();
+  RebuildUserNameIndex();
 }
 
 void server::FileDataSource::Terminate()
@@ -384,16 +466,26 @@ void server::FileDataSource::StoreUser(const std::string_view&, const data::User
   server::util::WriteFileAtomically(
     dataFilePath, json.dump(2), "User file",
     server::util::FileSensitivity::Secret);
+
+  // ★ИНДЕКС ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, как и у персонажей: бросок оставляет диск в
+  // прежнем состоянии, и индекс обязан остаться согласованным с диском.
+  IndexUserName(user.name());
 }
 
 bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
 {
-  // ★СНАЧАЛА КЛАСС ИМЕНИ, ПОТОМ ДИСК. Прежняя редакция СОБИРАЛА РЕГУЛЯРНОЕ
-  // ВЫРАЖЕНИЕ из присланного имени (`std::format("{}.*", name)`) до всякой
-  // проверки. Имя вида `(a{200}){200}` разворачивает автомат libstdc++ в
+  // ★СНАЧАЛА КЛАСС ИМЕНИ, ПОТОМ ЧТО-ЛИБО ЕЩЁ. Прежняя редакция СОБИРАЛА
+  // РЕГУЛЯРНОЕ ВЫРАЖЕНИЕ из присланного имени (`std::format("{}.*", name)`) до
+  // всякой проверки. Имя вида `(a{200}){200}` разворачивает автомат libstdc++ в
   // миллионы состояний ещё на КОНСТРУКЦИИ, а имя `[` бросает `regex_error`
   // наружу — то есть строка `[error]` на КАЖДЫЙ пакет.
-  if (not server::util::IsLoginNameSafe(name))
+  //
+  // Потолок берётся из ИНДЕКСА, а не из константы (правка ревью, итерация 1):
+  // аккаунт, заведённый до появления проверки #18b, может быть длиннее
+  // сегодняшних 48 байт, и отбить его на входе значило бы сделать реального
+  // игрока неадресуемым для staff-команды.
+  if (not server::util::IsLoginNameSafe(
+    name, _loginNameCeiling.load(std::memory_order::relaxed)))
   {
     _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
     // Имя, которого не может существовать, «уникально»: вызывающий (staff-
@@ -403,25 +495,78 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
     return true;
   }
 
-  for (const auto& file : std::filesystem::directory_iterator(_userDataPath))
+  // ★ИНДЕКС ВМЕСТО ОБХОДА КАТАЛОГА (LOA-fix R73-4b, правка ревью 1). Снять
+  // регулярку было половиной дела: обход `data/users` на КАЖДУЮ staff-команду
+  // оставлял стоимость пакета линейной по числу аккаунтов, то есть заявленный
+  // класс «имя с провода не вызывает обхода файловой системы» оставался
+  // открытым. Сравнение по-прежнему ASCII-регистронезависимое — ключ индекса
+  // и есть имя в нижнем ASCII-регистре, поэтому смысл ответа не изменился.
   {
-    // LOA-fix (R58-7, round58, backlog #175): сравнение идёт по ИМЕНИ ФАЙЛА, и
-    // без этого фильтра осиротевший `Вася.json.tmp` сделал бы имя «Вася»
-    // занятым навсегда. Это условие безопасности самой атомарной записи, а не
-    // косметика: фикс иначе породил бы дефект, которого до него не было.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
-      continue;
-
-    // ★СРАВНЕНИЕ ТОЧНОЕ И С ОСНОВОЙ ИМЕНИ, А НЕ С ПОЛНЫМ. Апстримный шаблон
-    // `name.*` матчился против ПОЛНОГО `nikross.json`, поэтому «nik»
-    // отчитывался как ЗАНЯТОЕ имя, а `//infraction add nik` отвечал «временно
-    // недоступен» вместо «нет такого». Оба ответа отказывают, но врал только
-    // первый.
-    if (server::util::EqualsAsciiIgnoreCase(file.path().stem().string(), name))
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    if (_userNameKeys.contains(server::util::AsciiLowerKey(name)))
       return false;
   }
 
-  return true;
+  // ★ОДИН `stat`, А НЕ ВОЗВРАТ ОБХОДА. Файл аккаунта могут положить рядом с
+  // работающим сервером (скрипт заведения друга на ВПС), и индекс о нём узнает
+  // только после перезапуска. Прежний обход такой аккаунт видел; менять путь
+  // успеха ради пути отказа нельзя, поэтому промах индекса стоит РОВНО одну
+  // проверку одного пути — константу, а не O(число аккаунтов). Имя уже прошло
+  // `IsLoginNameSafe`, то есть в нём нет ни `/`, ни точек: собрать из него путь
+  // наружу каталога невозможно.
+  std::error_code error;
+  const bool onDisk = std::filesystem::is_regular_file(
+    _userDataPath / (std::string(name) + ".json"), error);
+  return not onDisk || static_cast<bool>(error);
+}
+
+void server::FileDataSource::RebuildUserNameIndex()
+{
+  const std::unique_lock indexLock(_userNameIndexMutex);
+  _userNameKeys.clear();
+  RaiseNameCeiling(_loginNameCeiling, server::util::kMaxLoginNameBytes);
+
+  std::error_code error;
+  if (not std::filesystem::is_directory(_userDataPath, error) || error)
+  {
+    server::util::QuietLogError(
+      "Account name index: '{}' is not a directory, staff lookups by account "
+      "name will find nothing", _userDataPath.string());
+    return;
+  }
+
+  for (const auto& file :
+    std::filesystem::directory_iterator(_userDataPath, error))
+  {
+    if (error)
+      break;
+    // Тот же фильтр, что у прежнего обхода (R58-7): `.json` и только он —
+    // осиротевший `Вася.json.tmp` не имеет права занять имя «Вася».
+    if (not file.is_regular_file() || file.path().extension() != ".json")
+      continue;
+
+    // ★КЛЮЧ БЕРЁТСЯ ИЗ ИМЕНИ ФАЙЛА, а не из JSON: именно по имени файла
+    // `LocalAuthenticationBackend` открывает аккаунт, и именно оно решало исход
+    // прежнего обхода. Читать здесь содержимое значило бы разобрать все
+    // аккаунты на старте ради поля, которое ни на что не влияет.
+    const auto stem = file.path().stem().string();
+    if (stem.empty())
+      continue;
+    RaiseNameCeiling(_loginNameCeiling, stem.size());
+    _userNameKeys.insert(server::util::AsciiLowerKey(stem));
+  }
+
+  server::util::QuietLogInfo(
+    "Account name index: {} account names indexed", _userNameKeys.size());
+}
+
+void server::FileDataSource::IndexUserName(const std::string& name)
+{
+  if (name.empty())
+    return;
+  RaiseNameCeiling(_loginNameCeiling, name.size());
+  const std::unique_lock indexLock(_userNameIndexMutex);
+  _userNameKeys.insert(server::util::AsciiLowerKey(name));
 }
 
 void server::FileDataSource::CreateInfraction(data::Infraction& infraction)
@@ -1161,25 +1306,34 @@ void server::FileDataSource::RebuildCharacterNameIndex()
     { ++skipped; continue; }
 
     auto key = server::util::AsciiLowerKey(existingName);
-    const auto [position, inserted] =
-      _characterNameToUid.try_emplace(key, existingUid);
-    if (not inserted)
+
+    // ★ОДИН uid ЖИВЁТ РОВНО В ОДНОМ СПИСКЕ. Два файла вправе объявить один и тот
+    // же `uid` в JSON (имя файла и поле внутри независимы), и без этой ветки
+    // второй файл оставил бы первый uid болтаться в чужом списке навсегда.
+    const auto alreadyIndexed = _characterUidToName.find(existingUid);
+    if (alreadyIndexed != _characterUidToName.end())
     {
-      // ★СТОЛКНОВЕНИЕ РЕШАЕТСЯ ДЕТЕРМИНИРОВАННО, И ЭТО УЛУЧШЕНИЕ. Прежний обход
-      // возвращал того, кто раньше попался `directory_iterator`, то есть порядок
-      // был не определён стандартом. Оставляем МЕНЬШИЙ uid — старшую запись — и
-      // говорим об этом вслух.
+      if (alreadyIndexed->second == key)
+        continue;
+      DetachNameKey(_characterNameToUid, alreadyIndexed->second, existingUid);
+    }
+
+    // ★ВСЕ СТОЛКНУВШИЕСЯ uid ОСТАЮТСЯ В ИНДЕКСЕ, разрешает имя МЕНЬШИЙ. Прежний
+    // обход возвращал того, кто раньше попался `directory_iterator`, — порядок
+    // не был определён стандартом; прежняя редакция индекса выбирала меньший, но
+    // ПРОИГРАВШИХ ВЫБРАСЫВАЛА, и снятие победителя (переименование, удаление)
+    // делало имя неразрешимым до перезапуска. Найдено ревью (итерация 1).
+    const std::size_t collisions =
+      AttachNameKey(_characterNameToUid, key, existingUid);
+    RaiseNameCeiling(_characterNameCeiling, existingName.size());
+    if (collisions > 1)
+    {
       ++duplicates;
-      const data::Uid kept = std::min(position->second, existingUid);
-      const data::Uid shadowed = std::max(position->second, existingUid);
+      const auto& bucket = _characterNameToUid.find(key)->second;
       server::util::QuietLogWarn(
-        "Duplicate character name '{}' in the data directory: uid {} kept, "
-        "uid {} shadowed", existingName, kept, shadowed);
-      position->second = kept;
-      if (shadowed != kept)
-        _characterUidToName.erase(shadowed);
-      _characterUidToName[kept] = std::move(key);
-      continue;
+        "Duplicate character name '{}' in the data directory: uid {} resolves "
+        "the name, {} further uid(s) kept shadowed",
+        existingName, bucket.front(), bucket.size() - 1);
     }
     _characterUidToName[existingUid] = std::move(key);
   }
@@ -1204,19 +1358,19 @@ void server::FileDataSource::IndexCharacterName(
   }
 
   auto key = server::util::AsciiLowerKey(name);
+  RaiseNameCeiling(_characterNameCeiling, name.size());
   const std::unique_lock indexLock(_characterNameIndexMutex);
   const auto previous = _characterUidToName.find(uid);
   if (previous != _characterUidToName.end())
   {
     if (previous->second == key)
       return;                                   // имя не менялось
-    // ★СТАРОЕ ИМЯ СНИМАЕТСЯ ТОЛЬКО ЕСЛИ ОНО ВЕДЁТ НА НАС. Если его перехватил
-    // кто-то другой (столкновение регистров), стирать чужую запись нельзя.
-    const auto stale = _characterNameToUid.find(previous->second);
-    if (stale != _characterNameToUid.end() && stale->second == uid)
-      _characterNameToUid.erase(stale);
+    // ★СНИМАЕТСЯ РОВНО НАШ uid, а список старого имени остаётся жить. Если под
+    // тем же именем стоял ещё кто-то (столкновение регистров), он МОЛЧА
+    // становится тем, кто это имя разрешает, — вместо того чтобы имя исчезло.
+    DetachNameKey(_characterNameToUid, previous->second, uid);
   }
-  _characterNameToUid[key] = uid;
+  AttachNameKey(_characterNameToUid, key, uid);
   _characterUidToName[uid] = std::move(key);
 }
 
@@ -1226,9 +1380,10 @@ void server::FileDataSource::ForgetCharacterName(const data::Uid uid)
   const auto previous = _characterUidToName.find(uid);
   if (previous == _characterUidToName.end())
     return;
-  const auto stale = _characterNameToUid.find(previous->second);
-  if (stale != _characterNameToUid.end() && stale->second == uid)
-    _characterNameToUid.erase(stale);
+  // ★УДАЛЕНИЕ ПОБЕДИТЕЛЯ ПОДНИМАЕТ СЛЕДУЮЩЕГО, а не гасит имя: список хранит
+  // всех, кто это имя носит, и `DetachNameKey` убирает ключ, только когда после
+  // снятия не осталось никого.
+  DetachNameKey(_characterNameToUid, previous->second, uid);
   _characterUidToName.erase(previous);
 }
 
@@ -1238,7 +1393,15 @@ server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::
   // отдаёт до ~8190 байт (Stream.cpp при потолке CommandServer.cpp
   // `MaxCommandDataSize`), а хранимое имя не длиннее 36 байт UTF-8 (вывод — в
   // NameGuard.hpp).
-  if (not server::util::IsStorableNameShaped(name))
+  //
+  // ★ПОТОЛОК БЕРЁТСЯ ИЗ ИНДЕКСА, А НЕ ИЗ КОНСТАНТЫ (правка ревью, итерация 1).
+  // Индекс принимает ЛЮБОЕ имя, лежащее на диске; константа 64 отбивала запрос
+  // ДО индекса. Персонаж, сохранённый до появления `IsNameValid` с именем в 65
+  // байт, был бы проиндексирован и при этом вечно неадресуем — притом что
+  // прежний точный поиск его находил. Потолок = максимум(64, самое длинное
+  // проиндексированное имя): граница остаётся конечной и не режет живых.
+  if (not server::util::IsStorableNameShaped(
+    name, _characterNameCeiling.load(std::memory_order::relaxed)))
   {
     _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
     return data::InvalidUid;
@@ -1252,7 +1415,11 @@ server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::
   const auto key = server::util::AsciiLowerKey(name);
   const std::shared_lock indexLock(_characterNameIndexMutex);
   const auto found = _characterNameToUid.find(key);
-  return found == _characterNameToUid.end() ? data::InvalidUid : found->second;
+  if (found == _characterNameToUid.end() || found->second.empty())
+    return data::InvalidUid;
+  // Список отсортирован по возрастанию — имя разрешает МЕНЬШИЙ uid, то есть
+  // старшая запись, и это правило одно и то же на старте и в рантайме.
+  return found->second.front();
 }
 
 bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)

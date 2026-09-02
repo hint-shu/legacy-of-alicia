@@ -72,6 +72,31 @@ void TestStorableNameShaped()
   assert(not IsStorableNameShaped(std::string_view("a\x01" "b", 3)));
 }
 
+void TestCeilingComesFromWhatIsStored()
+{
+  // ★ГЕЙТ, ОТКАЗЫВАЮЩИЙ ЖИВОМУ ИМЕНИ, ХУЖЕ ОТСУТСТВУЮЩЕГО (правка ревью,
+  // итерация 1). Индекс принимает любое имя, лежащее на диске; константа 64
+  // отбивала запрос ДО индекса, и персонаж, сохранённый до появления
+  // `IsNameValid` с 65-байтовым ASCII-именем, оказывался проиндексирован и при
+  // этом вечно неадресуем. Потолок обязан приходить параметром.
+  const std::string legacy(65, 'a');
+  assert(not IsStorableNameShaped(legacy));                 // потолок по умолчанию
+  assert(not IsStorableNameShaped(legacy, kMaxStoredNameBytes));
+  assert(IsStorableNameShaped(legacy, 65));                 // потолок поднят индексом
+  // Поднятый потолок остаётся КОНЕЧНЫМ: 8190 байт с провода отбиваются и при нём.
+  assert(not IsStorableNameShaped(std::string(8000, 'a'), 65));
+  // Структурные отказы поднятие потолка не отменяет.
+  assert(not IsStorableNameShaped(std::string(60, 'a') + "/x", 65));
+
+  const std::string legacyLogin(49, 'b');
+  assert(not IsLoginNameSafe(legacyLogin));
+  assert(not IsLoginNameSafe(legacyLogin, kMaxLoginNameBytes));
+  assert(IsLoginNameSafe(legacyLogin, 49));
+  assert(not IsLoginNameSafe(std::string(8000, 'b'), 49));
+  // Класс символов поднятие потолка не расширяет.
+  assert(not IsLoginNameSafe(std::string(40, 'b') + "/x", 49));
+}
+
 void TestCaseFolding()
 {
   assert(AsciiToLower('A') == 'a');
@@ -146,6 +171,7 @@ int main()
 {
   TestLoginNameSafe();
   TestStorableNameShaped();
+  TestCeilingComesFromWhatIsStored();
   TestCaseFolding();
   TestGateCannotRefuseALegalName();
   TestBudget();

@@ -33,17 +33,45 @@
 
   #include <sys/stat.h>
   #include <sys/types.h>
+  #include <unistd.h>
 
 namespace
 {
 
 using server::util::FileSensitivity;
 
+//! Снимает замки с остатков прошлой песочницы.
+//!
+//! ★НУЖНО ПОТОМУ, ЧТО ТЕСТ САМ СТАВИТ КАТАЛОГ В 0000 (проверка `EACCES` у
+//! `EnsureDirectoryMode`). Упавший на `assert` прогон обрывается ДО снятия
+//! замка, и следующий запуск не смог бы даже убрать за собой: тест стал бы
+//! красным навсегда и по причине, к проверяемому коду отношения не имеющей.
+//! Ложно-красный не безопаснее ложно-зелёного — цена у него та же.
+void UnlockTree(const std::filesystem::path& root)
+{
+  std::error_code error;
+  if (not std::filesystem::exists(root, error) || error)
+    return;
+  ::chmod(root.c_str(), 0700);
+
+  std::filesystem::recursive_directory_iterator entry(
+    root, std::filesystem::directory_options::skip_permission_denied, error);
+  const std::filesystem::recursive_directory_iterator end;
+  for (; not error && entry != end; entry.increment(error))
+  {
+    std::error_code kind;
+    // Каталог правится ДО спуска в него, иначе обход в него не войдёт.
+    if (entry->is_directory(kind) && not kind)
+      ::chmod(entry->path().c_str(), 0700);
+  }
+}
+
 //! Каталог-песочница одного прогона.
 std::filesystem::path MakeSandbox()
 {
   const auto sandbox = std::filesystem::temp_directory_path()
     / std::filesystem::path("alicia-atomicfile-test");
+  UnlockTree(sandbox);
   std::error_code ignored;
   std::filesystem::remove_all(sandbox, ignored);
   std::filesystem::create_directories(sandbox);
@@ -180,6 +208,80 @@ void TestEnsureDirectoryMode(const std::filesystem::path& sandbox)
 
   // Отсутствующий каталог — не ошибка прав и не бросок.
   assert(server::util::EnsureDirectoryMode(sandbox / "no-such-directory", 0700));
+
+  // ★ОТКАЗ `stat`, НЕ РАВНЫЙ «ЕГО НЕТ», ОБЯЗАН ЧИТАТЬСЯ КАК ПРОВАЛ (правка
+  // ревью, итерация 1). Прежняя редакция отвечала `true` на любой отказ, и
+  // режим каталога с аккаунтами оставался неизвестным БЕЗ единой строки в
+  // логе. Улику ставим руками: родительский каталог без бита `x` делает
+  // `stat` по вложенному пути `EACCES`, а не `ENOENT`.
+  const auto closed = sandbox / "closed";
+  const auto hidden = closed / "users";
+  std::filesystem::create_directories(hidden);
+  const int shut = ::chmod(closed.c_str(), 0000);
+  assert(shut == 0);
+  if (::geteuid() != 0)   // под root биты прав не действуют — проверка была бы слепой
+  {
+    assert(not server::util::EnsureDirectoryMode(hidden, 0700));
+  }
+  const int reopened = ::chmod(closed.c_str(), 0700);
+  assert(reopened == 0);
+}
+
+void TestHardenSecretFilesInDirectory(const std::filesystem::path& sandbox)
+{
+  // ★АККАУНТ, В КОТОРЫЙ СЕРВЕР НИКОГДА НЕ НАПИШЕТ, ТОЖЕ ОБЯЗАН СУЗИТЬСЯ
+  // (правка ревью, итерация 1): `FileSensitivity` чинит режим на ПЕРВОЙ записи,
+  // а спящий аккаунт первой записи не дождётся.
+  const auto directory = sandbox / "dormant";
+  std::filesystem::create_directories(directory);
+
+  const auto worldReadable = directory / "dormant-0644.json";
+  const auto groupWritable = directory / "dormant-0664.json";
+  const auto alreadyPrivate = directory / "dormant-0600.json";
+  const auto exotic = directory / "dormant-0640.json";
+  SeedFile(worldReadable, 0644);
+  SeedFile(groupWritable, 0664);
+  SeedFile(alreadyPrivate, 0600);
+  SeedFile(exotic, 0640);
+  const auto contentsBefore = ReadBack(worldReadable);
+
+  const auto result = server::util::HardenSecretFilesInDirectory(directory);
+  assert(result.examined == 4);
+  assert(result.narrowed == 3);       // 0600 уже был узким и не считается
+  assert(result.failed == 0);
+
+  assert(ModeOf(worldReadable) == 0600);
+  assert(ModeOf(groupWritable) == 0600);
+  assert(ModeOf(alreadyPrivate) == 0600);
+  assert(ModeOf(exotic) == 0600);
+  // ★СОДЕРЖИМОЕ НЕ ТРОНУТО: правка меняет инод, а не запись.
+  assert(ReadBack(worldReadable) == contentsBefore);
+
+  // Повторный проход не находит работы — то есть проверка умеет отличать
+  // «сузили» от «и так было узко», а не отчитывается о работе всегда.
+  const auto second = server::util::HardenSecretFilesInDirectory(directory);
+  assert(second.examined == 4);
+  assert(second.narrowed == 0);
+  assert(second.failed == 0);
+
+  // ★ССЫЛКА НЕ АККАУНТ, И ИДТИ ПО НЕЙ НЕЛЬЗЯ. Цель ссылки обязана остаться со
+  // своим режимом: иначе «сужение прав аккаунтов» правило бы чужие файлы.
+  const auto outsider = sandbox / "outsider-0644.json";
+  SeedFile(outsider, 0644);
+  std::error_code linkError;
+  std::filesystem::create_symlink(outsider, directory / "link.json", linkError);
+  assert(not linkError);
+  const auto third = server::util::HardenSecretFilesInDirectory(directory);
+  assert(third.examined == 4);        // ссылка не осмотрена и не провалена
+  assert(third.failed == 0);
+  assert(ModeOf(outsider) == 0644);
+
+  // Каталога нет — не ошибка и не бросок.
+  const auto absent =
+    server::util::HardenSecretFilesInDirectory(sandbox / "no-such-dir");
+  assert(absent.examined == 0);
+  assert(absent.narrowed == 0);
+  assert(absent.failed == 0);
 }
 
 } // namespace
@@ -194,7 +296,9 @@ int main()
   TestOwnerFloor(sandbox);
   TestHostileUmask(sandbox);
   TestEnsureDirectoryMode(sandbox);
+  TestHardenSecretFilesInDirectory(sandbox);
 
+  UnlockTree(sandbox);
   std::error_code ignored;
   std::filesystem::remove_all(sandbox, ignored);
   std::puts("TestAtomicFile: ok");
