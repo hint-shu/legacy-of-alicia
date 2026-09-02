@@ -35,7 +35,6 @@
 #include <format>
 
 #include <spdlog/spdlog.h>
-#include <fstream>
 
 #include <nlohmann/json.hpp>
 
@@ -114,6 +113,33 @@ void RaiseNameCeiling(std::atomic_size_t& ceiling, const std::size_t candidate)
       current, candidate, std::memory_order::relaxed))
   {
   }
+}
+
+//! ЕДИНСТВЕННОЕ ЧТЕНИЕ ФАЙЛА ДАННЫХ В ЭТОМ КЛАССЕ (LOA-fix R73-6, ревью 4).
+//!
+//! ★ЗАЧЕМ ОДНА ФУНКЦИЯ ВМЕСТО ДЕВЯТНАДЦАТИ ОДИНАКОВЫХ ТРОЙЧАТОК. Каждое чтение
+//! было написано как `std::ifstream file(path)` + проверка `is_open` + разбор.
+//! `ifstream` ХОДИТ ПО СИМВОЛИЧЕСКОЙ ССЫЛКЕ и открывает именованные каналы,
+//! поэтому свойство «под `data/` читается только управляемая запись» было
+//! ложным в девятнадцати местах сразу, а двадцатое чтение, написанное через
+//! полгода, унаследовало бы дефект по образцу соседей. Теперь оно одно, и
+//! свойство держится построением, а не перечнем починенных мест.
+//!
+//! ★ТЕКСТ БРОСКА СОХРАНЁН ДОСЛОВНО. `"{} '{}' not accessible"` — маркер лесенки
+//! прошлых раундов; переписать его значило бы объявить контроль сдвинувшимся
+//! там, где поведение не менялось.
+nlohmann::json ReadManagedJson(
+  const std::filesystem::path& path,
+  const std::string_view what,
+  const server::util::FileSensitivity sensitivity)
+{
+  const auto read = server::util::ReadManagedFile(path, sensitivity);
+  if (read.status != server::util::ManagedReadStatus::Ok)
+  {
+    throw std::runtime_error(
+      std::format("{} '{}' not accessible", what, path.string()));
+  }
+  return nlohmann::json::parse(read.content);
 }
 
 std::filesystem::path ProduceDataFilePath(
@@ -196,7 +222,19 @@ UidFloorScan HighestUidInDirectory(const std::filesystem::path& root)
   const auto listing = server::util::ListRegularFiles(root);
   scan.incomplete = listing.incomplete;
 
-  for (const auto& entryPath : listing.files)
+  // ★ОТВЕРГНУТАЯ ССЫЛКА ВСЁ РАВНО ЗАНИМАЕТ ИМЯ (правка ревью, итерация 4). Пол
+  // счётчика — это утверждение об ИМЕНАХ в каталоге, а не о инодах: если
+  // `characters/100.json` стал ссылкой, читать её мы отказываемся, но выдать
+  // uid 100 следующему персонажу нельзя тем более — запись легла бы на занятое
+  // имя. Прежняя редакция ссылку молча пропускала, то есть пол опускался ровно
+  // на том имени, из-за которого он и заведён.
+  std::vector<std::filesystem::path> occupied = listing.files;
+  occupied.insert(
+    occupied.end(),
+    listing.refusedSymlinks.begin(),
+    listing.refusedSymlinks.end());
+
+  for (const auto& entryPath : occupied)
   {
     if (entryPath.extension() != ".json")
       continue;
@@ -247,6 +285,18 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
     "the character name ceiling floor has drifted from the name guard's bound");
   static_assert(server::util::kMaxLoginNameBytes == kLoginNameCeilingFloor,
     "the login name ceiling floor has drifted from the name guard's bound");
+
+  // ★ПРИЁМНИК ПРЕДУПРЕЖДЕНИЙ ФАЙЛОВОГО ПОМОЩНИКА СТАВИТСЯ ЗДЕСЬ (LOA-fix R73-5,
+  // ревью 4). `AtomicFile.hpp` сознательно не тянет spdlog (см. его заголовок),
+  // поэтому редкие жалобы — отвергнутая ссылка, не усыновлённый владелец,
+  // сужение поздно пришедшего файла — выходят через указатель на функцию.
+  // Установка ДО первого обращения к диску: иначе первое же сообщение ушло бы в
+  // тишину, а «сузили молча» неотличимо от «не сузили».
+  server::util::SetFileWarningSink(
+    [](const std::string_view message)
+    {
+      server::util::QuietLogWarn("{}", message);
+    });
 
   _dataPath = path;
   _metaFilePath = _dataPath;
@@ -299,6 +349,15 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   // который сервер больше не пишет (игрок не заходит), первой записи не
   // дождётся никогда и остался бы 0644 бессрочно. Один проход на старте, без
   // единой перезаписи содержимого.
+  //
+  // ★ЭТОТ ПРОХОД НЕ ЛИШНИЙ ПРИ ТОМ, ЧТО ПЕРЕСТРОЙКА ИНДЕКСА НИЖЕ СУЖАЕТ ТЕ ЖЕ
+  // ФАЙЛЫ (пояснение к правке ревью, итерация 4). Сужают оба, но ВЕРДИКТ выносит
+  // только этот: перестройка живёт и на пути запроса, поэтому она обязана
+  // ЖУРНАЛИРОВАТЬ отказ, а не бросать — иначе staff-команда рвалась бы вместо
+  // ответа. Единственное место, где «хеш пароля не удалось защитить» может
+  // КОГО-ТО ОСТАНОВИТЬ, — старт; здесь оно и стоит. Убрать этот проход значило
+  // бы оставить сужение без единого читателя вердикта, то есть вернуть
+  // инвариант, который умеет не выполниться и никого не остановить.
   const auto hardening =
     server::util::HardenSecretFilesInDirectory(_userDataPath);
   if (hardening.narrowed > 0)
@@ -307,6 +366,24 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
       "Account files in '{}': {} of {} examined were group/other-readable and "
       "were narrowed to owner-only",
       _userDataPath.string(), hardening.narrowed, hardening.examined);
+  }
+
+  // ★ССЫЛКА В КАТАЛОГЕ АККАУНТОВ НАЗЫВАЕТСЯ ВСЛУХ, А НЕ ПРОПУСКАЕТСЯ (правка
+  // ревью, итерация 4). Прежде проход рапортовал полный успех, ни разу не
+  // тронув `Alice.json`, ставший ссылкой на файл 0644, — и это было ХУЖЕ
+  // отсутствия прохода: отчёт утверждал ровно то, чего не произошло.
+  //
+  // ★ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ, и это не смягчение политики. Ссылка теперь
+  // отвергается ВСЕМИ потребителями: вход по ней не аутентифицирует
+  // (`ReadManagedFile` даёт `ELOOP`), индекс её не заводит, запись сквозь неё
+  // бросает. То есть аккаунт УЖЕ недоступен — падать сверх этого значило бы
+  // отнять сервер у всех остальных из-за мусора, положенного рядом.
+  if (hardening.refusedLinks > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account files in '{}': {} entry(ies) are symbolic links and were refused; "
+      "they are neither hardened, indexed nor authenticated from",
+      _userDataPath.string(), hardening.refusedLinks);
   }
 
   // ★ОТКАЗ СУЖЕНИЯ ОСТАНАВЛИВАЕТ СТАРТ (правка ревью, итерация 2). Прежняя
@@ -346,8 +423,12 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
 
   nlohmann::json meta = nlohmann::json::object();
 
-  std::ifstream metaFile(metaFilePath);
-  if (not metaFile.is_open())
+  // ★ЧЕРЕЗ ТОТ ЖЕ ЕДИНСТВЕННЫЙ ВХОД В ЧТЕНИЕ (правка ревью, итерация 4): мета
+  // лежит под `data/` и подчиняется той же политике, что остальные записи —
+  // ссылка на него не читается.
+  const auto metaRead = server::util::ReadManagedFile(
+    metaFilePath, server::util::FileSensitivity::Public);
+  if (metaRead.status != server::util::ManagedReadStatus::Ok)
   {
     // ★РАНЬШЕ ЗДЕСЬ БЫЛ ТИХИЙ `return` — без единой строки в логе. Он и делал
     // потерю мета-файла беззвучной катастрофой: все счётчики оставались нулями,
@@ -360,7 +441,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   {
     try
     {
-      meta = nlohmann::json::parse(metaFile);
+      meta = nlohmann::json::parse(metaRead.content);
     }
     catch (const std::exception& x)
     {
@@ -518,14 +599,8 @@ void server::FileDataSource::RetrieveUser(const std::string_view& name, data::Us
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _userDataPath, user.name());
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("User file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "User file", server::util::FileSensitivity::Secret);
   user.name = json.value("name", std::string{});
   user.token = json.value("token", std::string{});
   user.characterUid = json.value("characterUid", data::Uid{});
@@ -614,10 +689,10 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   // и есть имя в нижнем ASCII-регистре, поэтому смысл ответа не изменился.
   const auto key = server::util::AsciiLowerKey(name);
 
+  bool present = false;
   {
     const std::shared_lock indexLock(_userNameIndexMutex);
-    if (_userNameKeys.contains(key))
-      return false;
+    present = _userNameKeys.contains(key);
   }
 
   // ★ПРОМАХ ПЕРЕСПРАШИВАЕТ ИНДЕКС, А НЕ ФАЙЛОВУЮ СИСТЕМУ ПО ТОЧНОМУ ИМЕНИ
@@ -633,14 +708,24 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   // ★И ЭТО НЕ ВОЗВРАТ ОБХОДА НА ПАКЕТ. Перестройка ограничена и по поводу, и по
   // частоте: не чаще одного раза в `kUserIndexReconcileGap` (см. ниже), сколько
   // бы промахов ни пришло и сколько бы потоков ни промахнулось одновременно.
+  //
+  // ★СВЕРКА ИДЁТ И ПРИ ПОПАДАНИИ, А НЕ ТОЛЬКО ПРИ ПРОМАХЕ (правка ревью,
+  // итерация 4). Прежняя редакция возвращала «имя занято» прямо из индекса и
+  // до диска не доходила ВООБЩЕ — то есть УСТАРЕВШАЯ ПОЛОЖИТЕЛЬНАЯ запись жила
+  // вечно: `Alice.json` переименовали рядом с работающим сервером, а
+  // `//infraction list Alice` продолжал отвечать «запись временно недоступна»
+  // до перезапуска, потому что путь к сверке проходил только через промах.
+  // Ограничение частоты — потолок в `kUserIndexReconcileGap` и пол в
+  // `kUserIndexStaleAfter` — общее для обоих исходов, поэтому единый путь
+  // ничего не удорожает: он ровно тот же обход, только теперь он достижим и
+  // тогда, когда индекс ошибается в другую сторону.
   if (RefreshUserNameIndexIfDirectoryChanged())
   {
     const std::shared_lock indexLock(_userNameIndexMutex);
-    if (_userNameKeys.contains(key))
-      return false;
+    present = _userNameKeys.contains(key);
   }
 
-  return true;
+  return not present;
 }
 
 bool server::FileDataSource::NeedsUserIndexReconcile(
@@ -726,6 +811,48 @@ void server::FileDataSource::RebuildUserNameIndexLocked()
   const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
 
   const auto listing = server::util::ListRegularFiles(_userDataPath);
+
+  // ★ПОЗДНО ПРИШЕДШИЙ ФАЙЛ СУЖАЕТСЯ ДО ТОГО, КАК ПОПАДЁТ В ИНДЕКС (LOA-fix
+  // R73-6, правка ревью, итерация 4).
+  //
+  // Стартовый проход `HardenSecretFilesInDirectory` — это СНИМОК. Штатный путь
+  // завести аккаунт рядом с работающим сервером (помощник переименовывает
+  // готовый `Alice.json` в `data/users`) кладёт файл с обычным umask, то есть
+  // 0644, и до перезапуска ИЛИ до следующего сохранения этого аккаунта хеш
+  // пароля лежал читаемым для group/other — а сервер тем временем спокойно им
+  // пользовался. Перестройка индекса и есть тот момент, когда файл впервые
+  // становится ВИДЕН серверу; сузить его позже, чем внести в индекс, значило бы
+  // сделать запись используемой раньше, чем защищённой.
+  //
+  // ★ТОТ ЖЕ СПИСОК, А НЕ ВТОРОЙ ОБХОД: между двумя независимыми обходами лежало
+  // бы окно, в котором сужен один набор файлов, а проиндексирован другой.
+  const auto hardening = server::util::HardenSecretFiles(listing);
+  if (hardening.narrowed > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account name index: {} of {} account files in '{}' were group/other-"
+      "readable and were narrowed to owner-only before being indexed",
+      hardening.narrowed, hardening.examined, _userDataPath.string());
+  }
+  if (hardening.failed > 0)
+  {
+    // ★ЖУРНАЛ, А НЕ БРОСОК — по той же причине, что и у неполноты ниже: эта
+    // перестройка живёт на пути запроса, и бросок отсюда рвал бы staff-команду.
+    // На СТАРТЕ тот же отказ фатален (`Initialize`), поэтому «не сузили» не
+    // остаётся без остановки там, где остановка возможна.
+    server::util::QuietLogError(
+      "Account name index: {} account file(s) in '{}' could not be narrowed to "
+      "owner-only; their password hashes stay readable beyond their owner",
+      hardening.failed, _userDataPath.string());
+  }
+  if (hardening.refusedLinks > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they are not indexed and cannot be authenticated from",
+      hardening.refusedLinks, _userDataPath.string());
+  }
+
   if (listing.incomplete)
   {
     // ★ЗДЕСЬ ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ — И ЭТО НЕ НЕПОСЛЕДОВАТЕЛЬНОСТЬ
@@ -816,14 +943,8 @@ void server::FileDataSource::RetrieveInfraction(data::Uid uid, data::Infraction&
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
    _infractionDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Infraction file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Infraction file", server::util::FileSensitivity::Public);
   infraction.uid = json.value("uid", data::Uid{});
   infraction.description = json.value("description", std::string{});
   infraction.punishment = json.value("punishment", data::Infraction::Punishment{});
@@ -869,14 +990,8 @@ void server::FileDataSource::RetrieveCharacter(data::Uid uid, data::Character& c
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Character file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Character file", server::util::FileSensitivity::Public);
 
   character.uid = json.value("uid", data::Uid{});
   character.name = json.value("name", std::string{});
@@ -1517,21 +1632,35 @@ void server::FileDataSource::RebuildCharacterNameIndex()
         _characterDataPath.string()));
   }
 
+  // ★ОТВЕРГНУТАЯ ССЫЛКА НАЗЫВАЕТСЯ ВСЛУХ И ЗДЕСЬ (правка ревью, итерация 4).
+  // Она не индексируется — читать её `ReadManagedFile` отказывается, — но её
+  // ИМЯ уже учтено полом счётчика uid (см. `HighestUidInDirectory`), поэтому
+  // uid под ней не переиспользуется. Молчание же означало бы отчёт о полном
+  // индексе над каталогом, часть которого мы отказались смотреть.
+  if (not listing.refusedSymlinks.empty())
+  {
+    server::util::QuietLogWarn(
+      "Character name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they are not indexed and their uids stay reserved",
+      listing.refusedSymlinks.size(), _characterDataPath.string());
+  }
+
   for (const auto& filePath : listing.files)
   {
     // Тот же фильтр, что у прежнего обхода (R58-8): `.json` и только он.
     if (filePath.extension() != ".json")
       continue;
 
-    std::ifstream dataFile(filePath);
-    if (not dataFile.is_open())
+    const auto read = server::util::ReadManagedFile(
+      filePath, server::util::FileSensitivity::Public);
+    if (read.status != server::util::ManagedReadStatus::Ok)
     { ++skipped; continue; }
 
     std::string existingName;
     data::Uid existingUid = data::InvalidUid;
     try
     {
-      const auto json = nlohmann::json::parse(dataFile);
+      const auto json = nlohmann::json::parse(read.content);
       existingName = json.value("name", std::string{});
       existingUid = json.value("uid", data::InvalidUid);
     }
@@ -1684,14 +1813,8 @@ void server::FileDataSource::RetrieveHorse(data::Uid uid, data::Horse& horse)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _horseDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Horse file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Horse file", server::util::FileSensitivity::Public);
   horse.uid = json.value("uid", data::Uid{});
   horse.tid = json.value("tid", data::Tid{});
   horse.name = json.value("name", std::string{});
@@ -1917,14 +2040,8 @@ void server::FileDataSource::RetrieveItem(data::Uid uid, data::Item& item)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _itemDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Item file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Item file", server::util::FileSensitivity::Public);
 
   item.uid = json.value("uid", data::Uid{});
   item.tid = json.value("tid", data::Tid{});
@@ -1970,14 +2087,8 @@ void server::FileDataSource::RetrieveStorageItem(data::Uid uid, data::StorageIte
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _storageItemPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Storage item file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Storage item file", server::util::FileSensitivity::Public);
 
   storageItem.uid = json.value("uid", data::Uid{});
   storageItem.sender = json.value("sender", std::string{});
@@ -2058,14 +2169,8 @@ void server::FileDataSource::RetrieveEgg(data::Uid uid, data::Egg& egg)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _eggDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Egg file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Egg file", server::util::FileSensitivity::Public);
 
   egg.uid = json.value("uid", data::Uid{});
   egg.itemUid = json.value("itemUid", data::Uid{});
@@ -2114,14 +2219,8 @@ void server::FileDataSource::RetrievePet(data::Uid uid, data::Pet& pet)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _petDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Pet file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Pet file", server::util::FileSensitivity::Public);
 
   pet.uid = json.value("uid", data::Uid{});
   pet.itemUid = json.value("itemUid", data::Uid{});
@@ -2167,14 +2266,8 @@ void server::FileDataSource::RetrieveHousing(data::Uid uid, data::Housing& housi
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _housingDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Housing file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Housing file", server::util::FileSensitivity::Public);
   housing.uid = json.value("uid", data::Uid{});
   housing.housingId = json.value("housingId", uint32_t{});
   housing.expiresAt = data::Clock::time_point(
@@ -2217,14 +2310,8 @@ void server::FileDataSource::RetrieveGuild(data::Uid uid, data::Guild& guild)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _guildDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Guild file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Guild file", server::util::FileSensitivity::Public);
 
   guild.uid = json.value("uid", data::Uid{});
   guild.name = json.value("name", std::string{});
@@ -2290,13 +2377,14 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
     if (not file.is_regular_file() || file.path().extension() != ".json")
       continue;
 
-    std::ifstream dataFile(file.path());
-    if (not dataFile.is_open())
+    const auto read = server::util::ReadManagedFile(
+      file.path(), server::util::FileSensitivity::Public);
+    if (read.status != server::util::ManagedReadStatus::Ok)
       continue;
 
     try
     {
-      const auto json = nlohmann::json::parse(dataFile);
+      const auto json = nlohmann::json::parse(read.content);
       const auto existingGuildName = json.value("name", std::string{});
 
       if (equalsIgnoreCase(existingGuildName, name))
@@ -2323,14 +2411,8 @@ void server::FileDataSource::RetrieveSettings(data::Uid uid, data::Settings& set
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _settingsDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Settings file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Settings file", server::util::FileSensitivity::Public);
   settings.uid = json.value("uid", data::Uid{});
 
   settings.age = json.value("age", uint32_t{});
@@ -2455,14 +2537,8 @@ void server::FileDataSource::RetrieveDailyQuestGroup(data::Uid uid, data::DailyQ
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _dailyQuestGroupDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Daily quest group file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Daily quest group file", server::util::FileSensitivity::Public);
   group.uid          = json.value("uid", data::Uid{});
   group.rewardId     = json.value("rewardId", uint8_t{});
   group.rewardType   = json.value("rewardType", uint8_t{});
@@ -2557,14 +2633,8 @@ void server::FileDataSource::RetrieveMail(data::Uid uid, data::Mail& mail)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _mailDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Mail file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Mail file", server::util::FileSensitivity::Public);
   mail.uid = json.value("uid", data::Uid{});
   mail.from = json.value("from", data::Uid{});
   mail.to = json.value("to", data::Uid{});
@@ -2625,14 +2695,8 @@ void server::FileDataSource::RetrieveQuest(data::Uid uid, data::Quest& quest)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _questDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Quest file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Quest file", server::util::FileSensitivity::Public);
   quest.uid         = json.value("uid", data::Uid{});
   quest.questId     = json.value("questId", uint32_t{});
   quest.isCompleted = json.value("isCompleted", data::Quest::Status{});
@@ -2673,14 +2737,8 @@ void server::FileDataSource::RetrieveStallion(data::Uid uid, data::Stallion& sta
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _stallionDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Stallion file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Stallion file", server::util::FileSensitivity::Public);
   stallion.uid() = json.value("uid", data::InvalidUid);
   stallion.horseUid() = json.value("horseUid", data::InvalidUid);
   stallion.ownerUid() = json.value("ownerUid", data::InvalidUid);
@@ -2760,14 +2818,8 @@ void server::FileDataSource::RetrieveReward(data::Uid claimUid, data::Reward& re
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _rewardDataPath, std::format("{}", claimUid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Reward file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Reward file", server::util::FileSensitivity::Public);
   reward.claimUid() = json.value("claimUid", data::InvalidUid);
   reward.characterUid() = json.value("characterUid", data::InvalidUid);
   reward.type() = static_cast<data::Reward::Type>(json.value("type", uint32_t{0}));

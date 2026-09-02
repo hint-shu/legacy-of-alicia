@@ -62,8 +62,16 @@ done
 # Возврат: 0 — файл прочитан (дубли, если есть, напечатаны), 2 — прочитать не
 # удалось; вызывающий обязан читать код возврата, иначе проверка снова станет
 # слепой.
+#
+# ★`--binary-files=text` — ЭТО ТРЕТЬЯ СЛЕПОТА ТОГО ЖЕ КОНВЕЙЕРА (правка ревью,
+# итерация 4). GNU grep, встретив NUL, печатает «binary file … matches» И
+# ВОЗВРАЩАЕТ 0: строки не выводятся, `uniq -d` находит пусто, счётчик
+# «просканировано» растёт — то есть файл объявлен прочитанным, а прочитан не
+# был. Тот же класс уже ловили в `check_quiet_logging.sh` (фикстура qtree4,
+# R70-prep), и он вернулся сюда, потому что чинили СЛУЧАЙ, а не ПРАВИЛО.
+# Текстовый режим убирает само понятие «двоичный файл» из решения.
 duplicates_in() {
-  DUP_RAW="$(grep -E '^[[:space:]]*#[[:space:]]*include[[:space:]]' "$1" 2>"$GREP_ERR")"
+  DUP_RAW="$(grep -aE '^[[:space:]]*#[[:space:]]*include[[:space:]]' "$1" 2>"$GREP_ERR")"
   DUP_RC=$?
   if [ "$DUP_RC" -ge 2 ] || [ -s "$GREP_ERR" ]; then
     return 2
@@ -90,19 +98,31 @@ readable_file() {
 # Blindness guard #1: the canary must come back dirty.
 # Создание и запись канарейки проверяются по тому же правилу, что и в
 # `no_name_regex_gate.sh`: непроверенный `mktemp` — это класс, а не сайт.
+# ★ПЕРЕМЕННЫЕ ЛОВУШКИ ОБЪЯВЛЕНЫ ДО ПЕРВОЙ ЛОВУШКИ (правка ревью, итерация 4).
+# `UNREADABLE` заводится только в ветке «не root», а ловушка `EXIT` разворачивает
+# её безусловно: под root чистый прогон заканчивался диагностикой «unbound
+# variable» и НЕ УБИРАЛ временные файлы, сохраняя при этом код 0. Уборка,
+# которая не отрабатывает ровно в том прогоне, где всё хорошо, — не уборка.
+UNREADABLE=""
+NO_INCLUDES=""
+SCAN_ERR=""
+CANARY=""
+BINARY_CANARY=""
+
 GREP_ERR="$(mktemp 2>/dev/null)" || GREP_ERR=""
 if [ -z "$GREP_ERR" ] || [ ! -f "$GREP_ERR" ]; then
   echo "ОСТАНОВ: не удалось создать файл для ошибок чтения (mktemp) — проверить нечем."
   exit 2
 fi
-trap 'rm -f "$GREP_ERR"' EXIT
+# Одна ловушка на весь скрипт: все имена объявлены выше, поэтому уборка не
+# зависит от того, до какой ветки прогон успел дойти.
+trap 'rm -f "$CANARY" "$BINARY_CANARY" "$GREP_ERR" "$NO_INCLUDES" "$SCAN_ERR" "$UNREADABLE"' EXIT
 
 CANARY="$(mktemp 2>/dev/null)" || CANARY=""
 if [ -z "$CANARY" ] || [ ! -f "$CANARY" ]; then
   echo "ОСТАНОВ: не удалось создать канареечный файл (mktemp) — проверить нечем."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$GREP_ERR"' EXIT
 if ! {
   echo '#include <string>'
   echo '#include <vector>'
@@ -119,6 +139,30 @@ if [ "$CANARY_RC" -ne 0 ] || [ -z "$CANARY_DUPS" ]; then
   exit 2
 fi
 
+# ★КАНАРЕЙКА С NUL-БАЙТОМ: ДУБЛЬ ОБЯЗАН НАЙТИСЬ И В «ДВОИЧНОМ» ФАЙЛЕ (правка
+# ревью, итерация 4). Без неё `--binary-files=text` осталось бы намерением: ровно
+# так и жила прежняя редакция — исход «grep счёл файл двоичным» не проверялся
+# ничем, потому что в дереве такого файла сегодня нет. Проверка, которая
+# доказывает себя только на удобном входе, доказывает не то свойство.
+BINARY_CANARY="$(mktemp 2>/dev/null)" || BINARY_CANARY=""
+if [ -z "$BINARY_CANARY" ] || [ ! -f "$BINARY_CANARY" ]; then
+  echo "ОСТАНОВ: не удалось создать двоичную канарейку (mktemp) — проверить нечем."
+  exit 2
+fi
+if ! printf '#include <string>\n\000 binary payload\n#include <string>\n' \
+     > "$BINARY_CANARY"; then
+  echo "ОСТАНОВ: не удалось записать двоичную канарейку '$BINARY_CANARY'."
+  exit 2
+fi
+BINARY_DUPS="$(duplicates_in "$BINARY_CANARY")"
+BINARY_RC=$?
+if [ "$BINARY_RC" -ne 0 ] || [ -z "$BINARY_DUPS" ]; then
+  echo "ОСТАНОВ: канарейка с NUL-байтом и заведомым дублем прочиталась как чистая"
+  echo "         (код $BINARY_RC) — grep объявил файл двоичным и вернул 0, то есть"
+  echo "         «просканировано» снова означает «не прочитано». Ноль читать нельзя."
+  exit 2
+fi
+
 # ★И ТРЕТИЙ ИСХОД: файл БЕЗ единой строки `#include` обязан вернуться чистым и с
 # кодом 0. `grep` отвечает на «не нашёл» кодом 1, и если читать любой ненулевой
 # код как беду, гейт станет ложно-КРАСНЫМ на честном файле (в дереве такой есть:
@@ -129,7 +173,6 @@ if [ -z "$NO_INCLUDES" ] || [ ! -f "$NO_INCLUDES" ]; then
   echo "ОСТАНОВ: не удалось создать канарейку без включений (mktemp)."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES"' EXIT
 echo 'int main() { return 0; }' > "$NO_INCLUDES"
 NO_INCLUDES_DUPS="$(duplicates_in "$NO_INCLUDES")"
 NO_INCLUDES_RC=$?
@@ -150,7 +193,6 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "ОСТАНОВ: не удалось создать файл для проверки нечитаемости (mktemp)."
     exit 2
   fi
-  trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES" "$UNREADABLE"' EXIT
   echo '#include <string>' > "$UNREADABLE"
   chmod 000 "$UNREADABLE"
   duplicates_in "$UNREADABLE" >/dev/null
@@ -173,7 +215,6 @@ if [ -z "$SCAN_ERR" ] || [ ! -f "$SCAN_ERR" ]; then
   echo "ОСТАНОВ: не удалось создать файл для ошибок обхода (mktemp)."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES" "$UNREADABLE" "$SCAN_ERR"' EXIT
 
 FILES_RAW="$(cd "$ROOT" && find $SCOPE -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.inl' \) 2>"$SCAN_ERR")"
 FIND_RC=$?

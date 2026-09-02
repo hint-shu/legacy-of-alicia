@@ -18,6 +18,25 @@ WHY THIS EXISTS
     somehow compiles without the parameter — a careless merge that reintroduces a
     default value — is caught here rather than in production.
 
+WHY IT KEYS ON THE IDENTIFIER, NOT ON THE STRING "WriteFileAtomically("
+    Iteration 4 of the review showed the claimed totality was false by SYNTAX, not
+    by coverage: `WriteFileAtomically` followed by a newline before `(` compiles and
+    was not seen at all; `auto writer = &WriteFileAtomically;` was not seen either;
+    and a label spelled `"User " "file"` is one string to the compiler but two to a
+    literal comparison.  A gate that misses the forms an author would actually reach
+    for is a list of shapes, not a property.
+
+    So the unit of analysis is now every OCCURRENCE OF THE IDENTIFIER in the
+    comment-stripped text:
+      * identifier + optional whitespace + '('  -> analysed as a call (4 args, class)
+      * the declaration itself                  -> skipped
+      * anything else (address-of, alias, macro,
+        a name passed as a value)               -> VIOLATION, because the gate cannot
+                                                   see what class such a use passes
+    Comments are stripped first: the header explains itself in prose, and prose is
+    not code.  Adjacent string literals are folded, so the compiler's view of the
+    label and the gate's view are the same view.
+
 HOW IT PROVES IT CAN FAIL
     `--selftest` runs the same analyser over in-memory fixtures: a clean pair, a
     "User file" written as Public, a non-user file written as Secret, and a
@@ -40,10 +59,99 @@ import re
 import sys
 from pathlib import Path
 
-CALL = "WriteFileAtomically("
-SECRET_KIND = '"User file"'
+IDENTIFIER = "WriteFileAtomically"
+SECRET_KIND = "User file"
 # The tree is small; a floor keeps "0 violations" from meaning "I read nothing".
 MIN_CALLS = int(os.environ.get("SECRET_MIN_CALLS", "18"))
+
+
+def strip_comments(text: str) -> str:
+    """Заменяет содержимое комментариев пробелами, сохраняя длину и переводы строк.
+
+    ★ЗАЧЕМ. Заголовок объясняет себя прозой и называет функцию по имени десятки
+    раз. Ключ по ИДЕНТИФИКАТОРУ без этого шага сделал бы каждое такое упоминание
+    нарушением, то есть гейт стал бы ложно-КРАСНЫМ на честном дереве — а
+    ложно-красный так же вреден, как ложно-зелёный: его отключают.
+
+    Строковые и символьные литералы НЕ трогаются: именно из них читается класс
+    файла."""
+    out: list[str] = []
+    index = 0
+    size = len(text)
+    while index < size:
+        symbol = text[index]
+        pair = text[index : index + 2]
+        if pair == "//":
+            end = text.find("\n", index)
+            end = size if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+            continue
+        if pair == "/*":
+            end = text.find("*/", index + 2)
+            end = size if end < 0 else end + 2
+            out.append("".join(
+                character if character == "\n" else " "
+                for character in text[index:end]))
+            index = end
+            continue
+        if symbol in "\"'":
+            quote = symbol
+            out.append(symbol)
+            index += 1
+            while index < size:
+                if text[index] == "\\":
+                    out.append(text[index : index + 2])
+                    index += 2
+                    continue
+                out.append(text[index])
+                if text[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        out.append(symbol)
+        index += 1
+    return "".join(out)
+
+
+def fold_string_literals(argument: str) -> str | None:
+    """Склеивает соседние строковые литералы в один канонический литерал.
+
+    `"User " "file"` — для компилятора ОДНА строка «User file», и биконъюнкция
+    обязана видеть её так же. Возвращает `None`, если аргумент не состоит целиком
+    из строковых литералов (переменная, вызов, макрос) — такой ярлык гейт
+    прочитать не может и обязан это сказать, а не промолчать."""
+    pieces: list[str] = []
+    index = 0
+    size = len(argument)
+    while index < size:
+        symbol = argument[index]
+        if symbol.isspace():
+            index += 1
+            continue
+        if symbol != '"':
+            return None
+        index += 1
+        current: list[str] = []
+        closed = False
+        while index < size:
+            if argument[index] == "\\":
+                current.append(argument[index : index + 2])
+                index += 2
+                continue
+            if argument[index] == '"':
+                index += 1
+                closed = True
+                break
+            current.append(argument[index])
+            index += 1
+        if not closed:
+            return None
+        pieces.append("".join(current))
+    if not pieces:
+        return None
+    return "".join(pieces)
 
 
 def split_arguments(text: str, start: int) -> tuple[list[str], int] | None:
@@ -98,18 +206,39 @@ def split_arguments(text: str, start: int) -> tuple[list[str], int] | None:
     return None
 
 
+IDENTIFIER_PATTERN = re.compile(r"\b" + re.escape(IDENTIFIER) + r"\b")
+DECLARATION_PATTERN = re.compile(
+    r"(?:inline\s+)?(?:void|auto)\s+" + re.escape(IDENTIFIER) + r"\s*\(")
+
+
 def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
     """Return (violations, number of calls seen) for one translation unit."""
     violations: list[tuple[str, str]] = []
     seen = 0
-    for match in re.finditer(re.escape(CALL), text):
+    code = strip_comments(text)
+    for match in IDENTIFIER_PATTERN.finditer(code):
+        location = f"{origin}:{code.count(chr(10), 0, match.start()) + 1}"
+
         # The declaration itself is not a call.
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line = text[line_start : text.find("\n", match.start())]
-        if "inline void" in line or "void WriteFileAtomically" in line:
+        declaration = DECLARATION_PATTERN.search(code, max(0, match.start() - 32))
+        if declaration is not None and declaration.end() >= match.end() \
+                and declaration.start() <= match.start():
             continue
-        parsed = split_arguments(text, match.end() - 1)
-        location = f"{origin}:{text.count(chr(10), 0, match.start()) + 1}"
+
+        # ★ИДЕНТИФИКАТОР БЕЗ СКОБКИ — ЭТО НЕ «НЕ ВЫЗОВ», А НЕПРОСМАТРИВАЕМЫЙ
+        # ВЫЗОВ. `&WriteFileAtomically`, `auto writer = WriteFileAtomically;`,
+        # макрос-псевдоним: класс конфиденциальности такого использования гейт
+        # прочитать не может, и молчание здесь и было бы той самой дырой.
+        tail = code[match.end():]
+        offset = len(tail) - len(tail.lstrip())
+        if not tail[offset : offset + 1] == "(":
+            violations.append(
+                (location, f"{IDENTIFIER} используется без прямого вызова "
+                           f"(указатель/псевдоним/макрос) — класс конфиденциальности "
+                           f"такого использования не читается"))
+            continue
+
+        parsed = split_arguments(code, match.end() + offset)
         if parsed is None:
             violations.append((location, "не удалось разобрать список аргументов"))
             continue
@@ -121,7 +250,13 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
                            f"(класс конфиденциальности обязателен): {args}"))
             continue
         what, sensitivity = args[2], args[3]
-        is_user_file = what == SECRET_KIND
+        label = fold_string_literals(what)
+        if label is None:
+            violations.append(
+                (location, f"ярлык файла не строковый литерал ({what}) — гейт не "
+                           f"может решить, секрет это или нет"))
+            continue
+        is_user_file = label == SECRET_KIND
         is_secret = sensitivity.endswith("FileSensitivity::Secret")
         is_public = sensitivity.endswith("FileSensitivity::Public")
         if not (is_secret or is_public):
@@ -130,12 +265,12 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
             continue
         if is_user_file and not is_secret:
             violations.append(
-                (location, f'{SECRET_KIND} записывается как {sensitivity} — '
+                (location, f'"{SECRET_KIND}" записывается как {sensitivity} — '
                            f"файл с хешем пароля стал бы читаемым всем"))
         if is_secret and not is_user_file:
             violations.append(
                 (location, f"{what} объявлен Secret, хотя секрет несёт только "
-                           f"{SECRET_KIND} — биконъюнкция нарушена в другую сторону"))
+                           f'"{SECRET_KIND}" — биконъюнкция нарушена в другую сторону'))
     return violations, seen
 
 
@@ -200,6 +335,44 @@ SELFTEST_FIXTURES = [
   server::util::WriteFileAtomically(
     p, std::format("{}, {}", a, b), "Meta file", server::util::FileSensitivity::Public);
 '''),
+    # ★ЧЕТЫРЕ ФИКСТУРЫ ИТЕРАЦИИ 4 — по одной на каждую форму, которую прежний
+    # гейт НЕ ВИДЕЛ (пробы ревью возвращали ноль замеченных вызовов и ноль
+    # нарушений). Пока их не было, «тотальность» была утверждением, а не
+    # свойством.
+    ("call split by a newline before the parenthesis is still a call", 1, '''
+  server::util::WriteFileAtomically
+    (p, json.dump(2), "User file", server::util::FileSensitivity::Public);
+'''),
+    ("taking the address of the writer hides its class", 1, '''
+  const auto writer = &server::util::WriteFileAtomically;
+  writer(p, json.dump(2), "User file", server::util::FileSensitivity::Public);
+'''),
+    ("an alias assignment hides its class too", 1, '''
+  auto WriteUserFile = server::util::WriteFileAtomically;
+'''),
+    ("adjacent string literals are one label to the compiler", 1, '''
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User " "file", server::util::FileSensitivity::Public);
+'''),
+    ("a non-literal label cannot be classified and is refused", 1, '''
+  server::util::WriteFileAtomically(
+    p, json.dump(2), what, server::util::FileSensitivity::Public);
+'''),
+    ("the name mentioned in a comment is prose, not a call", 0, '''
+  // WriteFileAtomically is the only writer; see WriteFileAtomically above.
+  /* WriteFileAtomically */
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User file", server::util::FileSensitivity::Secret);
+'''),
+    ("the declaration itself is not a call", 0, '''
+inline void WriteFileAtomically(
+  const std::filesystem::path& path,
+  const std::string_view payload,
+  const std::string_view what,
+  const FileSensitivity sensitivity)
+{
+}
+'''),
 ]
 
 
@@ -242,7 +415,7 @@ def main() -> int:
     calls = 0
     for path in sources:
         text = path.read_text(encoding="utf-8", errors="replace")
-        if CALL not in text:
+        if IDENTIFIER not in text:
             continue
         found, seen = analyse(text, str(path.relative_to(root)))
         violations += found

@@ -29,6 +29,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #ifndef WIN32
 
@@ -397,6 +399,236 @@ void TestNonRegularEntriesAreSkippedNotFatal(const std::filesystem::path& sandbo
   std::filesystem::remove_all(directory, cleanup);
 }
 
+//! Пара «владелец:группа» файла или каталога.
+std::pair<uid_t, gid_t> OwnerOf(const std::filesystem::path& path)
+{
+  struct ::stat status{};
+  const int result = ::lstat(path.c_str(), &status);
+  assert(result == 0);
+  return {status.st_uid, status.st_gid};
+}
+
+//! Собранные приёмником сообщения — ими и проверяется, что жалоба ПРОЗВУЧАЛА.
+//!
+//! ★ЗАЧЕМ ВООБЩЕ ЛОВИТЬ СТРОКИ. Три правки этой итерации молчаливы по природе:
+//! ссылку «отвергли», режим «сузили», владельца «усыновили». Отличить их от
+//! «ничего не сделали» можно только по внешнему признаку, и лог — тот самый
+//! признак, который в бою прочитает человек. Проверка, чей вердикт никто не
+//! читает, проверкой не является — поэтому здесь его читает тест.
+std::vector<std::string>& SinkMessages()
+{
+  static std::vector<std::string> messages;
+  return messages;
+}
+
+void CapturingSink(const std::string_view message)
+{
+  SinkMessages().emplace_back(message);
+}
+
+//! ★ДРОССЕЛЬ ОБЯЗАН И ПРОПУСКАТЬ, И ГЛУШИТЬ. Проверка только «пропускает»
+//! оставила бы поток строк на пути входа (дефект R57) необнаруженным, проверка
+//! только «глушит» — не отличила бы работающий приёмник от отсутствующего.
+void TestWarningSinkIsThrottled()
+{
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  server::util::WarningThrottle throttle;
+  server::util::ReportFileWarning(throttle, "первое сообщение {}", 1);
+  server::util::ReportFileWarning(throttle, "второе сообщение {}", 2);
+  server::util::ReportFileWarning(throttle, "третье сообщение {}", 3);
+
+  // Одна площадка — ровно одно сообщение в окне.
+  assert(SinkMessages().size() == 1);
+  assert(SinkMessages().front().find("первое сообщение 1") != std::string::npos);
+
+  // Соседняя площадка дросселируется независимо: иначе редкая, но важная
+  // жалоба тонула бы в частой соседней.
+  server::util::WarningThrottle other;
+  server::util::ReportFileWarning(other, "другая площадка");
+  assert(SinkMessages().size() == 2);
+
+  // Подавленные не теряются: их число едет в следующем сообщении этой площадки.
+  throttle.lastEmitNanos.store(server::util::WarningThrottle::kNever);
+  server::util::ReportFileWarning(throttle, "после окна");
+  assert(SinkMessages().size() == 3);
+  assert(SinkMessages().back().find("подавлено") != std::string::npos);
+
+  SinkMessages().clear();
+}
+
+//! ★ССЫЛКА ОТВЕРГАЕТСЯ ВСЕМИ ЧЕТЫРЬМЯ ПОТРЕБИТЕЛЯМИ, А НЕ ТРЕМЯ ИЗ ЧЕТЫРЁХ.
+//!
+//! Ревью (итерация 4) показало ровно расхождение потребителей: обход ссылку
+//! молча пропускал, проход сужения рапортовал полный успех, индекс имени не
+//! знал — а вход открывал ЦЕЛЬ и принимал её хеш пароля. Поэтому здесь один
+//! тест на все стороны сразу: если хоть одна снова начнёт ходить по ссылке,
+//! красным станет именно она.
+void TestSymbolicLinksAreRefusedEverywhere(const std::filesystem::path& sandbox)
+{
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  const auto directory = sandbox / "linked-accounts";
+  std::filesystem::create_directories(directory);
+
+  // ★ЦЕЛЬ ЛЕЖИТ В ДРУГОМ КАТАЛОГЕ, И ЭТО УСЛОВИЕ КОРРЕКТНОСТИ ТЕСТА, А НЕ
+  // декорация. Лежи она рядом, проход сужения нашёл бы её СВОИМ обходом как
+  // обычный файл и честно сузил — а тест засчитал бы это как «пошли по ссылке»
+  // и был бы ложно-красным. Проверять надо ровно одно: сквозь ССЫЛКУ не ходят.
+  const auto elsewhere = sandbox / "link-target-elsewhere";
+  std::filesystem::create_directories(elsewhere);
+  const auto target = elsewhere / "target-0644.data";
+  SeedFile(target, 0644);
+  const auto link = directory / "Alice.json";
+  std::error_code linkError;
+  std::filesystem::create_symlink(target, link, linkError);
+  assert(not linkError);
+
+  // 1) Обход: ссылки нет среди файлов, но она НАЗВАНА отдельно.
+  const auto listing = server::util::ListRegularFiles(directory);
+  assert(listing.refusedSymlinks.size() == 1);
+  assert(listing.refusedSymlinks.front() == link);
+  assert(not listing.incomplete);
+  for (const auto& file : listing.files)
+    assert(file != link);
+
+  // 2) Проход сужения: ссылка сосчитана как отвергнутая и НЕ сужена по цели.
+  const auto hardening = server::util::HardenSecretFiles(listing);
+  assert(hardening.refusedLinks == 1);
+  assert(hardening.failed == 0);
+  assert(ModeOf(target) == 0644);   // цель не тронута — по ссылке не ходили
+
+  // 3) Чтение: отказ, ни байта содержимого, и цель по-прежнему не тронута.
+  const auto read = server::util::ReadManagedFile(link, FileSensitivity::Secret);
+  assert(read.status == server::util::ManagedReadStatus::Refused);
+  assert(read.content.empty());
+  assert(not read.narrowed);
+  assert(ModeOf(target) == 0644);
+
+  // 4) Запись: бросок, и ни ссылка, ни цель не заменены.
+  bool threw = false;
+  try
+  {
+    server::util::WriteFileAtomically(
+      link, kPayload, "User file", FileSensitivity::Secret);
+  }
+  catch (const std::exception&)
+  {
+    threw = true;
+  }
+  assert(threw);
+  assert(std::filesystem::is_symlink(link));
+  assert(ReadBack(target) == "старое содержимое");
+
+  // И об отказе БЫЛО СКАЗАНО ВСЛУХ хотя бы один раз.
+  assert(not SinkMessages().empty());
+
+  SinkMessages().clear();
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+  std::filesystem::remove_all(elsewhere, cleanup);
+}
+
+//! ★ФАЙЛ, ПРИШЕДШИЙ ПОСЛЕ СТАРТА, СУЖАЕТСЯ ДО ТОГО, КАК ЕГО ПРОЧТУТ.
+//!
+//! Стартовый проход — снимок; помощник, положивший `Alice.json` с обычным
+//! umask рядом с работающим сервером, оставлял хеш пароля читаемым всем до
+//! перезапуска. Здесь проверяется именно порядок: содержимое отдано, и к этому
+//! моменту режим уже 0600.
+void TestLateArrivingSecretIsNarrowedOnRead(const std::filesystem::path& sandbox)
+{
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  const auto directory = sandbox / "late-arrival";
+  std::filesystem::create_directories(directory);
+  const auto account = directory / "Bob.json";
+  SeedFile(account, 0644);
+
+  const auto read = server::util::ReadManagedFile(account, FileSensitivity::Secret);
+  assert(read.status == server::util::ManagedReadStatus::Ok);
+  assert(read.narrowed);                       // сузили ПРЯМО СЕЙЧАС
+  assert(ModeOf(account) == 0600);             // и до выдачи содержимого
+  assert(read.content == "старое содержимое"); // содержимое при этом целое
+  assert(not SinkMessages().empty());
+
+  // Повторное чтение уже ничего не чинит и ни одного лишнего вызова не делает.
+  const auto again = server::util::ReadManagedFile(account, FileSensitivity::Secret);
+  assert(again.status == server::util::ManagedReadStatus::Ok);
+  assert(not again.narrowed);
+  assert(ModeOf(account) == 0600);
+
+  // ★А `Public` НЕ СУЖАЕТ, и это не забывчивость: режим файла персонажа —
+  // ровно тот, что был до раунда (радиус правки не расширяется молча).
+  const auto character = directory / "100.json";
+  SeedFile(character, 0644);
+  const auto publicRead = server::util::ReadManagedFile(
+    character, FileSensitivity::Public);
+  assert(publicRead.status == server::util::ManagedReadStatus::Ok);
+  assert(not publicRead.narrowed);
+  assert(ModeOf(character) == 0644);
+
+  // Отсутствие файла — отдельный исход, а не отказ: на нём стоит регистрация.
+  const auto missing = server::util::ReadManagedFile(
+    directory / "no-such.json", FileSensitivity::Secret);
+  assert(missing.status == server::util::ManagedReadStatus::Missing);
+
+  SinkMessages().clear();
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
+//! ★НОВЫЙ СЕКРЕТ БЕРЁТ ВЛАДЕЛЬЦА У КАТАЛОГА, А НЕ У ПРОЦЕССА.
+//!
+//! ★УТВЕРЖДЕНИЕ, А НЕ ТЕСТ, ПРОПУСКАЕТСЯ ПОД НЕ-ROOT. Доказать усыновление
+//! можно только там, где владелец каталога ОТЛИЧАЕТСЯ от владельца процесса, а
+//! назначить чужого владельца умеет лишь root. Под обычным пользователем
+//! проверяется всё остальное (режим 0600, владелец совпал с каталогом) —
+//! ложно-зелёного утверждения «усыновили», которое на деле сравнивало бы
+//! процесс сам с собой, здесь нет.
+void TestNewSecretAdoptsDirectoryOwner(const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "owned-accounts";
+  std::filesystem::create_directories(directory);
+
+  const bool asRoot = ::geteuid() == 0;
+  if (asRoot)
+  {
+    // Каталог принадлежит НЕ нам — ровно расклад прода: контейнер стартует от
+    // root, а `data/users` на деплое отдан непривилегированному помощнику.
+    assert(::chown(directory.c_str(), 1000, 1000) == 0);
+  }
+
+  const auto account = directory / "Carol.json";
+  server::util::WriteFileAtomically(
+    account, kPayload, "User file", FileSensitivity::Secret);
+
+  assert(ModeOf(account) == 0600);
+  assert(OwnerOf(account) == OwnerOf(directory));
+  if (asRoot)
+  {
+    // ★ИМЕННО ЭТО И БЫЛО СЛОМАНО: файл получал root:root, и помощник
+    // `set-password.py` терял путь успеха на КАЖДОМ новом аккаунте.
+    assert(OwnerOf(account).first == 1000u);
+    assert(OwnerOf(account).second == 1000u);
+  }
+
+  // ★А `Public` ВЛАДЕЛЬЦА НЕ УСЫНОВЛЯЕТ: политика объявлена для секрета, и
+  // семнадцать прочих писателей ведут себя ровно как до раунда.
+  if (asRoot)
+  {
+    const auto record = directory / "200.json";
+    server::util::WriteFileAtomically(
+      record, kPayload, "Character file", FileSensitivity::Public);
+    assert(OwnerOf(record).first == 0u);
+  }
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
 } // namespace
 
 int main()
@@ -412,6 +644,10 @@ int main()
   TestHardenSecretFilesInDirectory(sandbox);
   TestListRegularFiles(sandbox);
   TestNonRegularEntriesAreSkippedNotFatal(sandbox);
+  TestWarningSinkIsThrottled();
+  TestSymbolicLinksAreRefusedEverywhere(sandbox);
+  TestLateArrivingSecretIsNarrowedOnRead(sandbox);
+  TestNewSecretAdoptsDirectoryOwner(sandbox);
 
   UnlockTree(sandbox);
   std::error_code ignored;
