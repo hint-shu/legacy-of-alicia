@@ -495,6 +495,10 @@ private:
   util::LogThrottle _aiAttackerThrottle;
   util::LogThrottle _dragonTargetThrottle;
   util::LogThrottle _magicClassificationThrottle;
+  //! LOA-fix (R71-25, находка ревью 4 #1): у каста и у отчёта СВОИ дроссели —
+  //! общий гасил бы одну жалобу из-за другой, и раунд снова судил бы по молчанию.
+  util::LogThrottle _magicTypeUnknownThrottle;
+  util::LogThrottle _reportedMagicTypeThrottle;
 };
 
 } // namespace server

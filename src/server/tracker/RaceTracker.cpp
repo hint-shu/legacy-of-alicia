@@ -312,7 +312,7 @@ bool RaceTracker::CanIssueEffectInstances(
 void RaceTracker::AddEffectInstances(
   const uint16_t firstInstanceId,
   const uint16_t count,
-  const uint16_t magicType,
+  const uint32_t magicType,
   const Oid casterOid,
   const bool serverApplied,
   const std::vector<Oid>& authorizedTargets)

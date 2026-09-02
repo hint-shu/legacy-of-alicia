@@ -17,6 +17,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  **/
 
+#include "server/race/MagicApplication.hpp"
 #include "server/race/MagicSystem.hpp"
 #include "libserver/util/QuietLog.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
@@ -592,6 +593,13 @@ uint16_t RaceNetworkHandler::GetOrCreateP2dId(ClientId clientId)
 namespace
 {
 
+// LOA-fix (R71-25, находка ревью 4 #1): классификация типа магии переехала в
+// `server/race/MagicApplication.hpp` — ровно затем, чтобы её можно было проверить
+// юнит-тестом (`RaceTestMagicApplication`), а не только глазами в ревью. Здесь
+// остаются короткие имена, чтобы места использования не разъехались по форме.
+using race::ClassifyMagicApplication;
+using race::MagicApplication;
+
 //! Ростер AI-соперников соло-заезда (R56, #61).
 //!
 //! ★Имена не выдуманы: они сверены с таблицами вождения САМОГО КЛИЕНТА.
@@ -653,46 +661,6 @@ constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
 [[nodiscard]] constexpr bool IsSchedulableEffectId(const uint32_t effectId) noexcept
 {
   return effectId < tracker::RaceTracker::Racer::EffectCount;
-}
-
-//! LOA-fix (R71-22, находки ревью 3 #1 и #2): КТО ИМЕННО ПРИМЕНЯЕТ ЭФФЕКТ.
-//!
-//! Раунд опирался на «зарегистрирован ли номер экземпляра» и не спрашивал главного:
-//! КТО вешает этот эффект. А ответ у магии ровно трёх видов, и он определяет, что
-//! вообще имеет право сделать клиентский отчёт «на мне сработало»:
-//!
-//!  * `ServerAppliedAtCast` — щиты, бустеры, разгон и командные бафы. Их вешает САМ
-//!    сервер в момент каста (`HandleUseMagicItem`, switch по типу). Клиентский отчёт
-//!    про них не нужен НИКОГДА: он либо повтор, либо кража чужого каста себе —
-//!    ровно та дыра, которой ревью 3 выдавало себе водяной щит.
-//!  * `IceWallObstacle` — препятствие на трассе. Отчёт про него значит «я её сломал»,
-//!    и его вправе прислать любой, кто в стену въехал.
-//!  * `TargetReportedAttack` — атака по гонщику. Геометрии у сервера нет, поэтому
-//!    отчёт жертвы — ЕДИНСТВЕННЫЙ путь применения; всё, что он может сделать, —
-//!    навредить самому отправителю (гард R71-4 не пускает эффект на чужого).
-//!
-//! ★ЭТО ОДИН ИСТОЧНИК ПРАВДЫ НА ДВА МЕСТА (каст и отчёт), а не два похожих списка:
-//! расхождение таких списков — тот самый класс, ради которого затеян раунд. И оно
-//! не «обещано комментарием»: `HandleUseMagicItem` сверяет эту классификацию с ВЕТКОЙ
-//! switch, которая реально исполнилась, и кричит, если они разошлись.
-enum class MagicApplication : uint8_t
-{
-  ServerAppliedAtCast,
-  IceWallObstacle,
-  TargetReportedAttack,
-};
-
-[[nodiscard]] constexpr MagicApplication ClassifyMagicApplication(
-  const uint16_t magicType) noexcept
-{
-  // Границы взяты не с потолка: это метки case из `HandleUseMagicItem` — Shield,
-  // Booster, Phoenix (4-9) и BufPower/BufGauge/BufSpeed (20-25) сервер вешает сам,
-  // IceWall (10-11) кладёт на трассу.
-  if ((magicType >= 4 && magicType <= 9) || (magicType >= 20 && magicType <= 25))
-    return MagicApplication::ServerAppliedAtCast;
-  if (magicType == 10 || magicType == 11)
-    return MagicApplication::IceWallObstacle;
-  return MagicApplication::TargetReportedAttack;
 }
 
 [[nodiscard]] bool IsFiniteIceWallPlacement(
@@ -5285,6 +5253,33 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // LOA-fix (R71-22): «стена ли это» спрашивается у ЕДИНСТВЕННОЙ классификации,
   // которой пользуется и хендлер отчёта, — чтобы два места не разъехались.
   const MagicApplication magicApplication = ClassifyMagicApplication(magicSlotInfo.type);
+
+  // LOA-fix (R71-25, находка ревью 4 #1): НЕИЗВЕСТНЫЙ ТИП НЕ ПОЛУЧАЕТ ЭКЗЕМПЛЯРА.
+  //
+  // Классификатор больше не «догадывается»: тип, который не назван поимённо, — это
+  // `Unknown`, и раньше он молча получал права атаки (запись экземпляра, клиентский
+  // отчёт, рассылка). Отказ стоит ЗДЕСЬ — до бюджета, до списания крит-бафа, до
+  // выдачи номеров и до любой рассылки: неизвестный тип не должен оставить после
+  // себя вообще ничего.
+  //
+  // ★ЭТО НЕ УДАР ПО ЧЕСТНОЙ ИГРЕ: до этой строки доходит только тип, который сервер
+  // САМ выдал гонщику на руки (гард R71-1 выше), а в поставляемом `magic.yaml` все
+  // выдаваемые типы перечислены. Сработает эта жалоба ровно тогда, когда в конфиг
+  // приедет тип, которого код не знает, — и это надо УВИДЕТЬ, а не «применить как
+  // атаку».
+  if (magicApplication == MagicApplication::Unknown)
+  {
+    uint64_t suppressed = 0;
+    if (_magicTypeUnknownThrottle.Allow(suppressed))
+      server::util::QuietLogError(
+        "Racer {} cast magic type {} which no application class covers; the cast is "
+        "refused (suppressed {})",
+        racer.oid,
+        magicSlotInfo.type,
+        suppressed);
+    return;
+  }
+
   const bool isIceWall = magicApplication == MagicApplication::IceWallObstacle;
 
   // LOA-fix (R71-3, SYNTHESIS item 10 + item 26): ОТВЕТ СОБИРАЕТСЯ ИЗ ДВУХ РАЗНЫХ ЧИСЕЛ.
@@ -6419,8 +6414,30 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // ★ПОБОЧНЫЙ ЭФФЕКТ, НАЗВАННЫЙ ВСЛУХ: у Booster'а обычный и критический варианты
   // делят один `skillEffectId` (5) в `magic.yaml`. Отчёты о нём и так запрещены
   // пунктом 1 (бустер сервер вешает сам), так что различать их незачем.
-  const uint16_t reportedMagicType = magicSlotInfo.type;
+  const uint32_t reportedMagicType = magicSlotInfo.type;
   const MagicApplication reportedApplication = ClassifyMagicApplication(reportedMagicType);
+
+  // LOA-fix (R71-25, находка ревью 4 #1): ПО НЕИЗВЕСТНОМУ ТИПУ ОТЧЁТА НЕ БЫВАЕТ.
+  //
+  // Симметрично отказу на касте: класс `Unknown` не даёт ни прав атаки, ни прав
+  // стены. Отказ стоит ДО ветки ботов, ДО потребления и ДО единственной рассылки
+  // этого хендлера (`ScheduleSkillEffect` рассылает `AcCmdRCAddSkillEffect`
+  // раньше, чем отвергает дубль) — то есть до первого кадра, а не после.
+  // Экземпляра с таким типом сервер выдать уже не может, но проверка стоит и здесь:
+  // правило обязано быть на ОБОИХ концах, иначе оно снова станет «списком мест».
+  if (reportedApplication == MagicApplication::Unknown)
+  {
+    uint64_t suppressed = 0;
+    if (_reportedMagicTypeThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} reported magic type {} which no application class covers; the "
+        "report is dropped (suppressed {})",
+        targetRacer.oid,
+        reportedMagicType,
+        suppressed);
+    return;
+  }
+
   const bool attackerIsAiRacer = raceInstance.IsAiRacerOid(command.attackerOid);
 
   // Кого сервер считает источником эффекта. Для отчётов про ботов серверной записи

@@ -769,7 +769,13 @@ public:
     //! Номер, выданный `GetNextEffectInstanceIdAndIncrementBy`.
     uint16_t instanceId{};
     //! Тип магии, РАЗРЕШЁННЫЙ сервером (10 обычная стена, 11 критическая, и т.д.).
-    uint16_t magicType{};
+    //! ★LOA-fix (R71-25, находка ревью 4 #1): ПОЛНАЯ ШИРИНА. Тип в реестре —
+    //! `uint32_t` (`MagicRegistry.hpp:39`), и `magic.yaml` лежит bind-mount'ом, то
+    //! есть значение НЕ ограничено кодом. Пока поле было `uint16_t`, запись
+    //! `type: 0x10002` усекалась до `2` и становилась неотличима от FireBall'а —
+    //! отчёт по «типу 2» совпадал с усечённой записью, а обе половины сверки
+    //! классификации при этом молчали.
+    uint32_t magicType{};
     //! Гонщик, чей каст сервер обслужил.
     Oid casterOid{};
     //! LOA-fix (R71-22, находка ревью 3 #1): СЕРВЕР УЖЕ ПРИМЕНИЛ ЭТОТ ЭФФЕКТ САМ.
@@ -831,7 +837,7 @@ public:
   void AddEffectInstances(
     uint16_t firstInstanceId,
     uint16_t count,
-    uint16_t magicType,
+    uint32_t magicType,
     Oid casterOid,
     bool serverApplied,
     const std::vector<Oid>& authorizedTargets);
