@@ -432,6 +432,57 @@ struct DirectoryListing
   bool incomplete = false;
 };
 
+namespace detail
+{
+
+//! Классификация ОДНОЙ записи каталога для `ListRegularFiles`.
+//!
+//! ★ОТДЕЛЬНАЯ ФУНКЦИЯ, ЧТОБЫ ПРОПУСК БЫЛ `return`, А НЕ `continue`. Цикл ниже
+//! продвигает итератор ЯВНЫМ `increment` в конце тела, поэтому `continue`
+//! перепрыгнул бы продвижение и подвесил обход навсегда.
+inline void ClassifyOneDirectoryEntry(
+  const std::filesystem::directory_entry& entry,
+  DirectoryListing& listing)
+{
+  // ★ССЫЛКА ОТСЕИВАЕТСЯ ПЕРВОЙ И БЕЗ ОТМЕТКИ О НЕПОЛНОТЕ. `is_regular_file`
+  // ходит ПО ссылке (`status`), поэтому у ВИСЯЧЕЙ ссылки он вернул бы ошибку
+  // ENOENT, и безобидный мусор в каталоге останавливал бы старт сервера.
+  // Ссылка не аккаунт и не персонаж — её пропуск это решение, а не незнание.
+  std::error_code linkError;
+  const bool link = entry.is_symlink(linkError);
+  if (linkError)
+  {
+    // Даже `lstat` не удался — про эту запись мы не знаем НИЧЕГО.
+    listing.incomplete = true;
+    return;
+  }
+  if (link)
+    return;
+
+  // ★ОШИБКА КЛАССИФИКАЦИИ — ЭТО НЕПОЛНОТА, А НЕ ПРОПУСК (правка ревью,
+  // итерация 3). Прежняя редакция молча пропускала запись, у которой
+  // `is_regular_file` дал ошибку, и обход возвращал список БЕЗ неё, пометив
+  // себя полным. Потребитель (пол uid, индекс персонажей) читал усечённый
+  // снимок как авторитетный: `characters/100.json` не попадал в список, пол
+  // восстанавливался как 99, и следующий персонаж получал uid 100 — поверх
+  // живого файла. «Не смогли посмотреть» обязано отличаться от «не нашли».
+  std::error_code kindError;
+  const bool regular = entry.is_regular_file(kindError);
+  if (kindError)
+  {
+    listing.incomplete = true;
+    return;
+  }
+  // Каталог, FIFO, сокет, устройство — не наши файлы, и это ЗНАНИЕ, а не
+  // незнание: неполнотой такой пропуск не является.
+  if (not regular)
+    return;
+
+  listing.files.push_back(entry.path());
+}
+
+} // namespace detail
+
 [[nodiscard]] inline DirectoryListing ListRegularFiles(
   const std::filesystem::path& directory) noexcept
 {
@@ -456,9 +507,7 @@ struct DirectoryListing
   {
     while (entry != end)
     {
-      std::error_code entryError;
-      if (entry->is_regular_file(entryError) && not entryError)
-        listing.files.push_back(entry->path());
+      detail::ClassifyOneDirectoryEntry(*entry, listing);
 
       entry.increment(error);
       if (error)
@@ -508,12 +557,26 @@ inline void HardenOneSecretFile(
   const std::filesystem::path& file,
   SecretFileHardening& result) noexcept
 {
+  // ★`O_NONBLOCK`, И ЭТО НЕ МИКРООПТИМИЗАЦИЯ (правка ревью, итерация 3). Без
+  // него `open(O_RDONLY)` на ИМЕНОВАННОМ КАНАЛЕ ждёт писателя — то есть один
+  // `mkfifo data/users/x.json` вешает старт сервера НАВСЕГДА, без строки в
+  // логе. Список выше уже отсеял всё, что не обычный файл, но между обходом и
+  // открытием запись могли подменить, поэтому защита стоит и здесь: обход
+  // отвечает за норму, флаг — за гонку.
   const int descriptor = ::open(
-    file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (descriptor < 0)
   {
-    // ELOOP = это символическая ссылка; она не аккаунт, это не отказ.
-    if (errno != ELOOP)
+    // ★НЕ ВСЯКИЙ ОТКАЗ ОТКРЫТИЯ — ОТКАЗ СУЖЕНИЯ (правка ревью, итерация 3).
+    // Эти errno означают «это не обычный файл» или «его уже нет», то есть
+    // запись, которую политика и так велит ПРОПУСТИТЬ. Считать их отказами
+    // значило бы отказать в старте из-за сокета, положенного в каталог, —
+    // отказ обслуживать по причине, к секрету отношения не имеющей.
+    //   ELOOP        — стала символической ссылкой;
+    //   ENOENT       — исчезла между обходом и открытием;
+    //   ENXIO/ENODEV — сокет либо устройство без драйвера.
+    // Всё остальное (EACCES, EPERM, EMFILE, EIO) — настоящий отказ.
+    if (errno != ELOOP && errno != ENOENT && errno != ENXIO && errno != ENODEV)
       ++result.failed;
     return;
   }
@@ -574,38 +637,19 @@ inline void HardenOneSecretFile(
 {
   SecretFileHardening result;
 #ifndef WIN32
-  std::error_code error;
-  if (not std::filesystem::is_directory(directory, error) || error)
-  {
-    result.incomplete = true;
-    return result;
-  }
+  // ★ОБХОД ОДИН НА ВЕСЬ РАУНД (правка ревью, итерация 3). Собственный цикл
+  // здесь ОТКРЫВАЛ каждую запись каталога, чтобы через `fstat` узнать, обычный
+  // ли это файл, — то есть FIFO вешал старт, а сокет давал `++failed` и, после
+  // правки «отказ сужения останавливает старт», ЛОЖНЫЙ отказ в обслуживании из-
+  // за записи, которую политика велит пропустить. Классификация принадлежит
+  // обходу, а не потребителю: `ListRegularFiles` отдаёт только обычные файлы и
+  // честно сообщает о неполноте. Тот же обход теперь у пола uid и у обоих
+  // индексов — класс закрыт целиком, а не в трёх местах по отдельности.
+  const auto listing = ListRegularFiles(directory);
+  result.incomplete = listing.incomplete;
 
-  // ★ЯВНЫЙ `increment(error)`, А НЕ range-for (правка ревью, итерация 2).
-  // range-for продвигает итератор БРОСАЮЩИМ `operator++`; `error_code`,
-  // отданный конструктору, покрывает только ОТКРЫТИЕ каталога, но не переход к
-  // следующей записи. Функция помечена `noexcept`, поэтому `EIO` на середине
-  // каталога звал бы `std::terminate` — то есть отказ в обслуживании на старте
-  // вместо диагностики.
-  std::filesystem::directory_iterator entry(directory, error);
-  if (error)
-  {
-    result.incomplete = true;
-    return result;
-  }
-
-  const std::filesystem::directory_iterator end;
-  while (entry != end)
-  {
-    detail::HardenOneSecretFile(entry->path(), result);
-
-    entry.increment(error);
-    if (error)
-    {
-      result.incomplete = true;
-      break;
-    }
-  }
+  for (const auto& file : listing.files)
+    detail::HardenOneSecretFile(file, result);
 #else
   (void)directory;
 #endif

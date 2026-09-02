@@ -42,6 +42,28 @@
 namespace
 {
 
+//! ПРЕДЕЛ ЧАСТОТЫ СВЕРКИ ИНДЕКСА АККАУНТОВ С ДИСКОМ (правка ревью, итерация 3).
+//!
+//! ★ЭТО НЕ «ТЮНИНГ», А ГРАНИЦА КЛАССА. Промах индекса имеет право переспросить
+//! диск, иначе аккаунт, заведённый рядом с работающим сервером, не находился бы
+//! до перезапуска. Но право «переспросить» без потолка означает, что стоимость
+//! пакета снова становится O(число аккаунтов): staff-клиент, чередуя
+//! сохранение записи (оно меняет mtime каталога) с запросом отсутствующего
+//! имени, заказывает по полному обходу на пару. Потолок превращает «на пакет» в
+//! «не чаще раза в пять секунд», сколько бы пакетов и потоков ни пришло.
+constexpr auto kUserIndexReconcileGap = std::chrono::seconds(5);
+
+//! ПОЛ ЧАСТОТЫ: раз в минуту промах сверяется с диском ДАЖЕ при совпавшем
+//! отпечатке.
+//!
+//! ★ОТПЕЧАТОК КАТАЛОГА НЕ СВОБОДЕН ОТ КОЛЛИЗИЙ (найдено ревью, итерация 3).
+//! Файловая система с грубым разрешением времени, восстановление из копии,
+//! возвращающее каталогу прежний mtime, — и новый файл живёт под старым
+//! отпечатком. Признак «изменилось» тогда молчит НАВСЕГДА. Принудительная
+//! сверка ограничивает это молчание минутой и стоит один обход в минуту — и
+//! только при промахах, то есть только когда кто-то спрашивает.
+constexpr auto kUserIndexStaleAfter = std::chrono::seconds(60);
+
 //! Вносит uid в отсортированный список имени (LOA-fix R73-4, правка ревью 1).
 //!
 //! ★СПИСОК, А НЕ ЕДИНСТВЕННЫЙ ПОБЕДИТЕЛЬ. Столкновение имён на диске возможно
@@ -151,14 +173,29 @@ uint32_t NextUid(std::atomic<uint32_t>& counter, const std::string_view what)
   }
 }
 
-uint32_t HighestUidInDirectory(const std::filesystem::path& root)
+//! Пол счётчика uid, снятый с каталога, ВМЕСТЕ с честностью снимка.
+//!
+//! ★ЧИСЛО БЕЗ ПРИЗНАКА ПОЛНОТЫ — ЛОЖНО-ЗЕЛЁНОЕ ПО ПОСТРОЕНИЮ (правка ревью,
+//! итерация 3). Оборванный обход возвращает МЕНЬШИЙ максимум, неотличимый от
+//! честного: пол 99 вместо 100 выглядит как каталог, в котором просто нет
+//! сотого файла. Признак обязан ехать вместе со значением, иначе вызывающий
+//! физически не может его учесть.
+struct UidFloorScan
 {
   uint32_t highest = 0;
+  bool incomplete = false;
+};
+
+UidFloorScan HighestUidInDirectory(const std::filesystem::path& root)
+{
+  UidFloorScan scan;
 
   // ★ОБХОД ЧЕРЕЗ `ListRegularFiles` (правка ревью, итерация 2): продвижение
   // итератора в range-for бросает, а счётчик uid считается на СТАРТЕ — исключение
   // отсюда роняло бы процесс до первого игрока.
   const auto listing = server::util::ListRegularFiles(root);
+  scan.incomplete = listing.incomplete;
+
   for (const auto& entryPath : listing.files)
   {
     if (entryPath.extension() != ".json")
@@ -187,10 +224,10 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
     if (parsed == 0 || parsed >= std::numeric_limits<uint32_t>::max())
       continue;
 
-    highest = std::max(highest, static_cast<uint32_t>(parsed));
+    scan.highest = std::max(scan.highest, static_cast<uint32_t>(parsed));
   }
 
-  return highest;
+  return scan;
 }
 
 } // anon namespace
@@ -360,23 +397,48 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
       counter.store(observed);
   };
 
-  raiseFloor(_infractionSequentialUid, HighestUidInDirectory(_infractionDataPath));
-  raiseFloor(_characterSequentialUid, HighestUidInDirectory(_characterDataPath));
+  // ★НЕПОЛНЫЙ СНИМОК КАТАЛОГА НЕ ИМЕЕТ ПРАВА СТАТЬ ПОЛОМ (правка ревью,
+  // итерация 3). Оборванный обход отдаёт МЕНЬШИЙ максимум, и «пол применён»
+  // тогда означает «пол занижен»: `meta` потерян, обход не дошёл до
+  // `characters/100.json`, счётчик восстановлен как 99 — и следующий персонаж
+  // получает uid 100, а `WriteFileAtomically` кладёт его ПОВЕРХ живого файла.
+  // Ровно тот дефект, против которого пол и заведён, только с другой стороны.
+  // Поэтому неполнота фатальна: не выдать uid лучше, чем выдать занятый.
+  const auto uidFloor = [](const std::filesystem::path& root)
+  {
+    const auto scan = HighestUidInDirectory(root);
+    if (scan.incomplete)
+    {
+      server::util::QuietLogError(
+        "Uid floor: the scan of '{}' did not finish; the highest uid on disk is "
+        "unknown, so the next entity could be handed an occupied uid and "
+        "overwrite a live record",
+        root.string());
+
+      throw std::runtime_error(
+        std::format(
+          "Uid floor scan of '{}' did not finish", root.string()));
+    }
+    return scan.highest;
+  };
+
+  raiseFloor(_infractionSequentialUid, uidFloor(_infractionDataPath));
+  raiseFloor(_characterSequentialUid, uidFloor(_characterDataPath));
   // ★Один счётчик на ДВА каталога — лошади и предметы делят нумерацию.
   raiseFloor(_equipmentSequentialUid, std::max(
-    HighestUidInDirectory(_horseDataPath), HighestUidInDirectory(_itemDataPath)));
-  raiseFloor(_storageItemSequentialUid, HighestUidInDirectory(_storageItemPath));
-  raiseFloor(_eggSequentialUid, HighestUidInDirectory(_eggDataPath));
-  raiseFloor(_petSequentialUid, HighestUidInDirectory(_petDataPath));
-  raiseFloor(_housingSequentialUid, HighestUidInDirectory(_housingDataPath));
-  raiseFloor(_guildSequentialId, HighestUidInDirectory(_guildDataPath));
-  raiseFloor(_settingsSequentialId, HighestUidInDirectory(_settingsDataPath));
+    uidFloor(_horseDataPath), uidFloor(_itemDataPath)));
+  raiseFloor(_storageItemSequentialUid, uidFloor(_storageItemPath));
+  raiseFloor(_eggSequentialUid, uidFloor(_eggDataPath));
+  raiseFloor(_petSequentialUid, uidFloor(_petDataPath));
+  raiseFloor(_housingSequentialUid, uidFloor(_housingDataPath));
+  raiseFloor(_guildSequentialId, uidFloor(_guildDataPath));
+  raiseFloor(_settingsSequentialId, uidFloor(_settingsDataPath));
   raiseFloor(_dailyQuestGroupSequentialId,
-    HighestUidInDirectory(_dailyQuestGroupDataPath));
-  raiseFloor(_mailSequentialId, HighestUidInDirectory(_mailDataPath));
-  raiseFloor(_questSequentialId, HighestUidInDirectory(_questDataPath));
-  raiseFloor(_stallionSequentialUid, HighestUidInDirectory(_stallionDataPath));
-  raiseFloor(_rewardSequentialUid, HighestUidInDirectory(_rewardDataPath));
+    uidFloor(_dailyQuestGroupDataPath));
+  raiseFloor(_mailSequentialId, uidFloor(_mailDataPath));
+  raiseFloor(_questSequentialId, uidFloor(_questDataPath));
+  raiseFloor(_stallionSequentialUid, uidFloor(_stallionDataPath));
+  raiseFloor(_rewardSequentialUid, uidFloor(_rewardDataPath));
 
   // LOA-fix (R73-4, #130-C8): индекс имён строится ОДИН раз, здесь. После
   // `raiseFloor` намеренно: обход каталога персонажей уже прогрет, и порядок
@@ -514,7 +576,26 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   // аккаунт, заведённый до появления проверки #18b, может быть длиннее
   // сегодняшних 48 байт, и отбить его на входе значило бы сделать реального
   // игрока неадресуемым для staff-команды.
-  if (not server::util::IsLoginNameSafe(
+  //
+  // ★ГЕЙТ ПОИСКА — СТРУКТУРНЫЙ, А НЕ ALLOWLIST АУТЕНТИФИКАЦИИ (правка ревью,
+  // итерация 3). Прежняя редакция звала здесь `IsLoginNameSafe`, то есть
+  // сегодняшний класс РЕГИСТРАЦИИ `[A-Za-z0-9_-]`. Но индекс строится из имён
+  // ФАЙЛОВ и никакого класса не требует: `data/users/john.doe.json`, заведённый
+  // до появления проверки #18b (или скриптом), попадает в индекс как
+  // `john.doe` — и тут же становится неадресуемым, потому что гейт отбивает
+  // точку ДО обращения к индексу. `//infraction list john.doe` отвечал бы
+  // «пользователя нет» про существующего пользователя, хотя обход, который мы
+  // заменили индексом, его находил. Гейт, который строже индекса, который он
+  // охраняет, отнимает путь успеха у честного администратора.
+  //
+  // Поэтому здесь стоит ТОТ ЖЕ структурный гейт, что и у поиска персонажа:
+  // непустое, не длиннее потолка, без управляющих байтов и без разделителей
+  // пути. Он по-прежнему отбивает всё, ради чего гейт заводился (регулярка из
+  // имени, 8 КБ с провода, `../`), но не выдумывает класса символов, которого
+  // на диске нет. Строгий allowlist остаётся там, где он и уместен, — в
+  // `LocalAuthenticationBackend` (вход и регистрация): это правило о том, какие
+  // имена МОЖНО ЗАВЕСТИ, а не о том, какие УЖЕ лежат.
+  if (not server::util::IsStorableNameShaped(
     name, _loginNameCeiling.load(std::memory_order::relaxed)))
   {
     _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
@@ -549,12 +630,9 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   // который мы заменили, его находил. Это потеря пути успеха у честного
   // администратора — ровно то, чего замена обхода индексом делать не должна.
   //
-  // ★И ЭТО НЕ ВОЗВРАТ ОБХОДА НА ПАКЕТ. Перестройка запускается только когда
-  // отпечаток каталога ОТЛИЧАЕТСЯ от снятого при последней полной перестройке,
-  // то есть когда файлы действительно появлялись. Промах при неизменившемся
-  // каталоге стоит один `last_write_time` — константу. Изменить mtime каталога
-  // `data/users` с провода нельзя: аккаунты там заводит не игрок, так что
-  // повторную перестройку никто не «закажет» пакетами.
+  // ★И ЭТО НЕ ВОЗВРАТ ОБХОДА НА ПАКЕТ. Перестройка ограничена и по поводу, и по
+  // частоте: не чаще одного раза в `kUserIndexReconcileGap` (см. ниже), сколько
+  // бы промахов ни пришло и сколько бы потоков ни промахнулось одновременно.
   if (RefreshUserNameIndexIfDirectoryChanged())
   {
     const std::shared_lock indexLock(_userNameIndexMutex);
@@ -565,28 +643,78 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   return true;
 }
 
+bool server::FileDataSource::NeedsUserIndexReconcile(
+  const std::filesystem::file_time_type stamp,
+  const bool stampUnreadable,
+  const std::chrono::steady_clock::time_point now) const
+{
+  // Вызывается ТОЛЬКО с удержанным `_userNameIndexMutex` (любым из двух
+  // режимов): читает три поля индекса и ничего не блокирует сам.
+
+  // ★ПОТОЛОК ЧАСТОТЫ — ПЕРВЫЙ, И ЭТО ГЛАВНАЯ ПРАВКА (ревью, итерация 3).
+  // Перестройка стоит O(число аккаунтов), а СВОЯ ЖЕ запись аккаунта меняет
+  // mtime каталога: staff-клиент, чередуя безобидное `//infraction remove <имя>
+  // 0` (ChatSystem.cpp:1345 сохраняет запись даже когда удалять нечего) с
+  // запросом отсутствующего имени, заказывал по полному обходу на пару. Здесь
+  // же стоит и КОАЛЕСЦЕНЦИЯ: тот же вопрос задаётся повторно под эксклюзивным
+  // замком, и поток, дождавшийся чужой перестройки, видит свежий `_lastScan` и
+  // не перестраивает второй раз.
+  if (now - _userIndexLastScan < kUserIndexReconcileGap)
+    return false;
+
+  // ★А ЭТО — ПОЛ ЧАСТОТЫ, И ОН ЗАКРЫВАЕТ РАВЕНСТВО ОТПЕЧАТКОВ (ревью,
+  // итерация 3, WARN о коллизиях mtime). Отпечаток каталога НЕ является
+  // свободным от коллизий признаком изменения: на файловой системе с грубым
+  // разрешением времени, а равно после восстановления из копии, которая
+  // возвращает каталогу прежний mtime, только что появившийся `Alice.json`
+  // остаётся под старым отпечатком — и без принудительной сверки не нашёлся бы
+  // до перезапуска. Раз в `kUserIndexStaleAfter` промах сверяется с диском
+  // независимо от отпечатка, поэтому «никогда» превращается в «в течение
+  // минуты».
+  if (now - _userIndexLastScan >= kUserIndexStaleAfter)
+    return true;
+
+  // Отпечаток совпал — каталог не менялся с последней ПОЛНОЙ перестройки,
+  // значит промах индекса и есть ответ «такого аккаунта нет».
+  return stampUnreadable || not _userIndexStampValid
+    || stamp != _userIndexDirectoryStamp;
+}
+
 bool server::FileDataSource::RefreshUserNameIndexIfDirectoryChanged()
 {
+  const auto now = std::chrono::steady_clock::now();
+
   std::error_code error;
   const auto stamp = std::filesystem::last_write_time(_userDataPath, error);
 
   {
     const std::shared_lock indexLock(_userNameIndexMutex);
-    // Отпечаток совпал — каталог не менялся с последней ПОЛНОЙ перестройки,
-    // значит промах индекса и есть ответ «такого аккаунта нет».
-    if (not error && _userIndexStampValid && stamp == _userIndexDirectoryStamp)
+    if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
       return false;
   }
 
-  // Замок здесь НЕ держится: `RebuildUserNameIndex` берёт тот же мьютекс
-  // эксклюзивно, а `shared_mutex` не рекурсивный — удержание было бы дедлоком.
-  RebuildUserNameIndex();
+  const std::unique_lock indexLock(_userNameIndexMutex);
+  // ★ПОВТОРНАЯ ПРОВЕРКА ПОД ЭКСКЛЮЗИВНЫМ ЗАМКОМ — ЭТО И ЕСТЬ КОАЛЕСЦЕНЦИЯ
+  // (правка ревью, итерация 3). Прежняя редакция отпускала общий замок и звала
+  // перестройку безусловно: несколько потоков, промахнувшихся одновременно,
+  // проходили проверку все, а потом ПО ОЧЕРЕДИ делали по полному обходу.
+  // Вопрос задаётся тем же `now`, что и снаружи, поэтому перестройка, успевшая
+  // завершиться после нашего входа, гарантированно закрывает нам дорогу.
+  if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
+    return false;
+
+  RebuildUserNameIndexLocked();
   return true;
 }
 
 void server::FileDataSource::RebuildUserNameIndex()
 {
   const std::unique_lock indexLock(_userNameIndexMutex);
+  RebuildUserNameIndexLocked();
+}
+
+void server::FileDataSource::RebuildUserNameIndexLocked()
+{
   _userNameKeys.clear();
   RaiseNameCeiling(_loginNameCeiling, server::util::kMaxLoginNameBytes);
 
@@ -600,6 +728,15 @@ void server::FileDataSource::RebuildUserNameIndex()
   const auto listing = server::util::ListRegularFiles(_userDataPath);
   if (listing.incomplete)
   {
+    // ★ЗДЕСЬ ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ — И ЭТО НЕ НЕПОСЛЕДОВАТЕЛЬНОСТЬ
+    // (пояснение к правке ревью, итерация 3). Каталог `data/users` на старте
+    // УЖЕ доказан полным: `HardenSecretFilesInDirectory` идёт по нему тем же
+    // обходом раньше в `Initialize` и при неполноте бросает. А в рантайме эта
+    // перестройка живёт на пути запроса: бросок отсюда рвал бы staff-команду
+    // вместо ответа. Неполнота при этом не «прощается»: `_userIndexStampValid`
+    // остаётся ложным (ниже), поэтому следующий промах сверится заново, а
+    // ответом до тех пор будет «такого пользователя нет» — отказ, а не выдача
+    // чужих прав.
     server::util::QuietLogError(
       "Account name index: the scan of '{}' did not finish, the index is "
       "incomplete and will be rebuilt on the next miss", _userDataPath.string());
@@ -628,6 +765,11 @@ void server::FileDataSource::RebuildUserNameIndex()
   _userIndexStampValid = not stampError && not listing.incomplete;
   _userIndexDirectoryStamp = stamp;
 
+  // ★ВРЕМЯ ОКОНЧАНИЯ, А НЕ НАЧАЛА. Именно оно ограничивает частоту: поток,
+  // вошедший ДО конца этой перестройки, увидит `now - _userIndexLastScan`
+  // отрицательным и перестраивать не станет.
+  _userIndexLastScan = std::chrono::steady_clock::now();
+
   server::util::QuietLogInfo(
     "Account name index: {} account names indexed", _userNameKeys.size());
 }
@@ -637,8 +779,30 @@ void server::FileDataSource::IndexUserName(const std::string& name)
   if (name.empty())
     return;
   RaiseNameCeiling(_loginNameCeiling, name.size());
+
+  // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ВЗЯТИЯ ЗАМКА И ПОСЛЕ ЗАПИСИ ФАЙЛА. `StoreUser`
+  // пишет файл, потом зовёт нас, поэтому этот `last_write_time` уже включает
+  // нашу собственную запись. Чужой файл, появившийся ПОСЛЕ снимка, оставит
+  // отпечаток разошедшимся — то есть ошибка идёт в безопасную сторону.
+  std::error_code stampError;
+  const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
+
   const std::unique_lock indexLock(_userNameIndexMutex);
   _userNameKeys.insert(server::util::AsciiLowerKey(name));
+
+  // ★СВОЯ ЗАПИСЬ НЕ ДЕЛАЕТ ИНДЕКС УСТАРЕВШИМ (правка ревью, итерация 3). Ключ
+  // уже внесён строкой выше — индекс СОГЛАСОВАН с диском, — но mtime каталога
+  // от нашей же записи изменился, и без этой строки следующий промах читал бы
+  // «каталог изменился» и заказывал полный обход. Именно это позволяло
+  // staff-клиенту размножать обходы: сохранить запись, спросить отсутствующее
+  // имя, повторить. Принимаем новый отпечаток ТОЛЬКО когда индекс полон
+  // (`_userIndexStampValid`) — у оборванной перестройки принимать нечего.
+  //
+  // Чужой файл, успевший появиться между записью и снимком, будет замаскирован
+  // до принудительной сверки раз в `kUserIndexStaleAfter` — та существует
+  // ровно для этого класса (см. `NeedsUserIndexReconcile`).
+  if (_userIndexStampValid && not stampError)
+    _userIndexDirectoryStamp = stamp;
 }
 
 void server::FileDataSource::CreateInfraction(data::Infraction& infraction)
@@ -1334,10 +1498,23 @@ void server::FileDataSource::RebuildCharacterNameIndex()
   const auto listing = server::util::ListRegularFiles(_characterDataPath);
   if (listing.incomplete)
   {
+    // ★НЕПОЛНЫЙ ИНДЕКС НА СТАРТЕ ФАТАЛЕН (правка ревью, итерация 3). Прежняя
+    // редакция печатала строку и продолжала — то есть сервер начинал
+    // обслуживать игроков, у которых ЖИВОЙ персонаж не находится по имени, а
+    // его имя при этом числится свободным: создание персонажа с тем же именем
+    // прошло бы «уникальность». Строка в логе не отменяет ни того, ни другого.
+    //
+    // Перестройка зовётся РОВНО из `Initialize` (см. объявление в заголовке),
+    // поэтому бросок здесь останавливает старт, а не рвёт живой запрос.
     server::util::QuietLogError(
-      "Character name index: the scan of '{}' did not finish, some characters "
-      "will not be addressable by name until the next restart",
+      "Character name index: the scan of '{}' did not finish; refusing to start "
+      "with live characters unaddressable by name and their names readable as free",
       _characterDataPath.string());
+
+    throw std::runtime_error(
+      std::format(
+        "Character name index scan of '{}' did not finish",
+        _characterDataPath.string()));
   }
 
   for (const auto& filePath : listing.files)

@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -31,8 +32,10 @@
 
 #ifndef WIN32
 
+  #include <sys/socket.h>
   #include <sys/stat.h>
   #include <sys/types.h>
+  #include <sys/un.h>
   #include <unistd.h>
 
 namespace
@@ -332,6 +335,68 @@ void TestListRegularFiles(const std::filesystem::path& sandbox)
   }
 }
 
+//! ★НЕОБЫЧНАЯ ЗАПИСЬ В КАТАЛОГЕ АККАУНТОВ НЕ ИМЕЕТ ПРАВА НИ ПОВЕСИТЬ СТАРТ, НИ
+//! ОТМЕНИТЬ ЕГО (правка ревью, итерация 3).
+//!
+//! Проход сужения сперва ОТКРЫВАЛ каждую запись, чтобы через `fstat` узнать её
+//! тип. На именованном канале `open(O_RDONLY)` ждёт писателя — старт сервера
+//! вис бы навсегда; на сокете `open` даёт ENXIO, а после правки «отказ сужения
+//! останавливает старт» это означало ОТКАЗ В ОБСЛУЖИВАНИИ из-за записи, которую
+//! политика велит пропустить. Оба случая проверяются здесь настоящими объектами
+//! файловой системы, а не рассуждением.
+void TestNonRegularEntriesAreSkippedNotFatal(const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "exotic-accounts";
+  std::filesystem::create_directories(directory);
+
+  const auto account = directory / "real-0644.json";
+  SeedFile(account, 0644);
+
+  // ★ИМЕНОВАННЫЙ КАНАЛ. Если `O_NONBLOCK` пропадёт, этот тест не покраснеет —
+  // он ПОВИСНЕТ, и повисший прогон есть тот же отказ, что и на старте сервера.
+  const auto fifo = directory / "fifo.json";
+  assert(::mkfifo(fifo.c_str(), 0600) == 0);
+
+  // ★СОКЕТ. `open` по нему даёт ENXIO: прежняя редакция посчитала бы это
+  // отказом сужения (++failed) и уронила бы старт.
+  const auto socketPath = directory / "socket.json";
+  const int socketDescriptor = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  assert(socketDescriptor >= 0);
+  ::sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto socketName = socketPath.string();
+  assert(socketName.size() + 1 < sizeof(address.sun_path));
+  std::memcpy(address.sun_path, socketName.c_str(), socketName.size() + 1);
+  const int bound = ::bind(
+    socketDescriptor,
+    reinterpret_cast<const ::sockaddr*>(&address),
+    static_cast<::socklen_t>(sizeof(address)));
+  assert(bound == 0);
+  assert(::close(socketDescriptor) == 0);
+
+  // ★ВИСЯЧАЯ ССЫЛКА. `is_regular_file` ходит ПО ссылке и даёт ENOENT; считать
+  // эту ошибку неполнотой значило бы останавливать старт из-за мусора.
+  std::error_code linkError;
+  std::filesystem::create_symlink(
+    directory / "no-such-target.json", directory / "dangling.json", linkError);
+  assert(not linkError);
+
+  const auto listing = server::util::ListRegularFiles(directory);
+  assert(listing.files.size() == 1);      // только настоящий аккаунт
+  assert(listing.files.front() == account);
+  assert(not listing.incomplete);         // и обход ПОЛНЫЙ, а не «мы не смотрели»
+
+  const auto hardening = server::util::HardenSecretFilesInDirectory(directory);
+  assert(hardening.examined == 1);
+  assert(hardening.narrowed == 1);
+  assert(hardening.failed == 0);          // сокет и канал — не отказы сужения
+  assert(not hardening.incomplete);       // и не повод отказать в старте
+  assert(ModeOf(account) == 0600);
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
 } // namespace
 
 int main()
@@ -346,6 +411,7 @@ int main()
   TestEnsureDirectoryMode(sandbox);
   TestHardenSecretFilesInDirectory(sandbox);
   TestListRegularFiles(sandbox);
+  TestNonRegularEntriesAreSkippedNotFatal(sandbox);
 
   UnlockTree(sandbox);
   std::error_code ignored;

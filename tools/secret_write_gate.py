@@ -139,6 +139,45 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
     return violations, seen
 
 
+#! ВСЕ ПРОДАКШН-КОРНИ, А НЕ ОДИН `src` (правка ревью, итерация 3).
+#
+#  Прежняя редакция перечисляла только `src/**/*.cpp` и `src/**/*.hpp`, а
+#  объявление `WriteFileAtomically` и три четверти утилит живут в `include/`.
+#  Встроенный (`inline`) писатель, добавленный в заголовок с парой
+#  `"User file", FileSensitivity::Public`, компилировался бы и оставался
+#  НЕВИДИМЫМ для гейта, а пол «не меньше 18 вызовов» продолжали бы держать
+#  существующие вызовы из `src` — то есть гейт молчал бы не потому, что чисто, а
+#  потому, что не смотрел. Заявленная тотальность («компилятор перечисляет ВСЕ
+#  записи») обязана иметь тотальный обход.
+#
+#  `tests` намеренно НЕ входит: тест вправе написать не-User файл как `Secret`,
+#  чтобы проверить сам режим, и биконъюнкция там была бы ложно-красной. Гейт
+#  описывает продакшн-дерево, а не проверочные приспособления.
+PRODUCTION_ROOTS = ("src", "include")
+SOURCE_SUFFIXES = (".cpp", ".hpp", ".h", ".inl")
+
+
+def collect_sources(root: Path) -> tuple[list[Path], list[str]]:
+    """Все исходники продакшн-корней + СПИСОК ОТКАЗОВ ОБХОДА.
+
+    ★`rglob` глотает ошибки обхода (нечитаемый подкаталог просто не даёт
+    файлов), поэтому обход идёт через `os.walk` с `onerror`: «не прочитали»
+    обязано отличаться от «там пусто», иначе ноль нарушений ничего не значит."""
+    errors: list[str] = []
+    sources: list[Path] = []
+    for name in PRODUCTION_ROOTS:
+        base = root / name
+        if not base.is_dir():
+            errors.append(f"{base}: продакшн-корень отсутствует или не каталог")
+            continue
+        for directory, _subdirectories, files in os.walk(
+                base, onerror=lambda error: errors.append(f"{error.filename}: {error.strerror}")):
+            for file_name in files:
+                if file_name.endswith(SOURCE_SUFFIXES):
+                    sources.append(Path(directory) / file_name)
+    return sorted(sources), errors
+
+
 SELFTEST_FIXTURES = [
     ("clean", 0, '''
   server::util::WriteFileAtomically(
@@ -187,9 +226,16 @@ def main() -> int:
         return selftest()
 
     root = Path(os.environ.get("ROOT", Path(__file__).resolve().parent.parent))
-    sources = sorted((root / "src").rglob("*.cpp")) + sorted((root / "src").rglob("*.hpp"))
+    sources, walk_errors = collect_sources(root)
+    if walk_errors:
+        print(f"ОСТАНОВ: обход дерева под {root} отказал:")
+        for line in walk_errors:
+            print(f"         {line}")
+        print("         часть дерева не прочитана — «0 нарушений» читать нельзя.")
+        return 2
     if not sources:
-        print(f"ОСТАНОВ: под {root}/src не найдено ни одного исходника — считать нечего")
+        roots = ", ".join(f"{root}/{name}" for name in PRODUCTION_ROOTS)
+        print(f"ОСТАНОВ: под {roots} не найдено ни одного исходника — считать нечего")
         return 2
 
     violations: list[tuple[str, str]] = []
@@ -204,6 +250,8 @@ def main() -> int:
 
     print("=== secret-write gate ===")
     print(f"дерево          : {root}")
+    print(f"области         : {' '.join(PRODUCTION_ROOTS)}")
+    print(f"файлов прочитано: {len(sources)}")
     print(f"вызовов найдено : {calls} (минимум {MIN_CALLS})")
     print(f"нарушений       : {len(violations)} (ожидалось 0)")
 

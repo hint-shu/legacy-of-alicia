@@ -95,6 +95,21 @@ void TestCeilingComesFromWhatIsStored()
   assert(not IsLoginNameSafe(std::string(8000, 'b'), 49));
   // Класс символов поднятие потолка не расширяет.
   assert(not IsLoginNameSafe(std::string(40, 'b') + "/x", 49));
+
+  // ★КЛАСС ПОИСКА ШИРЕ КЛАССА РЕГИСТРАЦИИ, И ЭТО НАМЕРЕННО (правка ревью,
+  // итерация 3). Индекс аккаунтов строится из имён ФАЙЛОВ и никакого allowlist
+  // не требует: `data/users/john.doe.json` попадает в него как `john.doe`.
+  // Если поиск охраняет `IsLoginNameSafe`, такой аккаунт становится
+  // неадресуемым для staff-команды — гейт строже индекса, который он охраняет.
+  // Строгий allowlist остаётся на входе и регистрации, где решается, какие
+  // имена МОЖНО ЗАВЕСТИ.
+  const std::string_view legacyStem = "john.doe";
+  assert(not IsLoginNameSafe(legacyStem));                    // завести нельзя
+  assert(IsStorableNameShaped(legacyStem, kMaxLoginNameBytes));// а найти нужно
+  // Разделитель пути не пролезает и через широкий класс.
+  assert(not IsStorableNameShaped("../etc/passwd", kMaxLoginNameBytes));
+  assert(not IsStorableNameShaped(
+    std::string_view("john\0doe", 8), kMaxLoginNameBytes));
 }
 
 void TestCaseFolding()

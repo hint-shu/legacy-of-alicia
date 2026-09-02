@@ -49,9 +49,32 @@ done
 # The one place the duplicate-detection pipeline is written; the canary and the tree
 # scan both go through it, so a broken pipeline cannot be clean on one and blind on
 # the other.
+#
+# ★СТАТУС И stderr `grep` ЧИТАЮТСЯ, А НЕ ГЛУШАТСЯ (правка ревью, итерация 3).
+# Прежняя редакция гнала `grep ... 2>/dev/null | sed | sort | uniq -d`: статус
+# принадлежал `uniq`, а сообщение `grep` уходило в никуда. Файл, у которого
+# первый байт прочёлся (проверка `readable_file` прошла), но чтение целиком
+# отказало — EIO, отозванный доступ, исчезнувший монтаж, — давал ПУСТО, то есть
+# ровно то же, что «дублей нет», и гейт печатал «ЧИСТО ✓», ни разу не заглянув
+# внутрь. `grep` различает три исхода: 0 — нашёл, 1 — НЕ нашёл (это норма и
+# именно это раньше было неотличимо от беды), ≥2 — ошибка чтения.
+#
+# Возврат: 0 — файл прочитан (дубли, если есть, напечатаны), 2 — прочитать не
+# удалось; вызывающий обязан читать код возврата, иначе проверка снова станет
+# слепой.
 duplicates_in() {
-  grep -E '^[[:space:]]*#[[:space:]]*include[[:space:]]' "$1" 2>/dev/null \
-    | sed 's/[[:space:]]*$//' | sort | uniq -d
+  DUP_RAW="$(grep -E '^[[:space:]]*#[[:space:]]*include[[:space:]]' "$1" 2>"$GREP_ERR")"
+  DUP_RC=$?
+  if [ "$DUP_RC" -ge 2 ] || [ -s "$GREP_ERR" ]; then
+    return 2
+  fi
+  printf '%s\n' "$DUP_RAW" | sed 's/[[:space:]]*$//' | sort | uniq -d
+  # `pipefail` включён (см. `set` выше), поэтому отказ ЛЮБОЙ стадии — sed без
+  # памяти, sort без места под временный файл — виден здесь и означает то же
+  # самое: результат пуст не потому, что дублей нет.
+  DUP_PIPE_RC=$?
+  [ "$DUP_PIPE_RC" -eq 0 ] || return 2
+  return 0
 }
 
 # ★ЧИТАЕМОСТЬ ФАЙЛА — ОТДЕЛЬНЫЙ ВОПРОС К `duplicates_in` (правка ревью,
@@ -67,12 +90,19 @@ readable_file() {
 # Blindness guard #1: the canary must come back dirty.
 # Создание и запись канарейки проверяются по тому же правилу, что и в
 # `no_name_regex_gate.sh`: непроверенный `mktemp` — это класс, а не сайт.
+GREP_ERR="$(mktemp 2>/dev/null)" || GREP_ERR=""
+if [ -z "$GREP_ERR" ] || [ ! -f "$GREP_ERR" ]; then
+  echo "ОСТАНОВ: не удалось создать файл для ошибок чтения (mktemp) — проверить нечем."
+  exit 2
+fi
+trap 'rm -f "$GREP_ERR"' EXIT
+
 CANARY="$(mktemp 2>/dev/null)" || CANARY=""
 if [ -z "$CANARY" ] || [ ! -f "$CANARY" ]; then
   echo "ОСТАНОВ: не удалось создать канареечный файл (mktemp) — проверить нечем."
   exit 2
 fi
-trap 'rm -f "$CANARY"' EXIT
+trap 'rm -f "$CANARY" "$GREP_ERR"' EXIT
 if ! {
   echo '#include <string>'
   echo '#include <vector>'
@@ -81,10 +111,56 @@ if ! {
   echo "ОСТАНОВ: не удалось записать канареечный файл '$CANARY'."
   exit 2
 fi
-if [ -z "$(duplicates_in "$CANARY")" ]; then
-  echo "ОСТАНОВ: канарейка с заведомым дублем прочиталась как чистая —"
+CANARY_DUPS="$(duplicates_in "$CANARY")"
+CANARY_RC=$?
+if [ "$CANARY_RC" -ne 0 ] || [ -z "$CANARY_DUPS" ]; then
+  echo "ОСТАНОВ: канарейка с заведомым дублем прочиталась как чистая (код $CANARY_RC) —"
   echo "         конвейер сломан, ноль нарушителей читать нельзя."
   exit 2
+fi
+
+# ★И ТРЕТИЙ ИСХОД: файл БЕЗ единой строки `#include` обязан вернуться чистым и с
+# кодом 0. `grep` отвечает на «не нашёл» кодом 1, и если читать любой ненулевой
+# код как беду, гейт станет ложно-КРАСНЫМ на честном файле (в дереве такой есть:
+# include/libserver/Constants.hpp). Три исхода `grep` — 0/1/≥2 — обязаны быть
+# различимы все три, иначе различение не доказано.
+NO_INCLUDES="$(mktemp 2>/dev/null)" || NO_INCLUDES=""
+if [ -z "$NO_INCLUDES" ] || [ ! -f "$NO_INCLUDES" ]; then
+  echo "ОСТАНОВ: не удалось создать канарейку без включений (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES"' EXIT
+echo 'int main() { return 0; }' > "$NO_INCLUDES"
+NO_INCLUDES_DUPS="$(duplicates_in "$NO_INCLUDES")"
+NO_INCLUDES_RC=$?
+if [ "$NO_INCLUDES_RC" -ne 0 ] || [ -n "$NO_INCLUDES_DUPS" ]; then
+  echo "ОСТАНОВ: файл без включений вернул код $NO_INCLUDES_RC и вывод"
+  echo "         '$NO_INCLUDES_DUPS' — «не нашёл» спутано с «не прочитал»."
+  exit 2
+fi
+
+# ★КАНАРЕЙКА ДОКАЗЫВАЕТ И ВТОРОЙ ИСХОД: файл, чтение которого ОТКАЗЫВАЕТ,
+# обязан отличаться от файла без дублей. Без этой проверки «умеет вернуть 2»
+# оставалось бы намерением, а не свойством (правка ревью, итерация 3). Под root
+# биты прав не действуют, поэтому улика ставится только под обычным
+# пользователем — ложно-зелёная проверка хуже отсутствующей.
+if [ "$(id -u)" -ne 0 ]; then
+  UNREADABLE="$(mktemp 2>/dev/null)" || UNREADABLE=""
+  if [ -z "$UNREADABLE" ] || [ ! -f "$UNREADABLE" ]; then
+    echo "ОСТАНОВ: не удалось создать файл для проверки нечитаемости (mktemp)."
+    exit 2
+  fi
+  trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES" "$UNREADABLE"' EXIT
+  echo '#include <string>' > "$UNREADABLE"
+  chmod 000 "$UNREADABLE"
+  duplicates_in "$UNREADABLE" >/dev/null
+  UNREADABLE_RC=$?
+  if [ "$UNREADABLE_RC" -ne 2 ]; then
+    echo "ОСТАНОВ: нечитаемый файл вернул код $UNREADABLE_RC вместо 2 —"
+    echo "         «пусто» и «не прочитали» снова неотличимы, гейт слеп."
+    exit 2
+  fi
+  chmod 600 "$UNREADABLE"
 fi
 
 # Blindness guard #2: count what will actually be read.
@@ -97,7 +173,7 @@ if [ -z "$SCAN_ERR" ] || [ ! -f "$SCAN_ERR" ]; then
   echo "ОСТАНОВ: не удалось создать файл для ошибок обхода (mktemp)."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$SCAN_ERR"' EXIT
+trap 'rm -f "$CANARY" "$GREP_ERR" "$NO_INCLUDES" "$UNREADABLE" "$SCAN_ERR"' EXIT
 
 FILES_RAW="$(cd "$ROOT" && find $SCOPE -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.inl' \) 2>"$SCAN_ERR")"
 FIND_RC=$?
@@ -124,8 +200,17 @@ while IFS= read -r relative; do
     echo "         пусто, что неотличимо от «дублей нет». Слепое «чисто» запрещено."
     exit 2
   fi
-  SCANNED=$((SCANNED + 1))
   DUPS="$(duplicates_in "$ROOT/$relative")"
+  DUP_STATUS=$?
+  if [ "$DUP_STATUS" -ne 0 ]; then
+    echo "ОСТАНОВ: чтение файла '$relative' отказало уже ПОСЛЕ проверки читаемости"
+    echo "         (код $DUP_STATUS) — пустой результат неотличим от «дублей нет»."
+    sed 's/^/         /' "$GREP_ERR"
+    exit 2
+  fi
+  # Счётчик растёт ТОЛЬКО после доказанного чтения: «просканировано» обязано
+  # означать «прочитано», иначе число сходится, а гейт слеп.
+  SCANNED=$((SCANNED + 1))
   if [ -n "$DUPS" ]; then
     while IFS= read -r line; do
       OFFENDERS="${OFFENDERS}${relative}: ${line}"$'\n'

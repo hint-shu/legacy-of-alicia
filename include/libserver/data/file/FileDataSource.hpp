@@ -24,6 +24,7 @@
 #include <libserver/data/DataSource.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <shared_mutex>
@@ -239,6 +240,12 @@ private:
   std::filesystem::file_time_type _userIndexDirectoryStamp{};
   //! Отпечаток снят полной перестройкой (а не оборванной) и ему можно верить.
   bool _userIndexStampValid = false;
+  //! Момент окончания последней полной перестройки (правка ревью, итерация 3).
+  //! Ограничивает частоту сверок сверху (`kUserIndexReconcileGap`) и снизу
+  //! (`kUserIndexStaleAfter`); нулевое значение по умолчанию читается как
+  //! «сверки не было», то есть первая же сверка разрешена. Живёт под тем же
+  //! `_userNameIndexMutex`, что и отпечаток.
+  std::chrono::steady_clock::time_point _userIndexLastScan{};
 
   //! Потолки длины имени для СТРУКТУРНОГО ГЕЙТА, поднятые до самой длинной
   //! записи, которая реально лежит в индексе (правка ревью, итерация 1).
@@ -262,21 +269,33 @@ private:
   //! вердикт кто-то читает, и при этом не давал строку на пакет.
   std::atomic_uint64_t _rejectedNameLookups{0};
 
-  //! Перестроить индекс имён с диска. Зовётся только из `Initialize`.
+  //! Перестроить индекс имён с диска. Зовётся только из `Initialize` и потому
+  //! имеет право БРОСИТЬ: неполный обход каталога персонажей на старте — это
+  //! отказ стартовать, а не строка в логе (правка ревью, итерация 3).
   void RebuildCharacterNameIndex();
   //! Внести/переписать одну запись индекса (создание и переименование).
   void IndexCharacterName(data::Uid uid, const std::string& name);
   //! Убрать запись индекса.
   void ForgetCharacterName(data::Uid uid);
-  //! Перестроить индекс имён аккаунтов с диска. Зовётся из `Initialize` и с
-  //! промаха `IsUserNameUnique`, когда каталог аккаунтов изменился.
+  //! Перестроить индекс имён аккаунтов с диска, взяв замок самому. Зовётся из
+  //! `Initialize`.
   void RebuildUserNameIndex();
+  //! То же самое, но с УЖЕ УДЕРЖАННЫМ `_userNameIndexMutex` (эксклюзивно).
+  //! Разделение нужно сверке: она обязана перепроверить условие под тем же
+  //! эксклюзивным замком, под которым перестраивает, иначе несколько
+  //! одновременных промахов дают несколько полных обходов подряд.
+  void RebuildUserNameIndexLocked();
+  //! Нужна ли сверка индекса аккаунтов с диском ПРЯМО СЕЙЧАС. Зовётся только с
+  //! удержанным `_userNameIndexMutex` (в любом режиме) и ничего не блокирует.
+  [[nodiscard]] bool NeedsUserIndexReconcile(
+    std::filesystem::file_time_type stamp,
+    bool stampUnreadable,
+    std::chrono::steady_clock::time_point now) const;
   //! Внести одну запись индекса аккаунтов (регистрация и любое сохранение).
   void IndexUserName(const std::string& name);
-  //! Перестроить индекс аккаунтов, ЕСЛИ каталог изменился с последней полной
-  //! перестройки. Возвращает `true`, если перестройка состоялась (тогда индекс
-  //! имеет смысл переспросить). Замок внутри не удерживается через вызов
-  //! `RebuildUserNameIndex`: `shared_mutex` не рекурсивный.
+  //! Сверить индекс аккаунтов с диском, если это и НУЖНО, и РАЗРЕШЕНО по
+  //! частоте (`NeedsUserIndexReconcile`). Возвращает `true`, если перестройка
+  //! состоялась — тогда индекс имеет смысл переспросить.
   bool RefreshUserNameIndexIfDirectoryChanged();
 };
 
