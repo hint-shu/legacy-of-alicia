@@ -6505,7 +6505,20 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     // даёт — тот же результат достижим и с привязкой, если кастер назовёт целью
     // самого себя, — а эффект в любом случае достаётся заявителю: гард R71-4 не
     // пускает его на чужого, а `serverApplied` не пускает сюда ничего полезного.
+    //
+    // ★СУЖЕНО ДО ТОГО СЕМЕЙСТВА, РАДИ КОТОРОГО УСТУПКА И СДЕЛАНА (R71-25, находка
+    // ревью 4 #4). Раньше послабление действовало для ЛЮБОЙ атаки, хотя неуверенность
+    // касалась только JumpStun'а: «мы не знаем, называет ли клиент цели» — это не
+    // «пусть у всех будет запасной путь». Условие ключится на САМ ДЕФЕКТ, а не на
+    // список номеров ([[sweep-must-key-on-the-defect]]): `targetingType == 0` — это и
+    // есть «каст не наводится на цель» по реестру. Среди атак таких ровно JumpStun
+    // 12/13 (FireBall 1, DarkFire/Summon 2, Lightning 3); у 4-9/20-25 нулевой
+    // targetingType тоже, но они `ServerAppliedAtCast` и сюда не доходят, а 10/11 —
+    // стена со своей веткой.
+    const bool castCannotNameTargets = magicSlotInfo.targetingType == 0;
+
     const bool castNamedNobody = effectInstance != nullptr
+      && castCannotNameTargets
       && effectInstance->authorizedTargets.empty()
       && effectInstance->casterOid != command.targetOid;
 
