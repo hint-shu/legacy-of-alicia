@@ -66,6 +66,12 @@ target_sources(race_test_relay_authz PRIVATE
 target_link_libraries(race_test_relay_authz
         PRIVATE project-properties alicia-libserver)
 
+add_executable(protocol_test_relay_payload)
+target_sources(protocol_test_relay_payload PRIVATE
+        src/protocol/TestRelayPayload.cpp)
+target_link_libraries(protocol_test_relay_payload
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(race_test_p2did_pool)
 target_sources(race_test_p2did_pool PRIVATE
         src/race/TestP2dIdPool.cpp)
@@ -170,6 +176,7 @@ add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
 add_test(NAME RaceTestRaceJournal COMMAND race_test_race_journal)
 add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
+add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
