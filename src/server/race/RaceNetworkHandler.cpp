@@ -637,6 +637,24 @@ constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
 //! можно проверить, не выдумывая порогов: конечность. NaN/Inf, разосланные каждому
 //! клиенту как позиция препятствия, — это не «странное значение», это порча
 //! состояния у всех сразу.
+//! LOA-fix (R71-12, находка ревью 2 #1): «ЭФФЕКТ ЕСТЬ В РЕЕСТРЕ» И «ЭФФЕКТ МОЖНО
+//! ПОВЕСИТЬ» — РАЗНЫЕ УТВЕРЖДЕНИЯ.
+//!
+//! `Racer::effects` — массив на 24 слота (RaceTracker.hpp:259). `magic.yaml` же
+//! хранит `skillEffectId` СВОБОДНЫМ числом, и в поставляемом конфиге лежит запись
+//! `type: 27` со `skillEffectId: 99999` (magic.yaml:748) — она в реестре ЕСТЬ, но
+//! слота под неё не существует. Отсюда две беды, и обе лечит одно предикатное имя:
+//! жалоба «out of range» на каждый пакет (лог-флуд, ради которого заведён
+//! `LogThrottle`) и индексация `effects[99999]` — чтение за границами `std::array`.
+//!
+//! ★СЕГОДНЯ ЗА ГРАНИЦУ НЕ ХОДЯТ, НО ПО ВЕЗЕНИЮ: у записи 27 `adjustMotionSpeed: 0`,
+//! поэтому короткое замыкание в цикле снятия бафов не доходит до индекса. Меняется
+//! одно число в КОНФИГЕ — и «повезло» кончается. Проверяем свойство, а не запись.
+[[nodiscard]] constexpr bool IsSchedulableEffectId(const uint32_t effectId) noexcept
+{
+  return effectId < tracker::RaceTracker::Racer::EffectCount;
+}
+
 [[nodiscard]] bool IsFiniteIceWallPlacement(
   const protocol::AcCmdCRUseMagicItem::IceWallProperties& properties) noexcept
 {
@@ -5987,17 +6005,29 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // `skillEffectId == effectId` по всей карте (25 записей); здесь тот же поиск, только
   // без исключения. Не «похожая» проверка по своему списку — иначе она разошлась бы с
   // реестром при первом же изменении `magic.yaml`.
+  //
+  // ★ДОПОЛНЕНО ПО РЕВЬЮ 2 (находка #1): «ЕСТЬ В РЕЕСТРЕ» ЕЩЁ НЕ ЗНАЧИТ «РАБОТАЕТ».
+  // Первая редакция гарда спрашивала только про реестр — и пропускала
+  // `effectId = 99999`, который в поставляемом `magic.yaml` РЕАЛЬНО ЛЕЖИТ (запись
+  // type 27, :748). Пакет проходил гард, доезжал до `ScheduleSkillEffect` и печатал
+  // там `[error] skillEffectId 99999 out of range` — на КАЖДЫЙ пакет, без дросселя.
+  // То есть гард закрывал выдуманный номер и оставлял открытым настоящий: ровно тот
+  // класс «обход соседним полем», ради которого он и заводился. Спрашиваем ОБА
+  // условия — существование И наличие слота (`IsSchedulableEffectId`).
   const auto& magicSlotInfoMap = GetServerInstance().GetMagicRegistry().GetSlotInfoMap();
-  if (std::ranges::none_of(
-        magicSlotInfoMap,
-        [&command](const auto& entry) { return entry.second.skillEffectId == command.effectId; }))
+  const bool effectIdRegistered = std::ranges::any_of(
+    magicSlotInfoMap,
+    [&command](const auto& entry) { return entry.second.skillEffectId == command.effectId; });
+
+  if (not effectIdRegistered || not IsSchedulableEffectId(command.effectId))
   {
     uint64_t suppressed = 0;
     if (_skillEffectIdThrottle.Allow(suppressed))
       server::util::QuietLogWarn(
-        "Racer {} activated unknown skill effect id {} (suppressed {})",
+        "Racer {} activated unknown skill effect id {} (registered: {}, suppressed {})",
         targetRacer.oid,
         command.effectId,
+        effectIdRegistered,
         suppressed);
     return;
   }
@@ -6224,12 +6254,23 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
     return EffectVerdict::Failed;
 
   // Guard against misconfigured skillEffectId crashing the server
-  if (magicSlotInfo.skillEffectId >= tracker::RaceTracker::Racer::EffectCount)
+  //
+  // LOA-fix (R71-12, находка ревью 2 #1): ЖАЛОБА ЗАДРОССЕЛЕНА, ПОТОМУ ЧТО ЕЁ УМЕЕТ
+  // ЗАКАЗАТЬ КЛИЕНТ. Гард R71-5 закрывает клиентский путь `HandleActivateSkillEffect`,
+  // но сюда ведут и серверные вызовы (`HandleUseMagicItem`, крит-подмена по DarkFire
+  // ниже по функции), а величина берётся из КОНФИГА — то есть строка остаётся
+  // достижимой без единой правки кода, стоит появиться ещё одной записи вроде
+  // `skillEffectId: 99999`. Дроссель ставится на месте самой жалобы: так она не
+  // зависит от того, какой из путей до неё дошёл.
+  if (not IsSchedulableEffectId(magicSlotInfo.skillEffectId))
   {
-    server::util::QuietLogError(
-      "ScheduleSkillEffect: skillEffectId {} out of range (max {})",
-      magicSlotInfo.skillEffectId,
-      tracker::RaceTracker::Racer::EffectCount - 1);
+    uint64_t suppressed = 0;
+    if (_scheduleEffectRangeThrottle.Allow(suppressed))
+      server::util::QuietLogError(
+        "ScheduleSkillEffect: skillEffectId {} out of range (max {}, suppressed {})",
+        magicSlotInfo.skillEffectId,
+        tracker::RaceTracker::Racer::EffectCount - 1,
+        suppressed);
     return EffectVerdict::Failed;
   }
 
@@ -6268,11 +6309,17 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
   const uint32_t checkEffectId = magicSlotInfo.replaceEffect
     ? magicSlotInfo.skillEffectId
     : GetServerInstance().GetMagicRegistry().GetSlotInfo(magicSlotInfo.basicType).skillEffectId;
+  // LOA-fix (R71-12): `checkEffectId` приходит из ДРУГОЙ записи реестра (basicType), и
+  // проверенный выше `magicSlotInfo.skillEffectId` про неё ничего не говорит. Слота
+  // нет — значит эффект не занят: индексировать нечего, а `effects[99999]` было бы
+  // чтением за границами массива.
+  const bool checkEffectActive =
+    IsSchedulableEffectId(checkEffectId) && targetRacer.effects[checkEffectId];
   const bool isDuplicated = hotroddingBlocks
     || (isAttack && magicSlotInfo.attackRank < 2 && targetRacer.attackRank >= 2)
     || (magicSlotInfo.attackRank > 0
       ? targetRacer.attackRank >= magicSlotInfo.attackRank
-      : targetRacer.effects[checkEffectId] && (isAttack || !magicSlotInfo.replaceEffect));
+      : checkEffectActive && (isAttack || !magicSlotInfo.replaceEffect));
 
   const uint32_t effectDurationMs = ComputeEffectDurationMs(
     magicSlotInfo, attackerOid, targetRacer, racers);
@@ -6312,10 +6359,13 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
   {
     for (const auto& [type, slot] : GetServerInstance().GetMagicRegistry().GetSlotInfoMap())
     {
+      // LOA-fix (R71-12): `IsSchedulableEffectId` СТОИТ ПЕРЕД ИНДЕКСОМ, а не после —
+      // порядок здесь и есть защита: `effects[]` индексируется числом из конфига.
       if (slot.adjustMotionSpeed && slot.attackValue == 0
         && slot.skillEffectId != 6 && slot.skillEffectId != 7
         && slot.skillEffectId != 18 && slot.skillEffectId != 19
         && slot.skillEffectId != 20 && slot.skillEffectId != 21
+        && IsSchedulableEffectId(slot.skillEffectId)
         && targetRacer.effects[slot.skillEffectId])
       {
         RemoveEffect(raceInstance, targetRacer, slot.skillEffectId);
