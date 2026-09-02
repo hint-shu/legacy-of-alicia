@@ -3144,6 +3144,21 @@ void RaceNetworkHandler::HandleUserRaceFinal(
     racer.courseTime = didNotFinish
       ? tracker::InvalidCourseTime
       : finishCourseTime;
+
+    // LOA-fix (R70, backlog #58): ИСХОД ЗАЕЗДА ЗАПИСЫВАЕТСЯ ТАМ, ГДЕ ОН ИЗВЕСТЕН.
+    // Ниже по стеку (RaceInstance::Stop, достижения) виден только `courseTime`,
+    // а он равен InvalidCourseTime сразу в трёх случаях: честный сход, ОТВЕРГНУТЫЙ
+    // АНТИЧИТОМ финиш и «гонщик не прислал ничего». Различить их там уже нечем —
+    // значит различать надо здесь. Без этого «сход» (10036) чеканился бы попытками
+    // мгновенного финиша: античит превращает их в InvalidCourseTime, и достижение
+    // читало бы попытку обмана как обидный сход.
+    // ПОРЯДОК ВЕТОК: `didNotFinish` — поле пакета, оно первично; античит правит
+    // только `finishCourseTime` и только на ветке заявленного финиша.
+    racer.finishOutcome = didNotFinish
+      ? tracker::RaceTracker::Racer::FinishOutcome::Retired
+      : (finishCourseTime == tracker::InvalidCourseTime
+          ? tracker::RaceTracker::Racer::FinishOutcome::Rejected
+          : tracker::RaceTracker::Racer::FinishOutcome::Finished);
   }
 
   const protocol::AcCmdUserRaceFinalNotify notify{

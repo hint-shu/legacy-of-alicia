@@ -97,7 +97,6 @@ public:
     //!        фильтр `CountsInMode` не применяется.
     std::optional<EventContext> context = std::nullopt);
 
-
 private:
   ServerInstance& _serverInstance;
 };

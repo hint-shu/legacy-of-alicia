@@ -33,7 +33,6 @@
 #include <vector>
 #include <format>
 
-
 namespace server
 {
 
@@ -90,7 +89,6 @@ constexpr std::string_view GoalInHourWindowCondition(const uint32_t hour)
   if (hour >= 19 and hour < 22) return "GoalIn_19h_22h";
   return {};
 }
-
 
 //! LOA-fix (R11-1, round11, backlog #22): ПОТОЛОК СТАДИИ ЗАГРУЗКИ КАРТЫ.
 //! Апстрим держал 60 c магическим числом в теле RaceInstance::Start() под
@@ -1007,16 +1005,7 @@ void RaceInstance::Stop()
   {
     auto& racers = _tracker.GetRacers();
 
-    // --- состав ------------------------------------------------------------
-    // ★ЛЮДИ СЧИТАЮТСЯ ПО ТРЕКЕРУ — той же величиной, которой гейтится спавн
-    // ботов (`RaceNetworkHandler`: `GetRacers().size() == 1`).
-    // Отсюда инвариант приёмки: «боты есть» ⟺ «людей ровно один» ⟺ «ранговые
-    // условия подавлены» — три утверждения, посчитанные ОДНИМ числом, разойтись
-    // не могут. Ростер стабилен от старта до `Stop()`: `RaceTracker::RemoveRacer`
-    // в дереве не вызывается НИГДЕ (только определение), а отключение лишь
-    // ставит `state = Disconnected`.
-    // ★ОТКЛЮЧИВШИЕСЯ СЧИТАЮТСЯ. Решение принято явно, с ценой — §7.2 спеки.
-    const uint32_t humanCount = static_cast<uint32_t>(racers.size());
+    using FinishOutcome = tracker::RaceTracker::Racer::FinishOutcome;
 
     // --- режим -------------------------------------------------------------
     // Та же величина, что у квестов: маски достижений и квестов приходят из
@@ -1030,7 +1019,7 @@ void RaceInstance::Stop()
     const std::string_view hourWindow = GoalInHourWindowCondition(localHour);
     const std::string_view mapName = _mapBlockInfo.name;
 
-    // --- финишеры, места и сходы -------------------------------------------
+    // --- состав, финишеры, места и сходы ------------------------------------
     // ★СЧИТАЕМ ЗАНОВО, А НЕ ПО `raceResult.scores`, и это ПРЕЦЕДЕНТ, а не
     // самодеятельность: тот же приём и по той же причине стоит у дейликов
     // выше. Сортировка табло ставит первой ПОБЕДИВШУЮ КОМАНДУ, а не
@@ -1041,6 +1030,7 @@ void RaceInstance::Stop()
     struct Finisher { uint32_t courseTime; data::Uid uid; Team team; };
     std::vector<Finisher> finishers;
     uint32_t retireCount = 0;
+    uint32_t humanCount = 0;
 
     const auto isPlausibleFinish = [](const tracker::RaceTracker::Racer& racer)
     {
@@ -1050,15 +1040,41 @@ void RaceInstance::Stop()
 
     for (const auto& [characterUid, racer] : racers)
     {
-      // Отвалившийся не финишировал и НЕ считается сходом: иначе «чистую
-      // победу» (PerfectWin) можно было бы напечатать вторым аккаунтом,
-      // который заходит в заезд и тут же выходит.
+      // ★СОСТАВ СЧИТАЕТСЯ ПО ПОДКЛЮЧЁННЫМ, А НЕ ПО РАЗМЕРУ РОСТЕРА, и это
+      // ИСПРАВЛЕНИЕ, а не вкусовщина. Ростер (`GetRacers().size()`) стабилен от
+      // старта до `Stop()` — `RaceTracker::RemoveRacer` не вызывается нигде, а
+      // обрыв лишь ставит `state = Disconnected`. Значит по ростеру «человек»
+      // равен «аккаунт когда-то вошёл», и состав ПОКУПАЕТСЯ альтами: четыре
+      // (восемь) аккаунтов входят, заезд стартует, все, кроме одного,
+      // отваливаются — а `numPlayer` 4/8 у записей `Win`/`TeamWin` (10225,
+      // 10226, 10054, 10227, 10228, 10060) считался бы выполненным, и
+      // оставшийся забирал бы ПОВТОРЯЕМЫЕ тиры в фактически соло-заезде.
+      // Одного дропнутого альта для этого мало (спека §7.2 считала цену именно
+      // для одного) — четырёх достаточно, а порог `>= 2` у ранговых условий
+      // ростер обходил и вовсе одним альтом.
+      // ЦЕНА УЖЕСТОЧЕНИЯ, ЗАПИСАННАЯ ЧЕСТНО: честный игрок, чей единственный
+      // соперник вылетел из игры, за ЭТОТ заезд ранговых условий не получит
+      // (10003 `MyFirstWin`, разовая, 1 очко) — получит за следующий. Это
+      // дешевле повторяемой чеканки `Win`.
       if (racer.state == State::Disconnected)
         continue;
+      ++humanCount;
+
       if (isPlausibleFinish(racer))
+      {
         finishers.push_back({racer.courseTime, characterUid, racer.team});
-      else
+      }
+      // ★СХОД ДОКАЗЫВАЕТСЯ ПОЛОЖИТЕЛЬНО. «Нет правдоподобного времени» — это
+      // ТРИ разных события (см. `Racer::FinishOutcome`), и два из них сходом не
+      // являются: отвергнутый античитом финиш и «не прислал ничего». Считать
+      // сходом только `Retired` обязательно и здесь, а не только у условия
+      // `Retire`: `retireCount` кормит `PerfectWin` (10008), и без этого альт,
+      // простоявший заезд или пытавшийся мгновенно финишировать, ПЕЧАТАЛ БЫ
+      // «чистую победу» напарнику.
+      else if (racer.finishOutcome == FinishOutcome::Retired)
+      {
         ++retireCount;
+      }
     }
 
     std::ranges::sort(finishers, [](const Finisher& a, const Finisher& b)
@@ -1086,8 +1102,11 @@ void RaceInstance::Stop()
 
       if (not isPlausibleFinish(racer))
       {
-        // Retire: `TimeRecord == 0` (ach_conditions.lua:1346-1350).
-        conditions.emplace_back("Retire");
+        // Retire: `TimeRecord == 0` (ach_conditions.lua:1346-1350) — но только
+        // для ДОКАЗАННОГО схода. Отвергнутый античитом финиш и молчание сходом
+        // не считаются: см. `Racer::FinishOutcome` и подсчёт `retireCount` выше.
+        if (racer.finishOutcome == FinishOutcome::Retired)
+          conditions.emplace_back("Retire");
       }
       else
       {
@@ -1120,6 +1139,23 @@ void RaceInstance::Stop()
           if (isFirst)
           {
             // Win и MyFirstWin — оба `Rank == 1` (:1047-1051, :56-58).
+            //
+            // ★ЯВНАЯ ОБЛАСТЬ ДЕЙСТВИЯ `Win`/`TeamWin` — ЧИТАТЬ ДО ПРАВОК.
+            // Эти два условия — ЕДИНСТВЕННЫЕ в блоке, которые зажигают записи с
+            // ненулевым `numPlayer`, и потому единственные, чей набор записей
+            // зависит от СОСТАВА заезда:
+            //   `Win`     -> 10225 (numPlayer 4), 10226 (4), 10054 (8);
+            //   `TeamWin` -> 10227 (4), 10228 (4), 10060 (8).
+            // Все шесть — повторяемые, тиры [1,10,50,100] / [1,10,50,300] /
+            // [1,2,3,4], суммарно 24 очка. Пока в заезде меньше ЧЕТЫРЁХ
+            // ПОДКЛЮЧЁННЫХ людей, `AchievementInfo::CountsInMode` не пропускает
+            // ни одну из них, и раунд зажигает ровно 17 записей / 53 очка —
+            // это и есть заявленная приёмка. Граница «17 против 23» не на
+            // словах: её проверяет `tests/src/registry/TestAchievementTiers.cpp`
+            // (`TestCatalogShapesOfRankConditions`) прямо на формах каталога.
+            // Отсюда два следствия для будущих правок: (а) `humanCount` обязан
+            // считать ПОДКЛЮЧЁННЫХ, иначе состав покупается альтами; (б) любое
+            // новое условие с ненулевым `numPlayer` обязано попасть в тот тест.
             conditions.emplace_back("Win");
             conditions.emplace_back("MyFirstWin");
             // PerfectWin — `Rank == 1 && RetireCount > 0` (:72-80).
@@ -1199,7 +1235,6 @@ void RaceInstance::Stop()
 }
 
 void RaceInstance::Tick()
-
 {
   try
   {

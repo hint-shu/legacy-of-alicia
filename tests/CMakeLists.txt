@@ -75,7 +75,6 @@ target_link_libraries(registry_test_achievement_tiers
         PRIVATE project-properties alicia-libserver)
 
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
-
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
 add_test(NAME UtilTestLocale COMMAND util_test_locale)

@@ -178,6 +178,88 @@ void TestCountsInMode()
   Check(both.CountsInMode(4, 4), "оба подошли -> да");
 }
 
+//! ★ГРАНИЦА «17 ЗАПИСЕЙ ПРОТИВ 23» — МАШИННО, А НЕ НА СЛОВАХ.
+//!
+//! Блок достижений в `RaceInstance::Stop()` называет условия `Win` и `TeamWin`
+//! безусловно (это верные реализации предикатов оригинала). Единственное, что
+//! удерживает раунд на заявленных 17 записях / 53 очках, — фильтр состава: все
+//! ШЕСТЬ записей, которые эти два условия зажигают, требуют 4 либо 8 человек, а
+//! остальные семнадцать `numPlayer` не требуют вовсе. Утверждение проверяемое —
+//! значит оно обязано быть проверкой, а не абзацем в комментарии.
+//!
+//! Формы взяты ИЗ КАТАЛОГА (`resources/config/game/achievements.yaml`,
+//! `gameModeFlag`/`numPlayer` записей 10225/10226/10054/10227/10228/10060).
+//! Если каталог перегенерируется и порог упадёт — тест покажет это здесь, а не
+//! в проде повторяемой чеканкой `Win`.
+void TestCatalogShapesOfRankConditions()
+{
+  struct CatalogShape { uint32_t tid; uint32_t gameModeFlag; uint32_t numPlayer; };
+
+  // Шесть записей условий Win / TeamWin — единственные с ненулевым numPlayer
+  // среди тех, что раунд может зажечь.
+  constexpr std::array<CatalogShape, 6> rankEntries{{
+    {10225, 1, 4},   // Win, speed-solo
+    {10226, 4, 4},   // Win, magic-solo
+    {10054, 5, 8},   // Win, speed-solo | magic-solo
+    {10227, 2, 4},   // TeamWin, speed-team
+    {10228, 8, 4},   // TeamWin, magic-team
+    {10060, 10, 8}}};// TeamWin, speed-team | magic-team
+
+  for (const auto& entry : rankEntries)
+  {
+    const auto info = MakeInfo(
+      {1, 0, 0, 0}, AchievementCompareType::Counter,
+      entry.gameModeFlag, entry.numPlayer);
+
+    // ДО четырёх ПОДКЛЮЧЁННЫХ людей не проходит ни одна и ни в одном режиме —
+    // именно поэтому набор раунда равен семнадцати записям, а не двадцати трём.
+    for (uint32_t playerCount = 0; playerCount <= 3; ++playerCount)
+    {
+      for (uint32_t bit : {0u, 1u, 2u, 4u, 8u})
+      {
+        Check(
+          not info.CountsInMode(bit, playerCount),
+          "запись Win/TeamWin не засчитывается, пока людей меньше четырёх");
+      }
+    }
+
+    // На восьми проходит каждая — в СВОЁМ режиме и только в нём.
+    for (uint32_t bit : {1u, 2u, 4u, 8u})
+    {
+      Check(
+        info.CountsInMode(bit, 8) == ((entry.gameModeFlag & bit) != 0),
+        "на восьмерых запись Win/TeamWin засчитывается ровно в своём режиме");
+    }
+
+    // На четверых проходят только записи с порогом 4; записи с порогом 8 — нет.
+    const uint32_t ownBit = entry.gameModeFlag & ~(entry.gameModeFlag - 1);
+    Check(
+      info.CountsInMode(ownBit, 4) == (entry.numPlayer <= 4),
+      "на четверых проходит ровно запись с numPlayer <= 4");
+  }
+
+  // Контроль: формы СЕМНАДЦАТИ записей раунда состава не требуют вовсе, поэтому
+  // соло-заезд их не отсекает. Проверять «ноль отсечений» на пустом множестве
+  // было бы самообманом — берём реальные маски каталога.
+  constexpr std::array<CatalogShape, 6> roundEntries{{
+    {10036, 31, 0},   // Retire
+    {10145, 31, 0},   // GoalIn_14h_16h
+    {10163, 127, 0},  // GoalIn_8h_13h
+    {10018, 15, 0},   // RiLand01Mastery
+    {10003, 3, 0},    // MyFirstWin
+    {10213, 15, 0}}}; // Revenge
+
+  for (const auto& entry : roundEntries)
+  {
+    const auto info = MakeInfo(
+      {1, 0, 0, 0}, AchievementCompareType::Counter,
+      entry.gameModeFlag, entry.numPlayer);
+    Check(
+      info.CountsInMode(1, 1),
+      "запись раунда засчитывается и в заезде на одного человека");
+  }
+}
+
 //! Игровой час = UTC + 3 (Europe/Moscow, постоянный сдвиг с 2014 года).
 //! Негатив negF обнуляет смещение — тогда равенство ниже станет ложным.
 void TestGameLocalHour()
@@ -220,6 +302,7 @@ int main()
   TestAvailableTierCount();
   TestReachedNeverExceedsAvailable();
   TestCountsInMode();
+  TestCatalogShapesOfRankConditions();
   TestGameLocalHour();
 
   if (g_failures != 0)

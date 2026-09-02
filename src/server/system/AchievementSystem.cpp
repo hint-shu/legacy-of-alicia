@@ -57,7 +57,6 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
   const uint32_t increment,
   const std::span<const std::string_view> provenConditions,
   const std::optional<EventContext> context)
-
 {
   std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies;
   if (increment == 0)
@@ -75,7 +74,6 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
 
   characterRecord.Mutable(
     [&notifies, &matching, &provenConditions, &context, characterUid, increment](
-
       data::Character& character)
     {
       for (const auto* const info : matching)
@@ -117,7 +115,6 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
           and not info->CountsInMode(context->modeBit, context->playerCount))
           continue;
 
-
         // ★УСЛОВИЕ ИСПОЛНЯЕТ ТОТ, У КОГО ЕСТЬ ДАННЫЕ. Система умеет сама только
         // «просто считай событие» (Function = TRUE). Всё прочее требует данных
         // с места события — сытость лошади, класс жеребёнка, вес, — и потому
@@ -144,7 +141,6 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
         // 0xe4 на КАЖДОМ событии. См. AchievementInfo::GetAvailableTierCount.
         if (tiersBefore >= info->GetAvailableTierCount())
           continue;
-
 
         entry->progress += increment;
         const auto tiersAfter = info->GetReachedTierCount(entry->progress);

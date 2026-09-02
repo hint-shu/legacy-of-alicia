@@ -18,12 +18,27 @@
      скобкой самой функции нет НИ ОДНОГО оператора: только пустые строки,
      комментарии и одиночные `}`.
 
+  ★ПРОВЕРКА ПОСИМВОЛЬНАЯ, А НЕ ПОСТРОЧНАЯ, И ЭТО ИСПРАВЛЕНИЕ ДЕФЕКТА ГЕЙТА.
+  Первая версия шла по СТРОКАМ от `block_end + 1` до `end` (не включая `end`),
+  из-за чего слепла на двух формах сразу, и обе прошли адверсариальный прогон:
+      `}  DoSomething();`   — оператор В ОДНОЙ СТРОКЕ с концом блока
+                              (строка `block_end` не осматривалась вовсе);
+      `DoSomething();  }`   — оператор В ОДНОЙ СТРОКЕ с концом функции
+                              (строка `end` не осматривалась вовсе).
+  Теперь хвост собирается как поток СИМВОЛОВ кода от закрывающей скобки блока до
+  закрывающей скобки функции, поэтому «в той же строке» перестало быть укрытием.
+  Конец блока ищется не «последним возвратом глубины в ноль» (его сдвинул бы
+  дописанный следом `if (x) { … }`), а ПЕРВЫМ возвратом в ноль, за которым не
+  стоит `catch`.
+
 САМОПРОВЕРКА (гейт сперва доказывает себя)
-  `--self-test` строит две фикстуры из НАСТОЯЩЕГО файла и требует, чтобы гейт на
-  каждой упал:
-    фикстура 1 — после блока вставлен оператор `DoSomething();`;
+  `--self-test` строит четыре фикстуры из НАСТОЯЩЕГО файла и требует, чтобы гейт
+  на каждой упал:
+    фикстура 1 — после блока вставлен оператор `DoSomething();` отдельной строкой;
     фикстура 2 — маркер удалён вовсе («маркер не найден» не имеет права читаться
-                 как «всё хорошо»).
+                 как «всё хорошо»);
+    фикстура 3 — `DoSomething();` дописан В ТОЙ ЖЕ СТРОКЕ, где блок кончается;
+    фикстура 4 — `DoSomething();` дописан В ТОЙ ЖЕ СТРОКЕ, где кончается функция.
   Плюс требует, чтобы на неизменённом файле гейт проходил.
 
 КОДЫ ВОЗВРАТА
@@ -142,38 +157,75 @@ def check(path):
     return problems
 
 
+def code_of_lines(lines, upto):
+    """Код строк 0..upto включительно, без комментариев и строковых литералов.
+
+    Состояние блочного комментария ведётся ОТ НАЧАЛА ФАЙЛА: начать разбор с
+    середины значило бы принять код внутри `/* … */` за настоящий.
+    """
+    codes = []
+    in_block_comment = False
+    for index in range(0, upto + 1):
+        code, in_block_comment = strip_comments_and_strings(lines[index], in_block_comment)
+        codes.append(code)
+    return codes
+
+
+def locate_block(lines, marker, end):
+    """Разбирает хвост Stop() посимвольно.
+
+    @returns (chars, zeros, func_close, error), где
+      chars      — [(строка, колонка, символ)] кода от маркера до конца функции;
+      zeros      — индексы в chars тех `}`, что вернули глубину блока в ноль;
+      func_close — индекс в chars закрывающей скобки самой функции.
+    """
+    codes = code_of_lines(lines, end)
+    chars = [
+        (index, column, ch)
+        for index in range(marker, end + 1)
+        for column, ch in enumerate(codes[index])]
+
+    depth = 0
+    zeros = []
+    func_close = None
+    for position, (_, _, ch) in enumerate(chars):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                zeros.append(position)
+            elif depth < 0:
+                func_close = position
+                break
+    if func_close is None:
+        return None, None, None, "закрывающая скобка Stop() не найдена — файл разобран неверно"
+    if not zeros:
+        return None, None, None, "не нашёл конца блока достижений: скобки не сошлись"
+    return chars, zeros, func_close, None
+
+
 def check_tail(lines, marker, end):
     """После блока в Stop() не должно остаться ни одного оператора."""
-    # Идём от маркера, считая скобки; блок кончается там, где глубина
-    # относительно маркера возвращается к нулю ПОСЛЕ последнего catch.
-    in_block_comment = False
-    depth = 0
-    block_end = None
-    for index in range(marker, end):
-        code, in_block_comment = strip_comments_and_strings(lines[index], in_block_comment)
-        for ch in code:
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    block_end = index
-    if block_end is None:
-        return "не нашёл конца блока достижений: скобки не сошлись"
+    chars, zeros, func_close, error = locate_block(lines, marker, end)
+    if error:
+        return error
 
-    in_block_comment = False
-    # Перематываем состояние блочного комментария до block_end + 1.
-    for index in range(0, block_end + 1):
-        _, in_block_comment = strip_comments_and_strings(lines[index], in_block_comment)
-
-    for index in range(block_end + 1, end):
-        code, in_block_comment = strip_comments_and_strings(lines[index], in_block_comment)
-        stripped = re.sub(r"[\s}]", "", code)
-        if stripped:
-            return (
-                "после блока достижений в Stop() стоит оператор — строка %d: %s"
-                % (index + 1, lines[index].strip()))
-    return None
+    for position in zeros:
+        tail = chars[position + 1:func_close]
+        rest = "".join(ch for (_, _, ch) in tail)
+        # `try { … } catch (…) { … } catch (…) { … }` возвращает глубину в ноль
+        # трижды; первые два раза за скобкой стоит `catch` — это ещё тот же блок.
+        if rest.lstrip().startswith("catch"):
+            continue
+        if not rest.strip():
+            return None
+        offender = next(
+            (index, column) for (index, column, ch) in tail if not ch.isspace())
+        return (
+            "после блока достижений в Stop() стоит оператор — строка %d, колонка %d: %s"
+            % (offender[0] + 1, offender[1] + 1, lines[offender[0]].strip()))
+    return "конец блока достижений не опознан — за каждой закрывающей скобкой стоит catch"
 
 
 def self_test(path):
@@ -194,6 +246,17 @@ def self_test(path):
         print("САМОПРОВЕРКА: %s" % error)
         return 2
 
+    marker_lines = [i for i, line in enumerate(lines) if MARKER in line]
+    if len(marker_lines) != 1:
+        print("САМОПРОВЕРКА: маркер найден %d раз(а) — фикстуры не построить"
+              % len(marker_lines))
+        return 2
+    chars, zeros, _, error = locate_block(lines, marker_lines[0], end)
+    if error:
+        print("САМОПРОВЕРКА: %s" % error)
+        return 2
+    block_end_line, block_end_column, _ = chars[zeros[-1]]
+
     fixtures = []
     # Фикстура 1: оператор после блока, ПЕРЕД закрывающей скобкой функции.
     injected = lines[:end] + ["  DoSomething();"] + lines[end:]
@@ -201,6 +264,21 @@ def self_test(path):
     # Фикстура 2: маркера нет вовсе.
     fixtures.append(
         ("маркер удалён", original.replace(MARKER, "// === (маркер снят фикстурой)")))
+    # Фикстура 3: `}  DoSomething();` — оператор в строке конца блока. Ровно эта
+    # форма проходила первую версию гейта: строку block_end она не смотрела.
+    same_line_block = list(lines)
+    same_line_block[block_end_line] = (
+        lines[block_end_line][:block_end_column + 1]
+        + "  DoSomething();"
+        + lines[block_end_line][block_end_column + 1:])
+    fixtures.append(
+        ("оператор в строке конца блока", "\n".join(same_line_block) + "\n"))
+    # Фикстура 4: `DoSomething();  }` — оператор в строке конца функции. Вторая
+    # форма, проходившая первую версию: строку end она тоже не смотрела.
+    same_line_function = list(lines)
+    same_line_function[end] = "  DoSomething();" + lines[end]
+    fixtures.append(
+        ("оператор в строке конца функции", "\n".join(same_line_function) + "\n"))
 
     directory = tempfile.mkdtemp(prefix="check_stop_tail_")
     for name, content in fixtures:
