@@ -5596,7 +5596,22 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
   const auto deckIter = items.find(command.itemDeckId);
   if (deckIter == items.end())
   {
-    server::util::QuietLogWarn("Client {} picked up untracked item deck {}", clientId, command.itemDeckId);
+    // LOA-fix (R71-13, находка ревью 2 #5): ЭТА СТРОКА ПИШЕТСЯ НА ЧЕСТНОМ ПОВЕДЕНИИ.
+    //
+    // Сюда приходят три разных случая, и только один из них — попытка: подделанный
+    // `itemDeckId` (гард R71-7 закрывает чужой oid, но не выдуманный номер деки),
+    // ДУБЛЬ честного пакета подбора (дека уже снята первым) и подбор деки, снятой
+    // соседом миллисекундой раньше. Два последних — обычная гонка, а строка писалась
+    // на каждый пакет: соседний комментарий про «тихую обработку дубля» относится к
+    // ветке кулдауна НИЖЕ и этой ветки не касался. Свой дроссель, а не общий: флуд
+    // подделанным номером не должен глушить жалобы других гардов раунда.
+    uint64_t suppressed = 0;
+    if (_itemDeckUnknownThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Client {} picked up untracked item deck {} (suppressed {})",
+        clientId,
+        command.itemDeckId,
+        suppressed);
     return;
   }
 
