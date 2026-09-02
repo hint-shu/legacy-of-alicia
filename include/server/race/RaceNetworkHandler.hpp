@@ -488,6 +488,7 @@ private:
   util::LogThrottle _itemDeckUnknownThrottle;
   util::LogThrottle _relayReferenceThrottle;
   util::LogThrottle _iceWallInstanceThrottle;
+  util::LogThrottle _effectInstanceCapacityThrottle;
 };
 
 } // namespace server

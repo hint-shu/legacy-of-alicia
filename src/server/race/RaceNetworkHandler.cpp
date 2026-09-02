@@ -5282,6 +5282,34 @@ void RaceNetworkHandler::HandleUseMagicItem(
     return;
   }
 
+  // LOA-fix (R71-21, находка ревью 2 #3): МЕСТО ПОД УЛИКУ СПРАШИВАЕТСЯ ДО КАСТА.
+  //
+  // Реестр выданных экземпляров — единственное, чем сервер потом отличит честный
+  // отчёт «на мне сработало» от выдуманного. Прежняя редакция гарантировала место
+  // ВЫТЕСНЕНИЕМ самой старой записи, то есть уничтожала улику о живой стене: девять
+  // кастов по восемь сегментов давали 72 живых экземпляра при потолке 64, и честный
+  // слом первых восьми стен после этого отбрасывался. Теперь наоборот: если места
+  // нет — отказывает КАСТ, и отказ стоит ЗДЕСЬ, до списания крит-бафа, до выдачи
+  // номеров и до любой рассылки. Ёмкость считается НА КАСТЕРА, поэтому флудер
+  // отказывает в кастах только самому себе, а чужую улику вытеснить не может.
+  const uint16_t issuedInstanceCount = isIceWall
+    ? static_cast<uint16_t>(command.targetList.size())
+    : uint16_t{1};
+
+  if (not raceInstance.GetTracker().CanIssueEffectInstances(racer.oid, issuedInstanceCount))
+  {
+    uint64_t suppressed = 0;
+    if (_effectInstanceCapacityThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} exhausted its effect-instance budget ({} per race), cast of magic {} "
+        "refused (suppressed {})",
+        racer.oid,
+        tracker::RaceTracker::MaxEffectInstancesPerRacer,
+        magicSlotInfo.type,
+        suppressed);
+    return;
+  }
+
   // LOA-fix (R71-11): вот теперь баф списывается — ни один гард выше уже не может
   // отбросить пакет, значит списание и его широковещательное объявление больше не
   // случаются «в никуда».
@@ -5296,24 +5324,33 @@ void RaceNetworkHandler::HandleUseMagicItem(
   }
 
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
-    isIceWall ? static_cast<uint16_t>(command.targetList.size()) : 1u);
+    issuedInstanceCount);
 
-  // LOA-fix (R71-17, находка ревью 2 #2): СЕРВЕР ЗАПОМИНАЕТ, ЧТО САМ ВЫДАЛ.
+  // LOA-fix (R71-17, находка ревью 2 #2; РАСШИРЕНО R71-20 по находке ревью 2 #1):
+  // СЕРВЕР ЗАПОМИНАЕТ ВСЁ, ЧТО САМ ВЫДАЛ.
   //
-  // Слом стены объявляет КЛИЕНТ, и номер экземпляра в его пакете до этого раунда
-  // ничем не сверялся. Здесь — единственное место, где экземпляры рождаются, поэтому
-  // здесь же они и записываются: тип берётся РАЗРЕШЁННЫЙ (`magicSlotInfo.type`, уже
-  // после крит-подмены), владелец — отправитель, чей oid сверен гардом R57-5 выше.
-  // Снимаются они в двух местах и только там: по слому (`HandleActivateSkillEffect`)
-  // и по истечению — тем же отложенным вызовом, который рассылает `AcCmdRCMagicExpire`.
-  if (isIceWall)
-  {
-    raceInstance.GetTracker().AddIceWallInstances(
-      effectInstanceId,
-      static_cast<uint16_t>(command.targetList.size()),
-      magicSlotInfo.type,
-      racer.oid);
-  }
+  // Отчёт «на мне сработал эффект» объявляет КЛИЕНТ, и номер экземпляра в его пакете
+  // до этого раунда ничем не сверялся. Здесь — единственное место, где экземпляры
+  // рождаются, поэтому здесь же они и записываются: тип берётся РАЗРЕШЁННЫЙ
+  // (`magicSlotInfo.type`, уже после крит-подмены), владелец — отправитель, чей oid
+  // сверен гардом R57-5 выше.
+  //
+  // ★ЗАПИСЫВАЮТСЯ ВСЕ ТИПЫ, А НЕ ОДНИ СТЕНЫ. Первая редакция вела реестр только для
+  // ледяной стены — то есть вела СПИСОК МЕСТ вместо правила, и всё остальное
+  // (`effectId = 2` + выдуманный `effectInstanceId` = бесплатный водяной щит) ехало
+  // мимо. Правило теперь одно: экземпляр эффекта существует ровно тогда, когда его
+  // выдал сервер.
+  //
+  // Снимаются записи только по событию, которое сервер объявил сам: по слому стены
+  // (`HandleActivateSkillEffect`) и по её истечению — тем же отложенным вызовом,
+  // который рассылает `AcCmdRCMagicExpire`. Остальные живут до конца заезда
+  // (`RaceTracker::Clear`): у них нет объявленного сервером срока, и выдумывать его
+  // значило бы выбрасывать честные отчёты о попадании.
+  raceInstance.GetTracker().AddEffectInstances(
+    effectInstanceId,
+    issuedInstanceCount,
+    magicSlotInfo.type,
+    racer.oid);
 
   // Darkfire should only affect one target
   // Client sends all targets infront of them but we should only apply the effect to the targeted one (the arrow above their head)
@@ -5422,7 +5459,7 @@ void RaceNetworkHandler::HandleUseMagicItem(
           // ЗДЕСЬ, а не по таймеру в реестре: живым экземпляр считается ровно столько,
           // сколько сервер сам объявил его живым, и выдумывать второй срок жизни (а с
           // ним и запас на задержку сети) не приходится.
-          raceInstance.GetTracker().RemoveIceWallInstances(
+          raceInstance.GetTracker().RemoveEffectInstances(
             effectInstanceId, obstacleInstanceCount);
         },
         Scheduler::Clock::now() + std::chrono::seconds(4)); // TODO: Change to 4 seconds
@@ -6152,7 +6189,7 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     // живут ТОЛЬКО в соло-заезде, где ломать чужое нечего.
     if (not raceInstance.IsAiRacerOid(command.attackerOid))
     {
-      const auto* iceWallInstance = raceInstance.GetTracker().FindIceWallInstance(
+      const auto* iceWallInstance = raceInstance.GetTracker().FindEffectInstance(
         command.effectInstanceId);
       const bool iceWallMatches = iceWallInstance != nullptr
         && iceWallInstance->magicType == magicSlotInfo.type
@@ -6173,7 +6210,7 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
         return;
       }
 
-      raceInstance.GetTracker().RemoveIceWallInstance(command.effectInstanceId);
+      raceInstance.GetTracker().RemoveEffectInstance(command.effectInstanceId);
     }
 
     const auto magicExpire = protocol::AcCmdRCMagicExpire{

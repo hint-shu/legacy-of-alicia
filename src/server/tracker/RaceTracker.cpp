@@ -278,7 +278,21 @@ uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
   return nextId;
 }
 
-void RaceTracker::AddIceWallInstances(
+bool RaceTracker::CanIssueEffectInstances(
+  const Oid casterOid,
+  const uint16_t count) const
+{
+  size_t ownedCount = 0;
+  for (const auto& instance : _effectInstances)
+  {
+    if (instance.casterOid == casterOid)
+      ++ownedCount;
+  }
+
+  return ownedCount + count <= MaxEffectInstancesPerRacer;
+}
+
+void RaceTracker::AddEffectInstances(
   const uint16_t firstInstanceId,
   const uint16_t count,
   const uint16_t magicType,
@@ -290,23 +304,28 @@ void RaceTracker::AddIceWallInstances(
 
     // Один номер — одна запись. Совпадение возможно только после оборота
     // шестнадцатибитного счётчика, и тогда старая запись именно что мертва.
-    RemoveIceWallInstance(instanceId);
+    RemoveEffectInstance(instanceId);
 
-    if (_iceWallInstances.size() >= MaxIceWallInstances)
-      _iceWallInstances.erase(_iceWallInstances.begin());
+    // LOA-fix (R71-21, находка ревью 2 #3): ВЫТЕСНЕНИЯ НЕТ. Прежняя редакция
+    // стирала самую старую запись, чтобы освободить место, — то есть уничтожала
+    // улику о ЖИВОЙ стене, и честный слом этой стены после переполнения получал
+    // отказ. Место спрашивают ЗАРАНЕЕ (`CanIssueEffectInstances`); если правило
+    // всё-таки нарушено, новая запись не делается, но ничего живого не гибнет.
+    if (not CanIssueEffectInstances(casterOid, 1))
+      return;
 
-    _iceWallInstances.push_back(
-      IceWallInstance{
+    _effectInstances.push_back(
+      EffectInstance{
         .instanceId = instanceId,
         .magicType = magicType,
         .casterOid = casterOid});
   }
 }
 
-const RaceTracker::IceWallInstance* RaceTracker::FindIceWallInstance(
+const RaceTracker::EffectInstance* RaceTracker::FindEffectInstance(
   const uint16_t instanceId) const
 {
-  for (const auto& instance : _iceWallInstances)
+  for (const auto& instance : _effectInstances)
   {
     if (instance.instanceId == instanceId)
       return &instance;
@@ -315,20 +334,20 @@ const RaceTracker::IceWallInstance* RaceTracker::FindIceWallInstance(
   return nullptr;
 }
 
-void RaceTracker::RemoveIceWallInstance(const uint16_t instanceId)
+void RaceTracker::RemoveEffectInstance(const uint16_t instanceId)
 {
   std::erase_if(
-    _iceWallInstances,
-    [instanceId](const IceWallInstance& instance)
+    _effectInstances,
+    [instanceId](const EffectInstance& instance)
     { return instance.instanceId == instanceId; });
 }
 
-void RaceTracker::RemoveIceWallInstances(
+void RaceTracker::RemoveEffectInstances(
   const uint16_t firstInstanceId,
   const uint16_t count)
 {
   for (uint16_t i = 0; i < count; ++i)
-    RemoveIceWallInstance(static_cast<uint16_t>(firstInstanceId + i));
+    RemoveEffectInstance(static_cast<uint16_t>(firstInstanceId + i));
 }
 
 bool RaceTracker::HasIssuedEffectInstanceId(const uint32_t effectInstanceId) const
@@ -347,9 +366,17 @@ void RaceTracker::Clear()
   _racers.clear();
   _itemDecks.clear();
   _events.clear();
-  // LOA-fix (R71-17): экземпляры стены живут РОВНО один заезд — как и гонщики,
-  // которые их поставили. Иначе номер из прошлого заезда остался бы «живым».
-  _iceWallInstances.clear();
+  // LOA-fix (R71-17/R71-21): экземпляры эффектов живут РОВНО один заезд — как и
+  // гонщики, которые их кастовали. Иначе номер из прошлого заезда остался бы «живым».
+  //
+  // ★СЧЁТЧИК НОМЕРОВ ЧИСТИТСЯ ЗДЕСЬ ЖЕ, И ЭТО ПОЧИНКА, А НЕ КОСМЕТИКА: он не
+  // сбрасывался, а трекер живёт вместе с КОМНАТОЙ — за её жизнь счётчик мог
+  // обернуться, после чего `HasIssuedEffectInstanceId` навсегда отвечал «да» на любой
+  // номер. Сброс ставит номера в один ряд с `_nextItemDeckOid`, который пер-заездным
+  // был всегда; oid'ы персонажей остаются пер-комнатными (клиент их не переназначает).
+  _effectInstances.clear();
+  _nextEffectInstanceId = 0;
+  _effectInstanceIdWrapped = false;
   _nextItemDeckOid = 1;
   firstPassItemSpawn = true;
 
