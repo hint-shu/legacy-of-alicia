@@ -317,6 +317,34 @@ def classify(type_name, aliases, enums, aggregates, steps=0):
 
 FIELD_NAME_RE = re.compile(r"^(?P<type>.+?)\s(?P<name>\w+)\s*(?P<arr>(\[[^\]]*\]\s*)*)$")
 
+# A pointer-to-function (or pointer-to-member-function) DATA MEMBER: the declarator
+# name sits inside parentheses behind a `*`. `void (*callback)();` is a scalar that
+# holds whatever was on the heap — exactly the defect this gate exists to find — and
+# the first version of this script threw it away together with method declarations,
+# because both merely "contain a parenthesis".
+FUNCTION_POINTER_RE = re.compile(r"\(\s*[\*&][^()]*\)\s*\(")
+
+# A member FUNCTION declaration: the declarator ends with the parameter list, possibly
+# followed by cv/ref/exception specifiers. A data member never ends that way — even
+# one whose type carries parentheses (`std::function<void(int)> callback`) ends with
+# its own name. Checked AFTER the function-pointer form, which also ends with `)`.
+METHOD_TAIL_RE = re.compile(
+    r"\)\s*(?:const|volatile|noexcept|override|final|&{1,2}|\s)*$")
+
+# A bit-field: `uint32_t flags : 3;`. The `(?<!:):(?!:)` pair keeps `data::Tid` out of
+# it. A bit-field without an initialiser is uninitialised exactly like any other
+# scalar; the first version skipped the whole statement and counted nothing.
+BITFIELD_RE = re.compile(r"^(?P<decl>.+?)\s*(?<!:):(?!:)\s*(?P<width>[^:]+)$")
+
+
+def classify_statement_with_parens(decl):
+    """'funcptr' | 'method' | None (unclassifiable — the caller must STOP)."""
+    if FUNCTION_POINTER_RE.search(decl):
+        return "funcptr"
+    if METHOD_TAIL_RE.search(decl):
+        return "method"
+    return None
+
 
 def scan_file(path, aliases, enums, aggregates, report):
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -330,12 +358,45 @@ def scan_file(path, aliases, enums, aggregates, report):
         head = text.split(" ")[0].rstrip(":")
         if head in DECL_SKIP_PREFIXES:
             continue
-        if "(" in text or ")" in text:
-            continue            # method declaration, constructor, functional cast
-        if re.search(r"(?<!:):\s*\d+\s*$", text):
-            continue            # bit-field: `uint32_t flags : 3;`
+        # `operator==(...)`, `operator=(...)`: the `=` belongs to the NAME, so the
+        # initialiser split below would tear the declaration apart and leave
+        # `bool operator` looking like an uninitialised scalar field.
+        if re.search(r"\boperator\b", text):
+            report["methods"] += 1
+            continue
+
         has_init = "{" in text or "=" in text
         decl = text.split("=")[0].split("{")[0].strip()
+
+        # ★PARENTHESES ARE NO LONGER A SILENT SKIP (R72-fix-5, Codex finding 5).
+        # Three outcomes, and silence is not one of them: a function-pointer member
+        # is a FIELD (and a scalar one), a method declaration is counted as a method,
+        # and anything else with a parenthesis STOPS the gate. Note the test is on
+        # `decl` — the part BEFORE any initialiser — so `uint32_t x = foo();` is
+        # judged as the initialised field it is, not thrown away as "a functional
+        # cast".
+        if "(" in decl or ")" in decl:
+            kind = classify_statement_with_parens(decl)
+            if kind == "method":
+                report["methods"] += 1
+                continue
+            if kind is None:
+                report["unparsed"].append((path, line, text))
+                continue
+            report["fields"] += 1
+            if has_init:
+                continue
+            report["without_init"] += 1
+            report["offenders"].append((path, line, text, "указатель на функцию"))
+            continue
+
+        # ★BIT-FIELDS ARE JUDGED, NOT SKIPPED (R72-fix-5, Codex finding 5). The width
+        # is cut off and the declaration underneath is classified like any other.
+        bitfield = BITFIELD_RE.match(decl)
+        if bitfield is not None:
+            report["bitfields"] += 1
+            decl = bitfield.group("decl").strip()
+
         match = FIELD_NAME_RE.match(decl)
         if not match:
             continue
@@ -363,7 +424,8 @@ def analyse(directory, repo_root):
             alias_sources.append(candidate)
     aliases, enums, aggregates = build_alias_table(alias_sources)
     report = {"files": len(headers), "fields": 0, "without_init": 0,
-              "offenders": [], "unknown": []}
+              "methods": 0, "bitfields": 0,
+              "offenders": [], "unknown": [], "unparsed": []}
     for header in headers:
         scan_file(header, aliases, enums, aggregates, report)
     return report
@@ -387,6 +449,8 @@ def run_tree(directory, repo_root):
     print(f"файлов просканировано              : {report['files']}   (порог: >= {MIN_FILES})")
     print(f"объявлений полей ВСЕГО             : {report['fields']}   (порог: >= {MIN_FIELD_DECLS})")
     print(f"из них без инициализатора          : {report['without_init']}   (порог: >= {MIN_WITHOUT_INIT})")
+    print(f"объявлений методов (пропущено)     : {report['methods']}")
+    print(f"из них битовых полей               : {report['bitfields']}")
 
     invalid = False
     if report["files"] < MIN_FILES:
@@ -397,6 +461,13 @@ def run_tree(directory, repo_root):
         invalid = True
     if report["without_init"] < MIN_WITHOUT_INIT:
         print("ОСТАНОВ: полей без инициализатора меньше порога — разбор поехал")
+        invalid = True
+    if report["unparsed"]:
+        print(f"ОСТАНОВ: объявлений со скобками, которые разбор не смог отнести "
+              f"ни к методу, ни к полю: {len(report['unparsed'])}")
+        for path, line, text in report["unparsed"]:
+            print(f"  {relpath(path, repo_root)}:{line}: {text};")
+        print("  молча пропустить такую форму нельзя — именно так поле уходит из-под гарда")
         invalid = True
     if report["unknown"]:
         print(f"ОСТАНОВ: типов, которые не удалось классифицировать: {len(report['unknown'])}")
@@ -435,7 +506,33 @@ SELFTEST_EXPECTATIONS = {
     "methods_ok.hpp":              {"code": 0, "offenders": []},
     "comments_and_strings_ok.hpp": {"code": 0, "offenders": [], "line_probe": ("probe", 39)},
     "unknown_type_stop.hpp":       {"code": 2, "offenders": []},
+    # R72-fix-5 (Codex finding 5): the two forms the first version threw away.
+    "func_pointer_bad.hpp":        {"code": 1, "offenders": [("callback", 18)]},
+    "bitfield_bad.hpp":            {"code": 1, "offenders": [("flags", 18)]},
+    "bitfield_init_ok.hpp":        {"code": 0, "offenders": []},
+    "trailing_return_stop.hpp":    {"code": 2, "offenders": []},
 }
+
+
+def offender_field_name(text):
+    """The declared NAME of an offending field, whatever shape it was declared in.
+
+    Exists for the selftest table: a plain scalar, a function pointer and a bit-field
+    put their name in three different places, and `text.split()[-1]` names only the
+    first of the three (it would call `void (*callback)()` "(*callback)()" and
+    `uint32_t flags : 3` "3").
+    """
+    decl = text.split("=")[0].split("{")[0].strip()
+    pointer = re.search(r"\(\s*\*+\s*(\w+)\s*\)", decl)
+    if pointer:
+        return pointer.group(1)
+    bitfield = BITFIELD_RE.match(decl)
+    if bitfield is not None:
+        decl = bitfield.group("decl").strip()
+    match = FIELD_NAME_RE.match(decl)
+    if match:
+        return match.group("name")
+    return decl.split()[-1] if decl.split() else decl
 
 
 def selftest(repo_root):
@@ -457,10 +554,11 @@ def selftest(repo_root):
         path = os.path.join(fixtures_dir, name)
         aliases, enums, aggregates = build_alias_table([path])
         report = {"files": 1, "fields": 0, "without_init": 0,
-                  "offenders": [], "unknown": []}
+                  "methods": 0, "bitfields": 0,
+                  "offenders": [], "unknown": [], "unparsed": []}
         scan_file(path, aliases, enums, aggregates, report)
 
-        if report["unknown"]:
+        if report["unknown"] or report["unparsed"]:
             code = 2
         elif report["offenders"]:
             code = 1
@@ -470,7 +568,7 @@ def selftest(repo_root):
         problems = []
         if code != expected["code"]:
             problems.append(f"код {code}, ожидался {expected['code']}")
-        got = [(text.split()[-1], line) for _, line, text, _ in report["offenders"]]
+        got = [(offender_field_name(text), line) for _, line, text, _ in report["offenders"]]
         want = expected["offenders"]
         if sorted(got) != sorted(want):
             problems.append(f"нарушители {got}, ожидались {want}")

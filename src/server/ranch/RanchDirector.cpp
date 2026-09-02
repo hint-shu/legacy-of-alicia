@@ -1187,6 +1187,13 @@ void RanchDirector::HandleNetworkTick()
     // помечен noexcept — исключение мимо него было бы std::terminate.
     DrainPendingDisconnects();
 
+    // LOA-fix (R72-fix-3, round72, находка Codex 2): отложенные уведомления о
+    // представлении — ВТОРЫМ, сразу после разрывов и по той же причине, по
+    // которой разрывы идут первыми: мёртвые клиенты уже убраны из `_clients`,
+    // и уведомление не адресуется трупу.
+    // ★Бросить отсюда безопасно: обрамляющий catch на месте (см. R34-5).
+    DrainPendingIntroductionNotifies();
+
     // LOA-fix (R35-4, round35, backlog #124): ПРОХОД ПО СОЗРЕВШИМ ЖЕРЕБЯТАМ —
     // здесь и только здесь. Мы на РАНЧ-СЕТЕВОМ потоке, единственном владельце
     // `_clients`/`_ranches`, поэтому обход и мутация контекстов законны.
@@ -1708,7 +1715,67 @@ void RanchDirector::DrainPendingDisconnects()
 }
 
 void RanchDirector::BroadcastSetIntroductionNotify(
-  uint32_t characterUid,
+  const uint32_t characterUid,
+  const std::string& introduction)
+{
+  // LOA-fix (R72-fix-3, round72, находка Codex 2): МАРШРУТИЗАЦИЯ ВМЕСТО
+  // ПРЯМОЙ РАССЫЛКИ. Зовут отсюда с ЛОББИ-сетевого потока, а `_clients` и
+  // `_ranches` принадлежат ранч-сетевому — читать их здесь значит гоняться с
+  // владельцем карт (см. разбор у объявления метода и у `Disconnect`, R34-4).
+  // Кладём ЗНАЧЕНИЯ под ЛИСТОВЫМ локом — одна операция с контейнером, ни
+  // одного вызова наружу — и уходим. Рассылку сделает
+  // DrainPendingIntroductionNotifies на ранч-сетевом тике.
+  //
+  // ★СХЛОПЫВАНИЕ ПО ПЕРСОНАЖУ ОСОЗНАННОЕ: побеждает ПОСЛЕДНЕЕ представление,
+  // а промежуточные редакции текста рассылать некому и незачем. Это и есть
+  // верхняя граница памяти очереди — число персонажей онлайн.
+  {
+    std::lock_guard lock(_pendingIntroductionNotifiesMutex);
+    _pendingIntroductionNotifies[characterUid] = introduction;
+  }
+}
+
+void RanchDirector::DrainPendingIntroductionNotifies()
+{
+  // LOA-fix (R72-fix-3, round72, находка Codex 2): исполнение отложенных
+  // уведомлений о представлении.
+  // ★ПОТОК: только РАНЧ-СЕТЕВОЙ (единственный вызов — из HandleNetworkTick).
+  // Здесь и только здесь законно трогать `_clients`, `_ranches` и
+  // `_commandServer` по просьбе чужого потока.
+
+  // Снимаем очередь ЦЕЛИКОМ и ОТПУСКАЕМ лок до любых действий: под листовым
+  // локом не должно оставаться ни одного вызова наружу.
+  std::unordered_map<data::Uid, std::string> pendingNotifies;
+  {
+    std::lock_guard lock(_pendingIntroductionNotifiesMutex);
+    if (_pendingIntroductionNotifies.empty())
+      return;
+
+    pendingNotifies.swap(_pendingIntroductionNotifies);
+  }
+
+  for (const auto& [characterUid, introduction] : pendingNotifies)
+  {
+    try
+    {
+      BroadcastSetIntroductionOnRanchThread(characterUid, introduction);
+    }
+    catch (const std::exception& x)
+    {
+      // ★ПЕРЕХВАТ НА КАЖДОЙ ЗАПИСИ, а не один на весь слив — тот же приём, что
+      // в DrainPendingDisconnects, и по той же причине: очередь УЖЕ снята, и
+      // осечка на одном персонаже иначе съела бы уведомления всех остальных,
+      // второй попытки для них не будет.
+      server::util::QuietLogWarn(
+        "Failed to broadcast the introduction of character {}: {}",
+        characterUid,
+        x.what());
+    }
+  }
+}
+
+void RanchDirector::BroadcastSetIntroductionOnRanchThread(
+  const uint32_t characterUid,
   const std::string& introduction)
 {
   // LOA-fix (R72-2, round72, backlog #170-item-28): «ПЕРСОНАЖ НЕ НА РАНЧО» —

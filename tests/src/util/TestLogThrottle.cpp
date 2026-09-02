@@ -109,10 +109,60 @@ void TestFirstLinePassesAndFloodIsSwallowed()
   CHECK(total == 1003);
 }
 
+//! ★ОТРИЦАТЕЛЬНАЯ ЭПОХА `steady_clock` (R72-fix-1, находка Codex 6).
+//!
+//! Стандарт НЕ обещает, что `steady_clock::now().time_since_epoch()`
+//! неотрицательна: эпоха не специфицирована и вправе лежать в будущем. Пока
+//! меткой «ещё ни разу не писали» служил НОЛЬ, на такой реализации условие
+//! «пора писать» (`now >= _nextAllowed`) было ложным для КАЖДОГО отрицательного
+//! `now` — то есть первые отказы гасились бы вовсе, без единой строки и без
+//! итогового счёта. Проверить это через `Allow()` невозможно: часы вернут то,
+//! что вернут. Поэтому решение вынесено в `AllowAt(now, …)`, и тест подаёт ему
+//! отрицательное время напрямую.
+//!
+//! ★ЭТА ПРОВЕРКА УМЕЕТ ПРОВАЛИТЬСЯ: со стартовым значением 0 первый же CHECK
+//! ниже красный (прогон на заведомо сломанной копии — в отчёте раунда).
+void TestNegativeEpochStillEmitsTheFirstLine()
+{
+  server::util::LogThrottle throttle(TestWindow);
+
+  // Тики отрицательные и заведомо далеки от нуля.
+  const auto farInThePast =
+    -1'000'000 * static_cast<server::util::LogThrottle::Clock::rep>(1);
+
+  uint64_t suppressed = 12345;
+  uint64_t total = 12345;
+
+  // Первая строка обязана выйти ДАЖЕ при отрицательной эпохе.
+  CHECK(throttle.AllowAt(farInThePast, suppressed, total));
+  CHECK(suppressed == 0);
+  CHECK(total == 1);
+
+  // Внутри окна — глотаем, но считаем.
+  suppressed = 12345;
+  total = 12345;
+  CHECK(not throttle.AllowAt(farInThePast + 1, suppressed, total));
+  CHECK(suppressed == 0);
+  CHECK(total == 2);
+
+  // Окно (1 с) прошло — снова можно, и проглоченное названо числом.
+  const auto pastWindow = farInThePast
+    + std::chrono::duration_cast<server::util::LogThrottle::Clock::duration>(
+        TestWindow).count()
+    + 1;
+
+  suppressed = 12345;
+  total = 12345;
+  CHECK(throttle.AllowAt(pastWindow, suppressed, total));
+  CHECK(suppressed == 1);
+  CHECK(total == 3);
+}
+
 } // namespace
 
 int main()
 {
   TestFirstLinePassesAndFloodIsSwallowed();
+  TestNegativeEpochStillEmitsTheFirstLine();
   return 0;
 }

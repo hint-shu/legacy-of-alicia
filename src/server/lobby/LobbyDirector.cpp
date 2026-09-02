@@ -98,6 +98,35 @@ size_t LobbyDirector::QueueClientLogin(
   if (clientLoginIter == _clientLogins.cend())
     return 99;
 
+  // LOA-fix (R72-fix-4, round72, backlog #129-S1, находка Codex 4):
+  // ★ОДИН КЛИЕНТ — НЕ БОЛЬШЕ ОДНОГО ВХОДА В ОЧЕРЕДЯХ.
+  //
+  // `AcCmdCLLogin` — команда ПРЕД-ЛОГИННАЯ по построению: гейт авторизации её
+  // пропускает, иначе войти было бы нельзя. Пока очередь не дедуплицировалась,
+  // один сокет мог положить в неё СВОЙ ЖЕ ClientId сколько угодно раз: очередь
+  // росла по числу присланных пакетов (память, ничем не ограниченная клиентом),
+  // а директор снимал по записи за тик и на каждой писал строку об отказе —
+  // клиентский лог-флуд, живущий ещё долго ПОСЛЕ того, как клиент замолчал.
+  // Сосед по файлу — `QueueClientConnect` — от этого защищён `try_emplace`;
+  // здесь защиты не было вовсе.
+  //
+  // ★СВОЙСТВО, А НЕ ФЛАГ: «ClientId встречается в двух очередях входа не более
+  // одного раза». Проверяем его прямо по очередям, а не отдельным полем
+  // состояния, которое пришлось бы согласовывать со ВСЕМИ путями снятия
+  // (отказ, ошибка данных, инфракция, успех, разрыв) — список мест обязательно
+  // отстанет. Цена — линейный поиск по очередям, но именно этот дедуп и держит
+  // их короткими (длина ≤ числа клиентов, входящих прямо сейчас).
+  //
+  // ★УЧЁТНЫЕ ДАННЫЕ НЕ ПЕРЕЗАПИСЫВАЮТСЯ: побеждает ПЕРВАЯ просьба. Иначе
+  // второй пакет менял бы имя и токен под уже отправленной просьбой об
+  // аутентификации, и вердикт относился бы не к тем учётным данным.
+  const bool alreadyQueued =
+    std::ranges::find(_loginRequestQueue, clientId) != _loginRequestQueue.cend()
+    || std::ranges::find(_loginResponseQueue, clientId) != _loginResponseQueue.cend();
+
+  if (alreadyQueued)
+    return _loginRequestQueue.size() + _loginResponseQueue.size();
+
   clientLoginIter->second.userName = userName;
   clientLoginIter->second.userToken = userToken;
 
@@ -386,7 +415,29 @@ void LobbyDirector::ProcessLoginRequest()
 
   if (not loginContext.isAuthenticated.value())
   {
-    server::util::QuietLogInfo("User '{}' failed authentication", loginContext.userName);
+    // LOA-fix (R72-fix-4, round72, находка Codex 4): ★СТРОКА ОБ ОТКАЗЕ
+    // ДРОССЕЛИРОВАНА, НО НЕ ПОТЕРЯНА.
+    //
+    // Дедуп очереди выше убирает рост памяти и повторную работу, но НЕ
+    // объём лога: вердикт аутентификации остаётся в контексте клиента, и
+    // каждый следующий пакет `AcCmdCLLogin` снова доходит сюда — то есть один
+    // сокет по-прежнему способен держать поток строк с частотой тика
+    // директора (50/с). Дроссель гасит объём, а накопительный счётчик не даёт
+    // проглоченным отказам исчезнуть: следующая выпущенная строка называет
+    // полное число неудачных входов за жизнь процесса, и подбор пароля
+    // остаётся видимым в логе числом, а не строкой на попытку.
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_failedAuthenticationThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogInfo(
+        "User '{}' failed authentication; {} more failures suppressed since the "
+        "previous line; {} failed logins total since start",
+        loginContext.userName,
+        suppressed,
+        total);
+    }
+
     _networkHandler->RejectLogin(
       clientId,
       protocol::AcCmdCLLoginCancel::Reason::InvalidUser);
@@ -547,7 +598,7 @@ void LobbyDirector::ProcesLoginResponse()
     "User '{}' (client {}) logged in from {}",
     loginContext.userName,
     clientId,
-    _networkHandler->GetCommandServer().GetClientAddress(clientId).to_string());
+    _networkHandler->GetClientAddress(clientId));
 
   userRecord.Mutable([](data::User& user)
   {

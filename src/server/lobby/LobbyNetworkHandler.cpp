@@ -639,9 +639,20 @@ void LobbyNetworkHandler::NotifyMatchmakeResult(
   }
 }
 
-CommandServer& LobbyNetworkHandler::GetCommandServer() noexcept
+std::string LobbyNetworkHandler::GetClientAddress(const ClientId clientId) noexcept
 {
-  return _commandServer;
+  // LOA-fix (R72-fix-2, round72, находка Codex 3): наружу уходит СТРОКА, а не
+  // диспетчер. `CommandServer::GetClientAddress` бросает, если клиента уже нет
+  // (`Server::GetClient`), а единственный вызывающий — строка лога об успешном
+  // входе. Терять из-за неё соединение или ронять поток директора нельзя.
+  try
+  {
+    return _commandServer.GetClientAddress(clientId).to_string();
+  }
+  catch (const std::exception&)
+  {
+    return {};
+  }
 }
 
 ClientId LobbyNetworkHandler::GetClientIdByUserName(

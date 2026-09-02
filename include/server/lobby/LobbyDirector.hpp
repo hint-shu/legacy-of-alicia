@@ -29,6 +29,7 @@
 
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/network/NetworkDefinitions.hpp>
+#include <libserver/util/LogThrottle.hpp>
 #include <libserver/util/Scheduler.hpp>
 
 #include <unordered_map>
@@ -219,6 +220,17 @@ private:
 
   //! A network handler.
   LobbyNetworkHandler* _networkHandler;
+
+  //! LOA-fix (R72-fix-4, round72, backlog #129-S1, находка Codex 4): дроссель
+  //! строк о неудачной аутентификации.
+  //! Строку порождает КЛИЕНТ: `AcCmdCLLogin` законно пред-логинная, вердикт
+  //! остаётся в контексте, и каждый следующий пакет снова доходит до отказа —
+  //! то есть один сокет держит поток строк с частотой тика директора.
+  //! Окно 10 с — то же, что у дросселя отказов лобби-хендлера: подбор пароля
+  //! обязан оставлять в логе след (строка + накопительный счёт), а не мегабайты.
+  //! ★Полный счёт дроссель ведёт САМ и не обнуляет — проглоченный отказ не
+  //! теряется, он назван числом в следующей выпущенной строке.
+  util::LogThrottle _failedAuthenticationThrottle{std::chrono::seconds(10)};
 };
 
 } // namespace server

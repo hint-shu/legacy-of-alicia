@@ -44,6 +44,9 @@
 // LOA-fix (R48-1, #58/R2-D): <span> и <string_view> — под список доказанных
 // условий достижения, который хук передаёт системе (SendAchievementEvent).
 #include <span>
+// LOA-fix (R72-fix-3, находка Codex 2): <string> — под значение очереди
+// отложенных уведомлений о представлении (_pendingIntroductionNotifies).
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -140,7 +143,32 @@ public:
   //! @param maxAge Возраст, начиная с которого запись считается мусором.
   void SweepRanchActivity(std::chrono::seconds maxAge);
 
+  //! LOA-fix (R72-fix-3, round72, backlog #170-item-28, находка Codex 2):
+  //! ★ПРОСИТ разослать новое представление. НЕ РАССЫЛАЕТ ЗДЕСЬ и НЕ ТРОГАЕТ
+  //! `_clients`/`_ranches`.
   //!
+  //! Единственный вызывающий — `LobbyNetworkHandler::HandleSetIntroduction`,
+  //! то есть ЛОББИ-СЕТЕВОЙ поток. А `_clients` и `_ranches` принадлежат
+  //! РАНЧ-СЕТЕВОМУ (см. их объявления ниже): ранч-поток в тот же момент
+  //! законно вставляет и стирает записи в HandleClientConnected /
+  //! HandleClientDisconnected / HandleRanchLeave. Читать их с лобби-потока —
+  //! гонка по неатомарной unordered_map: rehash под чужим обходом это порча
+  //! памяти, а не «редкий сбой». До этой правки метод делал ровно это, а
+  //! документация обещала обратное — ложное обещание о потокобезопасности
+  //! живёт тихо и подводит следующий раунд, который на него обопрётся.
+  //!
+  //! ★ПРИЁМ ТОТ ЖЕ, ЧТО У `Disconnect` (R34-4): кладём ЗНАЧЕНИЯ в очередь под
+  //! ЛИСТОВЫМ локом и уходим; рассылку делает DrainPendingIntroductionNotifies
+  //! на ранч-сетевом тике (задержка ≤1 c). Мьютексом `_clients` эту гонку не
+  //! лечат: `GetClientContext` отдаёт ссылку НАРУЖУ, она переживает любой лок
+  //! внутри аксессора — это была бы ложная безопасность.
+  //!
+  //! ★ОЧЕРЕДЬ КЛЮЧУЕТСЯ ПЕРСОНАЖЕМ, поэтому повторные правки представления
+  //! схлопываются в последнюю: верхняя граница памяти = число персонажей
+  //! онлайн, а не число присланных пакетов. Рассылка и так «лучшая попытка»,
+  //! промежуточные редакции текста никому не нужны.
+  //! @param characterUid UID персонажа, сменившего представление.
+  //! @param introduction Новый текст представления.
   void BroadcastSetIntroductionNotify(
     uint32_t characterUid,
     const std::string& introduction);
@@ -343,7 +371,7 @@ private:
   //!
   //! Прежний `GetClientContextByCharacterUid` бросал «Character not associated
   //! with any client» на ШТАТНОМ состоянии «персонаж не на ранчо», а его
-  //! единственный вызывающий (`BroadcastSetIntroductionNotify`) — путь,
+  //! единственный вызывающий (`BroadcastSetIntroductionOnRanchThread`) — путь,
   //! управляемый клиентом: одна строка [error] на каждый пакет 0x171.
   //!
   //! ★ОТДАЁТ И ClientId. Не удобство: skip-self обязан сравнивать ClientId с
@@ -356,7 +384,10 @@ private:
   //!        клиент не найден.
   //! @returns nullptr, если аутентифицированного ранч-клиента у персонажа нет.
   //! ★Указатель действителен ровно до следующей мутации `_clients`; звать и
-  //! использовать только на РАНЧ-СЕТЕВОМ потоке.
+  //! использовать только на РАНЧ-СЕТЕВОМ потоке. ★С R72-fix-3 это обещание
+  //! ВЫПОЛНЕНО и вызывающим: единственный вызывающий —
+  //! DrainPendingIntroductionNotifies, а он живёт на ранч-сетевом тике. До
+  //! правки сюда приходил лобби-поток, и предупреждение было ложным.
   [[nodiscard]] ClientContext* TryGetClientContextByCharacterUid(
     data::Uid characterUid,
     ClientId& clientId);
@@ -808,6 +839,27 @@ private:
   //! ОТДЕЛЬНЫМ проходом и разрыв делается уже ПОСЛЕ выхода из обхода map.
   void DrainPendingDisconnects();
 
+  //! LOA-fix (R72-fix-3, round72, находка Codex 2): СЛИВ ОЧЕРЕДИ ОТЛОЖЕННЫХ
+  //! УВЕДОМЛЕНИЙ О ПРЕДСТАВЛЕНИИ.
+  //! Зовётся ТОЛЬКО из HandleNetworkTick, то есть строго на РАНЧ-СЕТЕВОМ
+  //! потоке — единственном, которому законно трогать `_clients`, `_ranches` и
+  //! `_commandServer`.
+  //! ★Очередь снимается целиком, лок ОТПУСКАЕТСЯ, и только потом идут поиски и
+  //! отправки: под листовым локом не должно быть ни одного вызова наружу
+  //! (дисциплина раундов 21/34).
+  void DrainPendingIntroductionNotifies();
+
+  //! LOA-fix (R72-fix-3, round72, находка Codex 2): САМА РАССЫЛКА нового
+  //! представления — тело, которое до правки жило прямо в
+  //! `BroadcastSetIntroductionNotify` и исполнялось на ЛОББИ-потоке.
+  //! ★ПОТОК: только РАНЧ-СЕТЕВОЙ. Единственный вызывающий —
+  //! DrainPendingIntroductionNotifies.
+  //! @param characterUid UID персонажа, сменившего представление.
+  //! @param introduction Новый текст представления.
+  void BroadcastSetIntroductionOnRanchThread(
+    uint32_t characterUid,
+    const std::string& introduction);
+
   //! LOA-fix (R38-1, round38, backlog #131): ДЕДУП СЕССИЙ ОДНОГО ПЕРСОНАЖА.
   //! Рвёт ВСЕ уже аутентифицированные ранч-соединения персонажа, КРОМЕ
   //! указанного нового. Зовётся ровно из одной точки — HandleEnterRanch, сразу
@@ -930,6 +982,24 @@ private:
   //! он знает только персонажа, а достать id = снова читать чужую _clients —
   //! ровно та гонка, которую раунд 34 и убирает.
   std::unordered_map<data::Uid, std::uint64_t> _pendingDisconnects;
+
+  //! LOA-fix (R72-fix-3, round72, находка Codex 2): ★ЛИСТОВОЙ мьютекс очереди
+  //! отложенных уведомлений о представлении. Третий и последний межпотоковый
+  //! замок директора ранчо. Правило то же, нарушение = deadlock: под ним НЕ
+  //! берётся ни один другой лок и НЕ делается ни одного вызова наружу
+  //! (`_clients`, `_ranches`, `_commandServer`, `_scheduler`).
+  std::mutex _pendingIntroductionNotifiesMutex;
+
+  //! LOA-fix (R72-fix-3, round72, находка Codex 2): очередь отложенных
+  //! уведомлений — UID персонажа → его новое представление.
+  //! Пишется ЛОББИ-сетевым потоком (BroadcastSetIntroductionNotify), читается и
+  //! опустошается РАНЧ-СЕТЕВЫМ в HandleNetworkTick (задержка ≤1 c).
+  //! ★ТОЛЬКО ЗНАЧЕНИЯ: ни указателей, ни ссылок, ни ClientId. ClientId у
+  //! чужого потока взять неоткуда, не читая `_clients`, — а это ровно та
+  //! гонка, которую правка убирает.
+  //! map, а не vector: повторные правки одного персонажа схлопываются, что и
+  //! даёт верхнюю границу памяти = числу персонажей онлайн.
+  std::unordered_map<data::Uid, std::string> _pendingIntroductionNotifies;
 
   //! A command deferrer for the `AcCmdCRMountFamilyTree` command.
   CommandDeferrer<protocol::AcCmdCRMountFamilyTree> _mountFamilyTreeDeferrer;

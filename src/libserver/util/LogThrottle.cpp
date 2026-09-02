@@ -25,12 +25,19 @@ namespace server::util
 
 bool LogThrottle::Allow(uint64_t& suppressed, uint64_t& total) noexcept
 {
+  return AllowAt(Clock::now().time_since_epoch().count(), suppressed, total);
+}
+
+bool LogThrottle::AllowAt(
+  const Clock::rep now,
+  uint64_t& suppressed,
+  uint64_t& total) noexcept
+{
   // ★СЧЁТ СОБЫТИЙ — ПЕРВЫМ И БЕЗУСЛОВНО. Иначе «проглоченное» событие не
   // попадает никуда, и оракул «за легитимную сессию — ноль отказов» слепнет
   // ровно на том, ради чего он заведён.
   total = _total.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  const auto now = Clock::now().time_since_epoch().count();
   auto nextAllowed = _nextAllowed.load(std::memory_order_relaxed);
 
   // ★ЦИКЛ CAS, А НЕ «load; store». Лобби-поток один, но сам класс общий, и

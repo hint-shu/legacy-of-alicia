@@ -25,6 +25,7 @@
 #include "libserver/network/Server.hpp"
 #include "libserver/util/Stream.hpp"
 
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <unordered_map>
@@ -134,6 +135,47 @@ public:
   {
     _handlers[C::GetCommand()] = [handler](ClientId clientId, SourceStream& source)
     {
+      C command;
+      C::Read(command, source);
+      handler(clientId, command);
+    };
+  }
+
+  //! LOA-fix (R72-fix-1, round72, backlog #129-S1, находка Codex 1):
+  //! ★РЕГИСТРАЦИЯ С ВОРОТАМИ, КОТОРЫЕ СТОЯТ ДО РАЗБОРА ПАКЕТА.
+  //!
+  //! ПОЧЕМУ ОТДЕЛЬНЫЙ ВХОД, А НЕ ПРОВЕРКА В ТЕЛЕ ХЕНДЛЕРА. Обычный
+  //! `RegisterCommandHandler` разбирает пакет (`C::Read`) ПЕРЕД тем, как
+  //! отдать управление хендлеру. Значит любая проверка, живущая в хендлере или
+  //! в обёртке над ним, стоит ПОСЛЕ десериализации — и сокет, которому вообще
+  //! нечего тут делать, доходит до разбора. Кадр НЕВЕРНОЙ ДЛИНЫ заставляет
+  //! `C::Read` бросить, бросок ловит диспетчер и пишет строку [error] НА
+  //! КАЖДЫЙ ПАКЕТ, а счётчик отказов не растёт вовсе: то есть отказ и не
+  //! дросселирован, и не сосчитан. Ворота обязаны стоять раньше разбора.
+  //!
+  //! ★ДАННЫЕ ПОГЛОЩАЮТСЯ, А НЕ БРОСАЮТСЯ. Отказ двигает курсор потока команды
+  //! в конец. Диспетчер после хендлера утверждает `assert(cursor == size)`;
+  //! оставленный непрочитанным хвост — это падение отладочной сборки на каждом
+  //! отказе, то есть проверка, «работающая» только потому, что в релизе
+  //! `assert` выкинут препроцессором.
+  //!
+  //! @param gate Ворота: получают клиента и команду, возвращают «пускать ли».
+  //!             Обязаны быть дешёвыми и НЕ бросать — они на пути пакета.
+  //! @param handler Обработчик команды.
+  template <ReadableCommandStruct C>
+  void RegisterGatedCommandHandler(
+    std::function<bool(ClientId clientId, protocol::Command command)> gate,
+    std::function<void(ClientId clientId, const C& command)> handler)
+  {
+    _handlers[C::GetCommand()] = [gate, handler](ClientId clientId, SourceStream& source)
+    {
+      if (not gate(clientId, C::GetCommand()))
+      {
+        // Поглощаем команду целиком, не разбирая её.
+        source.Seek(source.Size());
+        return;
+      }
+
       C command;
       C::Read(command, source);
       handler(clientId, command);

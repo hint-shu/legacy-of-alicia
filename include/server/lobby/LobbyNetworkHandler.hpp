@@ -27,6 +27,8 @@
 #include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
 #include <libserver/util/LogThrottle.hpp>
 
+#include <string>
+
 namespace server
 {
 
@@ -72,7 +74,23 @@ public:
     const data::Uid characterUid,
     const MatchmakingSystem::Result& result);
 
-  [[nodiscard]] CommandServer& GetCommandServer() noexcept;
+  //! LOA-fix (R72-fix-2, round72, backlog #129-S1, находка Codex 3):
+  //! ★СЫРОЙ `CommandServer` БОЛЬШЕ НЕ ВЫХОДИТ ИЗ КЛАССА.
+  //!
+  //! Здесь стоял `GetCommandServer()`, отдававший наружу диспетчер целиком —
+  //! то есть и `RegisterCommandHandler`. Пока он существовал, инвариант
+  //! «у лобби нет регистрации без решения об авторизации» держался только на
+  //! том, что никто не воспользовался публичным входом: регистрацию можно было
+  //! завести из ЛЮБОЙ единицы трансляции, а гард смотрит один `.cpp`. Это
+  //! ровно [[a-gate-must-prove-itself-first]]: числа зелены, а свойство не
+  //! тотально. Границу закрывает не гард, а тип: диспетчер приватен, наружу
+  //! отдаётся ровно то, что единственному вызывающему было нужно, — адрес.
+  //!
+  //! Единственный бывший потребитель — `LobbyDirector::ProcesLoginResponse`,
+  //! которому нужен адрес клиента для строки лога.
+  //! @param clientId ID клиента.
+  //! @returns Адрес клиента строкой; пустая строка, если клиента уже нет.
+  [[nodiscard]] std::string GetClientAddress(ClientId clientId) noexcept;
 
 private:
   struct ClientContext
@@ -367,21 +385,29 @@ private:
   //! принимал каждый хендлер сам — 13 из 36 не спрашивали контекст вовсе.
   //! Список мест обязательно отстаёт от кода; инвариант диспетчеризации — нет.
   //! @param handler Обработчик команды.
+  //! ★★ВОРОТА СТОЯТ ДО РАЗБОРА ПАКЕТА (R72-fix-1, находка Codex 1).
+  //! Первая редакция раунда проверяла аутентификацию в обёртке НАД хендлером,
+  //! то есть уже после `C::Read`. Незалогиненный сокет мог прислать
+  //! зарегистрированную команду с УКОРОЧЕННЫМ телом: разбор бросал раньше
+  //! ворот, счётчик отказов не рос, дроссель не звался, а диспетчер писал
+  //! [error] на каждый пакет — новый флуд вместо закрытой дыры, ровно того
+  //! класса, который раунд убирает. Поэтому регистрация идёт через
+  //! `RegisterGatedCommandHandler`: решение принимается по clientId, до
+  //! десериализации, а отказанный кадр поглощается целиком.
   template <ReadableCommandStruct C>
   void RegisterAuthenticatedHandler(
     std::function<void(ClientId, const C&)> handler)
   {
-    _commandServer.RegisterCommandHandler<C>(
-      [this, handler](const ClientId clientId, const C& command)
+    _commandServer.RegisterGatedCommandHandler<C>(
+      [this](const ClientId clientId, const protocol::Command command)
       {
-        if (not IsClientAuthenticated(clientId))
-        {
-          NoteRefusedPreAuthCommand(clientId, C::GetCommand());
-          return;
-        }
+        if (IsClientAuthenticated(clientId))
+          return true;
 
-        handler(clientId, command);
-      });
+        NoteRefusedPreAuthCommand(clientId, command);
+        return false;
+      },
+      std::move(handler));
   }
 
   //! LOA-fix (R72-1, round72, backlog #129-S1): ★РЕГИСТРАЦИЯ ХЕНДЛЕРА,
