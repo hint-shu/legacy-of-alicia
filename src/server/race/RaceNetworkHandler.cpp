@@ -4828,18 +4828,34 @@ void RaceNetworkHandler::HandleRelay(
       // LOA-fix (R71-8): ЖАЛОБА, КОТОРУЮ ЗАКАЗЫВАЕТ КЛИЕНТ, ОБЯЗАНА БЫТЬ ЗАДРОССЕЛЕНА.
       // Строка писалась на КАЖДЫЙ пакет и несёт hex-дамп: клиент, шлющий неизвестный
       // `payloadType` четыре раза в секунду, получал готовый лог-флуд того же класса,
-      // что R57 нашёл на проде. Аргументы и формат-строка НЕ меняются — иначе поехал
-      // бы маркер лесенки прошлого раунда.
+      // что R57 нашёл на проде.
       // ★Эта ветка стоит ДО захвата `_raceInstancesMutex` — именно поэтому у
       // `LogThrottle` собственный замок-лист (LogThrottle.hpp).
+      //
+      // LOA-fix (R71-25, находка ревью 4 #3): ДРОССЕЛЬ ОГРАНИЧИВАЕТ ЧАСТОТУ, А НЕ
+      // РАЗМЕР. Длина нагрузки читается как `uint16` (RaceMessageDefinitions.cpp:1203),
+      // то есть ОДНА разрешённая дросселем жалоба несла до ~192 КиБ hex-дампа: раз в
+      // пять секунд это по-прежнему многогигабайтный рост лога за сутки. Печатаем
+      // ДЛИНУ и ограниченный префикс — этого хватает, чтобы опознать тип кадра, и не
+      // хватает, чтобы клиент писал в наш лог что угодно и сколько угодно.
+      //
+      // ★ПРЕЖНИЙ ДОВОД «формат-строку не трогаем, иначе поедет маркер лесенки» ОТМЕНЁН
+      // СОЗНАТЕЛЬНО: маркер — это инструмент проверки, а не ограничение на фикс. Новый
+      // маркер назван в отчёте раунда.
       uint64_t suppressed = 0;
       if (_relayPayloadTypeThrottle.Allow(suppressed))
-        server::util::QuietLogWarn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {:02X} (suppressed {})",
+      {
+        const size_t loggedBytes = std::min<size_t>(
+          command.data.size(), MaxLoggedRelayPayloadBytes);
+        server::util::QuietLogWarn("Relay payload from client '{}', with oids {}, sent an unrecognised relay payload type '{:#04x}': {} bytes, first {}: {:02X} (suppressed {})",
           clientId,
           header,
           static_cast<uint16_t>(command.payloadType),
-          spdlog::to_hex(command.data),
+          command.data.size(),
+          loggedBytes,
+          spdlog::to_hex(command.data.cbegin(), command.data.cbegin() + loggedBytes),
           suppressed);
+      }
 
       // LOA-fix (R71-14, находка ревью 2 #4): НЕРАЗОБРАННАЯ НАГРУЗКА НЕ РЕТРАНСЛИРУЕТСЯ.
       //
