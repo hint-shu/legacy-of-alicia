@@ -72,6 +72,19 @@ target_sources(protocol_test_relay_payload PRIVATE
 target_link_libraries(protocol_test_relay_payload
         PRIVATE project-properties alicia-libserver)
 
+# LOA-fix (R71-22, находки ревью 3 #1 и #5): правила реестра экземпляров эффектов
+# проверяются юнит-тестом. `RaceTracker.cpp` не лежит в `alicia-libserver` (он часть
+# исполняемого сервера), поэтому компилируется в тест напрямую — зависимостей у него
+# ровно две: собственный заголовок и `<limits>`.
+add_executable(race_test_effect_instances)
+target_sources(race_test_effect_instances PRIVATE
+        src/race/TestEffectInstances.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/tracker/RaceTracker.cpp)
+target_include_directories(race_test_effect_instances PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_effect_instances
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(race_test_p2did_pool)
 target_sources(race_test_p2did_pool PRIVATE
         src/race/TestP2dIdPool.cpp)
@@ -175,6 +188,7 @@ add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_noti
 add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
 add_test(NAME RaceTestRaceJournal COMMAND race_test_race_journal)
+add_test(NAME RaceTestEffectInstances COMMAND race_test_effect_instances)
 add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
 add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 
