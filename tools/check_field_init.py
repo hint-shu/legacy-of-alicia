@@ -359,6 +359,28 @@ BITFIELD_RE = re.compile(r"^(?P<decl>.+?)\s*(?<!:):(?!:)\s*(?P<width>[^:]+)$")
 # field left the gate counted as "a method" (Codex finding 3, iteration 2).
 PAREN_DECLARATOR_RE = re.compile(r"^(?P<type>.+?)\s*\(\s*(?P<name>\w+)\s*\)$")
 
+# ★ИМЯ ОПЕРАТОРА — ЭТО ИМЯ НА ВЕРХНЕМ УРОВНЕ ОБЪЯВЛЕНИЯ, А НЕ ЛЮБОЕ ВХОЖДЕНИЕ СЛОВА
+# (R72-fix4-4, Codex finding 4). `bool operator==(const X&) const;` называет оператор:
+# слово стоит вне скобок. `decltype(&Callable::operator()) callback;` НЕ называет —
+# там оно внутри `decltype(...)`, то есть часть ТИПА скалярного поля. Глубина
+# считается по всем скобкам и подрезается снизу нулём: `operator>` уводит счётчик в
+# минус, а само слово к этому моменту уже прочитано на глубине 0.
+def declares_operator(text):
+    depth = 0
+    masked = []
+    for char in text:
+        if char in "<([{":
+            masked.append(" ")
+            depth += 1
+            continue
+        if char in ">)]}":
+            masked.append(" ")
+            depth = max(0, depth - 1)
+            continue
+        masked.append(char if depth == 0 else " ")
+    return re.search(r"\boperator\b", "".join(masked)) is not None
+
+
 # A top-level comma joins SEVERAL declarators into one statement (`uint32_t a, b;`).
 # Commas inside <>, (), [] or {} belong to a template argument list, a parameter list,
 # an array bound or a braced initialiser and are none of our business.
@@ -418,7 +440,19 @@ def scan_file(path, aliases, enums, aggregates, report):
             # `operator==(...)`, `operator=(...)`: the `=` belongs to the NAME, so the
             # initialiser split below would tear the declaration apart and leave
             # `bool operator` looking like an uninitialised scalar field.
-            if re.search(r"\boperator\b", text):
+            #
+            # ★СКИДКА ТОЛЬКО ТОМУ, ЧТО ДОКАЗАННО ОПЕРАТОР (R72-fix4-4, Codex
+            # finding 4, итерация 4). Прежде здесь стоял голый грep `\boperator\b`
+            # по ВСЕМУ объявлению, и законное СКАЛЯРНОЕ поле, у которого имя
+            # оператора сидит внутри ТИПА, уходило как «метод»:
+            # `decltype(&Callable::operator()) callback;` давало 0 полей,
+            # 0 неинициализированных, 0 неразобранных — то есть указатель на
+            # член-функцию, ровно тот же неинициализированный скаляр класса #174,
+            # исчезал молча. Объявление ОПЕРАТОРА называет его на ВЕРХНЕМ уровне
+            # объявления; вхождение внутри скобок принадлежит типу, а не имени.
+            # Всё, что не доказано оператором, идёт дальше по обычному пути и
+            # будет либо классифицировано, либо ГРОМКО остановит гард.
+            if declares_operator(text):
                 report["methods"] += 1
                 continue
 
@@ -632,6 +666,17 @@ SELFTEST_EXPECTATIONS = {
     # FIRST declarator is initialised and whose second is not. It reached the judge as
     # one initialised field, and the uninitialised one left without a trace.
     "inline_enum_mixed_stop.hpp":  {"code": 2, "offenders": []},
+    # R72-fix4-4 (Codex finding 4, iteration 4): the `operator` filter used to fire on
+    # ANY occurrence of the word, so a scalar field whose TYPE names an operator left
+    # the gate counted as a method. Both directions are pinned here: a declaration
+    # that really names an operator stays a method, one that only mentions it inside
+    # its type stops the gate instead of vanishing.
+    "operator_method_ok.hpp":      {"code": 0, "offenders": [],
+                                    "counts": {"fields": 0, "methods": 4,
+                                               "unparsed": 0, "unknown": 0}},
+    "decltype_operator_stop.hpp":  {"code": 2, "offenders": [],
+                                    "counts": {"fields": 0, "methods": 0,
+                                               "unparsed": 1, "unknown": 0}},
 }
 
 
@@ -696,6 +741,18 @@ def selftest(repo_root):
         want = expected["offenders"]
         if sorted(got) != sorted(want):
             problems.append(f"нарушители {got}, ожидались {want}")
+        # ★СЧЁТЧИКИ, А НЕ ТОЛЬКО ВЕРДИКТ (R72-fix4-4). Код и список нарушителей
+        # у фикстуры про КЛАССИФИКАЦИЮ совпадают в обе стороны: объявление
+        # `Probe& operator=(const Probe&);`, если ветку операторов сломать, уедет
+        # не в «метод», а в «поле с инициализатором» — код по-прежнему 0,
+        # нарушителей по-прежнему нет. Направление доказывают счётчики.
+        counts = expected.get("counts")
+        if counts is not None:
+            got_counts = {key: (len(report[key]) if isinstance(report[key], list)
+                                else report[key])
+                          for key in counts}
+            if got_counts != counts:
+                problems.append(f"счётчики {got_counts}, ожидались {counts}")
         probe = expected.get("line_probe")
         if probe is not None:
             # The fixture is clean, so the offenders list cannot carry the proof

@@ -66,15 +66,40 @@
 #   alias-qualified foreign member inside an allowlisted .cpp — and the gate stops
 #   unless it sees both.
 #
+# ★THE THREAT MODEL, STATED ONCE AND ON PURPOSE (lead directive, iteration 4)
+#   This gate — and every static gate in tools/ — guards against an HONEST REGRESSION
+#   by one of us: a handler registered without an authorization decision because the
+#   wrapper felt inconvenient, a pre-login command quietly added, a member sliding out
+#   of the class. It is NOT a defence against a committer who deliberately hides a
+#   registration from a text scanner: we own this repository and read every diff, and
+#   a static checker that tried to win that argument would have to become a C++
+#   preprocessor and then a compiler. Where the source uses a form this gate cannot
+#   read, the honest answer is therefore neither "expand it" nor "assume it is fine"
+#   but REFUSE TO CERTIFY — code 2 with the file and the line named (check 0c). The
+#   forms refused are exactly the ones that change SPELLING without changing meaning:
+#   token pasting, a macro body that names a registration, a macro-named include, a
+#   spliced include. What remains after that refusal is documented residual risk.
+#
+# ★AND THE PART THAT IS NOT A SNAPSHOT (check 12)
+#   The per-file census is a pinned table, and a pinned table has one cure for every
+#   disagreement: update the expectation. That is enough for drift and not enough for
+#   a property — rewriting a row is how an invariant gets approved away. So three
+#   rules stand next to the table with no expected value at all, only a prohibition:
+#   a lobby command registered through the raw dispatcher entry point (anywhere), a
+#   lobby command registered outside the lobby's own translation unit, and a member of
+#   the lobby class defined outside it. Each of the four evasions this gate has been
+#   shown is caught by at least one of the three, and none of them can be rebaselined.
+#
 # USAGE
 #   bash tools/check_lobby_auth_gate.sh
 #   ROOT=/tmp/some/other/checkout bash tools/check_lobby_auth_gate.sh
 #
 # EXIT CODES
 #   0 clean · 1 the invariant is broken (offending lines are printed) · 2 the check is
-#     invalid (files missing, the parser failed its own fixture, template names absent
-#     from the header, or coverage floor not met — in which case "zero raw
-#     registrations" would be blindness, not news)
+#     invalid (files missing, the parser or the census failed its own fixture, template
+#     names absent from the header, coverage floor not met, or the tree uses a
+#     preprocessing form this gate cannot read — in each case "zero raw registrations"
+#     would be blindness, not news)
 set -uo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -188,6 +213,30 @@ def strip_comments_and_strings(text):
     return "".join(out)
 
 
+def splice_lines(text):
+    """Join backslash-newline line splices, KEEPING the total line count.
+
+    ★A LINE SPLICE IS A PREPROCESSING FORM, AND EVERY REGEX BELOW READS RAW SPELLING
+    (R72-fix4-1). `Register\\<newline>CommandHandler` is one token to the compiler and
+    two invisible halves to a grep. The newlines that were consumed are re-emitted at
+    the END of the joined logical line, so an offence still reports the line it starts
+    on and every line after it keeps its true number.
+    """
+    lines = text.split("\n")
+    out = []
+    index = 0
+    while index < len(lines):
+        buffer = lines[index]
+        eaten = 0
+        while buffer.endswith("\\") and index + 1 < len(lines):
+            buffer = buffer[:-1] + lines[index + 1]
+            eaten += 1
+            index += 1
+        out.append(buffer + "\n" * eaten)
+        index += 1
+    return "\n".join(out)
+
+
 RAW_RE = re.compile(r"_commandServer\s*\.\s*Register[A-Za-z]*CommandHandler\s*<\s*protocol::")
 AUTH_RE = re.compile(r"\bRegisterAuthenticatedHandler\s*<\s*protocol::")
 PRE_RE = re.compile(r"\bRegisterPreAuthHandler\s*<\s*protocol::")
@@ -210,7 +259,7 @@ def report(clean):
 
 
 with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
-    report(strip_comments_and_strings(handle.read()))
+    report(strip_comments_and_strings(splice_lines(handle.read())))
 PY
 )
 
@@ -246,6 +295,192 @@ if [ "${PROBE_RAW:-x}" != "1" ] || [ "${PROBE_AUTH:-x}" != "1" ] || [ "${PROBE_P
 fi
 
 # ---------------------------------------------------------------------------
+# (0c) ★UNSUPPORTED PREPROCESSING IS A HARD STOP, NOT A BLIND SPOT
+#      (R72-fix4-1/2, Codex findings 1 and 2, iteration 4).
+#
+# Every check in this file reads the SPELLING of the source. The preprocessor can
+# change the spelling without changing the meaning, and two legal forms made the whole
+# gate green on a tree that had a raw lobby registration in it:
+#
+#   #define RAW_REGISTER _commandServer.Register##CommandHandler
+#   RAW_REGISTER<protocol::AcCmdCLRequestPersonalInfo>(...);   // ← re-opens the hole
+#
+#   #define LH "server/lobby/LobbyNetworkHandler.hpp"
+#   #include LH                                                // ← invisible includer
+#
+# Reproduced on a copy of this very tree: rc=0, "ЧИСТО ✓", output byte-identical to the
+# clean run in the first case; the visibility line still named two files in the second.
+#
+# ★WHAT THIS GATE IS FOR, AND WHAT IT IS NOT FOR. It guards against an HONEST
+# regression by one of us — a handler registered without an authorization decision
+# because the wrapper was inconvenient. It is not, and cannot be, a defence against a
+# committer deliberately hiding a registration behind the preprocessor: we own the
+# repository and read every diff. The answer to an unsupported form is therefore not
+# "expand it" (that would mean shipping a C++ preprocessor inside a build gate) but
+# REFUSE TO CERTIFY: code 2, the file and the line named. A gate that cannot read the
+# tree must say so instead of saying "clean".
+#
+# Line splices are the exception, because they are cheap and honest to support: they
+# are JOINED before anything is counted (splice_lines above), so a registration broken
+# across lines is counted like any other. A spliced #include is still refused, because
+# the include census pairs raw and cleaned lines and a spliced directive is exactly
+# where that pairing stops being obvious.
+PP_PY=$(cat <<'PY'
+import os
+import re
+import sys
+
+STRIP_SRC = sys.stdin.read()
+_ns = {}
+exec(STRIP_SRC.split("with open(")[0], _ns)
+strip = _ns["strip_comments_and_strings"]
+splice = _ns["splice_lines"]
+
+DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(\w+)")
+# A supported include names its file literally. The trailing comment is allowed on
+# purpose: `#include <ranges> // for views::filter` is an ordinary line, and a stop
+# that fired on it would be a wrong diagnosis, not a strict one.
+INCLUDE_OK_RE = re.compile(
+  r"^[ \t]*#[ \t]*include[ \t]*(?:\"[^\"]*\"|<[^>]*>)[ \t]*(?://.*|/\*.*)?$")
+DEFINE_HEAD_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)(\([^)]*\))?")
+BODY_NAMES_RE = re.compile(r"Register|Handler|Command")
+
+
+def spliced_starts(text):
+    """Indices of logical lines that were assembled out of two or more source lines."""
+    starts = set()
+    lines = text.split("\n")
+    index = 0
+    logical = 0
+    while index < len(lines):
+        eaten = 0
+        while lines[index].endswith("\\") and index + 1 < len(lines):
+            eaten += 1
+            index += 1
+        if eaten:
+            starts.add(logical)
+        index += 1
+        logical += 1
+    return starts
+
+
+def scan(path):
+    """Every unsupported preprocessing form in one file: (line, reason, text)."""
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        original = handle.read()
+    joined = splice(original)
+    clean = strip(joined)
+    raw_lines = joined.split("\n")
+    clean_lines = clean.split("\n")
+    assembled = spliced_starts(original)
+    stops = []
+    for index, clean_line in enumerate(clean_lines):
+        directive = DIRECTIVE_RE.match(clean_line)
+        if directive is None:
+            continue
+        name = directive.group(1)
+        raw_line = raw_lines[index] if index < len(raw_lines) else ""
+        if name == "include":
+            if index in assembled:
+                stops.append((index + 1, "включение-со-склейкой", raw_line.strip()))
+            elif not INCLUDE_OK_RE.match(raw_line):
+                stops.append((index + 1, "включение-через-макрос", raw_line.strip()))
+            continue
+        if name == "define":
+            head = DEFINE_HEAD_RE.match(clean_line)
+            if head is None:
+                continue
+            body = clean_line[head.end():]
+            if "##" in body:
+                stops.append((index + 1, "макрос-склейка", raw_line.strip()))
+            elif BODY_NAMES_RE.search(body):
+                stops.append((index + 1, "макрос-регистрация", raw_line.strip()))
+    return stops
+
+
+def walk(root):
+    found = []
+    for base in ("src", "include"):
+        for dirpath, _, filenames in os.walk(os.path.join(root, base)):
+            for name in sorted(filenames):
+                if not name.endswith((".cpp", ".hpp", ".h", ".cc", ".cxx")):
+                    continue
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, root)
+                for line, reason, text in scan(path):
+                    found.append("%s:%d: %s: %s" % (rel, line, reason, text))
+    return sorted(found)
+
+
+print("PP_BEGIN")
+print("\n".join(walk(sys.argv[1])))
+print("PP_END")
+PY
+)
+
+run_pp() { printf '%s' "$PARSE_PY" | python3 -c "$PP_PY" "$1"; }
+
+# --- (0c-i) THE STOP PROVES ITSELF, on a fixture holding one file per rule plus a
+# --- perfectly ordinary file that must NOT be flagged. A stop that fires on everything
+# --- is as useless as one that fires on nothing.
+PPROBE="$(mktemp -d)"
+trap 'rm -f "$PROBE"; rm -rf "$PPROBE"' EXIT
+mkdir -p "$PPROBE/include/decoy" "$PPROBE/src/decoy"
+cat > "$PPROBE/src/decoy/Paste.cpp" <<'FIXTURE'
+#define RAW_REGISTER _commandServer.Register##CommandHandler
+FIXTURE
+cat > "$PPROBE/src/decoy/NameOnly.cpp" <<'FIXTURE'
+#define LOBBY_REG RegisterAuthenticatedHandler
+FIXTURE
+cat > "$PPROBE/src/decoy/MacroInclude.cpp" <<'FIXTURE'
+#define LH "server/lobby/LobbyNetworkHandler.hpp"
+#include LH
+FIXTURE
+printf '#include \\\n  "server/lobby/LobbyNetworkHandler.hpp"\n' > "$PPROBE/src/decoy/SplicedInclude.cpp"
+cat > "$PPROBE/include/decoy/Clean.hpp" <<'FIXTURE'
+#ifndef DECOY_CLEAN_HPP
+#define DECOY_CLEAN_HPP
+// #define RAW_REGISTER _commandServer.Register##CommandHandler
+#include <cstdint>
+#include "server/lobby/LobbyNetworkHandler.hpp"
+#define DECOY_LIMIT 5
+#endif
+FIXTURE
+WANT_PP_PROBE="src/decoy/MacroInclude.cpp:2: включение-через-макрос: #include LH
+src/decoy/NameOnly.cpp:1: макрос-регистрация: #define LOBBY_REG RegisterAuthenticatedHandler
+src/decoy/Paste.cpp:1: макрос-склейка: #define RAW_REGISTER _commandServer.Register##CommandHandler
+src/decoy/SplicedInclude.cpp:1: включение-со-склейкой: #include   \"server/lobby/LobbyNetworkHandler.hpp\""
+PPROBE_OUT="$(run_pp "$PPROBE")" || { echo "ОСТАНОВ: разбор препроцессорных форм упал на своей фикстуре"; exit 2; }
+PPROBE_LIST="$(printf '%s\n' "$PPROBE_OUT" | sed -n '/^PP_BEGIN$/,/^PP_END$/p' | sed '1d;$d' | grep -v '^$' || true)"
+if [ "$PPROBE_LIST" != "$WANT_PP_PROBE" ]; then
+  echo "ОСТАНОВ: проверка препроцессорных форм провалила СВОЮ фикстуру."
+  echo "  увидела:"
+  printf '%s\n' "$PPROBE_LIST" | sed 's/^/    /'
+  echo "  ожидалось:"
+  printf '%s\n' "$WANT_PP_PROBE" | sed 's/^/    /'
+  echo "  Либо она перестала видеть форму, которой прячут регистрацию, либо начала"
+  echo "  ругаться на обычный файл. Судить дерево ею нельзя."
+  exit 2
+fi
+
+# --- (0c-ii) AND NOW THE TREE.
+PP_OUT="$(run_pp "$ROOT")" || { echo "ОСТАНОВ: разбор препроцессорных форм упал на дереве"; exit 2; }
+PP_LIST="$(printf '%s\n' "$PP_OUT" | sed -n '/^PP_BEGIN$/,/^PP_END$/p' | sed '1d;$d' | grep -v '^$' || true)"
+PP_COUNT="$(printf '%s' "$PP_LIST" | grep -c . || true)"
+echo "препроцессорных форм вне поддержки: $PP_COUNT (ожидалось 0)"
+if [ "$PP_COUNT" -ne 0 ]; then
+  echo "ОСТАНОВ: дерево использует препроцессорную форму, которую этот гард читать не"
+  echo "         умеет. Ни один счёт ниже не имеет силы: имя, собранное из ## или"
+  echo "         подставленное макросом, не совпадёт ни с одним регексом, и «сырых"
+  echo "         регистраций 0» будет означать «я не смотрел»."
+  printf '%s\n' "$PP_LIST" | sed 's/^/  ✗ /'
+  echo "         Пиши регистрацию и включение обычным образом — либо, если форма"
+  echo "         действительно нужна, расширяй гард сознательно."
+  echo "=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ==="
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
 # (1) The tree itself.
 SRC_OUT="$(parse "$SRC")" || { echo "ОСТАНОВ: разбор $SRC упал"; exit 2; }
 eval "$(printf '%s\n' "$SRC_OUT" | sed -n 's/^\(RAW\|AUTH\|PRE\|CALLS\)=/\1=/p')"
@@ -271,7 +506,8 @@ src = sys.stdin.read()
 namespace = {}
 exec(src.split("with open(")[0], namespace)
 with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
-    sys.stdout.write(namespace["strip_comments_and_strings"](handle.read()))
+    sys.stdout.write(namespace["strip_comments_and_strings"](
+        namespace["splice_lines"](handle.read())))
 ' "$HDR")" || { echo "ОСТАНОВ: разбор $HDR упал"; exit 2; }
 
 hdr_count() { printf '%s' "$HDR_CLEAN" | grep -oF "$1" | grep -c . ; }
@@ -368,6 +604,7 @@ STRIP_SRC = sys.stdin.read()
 _ns = {}
 exec(STRIP_SRC.split("with open(")[0], _ns)
 strip = _ns["strip_comments_and_strings"]
+splice = _ns["splice_lines"]
 
 # A raw dispatcher entry point, by NAME: this is what a sneaky member would call.
 REG_RE = re.compile(r"\bRegister[A-Za-z]*CommandHandler\b")
@@ -411,10 +648,26 @@ def includes_lobby_header(raw, clean):
     return False
 
 
+class AliasNotConverged(Exception):
+    """The alias closure did not reach a fixed point inside its own bound."""
+
+
 def lobby_names(clean):
-    """Every name that denotes LobbyNetworkHandler in this file. Fixed point."""
+    """Every name that denotes LobbyNetworkHandler in this file. Fixed point.
+
+    ★ПОТОЛОК ЗДЕСЬ ВЫВЕДЕН, А НЕ УГАДАН (R72-fix4-2, Codex finding 2, итерация 4).
+    Раньше стояло `range(8)`: восемь проходов и молча наружу. Девять псевдонимов,
+    записанных В ОБРАТНОМ ПОРЯДКЕ (каждый ссылается на следующий), сходятся ровно за
+    девять проходов — то есть цепочка из десяти строк выводила класс лобби из-под
+    колонки MEM, и гард об этом не сообщал. Каждый проход добавляет минимум одно имя,
+    а имён не может быть больше, чем объявлений псевдонимов в файле; поэтому потолок
+    считается ПО ФАЙЛУ, и достижение потолка без сходимости — не «хватит», а ОСТАНОВ.
+    """
     names = {"LobbyNetworkHandler"}
-    for _ in range(8):
+    budget = (len(ALIAS_USING_RE.findall(clean))
+              + len(ALIAS_TYPEDEF_RE.findall(clean))
+              + len(ALIAS_DEFINE_RE.findall(clean)) + 2)
+    for _ in range(budget):
         grew = False
         for match in ALIAS_USING_RE.finditer(clean):
             if (match.group(2).split("::")[-1] in names
@@ -432,14 +685,36 @@ def lobby_names(clean):
                 names.add(match.group(1))
                 grew = True
         if not grew:
-            break
-    return names
+            return names
+    raise AliasNotConverged()
+
+
+# ★СЕМАНТИЧЕСКИЕ ЗАПРЕТЫ — НЕ ТАБЛИЦА, КОТОРУЮ МОЖНО ПЕРЕСОГЛАСОВАТЬ
+# (R72-fix4-3, Codex finding 3, итерация 4). Перепись выше — это СНИМОК: пять чисел на
+# файл, пиноvanных поимённо. Снимок ловит любое изменение, но лечится он одинаково —
+# «обнови ожидание». Приписать в заголовок лобби сырой регистратор (это ровно негатив
+# neg-h) и поправить его строку с `2 0 0 3 0` на `3 1 1 3 0` — и гард снова зелёный,
+# хотя решения об авторизации в дереве стало на одно меньше. Поэтому рядом со снимком
+# стоят ТРИ ПРАВИЛА, у которых нет ожидаемого значения, только запрет; их нельзя
+# «пересогласовать», их можно только выполнить:
+#   (A) лобби-команда, зарегистрированная СЫРЫМ входом, — нигде и никогда;
+#   (B) лобби-команда, зарегистрированная где-либо, кроме единственной единицы
+#       трансляции лобби, — то есть решение об авторизации принято не там, где живут
+#       обёртки;
+#   (C) член класса лобби, определённый вне его собственной единицы трансляции, —
+#       чужой файл, дотянувшийся до приватного диспетчера (в любом написании: имя
+#       разворачивается по псевдонимам).
+LOBBY_TU = os.path.join("src", "server", "lobby", "LobbyNetworkHandler.cpp")
+RAW_LOBBY_RE = re.compile(
+  r"\bRegister[A-Za-z]*CommandHandler\s*<\s*protocol::AcCmd(?:C[Ll]|LC)")
 
 
 def census(root):
     rows = []
     includers = []
     header_includers = []
+    violations = []
+    alias_stops = []
     for base in ("src", "include"):
         for dirpath, _, filenames in os.walk(os.path.join(root, base)):
             for name in filenames:
@@ -448,31 +723,55 @@ def census(root):
                 path = os.path.join(dirpath, name)
                 rel = os.path.relpath(path, root)
                 with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                    raw = handle.read()
+                    raw = splice(handle.read())
                 clean = strip(raw)
                 member = 0
-                for lobby in lobby_names(clean):
+                try:
+                    names = lobby_names(clean)
+                except AliasNotConverged:
+                    alias_stops.append(rel)
+                    continue
+                for lobby in names:
                     member += len(
                       re.findall(r"\b" + re.escape(lobby) + r"\s*::", clean))
+                raw_lobby = len(RAW_LOBBY_RE.findall(clean))
+                lobby_cmd = len(LOBBYCMD_RE.findall(clean))
                 counts = (
                   len(REG_RE.findall(clean)),
                   len(REGP_RE.findall(clean)),
-                  len(LOBBYCMD_RE.findall(clean)),
+                  lobby_cmd,
                   len(WRAP_RE.findall(clean)),
                   member)
                 if any(counts):
                     rows.append("%s %s" % (rel, " ".join(str(c) for c in counts)))
+                if raw_lobby:
+                    violations.append(
+                      "%s: A: лобби-команд, зарегистрированных сырым входом: %d"
+                      % (rel, raw_lobby))
+                if lobby_cmd and rel != LOBBY_TU:
+                    violations.append(
+                      "%s: B: лобби-команд, зарегистрированных вне единицы трансляции"
+                      " лобби: %d" % (rel, lobby_cmd))
+                if member and rel != LOBBY_TU:
+                    violations.append(
+                      "%s: C: обращений к члену класса лобби вне его единицы"
+                      " трансляции: %d" % (rel, member))
                 if includes_lobby_header(raw, clean):
                     includers.append(rel)
                     if not rel.endswith(".cpp"):
                         header_includers.append(rel)
-    return sorted(rows), sorted(includers), sorted(header_includers)
+    return (sorted(rows), sorted(includers), sorted(header_includers),
+            sorted(violations), sorted(alias_stops))
 
 
-rows, includers, header_includers = census(sys.argv[1])
+rows, includers, header_includers, violations, alias_stops = census(sys.argv[1])
 print("CENSUS_BEGIN")
 print("\n".join(rows))
 print("CENSUS_END")
+print("VIOLATIONS_BEGIN")
+print("\n".join(violations))
+print("VIOLATIONS_END")
+print("ALIAS_STOPS=%s" % " ".join(alias_stops))
 print("VISIBILITY=%s" % " ".join(includers))
 print("HEADER_VISIBILITY=%s" % " ".join(header_includers))
 PY
@@ -486,7 +785,7 @@ run_census() { printf '%s' "$PARSE_PY" | python3 -c "$CENSUS_PY" "$1"; }
 # --- already-allowlisted .cpp. If the census cannot see them here, it is not allowed
 # --- to say the tree is clean.
 CPROBE="$(mktemp -d)"
-trap 'rm -f "$PROBE"; rm -rf "$CPROBE"' EXIT
+trap 'rm -f "$PROBE"; rm -rf "$PPROBE" "$CPROBE"' EXIT
 mkdir -p "$CPROBE/include/decoy" "$CPROBE/src/decoy"
 cat > "$CPROBE/include/decoy/Header.hpp" <<'FIXTURE'
 class Decoy
@@ -508,21 +807,67 @@ void LL::SneakyMember()
     [this](const ClientId clientId, const auto& command) {});
 }
 FIXTURE
+# ★ПОДМЕНА ЧЕРЕЗ ОБЁРТКУ: сырого входа нет, счёт REG нулевой, но лобби-команда
+# зарегистрирована НЕ В ТОЙ единице трансляции — это правило (B), и снимок его не
+# ловит, потому что у чужого файла просто появилась бы своя строка.
+cat > "$CPROBE/src/decoy/Swap.cpp" <<'FIXTURE'
+void SwapRegistrar()
+{
+  RegisterAuthenticatedHandler<protocol::AcCmdCLSwapped>(
+    [this](const ClientId clientId, const auto& command) {});
+}
+FIXTURE
+# ★ЦЕПОЧКА ПСЕВДОНИМОВ В ОБРАТНОМ ПОРЯДКЕ, ДЕВЯТЬ ЗВЕНЬЕВ. Каждый проход замыкания
+# разрешает ровно одно звено, поэтому прежний потолок `range(8)` не доходил до `A1`, и
+# `void A1::Sneak()` не попадал в колонку MEM: класс лобби выводился из-под переписи
+# десятью строками текста. Потолок теперь выводится из числа объявлений псевдонимов в
+# файле, и эта фикстура — его доказательство, а не украшение.
+cat > "$CPROBE/src/decoy/Chain.cpp" <<'FIXTURE'
+using A1 = A2;
+using A2 = A3;
+using A3 = A4;
+using A4 = A5;
+using A5 = A6;
+using A6 = A7;
+using A7 = A8;
+using A8 = A9;
+using A9 = LobbyNetworkHandler;
+void A1::Sneak() {}
+FIXTURE
+WANT_CPROBE_ROWS="include/decoy/Header.hpp 1 1 1 0 0
+src/decoy/Chain.cpp 0 0 0 0 1
+src/decoy/Foreign.cpp 1 1 0 0 1
+src/decoy/Swap.cpp 0 1 1 1 0"
+WANT_CPROBE_VIOL="include/decoy/Header.hpp: A: лобби-команд, зарегистрированных сырым входом: 1
+include/decoy/Header.hpp: B: лобби-команд, зарегистрированных вне единицы трансляции лобби: 1
+src/decoy/Chain.cpp: C: обращений к члену класса лобби вне его единицы трансляции: 1
+src/decoy/Foreign.cpp: C: обращений к члену класса лобби вне его единицы трансляции: 1
+src/decoy/Swap.cpp: B: лобби-команд, зарегистрированных вне единицы трансляции лобби: 1"
 CPROBE_OUT="$(run_census "$CPROBE")" || { echo "ОСТАНОВ: перепись упала на своей фикстуре"; exit 2; }
-CPROBE_HDR="$(printf '%s\n' "$CPROBE_OUT" | sed -n 's|^include/decoy/Header.hpp ||p')"
-CPROBE_FRG="$(printf '%s\n' "$CPROBE_OUT" | sed -n 's|^src/decoy/Foreign.cpp ||p')"
-if [ "$CPROBE_HDR" != "1 1 1 0 0" ] || [ "$CPROBE_FRG" != "1 1 0 0 1" ]; then
+CPROBE_ROWS="$(printf '%s\n' "$CPROBE_OUT" | sed -n '/^CENSUS_BEGIN$/,/^CENSUS_END$/p' | sed '1d;$d' | grep -v '^$' || true)"
+CPROBE_VIOL="$(printf '%s\n' "$CPROBE_OUT" | sed -n '/^VIOLATIONS_BEGIN$/,/^VIOLATIONS_END$/p' | sed '1d;$d' | grep -v '^$' || true)"
+if [ "$CPROBE_ROWS" != "$WANT_CPROBE_ROWS" ] || [ "$CPROBE_VIOL" != "$WANT_CPROBE_VIOL" ]; then
   echo "ОСТАНОВ: перепись провалила СВОЮ фикстуру."
-  echo "         встроенный регистратор в заголовке: '${CPROBE_HDR:-нет строки}' (ожидалось '1 1 1 0 0')"
-  echo "         чужой член под псевдонимом:         '${CPROBE_FRG:-нет строки}' (ожидалось '1 1 0 0 1')"
-  echo "         Это ровно те два обхода, ради которых перепись перестала сравнивать"
-  echo "         НАБОРЫ ФАЙЛОВ и стала считать содержимое. Считать дерево ею нельзя."
+  echo "  строки, которые она увидела:"
+  printf '%s\n' "$CPROBE_ROWS" | sed 's/^/    /'
+  echo "  ожидались:"
+  printf '%s\n' "$WANT_CPROBE_ROWS" | sed 's/^/    /'
+  echo "  запреты, которые она назвала:"
+  printf '%s\n' "$CPROBE_VIOL" | sed 's/^/    /'
+  echo "  ожидались:"
+  printf '%s\n' "$WANT_CPROBE_VIOL" | sed 's/^/    /'
+  echo "  В фикстуре лежат ЧЕТЫРЕ обхода: встроенный регистратор в разрешённом"
+  echo "  заголовке, чужой член лобби под псевдонимом, лобби-команда, зарегистрированная"
+  echo "  обёрткой в чужой единице трансляции, и девятизвенная цепочка псевдонимов."
+  echo "  Не видит хоть один — судить дерево ею нельзя."
   exit 2
 fi
 
 # --- (7) THE TREE ITSELF, file by file, number by number.
 TREE_OUT="$(run_census "$ROOT")" || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
 CENSUS="$(printf '%s\n' "$TREE_OUT" | sed -n '/^CENSUS_BEGIN$/,/^CENSUS_END$/p' | sed '1d;$d')"
+VIOLATIONS="$(printf '%s\n' "$TREE_OUT" | sed -n '/^VIOLATIONS_BEGIN$/,/^VIOLATIONS_END$/p' | sed '1d;$d' | grep -v '^$' || true)"
+ALIAS_STOPS="$(printf '%s\n' "$TREE_OUT" | sed -n 's/^ALIAS_STOPS=//p')"
 VISIBILITY="$(printf '%s\n' "$TREE_OUT" | sed -n 's/^VISIBILITY=//p')"
 HEADER_VISIBILITY="$(printf '%s\n' "$TREE_OUT" | sed -n 's/^HEADER_VISIBILITY=//p')"
 CENSUS_ROWS="$(printf '%s\n' "$CENSUS" | grep -c .)"
@@ -545,6 +890,34 @@ if [ "$CENSUS" != "$WANT_CENSUS" ]; then
   echo "    лобби под псевдонимом. Изменилось число — изменилось содержимое, и новая"
   echo "    точка регистрации обязана быть объявлена здесь вместе с решением об"
   echo "    авторизации."
+  RC=1
+fi
+
+# --- (12) THE RULES THAT CANNOT BE REBASELINED. The census above is a SNAPSHOT: five
+# --- pinned numbers per file. It notices every change — and every change has the same
+# --- cure, "update the expectation". Adding neg-h's raw registrar to the lobby header
+# --- and rewriting its row from `2 0 0 3 0` to `3 1 1 3 0` makes the snapshot agree
+# --- again while the tree has one authorization decision FEWER than before (Codex
+# --- finding 3, iteration 4). These three rules have no expected value to update —
+# --- only a prohibition — so the same edit stays red until the registration goes
+# --- through a wrapper in the lobby's own translation unit.
+if [ -n "$ALIAS_STOPS" ]; then
+  echo "ОСТАНОВ: замыкание псевдонимов не сошлось в файлах: $ALIAS_STOPS"
+  echo "         Потолок выведен из числа объявлений псевдонимов в файле, значит"
+  echo "         несходимость означает поломку самого замыкания, а не глубокую цепочку."
+  echo "=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ==="
+  exit 2
+fi
+echo "запретов нарушено    : $(printf '%s' "$VIOLATIONS" | grep -c . || true) (ожидалось 0)"
+if [ -n "$VIOLATIONS" ]; then
+  echo "  ✗ нарушены правила, у которых нет ожидаемого значения — только запрет:"
+  printf '%s\n' "$VIOLATIONS" | sed 's/^/      /'
+  echo "    (A) лобби-команда, зарегистрированная сырым входом, — нигде и никогда;"
+  echo "    (B) лобби-команда регистрируется только в единице трансляции лобби, где"
+  echo "        живут обёртки и где принимается решение об авторизации;"
+  echo "    (C) член класса лобби определяется только в его собственной единице"
+  echo "        трансляции — иначе чужой файл дотянулся до приватного диспетчера."
+  echo "    Эти три не лечатся правкой ожидаемой переписи: у них нет ожидания."
   RC=1
 fi
 
