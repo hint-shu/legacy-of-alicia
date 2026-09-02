@@ -22,6 +22,17 @@
 namespace server::tracker
 {
 
+// LOA-fix (R70 итерация 3, backlog #58): ЕДИНСТВЕННОЕ ОПРЕДЕЛЕНИЕ «ЕХАЛ ЛИ».
+// Разбор улик, порогов и цены — в объявлении (`RaceTracker.hpp`). Здесь важно
+// лишь одно: определение ОДНО, вне заголовка, и его спрашивают оба места, где
+// сервер решает, был ли гонщик участником заезда (`HandleUserRaceFinal` и
+// `RaceInstance::Stop`). Вторая копия правила разъехалась бы с первой молча.
+bool RaceTracker::Racer::HasProvenTraversal() const
+{
+  return distanceMetres >= MinMeaningfulTraversalMetres
+    and trustedProgress >= MinMeaningfulRaceProgress;
+}
+
 RaceTracker::Racer& RaceTracker::AddRacer(data::Uid characterUid)
 {
   const auto [racerIter, created] = _racers.try_emplace(characterUid);

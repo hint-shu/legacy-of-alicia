@@ -3172,21 +3172,52 @@ void RaceNetworkHandler::HandleUserRaceFinal(
     // ЦЕНА, ЗАПИСАННАЯ ЧЕСТНО: честный игрок, вышедший из заезда в первые 30
     // секунд, за ЭТОТ заезд «Обидного схода» не получит. Он его получит в
     // следующем — а чеканка четырёх тиров пакетом без езды закрыта.
+    //
+    // ★★ЧАСЫ — НЕ УЛИКА ЕЗДЫ (R70 итерация 3, находка ревью). Пол
+    // `MinPlausibleCourseTime` доказывает, что ЗАЕЗД шёл тридцать секунд, — но
+    // ровно то же самое он доказывает и про гонщика, который эти тридцать
+    // секунд ПРОСТОЯЛ. Время идёт у всех одинаково, ехал ты или нет: молчун,
+    // выждавший полминуты и приславший ОДИН пакет, получал либо «сход» (10036,
+    // четыре тира), либо ПРИНЯТЫЙ финиш — а с ним час, мастерство карты и место
+    // в ранговых условиях. Поэтому оба исхода теперь требуют ещё и улику,
+    // которую сервер собрал САМ, — пройденный путь (`HasProvenTraversal`,
+    // разбор в `RaceTracker.hpp`).
+    // ★ЧТО ЭТА ПРАВКА НЕ ТРОГАЕТ, И ЭТО НАМЕРЕННО: `racer.courseTime`,
+    // призовые места, квестовые счётчики, деньги и телеметрию лошади. Их гейтит
+    // прежний античит (R15-1/R15-1b/B5) и его радиус раунд не расширяет:
+    // `finishOutcome` читают ТОЛЬКО достижения. Ложное срабатывание здесь стоит
+    // достижения, а не заезда.
+    const bool traversalIsProven = racer.HasProvenTraversal();
+
     const bool retirementIsProven = raceHasStarted
-      && serverElapsedMs >= static_cast<int64_t>(tracker::MinPlausibleCourseTime);
+      && serverElapsedMs >= static_cast<int64_t>(tracker::MinPlausibleCourseTime)
+      && traversalIsProven;
 
     racer.finishOutcome = didNotFinish
       ? (retirementIsProven
           ? tracker::RaceTracker::Racer::FinishOutcome::Retired
           : tracker::RaceTracker::Racer::FinishOutcome::Rejected)
-      : (finishCourseTime == tracker::InvalidCourseTime
-          ? tracker::RaceTracker::Racer::FinishOutcome::Rejected
-          : tracker::RaceTracker::Racer::FinishOutcome::Finished);
+      : (finishCourseTime != tracker::InvalidCourseTime && traversalIsProven
+          ? tracker::RaceTracker::Racer::FinishOutcome::Finished
+          : tracker::RaceTracker::Racer::FinishOutcome::Rejected);
 
-    if (didNotFinish && not retirementIsProven)
+    // Один раз на гонщика за заезд (мы под латчем `alreadyFinishing`) —
+    // per-packet логирования здесь не появляется ни в одной ветке.
+    if (not traversalIsProven)
     {
-      // Один раз на гонщика за заезд (мы под латчем `alreadyFinishing`) —
-      // per-packet логирования здесь не появляется.
+      server::util::QuietLogWarn(
+        "AcCmdUserRaceFinal: character {} declared an outcome ({}) after the "
+        "server measured only {} m of travel and {} track progress (minimum {} m "
+        "and {}); the outcome does not count as participation",
+        clientContext.characterUid,
+        didNotFinish ? "retirement" : "finish",
+        static_cast<uint64_t>(racer.distanceMetres),
+        racer.trustedProgress,
+        static_cast<uint64_t>(tracker::MinMeaningfulTraversalMetres),
+        tracker::MinMeaningfulRaceProgress);
+    }
+    else if (didNotFinish && not retirementIsProven)
+    {
       server::util::QuietLogWarn(
         "AcCmdUserRaceFinal: character {} declared a retirement {} ms after the "
         "green light (plausible minimum {} ms); the retirement is not counted",
