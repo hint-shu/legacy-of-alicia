@@ -5157,17 +5157,25 @@ void RaceNetworkHandler::HandleUseMagicItem(
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(command.magicItemId);
 
-  if ((racer.effects[18] || racer.effects[19]) && (magicSlotInfo.criticalType != 0))
-  {
-    magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(magicSlotInfo.criticalType);
+  // LOA-fix (R71-11, находка ревью 2 #7): НЕОБРАТИМОЕ ПОСЛЕДСТВИЕ — ПОСЛЕ ВСЕХ ГАРДОВ.
+  //
+  // Крит-подмена состоит из ДВУХ шагов: выбрать крит-вариант (чистый расчёт) и СПИСАТЬ
+  // баф 18/19 (`RemoveEffect` — запись в трекер плюс широковещательный
+  // `AcCmdRCRemoveSkillEffect`). Оба шага стояли ДО гарда R71-3, поэтому ледяная стена
+  // с NaN-координатами съедала крит-баф, объявляла его снятие всей комнате и только
+  // потом отбрасывалась — предмет при этом оставался на руках. То есть гард, который
+  // «ничего не разрешает», всё равно давал читеру списать чужой (свой) баф пакетом,
+  // который сервер сам же и признал невалидным.
+  //
+  // ★ВЫБОР ОСТАЁТСЯ ЗДЕСЬ, СПИСАНИЕ УЕЗЖАЕТ ВНИЗ. Гард R71-3 сравнивает наличие
+  // `iceWallProperties` с РАЗРЕШЁННЫМ типом (`magicSlotInfo.type` после подмены), так
+  // что выбор обязан быть сделан до него. А `RemoveEffect` не влияет ни на один гард —
+  // его законное место сразу после последнего из них.
+  const bool consumesCritBuff =
+    (racer.effects[18] || racer.effects[19]) && (magicSlotInfo.criticalType != 0);
 
-    // Consume the crit chance buff immediately
-    for (const uint32_t critEffectId : {18u, 19u})
-    {
-      if (racer.effects[critEffectId])
-        RemoveEffect(raceInstance, racer, critEffectId);
-    }
-  }
+  if (consumesCritBuff)
+    magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(magicSlotInfo.criticalType);
 
   const bool isIceWall = magicSlotInfo.type == 10 || magicSlotInfo.type == 11;
 
@@ -5207,6 +5215,19 @@ void RaceNetworkHandler::HandleUseMagicItem(
         command.iceWallProperties.has_value(),
         suppressed);
     return;
+  }
+
+  // LOA-fix (R71-11): вот теперь баф списывается — ни один гард выше уже не может
+  // отбросить пакет, значит списание и его широковещательное объявление больше не
+  // случаются «в никуда».
+  if (consumesCritBuff)
+  {
+    // Consume the crit chance buff immediately
+    for (const uint32_t critEffectId : {18u, 19u})
+    {
+      if (racer.effects[critEffectId])
+        RemoveEffect(raceInstance, racer, critEffectId);
+    }
   }
 
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
