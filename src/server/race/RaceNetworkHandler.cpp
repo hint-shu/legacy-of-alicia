@@ -5434,8 +5434,29 @@ void RaceNetworkHandler::HandleUseMagicItem(
     case 11:
     {
       const uint16_t obstacleInstanceCount = static_cast<uint16_t>(command.targetList.size());
+      // LOA-fix (R71-23, находка ревью 3 #4): ДЖОБ ПРИНАДЛЕЖИТ ЗАЕЗДУ, А НЕ КОМНАТЕ.
+      //
+      // Захвачен был один `roomUid`, а `RaceInstance` комната переиспользует из заезда
+      // в заезд. За четыре секунды жизни стены заезд успевает кончиться и начаться
+      // заново (`HandleStartRace` -> `Tracker::Clear()` -> `RaceInstance::Start()`;
+      // гонщики добавляются сразу, магические хендлеры стадией не гейтятся), а
+      // `Clear()` с ревью 2 сбрасывает ещё и счётчик номеров — значит НОВЫЙ заезд
+      // выдаёт ТЕ ЖЕ номера. Джоб прошлого заезда рассылал чужое истечение и снимал
+      // из реестра ЖИВУЮ запись нового заезда с тем же номером: классическое ABA,
+      // причём созданное фиксом прошлой итерации (до сброса счётчика номера были
+      // сквозными по комнате и совпасть не могли).
+      //
+      // ★ЛЕЧИМ ТЕМ ЖЕ, ЧЕМ УЖЕ ЛЕЧЕНО В ЭТОМ ФАЙЛЕ: эпохой заезда (R67-6, командный
+      // калибр). Эпоха берётся ПО ЗНАЧЕНИЮ там же и так же, как `roomUid` — копия
+      // uint32_t не бросает, то есть захват не умеет «не установиться»
+      // ([[obligation-that-can-fail-to-install]]).
       _scheduler.Queue(
-        [this, effectInstanceId, obstacleInstanceCount, magicType = magicSlotInfo.type, roomUid = raceInstance.GetRoomUid()]()
+        [this,
+         effectInstanceId,
+         obstacleInstanceCount,
+         magicType = magicSlotInfo.type,
+         roomUid = raceInstance.GetRoomUid(),
+         raceEpoch = raceInstance.GetRaceEpoch()]()
         {
           std::scoped_lock lock(_raceInstancesMutex);
           const auto raceInstanceIter = _raceInstances.find(roomUid);
@@ -5443,6 +5464,11 @@ void RaceNetworkHandler::HandleUseMagicItem(
             return;
 
           auto& raceInstance = raceInstanceIter->second;
+
+          // ★ГАРД ЭПОХИ СТОИТ ДО ПЕРВОГО ПОБОЧНОГО ДЕЙСТВИЯ — и до рассылки, и до
+          // снятия записи: после них гасить было бы уже нечего.
+          if (raceInstance.GetRaceEpoch() != raceEpoch)
+            return;
 
           for (uint16_t i = 0; i < obstacleInstanceCount; ++i)
           {
@@ -6601,8 +6627,17 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
     }
   }
 
+  // LOA-fix (R71-23, находка ревью 3 #4): ТОТ ЖЕ КЛАСС, ТО ЖЕ ЛЕКАРСТВО.
+  //
+  // Ревью назвало ABA у джоба истечения СТЕНЫ, но джоб снятия эффекта устроен так же:
+  // комната переиспользуется, `Clear()` обнуляет `effectGenerations`, и поколение
+  // нового заезда может совпасть с захваченным — тогда джоб прошлого заезда снимает
+  // ЧЕСТНЫЙ эффект нового и рассылает про него `AcCmdRCRemoveSkillEffect`. Чиним
+  // ПРАВИЛОМ, а не местом ([[total-invariant-beats-list-of-sites]]): у каждого
+  // отложенного действия магии есть эпоха заезда, в котором оно родилось.
   _scheduler.Queue(
-    [this, roomUid = raceInstance.GetRoomUid(), targetOid, targetCharacterUid, effectId,
+    [this, roomUid = raceInstance.GetRoomUid(), raceEpoch = raceInstance.GetRaceEpoch(),
+      targetOid, targetCharacterUid, effectId,
       attackRank = magicSlotInfo.attackRank, generation,
       clearMagicTarget = magicSlotInfo.attackRank > 1]()
     {
@@ -6612,6 +6647,9 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
         return;
 
       auto& raceInstance = raceInstanceIter->second;
+
+      if (raceInstance.GetRaceEpoch() != raceEpoch)
+        return;
 
       if (!raceInstance.GetTracker().IsRacer(targetCharacterUid))
         return;
