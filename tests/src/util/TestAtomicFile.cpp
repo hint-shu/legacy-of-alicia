@@ -784,6 +784,228 @@ void TestOversizedRecordIsRefusedWithoutReading(
   std::filesystem::remove_all(directory, cleanup);
 }
 
+//! ★ОТКАЗ ПО РАЗМЕРУ НЕ ОТМЕНЯЕТ ПРИНУЖДЕНИЯ РЕЖИМА (ревью, итерация 6).
+//!
+//! Потолок размера, поставленный итерацией 5, встал ВЫШЕ принуждения секрета —
+//! и завёл путь, на котором файл аккаунта отвергается, ни разу не пройдя
+//! `EnsureSecretOnOpen`: помощник кладёт рядом с работающим сервером
+//! `Alice.json` 0644, добитый до 4 МиБ, вход честно отказывает, а хеш пароля
+//! остаётся читаемым для group/other до перезапуска. Отказ обслуживать и отказ
+//! защищать — разные вещи.
+void TestOversizedSecretIsNarrowedBeforeBeingRefused(
+  const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "oversized-secret";
+  std::filesystem::create_directories(directory);
+
+  const auto account = directory / "Fiona.json";
+  SeedFile(account, 0644);
+  // Разрежённый: `st_size` за потолком, места на диске почти не занимает.
+  assert(::truncate(
+    account.c_str(),
+    static_cast<off_t>(server::util::kMaxManagedRecordBytes) + 1) == 0);
+  assert(ModeOf(account) == 0644);
+
+  const auto read = server::util::ReadManagedFile(account, FileSensitivity::Secret);
+
+  // Содержимое не отдано — потолок на месте…
+  assert(read.status == server::util::ManagedReadStatus::Refused);
+  assert(read.content.empty());
+  // …и при этом режим ПРИВЕДЁН к политике, а не оставлен «на потом».
+  assert(ModeOf(account) == 0600);
+
+  // Контроль направления: тот же файл класса `Public` режима не меняет —
+  // значит 0600 выше пришло от принуждения секрета, а не от чего-то ещё.
+  const auto other = directory / "public.json";
+  SeedFile(other, 0644);
+  assert(::truncate(
+    other.c_str(),
+    static_cast<off_t>(server::util::kMaxManagedRecordBytes) + 1) == 0);
+  const auto publicRead = server::util::ReadManagedFile(
+    other, FileSensitivity::Public);
+  assert(publicRead.status == server::util::ManagedReadStatus::Refused);
+  assert(ModeOf(other) == 0644);
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
+//! ★ПОТОЛОК ЕСТЬ И У ПИСАТЕЛЯ, А НЕ ТОЛЬКО У ЧИТАТЕЛЯ (ревью, итерация 6).
+//!
+//! Потолок в одну сторону создавал запись, которая успешно СОХРАНЯЕТСЯ и
+//! перестаёт читаться после перезапуска, — то есть тихую потерю данных вместо
+//! громкого отказа. Здесь проверяется и то, что отказ НЕ ТРОГАЕТ прежний файл:
+//! инвариант «либо целиком, либо не тронули» обязан держаться и на этом отказе.
+void TestWriterRefusesRecordsBeyondTheCeiling(
+  const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "write-ceiling";
+  std::filesystem::create_directories(directory);
+
+  const auto record = directory / "Big.json";
+  server::util::WriteFileAtomically(
+    record, kPayload, "Character file", FileSensitivity::Public);
+  const auto before = ReadBack(record);
+
+  const std::string oversized(
+    static_cast<std::size_t>(server::util::kMaxManagedRecordBytes) + 1, 'x');
+  bool threw = false;
+  try
+  {
+    server::util::WriteFileAtomically(
+      record, oversized, "Character file", FileSensitivity::Public);
+  }
+  catch (const std::exception&)
+  {
+    threw = true;
+  }
+  assert(threw);
+  // Прежняя запись цела, и временного файла не осталось.
+  assert(ReadBack(record) == before);
+  std::error_code exists;
+  assert(not std::filesystem::exists(
+    directory / "Big.json.tmp", exists));
+
+  // Ровно по потолку — пишется: граница отсекает лишнее, а не живое.
+  const std::string atCeiling(
+    static_cast<std::size_t>(server::util::kMaxManagedRecordBytes), 'y');
+  server::util::WriteFileAtomically(
+    record, atCeiling, "Character file", FileSensitivity::Public);
+  assert(ReadBack(record).size() == atCeiling.size());
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
+//! ★СОЗДАНИЕ И УДАЛЕНИЕ ТОЖЕ НЕ ХОДЯТ ПО ССЫЛКАМ (ревью, итерация 6).
+//!
+//! `O_NOFOLLOW` и общий читатель закрыли чтение и запись, но пятнадцать методов
+//! `Delete*` звали `std::filesystem::remove(path)`, а пути данных рождались
+//! через `create_directories(path)`. Обе функции разрешают ПРОМЕЖУТОЧНЫЕ
+//! компоненты насквозь: подмена `characters/equipment` ссылкой на чужое дерево
+//! превращала штатное удаление предмета в удаление ЧУЖОГО файла.
+void TestManagedCreateAndRemoveRefuseSymlinkedDirectories(
+  const std::filesystem::path& sandbox)
+{
+  const auto root = sandbox / "anchored";
+  const auto foreign = sandbox / "foreign-tree";
+  std::filesystem::create_directories(root);
+  std::filesystem::create_directories(foreign);
+
+  const auto victim = foreign / "17.json";
+  SeedFile(victim, 0644);
+
+  std::error_code linkError;
+  std::filesystem::create_directory_symlink(foreign, root / "equipment", linkError);
+  assert(not linkError);
+
+  // Создание НЕ пролезает сквозь ссылку…
+  assert(not server::util::CreateManagedDirectories(root / "equipment" / "items"));
+  assert(not std::filesystem::exists(foreign / "items"));
+
+  // …и удаление тоже: чужой файл цел.
+  assert(not server::util::RemoveManagedFile(root / "equipment" / "17.json"));
+  assert(std::filesystem::exists(victim));
+
+  // Контроль направления: те же две операции в НАСТОЯЩЕМ каталоге работают.
+  assert(server::util::CreateManagedDirectories(root / "real" / "items"));
+  assert(std::filesystem::is_directory(root / "real" / "items"));
+  const auto mine = root / "real" / "items" / "17.json";
+  SeedFile(mine, 0644);
+  assert(server::util::RemoveManagedFile(mine));
+  assert(not std::filesystem::exists(mine));
+  // Отсутствующая запись — успех, а не отказ (прежний `remove` вёл себя так же).
+  assert(server::util::RemoveManagedFile(mine));
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(root, cleanup);
+  std::filesystem::remove_all(foreign, cleanup);
+}
+
+//! ★УБОРКА ВРЕМЕННЫХ ФАЙЛОВ НЕ ВЫХОДИТ ЗА ДЕРЕВО ДАННЫХ (ревью, итерация 6).
+//!
+//! Прежний проход шёл `recursive_directory_iterator` (в ссылки он не заходит),
+//! но удалял через `std::filesystem::remove(entry.path())` — по ПУТИ, то есть
+//! сквозь промежуточную ссылку. Достаточно было подменить один подкаталог, и
+//! уборка своего мусора становилась удалением чужих файлов.
+void TestSweepStaysInsideTheDataTree(const std::filesystem::path& sandbox)
+{
+  const auto root = sandbox / "sweep-root";
+  const auto foreign = sandbox / "sweep-foreign";
+  std::filesystem::create_directories(root / "characters");
+  std::filesystem::create_directories(foreign);
+
+  const auto theirs = foreign / "victim.tmp";
+  SeedFile(theirs, 0644);
+  const auto mine = root / "characters" / "7.json.tmp";
+  SeedFile(mine, 0644);
+  const auto keep = root / "characters" / "7.json";
+  SeedFile(keep, 0644);
+
+  std::error_code linkError;
+  std::filesystem::create_directory_symlink(foreign, root / "equipment", linkError);
+  assert(not linkError);
+
+  server::util::SweepStaleTemporaries(root);
+
+  // Свой мусор убран…
+  assert(not std::filesystem::exists(mine));
+  // …настоящая запись не тронута…
+  assert(std::filesystem::exists(keep));
+  // …а чужое дерево уборка не увидела вовсе.
+  assert(std::filesystem::exists(theirs));
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(root, cleanup);
+  std::filesystem::remove_all(foreign, cleanup);
+}
+
+//! ★ЧТО ОБХОД ПЕРЕЧИСЛИЛ, НО СУЖЕНИЕ НЕ ОСМОТРЕЛО, ПУБЛИКОВАТЬ НЕЛЬЗЯ
+//! (ревью, итерация 6).
+//!
+//! Обход и проход сужения работали по РАЗНЫМ дескрипторам одного имени, а
+//! запись, исчезнувшая или ставшая ссылкой между фазами, пропускалась МОЛЧА —
+//! после чего имя из СТАРОГО списка всё равно уходило в индекс, то есть
+//! «никогда не индексируется» было неправдой. Здесь проверяется и то, и другое:
+//! дескриптор у списка ОДИН и остаётся открытым, а неосмотренное имя названо.
+void TestUnexaminedListedPathsAreNotPublishable(
+  const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "unexamined";
+  std::filesystem::create_directories(directory);
+
+  const auto staying = directory / "Stays.json";
+  const auto vanishing = directory / "Vanishes.json";
+  SeedFile(staying, 0644);
+  SeedFile(vanishing, 0644);
+
+  const auto listing = server::util::ListRegularFiles(directory);
+  assert(not listing.incomplete);
+  assert(listing.files.size() == 2);
+  // ★ДЕСКРИПТОР ОБХОДА ЖИВ: именно он, а не повторное разрешение пути, отдаётся
+  // проходу сужения.
+  assert(listing.descriptor.descriptor >= 0);
+
+  // Запись исчезает МЕЖДУ фазами — ровно окно, о котором говорит ревью.
+  std::error_code removal;
+  std::filesystem::remove(vanishing, removal);
+  assert(not removal);
+
+  const auto hardening = server::util::HardenSecretFiles(listing);
+
+  // Оставшийся файл сужен и публикуем…
+  assert(ModeOf(staying) == 0600);
+  assert(hardening.narrowed == 1);
+  // …а исчезнувший НАЗВАН непубликуемым, а не пропущен молча.
+  assert(hardening.unsecured.size() == 1);
+  assert(hardening.unsecured.front() == vanishing);
+  // И это не «отказ сужения»: старт из-за пропавшего файла не падает.
+  assert(hardening.failed == 0);
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
 //! ★ССЫЛКА НА МЕСТЕ САМОГО КАТАЛОГА ТОЖЕ ОТВЕРГАЕТСЯ.
 //!
 //! `O_NOFOLLOW` защищает ТОЛЬКО последний компонент, поэтому `data/users`,
@@ -913,6 +1135,11 @@ int main()
   TestUnenforceableSecretIsRefusedNotServed(sandbox);
   TestOwnerIsAdoptedEvenWhenModeIsAlreadyNarrow(sandbox);
   TestOversizedRecordIsRefusedWithoutReading(sandbox);
+  TestOversizedSecretIsNarrowedBeforeBeingRefused(sandbox);
+  TestWriterRefusesRecordsBeyondTheCeiling(sandbox);
+  TestManagedCreateAndRemoveRefuseSymlinkedDirectories(sandbox);
+  TestSweepStaysInsideTheDataTree(sandbox);
+  TestUnexaminedListedPathsAreNotPublishable(sandbox);
   TestSymlinkedDirectoryIsRefused(sandbox);
 
   UnlockTree(sandbox);

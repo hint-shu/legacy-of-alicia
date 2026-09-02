@@ -344,9 +344,33 @@ struct DescriptorGuard
 {
   int descriptor = -1;
 
+  DescriptorGuard() noexcept = default;
   explicit DescriptorGuard(const int opened) noexcept : descriptor(opened) {}
   DescriptorGuard(const DescriptorGuard&) = delete;
   DescriptorGuard& operator=(const DescriptorGuard&) = delete;
+
+  //! ★ПЕРЕМЕЩЕНИЕ, НО НЕ КОПИРОВАНИЕ (правка ревью, итерация 6). Обход каталога
+  //! обязан ОТДАТЬ свой дескриптор проходу сужения — иначе тот разбирает путь
+  //! заново и работает уже не обязательно с тем инодом, который перечислял
+  //! обход. Копирование при этом остаётся запрещённым: две копии закрыли бы
+  //! один дескриптор дважды, а второе закрытие пришлось бы на чужой файл,
+  //! успевший занять тот же номер.
+  DescriptorGuard(DescriptorGuard&& other) noexcept
+    : descriptor(other.descriptor)
+  {
+    other.descriptor = -1;
+  }
+
+  DescriptorGuard& operator=(DescriptorGuard&& other) noexcept
+  {
+    if (this != &other)
+    {
+      CloseKeepingErrno(descriptor);
+      descriptor = other.descriptor;
+      other.descriptor = -1;
+    }
+    return *this;
+  }
 
   ~DescriptorGuard()
   {
@@ -356,6 +380,167 @@ struct DescriptorGuard
 
 } // namespace detail
 #endif
+
+//! СОЗДАЁТ КАТАЛОГ ДАННЫХ, НЕ ПРОЙДЯ НИ ОДНОЙ СИМВОЛИЧЕСКОЙ ССЫЛКИ
+//! (LOA-fix R73-12, правка ревью, итерация 6).
+//!
+//! ★ЗАЧЕМ, ЕСЛИ ЕСТЬ `std::filesystem::create_directories`. Инвариант раунда —
+//! «под `data/` не ходят по ссылкам» — держался у ЧТЕНИЯ, ЗАПИСИ и ОБХОДА, но
+//! не у СОЗДАНИЯ: `create_directories` разрешает путь именами и молча проходит
+//! ссылку на месте любого промежуточного компонента. Достаточно подменить
+//! `data/characters/equipment` ссылкой на чужое дерево — и старт сервера сам
+//! СОЗДАЁТ там `items`, после чего каждая запись и каждое удаление предмета
+//! работают за пределами `data/`. Найдено ревью (итерация 6): «P2 не тотален».
+//!
+//! ★ПОЭТОМУ КАЖДЫЙ КОМПОНЕНТ СОЗДАЁТСЯ И ОТКРЫВАЕТСЯ ОТ ДЕСКРИПТОРА
+//! ПРЕДЫДУЩЕГО: `mkdirat` + `openat(O_DIRECTORY | O_NOFOLLOW)`. Ссылка любого
+//! уровня даёт `ELOOP` — свойство системного вызова, а не проверка с окном.
+//!
+//! ★РЕЖИМ 0777, А НЕ 0755, И ЭТО НЕ РАСШИРЕНИЕ ПРАВ: ровно его передаёт
+//! `create_directories`, и ровно его гасит `umask` процесса. Поставить 0755
+//! значило бы НАЗНАЧИТЬ права там, где раунд обещал их не трогать (см.
+//! `Initialize`: пятнадцать каталогов создаются как создавались).
+//!
+//! @return `true`, если каталог существует по окончании вызова.
+[[nodiscard]] inline bool CreateManagedDirectories(
+  const std::filesystem::path& directory) noexcept
+{
+#ifndef WIN32
+  int current = -1;
+  try
+  {
+    current = ::open(
+      directory.is_absolute() ? "/" : ".",
+      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current < 0)
+      return false;
+
+    for (const auto& part : directory)
+    {
+      const auto component = part.string();
+      if (component.empty() || component == "/" || component == ".")
+        continue;
+      if (component == "..")
+      {
+        ::close(current);
+        errno = EINVAL;
+        return false;
+      }
+
+      int next = ::openat(
+        current, component.c_str(),
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (next < 0 && errno == ENOENT)
+      {
+        // ★`EEXIST` — НЕ ОШИБКА: соседний поток (или соседний процесс) вправе
+        // создать тот же каталог между нашими `openat` и `mkdirat`. Гонка
+        // разрешается повторным открытием, а не отказом.
+        if (::mkdirat(current, component.c_str(), 0777) != 0 && errno != EEXIST)
+        {
+          const int failure = errno;
+          ::close(current);
+          errno = failure;
+          return false;
+        }
+        next = ::openat(
+          current, component.c_str(),
+          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      }
+
+      // `errno` снимается ДО `close`: закрытие вправе его затереть.
+      const int failure = errno;
+      ::close(current);
+      if (next < 0)
+      {
+        errno = failure;
+        return false;
+      }
+      current = next;
+    }
+
+    ::close(current);
+    return true;
+  }
+  catch (...)
+  {
+    if (current >= 0)
+      ::close(current);
+    errno = ENOMEM;
+    return false;
+  }
+#else
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error)
+    return std::filesystem::is_directory(directory, error) && not error;
+  return true;
+#endif
+}
+
+//! УДАЛЯЕТ УПРАВЛЯЕМУЮ ЗАПИСЬ, НЕ ПРОЙДЯ НИ ОДНОЙ ССЫЛКИ В ПУТИ
+//! (LOA-fix R73-12, правка ревью, итерация 6).
+//!
+//! ★ЗАЧЕМ. Пятнадцать методов `Delete*` звали `std::filesystem::remove(path)`.
+//! `remove` снимает КОНЕЧНУЮ ссылку саму (это правильно), но промежуточные
+//! компоненты проходит НАСКВОЗЬ: подмена `data/characters/equipment` ссылкой на
+//! чужое дерево превращала штатное `DeleteItem(17)` в удаление ЧУЖОГО файла.
+//! Инвариант «под `data/` не ходят по ссылкам» обязан держаться у всех четырёх
+//! действий — чтение, запись, обход, удаление, — иначе он не инвариант, а
+//! список мест.
+//!
+//! ★ОТСУТСТВИЕ ФАЙЛА — УСПЕХ. Прежний `std::filesystem::remove` возвращал
+//! `false` без исключения на отсутствующем файле, и все пятнадцать вызывающих
+//! этот исход игнорировали; менять здесь политику значило бы завести отказ там,
+//! где его не было.
+//!
+//! ★ВЕРДИКТ ЧИТАЕТ ОПЕРАТОР. Настоящая неудача (права, ввод-вывод, подменённый
+//! каталог) уходит в дроссель предупреждений: удаление, которое молча не
+//! состоялось, оставляет запись жить после того, как код считает её снятой.
+inline bool RemoveManagedFile(const std::filesystem::path& path) noexcept
+{
+#ifndef WIN32
+  std::string fileName;
+  try
+  {
+    fileName = path.filename().string();
+  }
+  catch (...)
+  {
+    return false;
+  }
+  if (fileName.empty() || fileName == "." || fileName == "..")
+    return false;
+
+  detail::DescriptorGuard directory{
+    detail::OpenDirectoryNoSymlinks(path.parent_path())};
+  if (directory.descriptor < 0)
+  {
+    if (errno == ENOENT)
+      return true;   // каталога нет — значит нет и записи
+    static WarningThrottle directoryThrottle;
+    ReportFileWarning(directoryThrottle,
+      "Data file '{}' could not be deleted: its directory is not reachable "
+      "without following a symbolic link (errno {})", LogPath(path), errno);
+    return false;
+  }
+
+  if (::unlinkat(directory.descriptor, fileName.c_str(), 0) != 0)
+  {
+    if (errno == ENOENT)
+      return true;
+    static WarningThrottle unlinkThrottle;
+    ReportFileWarning(unlinkThrottle,
+      "Data file '{}' could not be deleted (errno {}); the record stays on disk "
+      "after the server considered it removed", LogPath(path), errno);
+    return false;
+  }
+  return true;
+#else
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  return not static_cast<bool>(error);
+#endif
+}
 
 //! ПОТОЛОК РАЗМЕРА ОДНОЙ УПРАВЛЯЕМОЙ ЗАПИСИ (LOA-fix R73-10, ревью 5).
 //!
@@ -429,12 +614,38 @@ inline constexpr std::uintmax_t kMaxManagedRecordBytes = 4u * 1024u * 1024u;
 //! @param what Название сущности для сообщения об ошибке («Character file»).
 //! @param sensitivity Несёт ли файл секрет. ★Без значения по умолчанию намеренно
 //!        (см. `FileSensitivity`): двадцатый вызов обязан ответить на вопрос.
+//!
+//! ★ЧЕГО ОНА НЕ СОХРАНИТ: содержимое длиннее `kMaxManagedRecordBytes`. Потолок
+//! у читателя без потолка у писателя — это запись, которая успешно сохраняется
+//! и перестаёт читаться после перезапуска (правка ревью, итерация 6).
 inline void WriteFileAtomically(
   const std::filesystem::path& path,
   const std::string_view payload,
   const std::string_view what,
   const FileSensitivity sensitivity)
 {
+  // ★ПОТОЛОК ЗАПИСИ — ТОТ ЖЕ, ЧТО У ЧТЕНИЯ, И ЭТО НЕ СИММЕТРИЯ РАДИ КРАСОТЫ
+  // (правка ревью, итерация 6). Итерация 5 завела потолок ТОЛЬКО у читателя, и
+  // тем самым создала запись, которая успешно СОХРАНЯЕТСЯ и не читается после
+  // перезапуска: агрегат персонажа (почтовый ящик плюс несколько растущих
+  // наборов uid) — единственный класс, который до 4 МиБ дорастить реально.
+  // Молчаливая потеря записи хуже отказа сохранения: отказ виден сразу, у него
+  // есть строка и есть виновник, а «сохранилось и пропало» обнаруживается
+  // игроком через недели.
+  //
+  // ★ОТКАЗ ДО ЛЮБОГО КАСАНИЯ ДИСКА: старый файл остаётся целым, временный не
+  // создаётся, и это ровно тот инвариант («либо целиком, либо не тронули»),
+  // ради которого функция и написана. Бросок — тем же способом, что все прочие
+  // отказы этой функции, поэтому вызывающие не получают нового класса исходов.
+  if (payload.size() > static_cast<std::size_t>(kMaxManagedRecordBytes))
+  {
+    throw std::runtime_error(
+      std::format(
+        "{} '{}' is {} bytes, beyond the {} byte ceiling for a single record, "
+        "and was not written", what, LogPath(path), payload.size(),
+        kMaxManagedRecordBytes));
+  }
+
 #ifndef WIN32
   // ★ВСЯ ЗАПИСЬ ПРИКРЕПЛЕНА К ДЕСКРИПТОРУ КАТАЛОГА, А НЕ К ПУТИ (правка ревью,
   // итерация 5). Прежняя редакция работала именами: `lstat(path)`,
@@ -878,6 +1089,23 @@ struct DirectoryListing
   std::vector<std::filesystem::path> refusedSymlinks;
   //! Обход не дошёл до конца: список НЕПОЛОН.
   bool incomplete = false;
+
+#ifndef WIN32
+  //! ★ДЕСКРИПТОР ОБОЙДЁННОГО КАТАЛОГА, ОСТАЮЩИЙСЯ ОТКРЫТЫМ (правка ревью,
+  //! итерация 6).
+  //!
+  //! Прежде обход закрывал свой дескриптор, а проход сужения РАЗРЕШАЛ ПУТЬ
+  //! `listing.directory` заново — то есть «обошли и сузили в одном каталоге»
+  //! было утверждением о ИМЕНИ, а не о иноде: между двумя фазами каталог можно
+  //! подменить другим настоящим каталогом, и `ELOOP` этого не покажет. Открытый
+  //! дескриптор держит ИНОД, поэтому обе фазы адресуют один и тот же каталог по
+  //! построению.
+  //!
+  //! ★ПОЭТОМУ СПИСОК ПЕРЕМЕЩАЕМЫЙ, НО НЕ КОПИРУЕМЫЙ (см. `DescriptorGuard`).
+  //! Все потребители получают его как `const auto listing = ListRegularFiles(…)`
+  //! — это гарантированное исключение копии, а не копирование.
+  detail::DescriptorGuard descriptor;
+#endif
 };
 
 #ifdef WIN32
@@ -958,11 +1186,24 @@ inline void ClassifyOneDirectoryEntry(
     return listing;
   }
 
-  // `fdopendir` ЗАБИРАЕТ дескриптор себе: закрывает его `closedir`.
-  DIR* const stream = ::fdopendir(directoryDescriptor);
+  // ★ДЕСКРИПТОР ПЕРЕЕЗЖАЕТ В РЕЗУЛЬТАТ, А ОБХОДУ ОТДАЁТСЯ ЕГО ДУБЛИКАТ (правка
+  // ревью, итерация 6). `fdopendir` ЗАБИРАЕТ дескриптор себе и закрывает его
+  // `closedir`, поэтому отдать ему единственный дескриптор значило бы снова
+  // заставить проход сужения разрешать путь заново. `F_DUPFD_CLOEXEC`, а не
+  // `dup`: обычный дубликат теряет `O_CLOEXEC` и утёк бы в дочерний процесс.
+  listing.descriptor = detail::DescriptorGuard{directoryDescriptor};
+
+  const int streamDescriptor = ::fcntl(directoryDescriptor, F_DUPFD_CLOEXEC, 0);
+  if (streamDescriptor < 0)
+  {
+    listing.incomplete = true;
+    return listing;
+  }
+
+  DIR* const stream = ::fdopendir(streamDescriptor);
   if (stream == nullptr)
   {
-    detail::CloseKeepingErrno(directoryDescriptor);
+    detail::CloseKeepingErrno(streamDescriptor);
     listing.incomplete = true;
     return listing;
   }
@@ -1117,10 +1358,18 @@ struct SecretFileHardening
   std::size_t narrowed = 0;
   //! Сколько не удалось ни осмотреть, ни сузить.
   std::size_t failed = 0;
-  //! ★ИМЕНА ФАЙЛОВ, КОТОРЫЕ ТАК И ОСТАЛИСЬ ШИРЕ ПОЛИТИКИ (правка ревью,
-  //! итерация 5). Числа хватало отчёту, но не ВЫЗЫВАЮЩЕМУ: перестройка индекса
-  //! обязана не заводить такое имя, а чтение — не отдавать содержимое. «Сколько»
-  //! отвечает человеку, «какие» отвечает коду.
+  //! ★ИМЕНА ФАЙЛОВ, КОТОРЫЕ НЕ ДОКАЗАНЫ ПОД ПОЛИТИКОЙ (правка ревью, итерация
+  //! 5, расширено итерацией 6). Числа хватало отчёту, но не ВЫЗЫВАЮЩЕМУ:
+  //! перестройка индекса обязана не заводить такое имя, а чтение — не отдавать
+  //! содержимое. «Сколько» отвечает человеку, «какие» отвечает коду.
+  //!
+  //! ★СЮДА ПОПАДАЕТ И ТО, ЧЕГО МЫ НЕ СМОТРЕЛИ, А НЕ ТОЛЬКО ТО, ЧТО НЕ СУЗИЛИ
+  //! (правка ревью, итерация 6). Запись, перечисленная обходом и ставшая к
+  //! моменту открытия ссылкой (`ELOOP`) или исчезнувшая (`ENOENT`), прежде
+  //! пропускалась МОЛЧА — и имя из СТАРОГО списка всё равно уходило в индекс,
+  //! то есть «непроиндексировано никогда» было неправдой. Список отвечает на
+  //! вопрос «какие имена публиковать НЕЛЬЗЯ», а не «какие мы не сумели
+  //! починить»: неосмотренное и неисправленное для публикации равны.
   std::vector<std::filesystem::path> unsecured;
   //! Сколько записей каталога отвергнуто как символические ссылки (правка
   //! ревью, итерация 4). ★НЕ `failed`: это не «не смогли», а «не стали» —
@@ -1241,6 +1490,23 @@ inline void HardenOneSecretFile(
   const std::filesystem::path& file,
   SecretFileHardening& result) noexcept
 {
+  // ★ЛЮБОЙ ВЫХОД, КРОМЕ «ФАЙЛ ПОД ПОЛИТИКОЙ», ОБЪЯВЛЯЕТ ИМЯ НЕПУБЛИКУЕМЫМ
+  // (правка ревью, итерация 6). Иначе запись, перечисленная обходом и ставшая к
+  // моменту открытия ссылкой, тихо пропускалась — а её имя из старого списка
+  // всё равно попадало в индекс.
+  const auto refuseToPublish = [&result](const std::filesystem::path& path)
+  {
+    try
+    {
+      result.unsecured.push_back(path);
+    }
+    catch (...)
+    {
+      // Имя не удалось запомнить — вызывающий не сможет его обойти стороной.
+      result.incomplete = true;
+    }
+  };
+
   std::string name;
   try
   {
@@ -1249,6 +1515,7 @@ inline void HardenOneSecretFile(
   catch (...)
   {
     result.incomplete = true;
+    refuseToPublish(file);
     return;
   }
 
@@ -1274,6 +1541,10 @@ inline void HardenOneSecretFile(
     // Всё остальное (EACCES, EPERM, EMFILE, EIO) — настоящий отказ.
     if (errno != ELOOP && errno != ENOENT && errno != ENXIO && errno != ENODEV)
       ++result.failed;
+    // ★НО ПУБЛИКОВАТЬ ЭТО ИМЯ НЕЛЬЗЯ В ЛЮБОМ СЛУЧАЕ (правка ревью, итерация 6):
+    // «не стали смотреть» и «не смогли смотреть» одинаково означают, что о
+    // режиме этого инода мы не знаем ничего.
+    refuseToPublish(file);
     return;
   }
 
@@ -1281,11 +1552,15 @@ inline void HardenOneSecretFile(
   if (::fstat(descriptor, &fileStat) != 0)
   {
     ++result.failed;
+    refuseToPublish(file);
     ::close(descriptor);
     return;
   }
   if (not S_ISREG(fileStat.st_mode))
   {
+    // Обход отдавал обычный файл, а открылось не оно: запись подменили между
+    // перечислением и открытием. Публиковать нечего.
+    refuseToPublish(file);
     ::close(descriptor);
     return;
   }
@@ -1298,21 +1573,74 @@ inline void HardenOneSecretFile(
       break;
     case SecretEnforcement::Failed:
       ++result.failed;
-      try
-      {
-        result.unsecured.push_back(file);
-      }
-      catch (...)
-      {
-        // Имя не удалось запомнить — значит вызывающий не сможет его обойти
-        // стороной. Честный ответ «мы не знаем, что тут лежит»: неполнота.
-        result.incomplete = true;
-      }
+      refuseToPublish(file);
       break;
     case SecretEnforcement::AlreadySecure:
       break;
   }
   ::close(descriptor);
+}
+
+//! УБОРКА ОДНОГО КАТАЛОГА ПО ДЕСКРИПТОРУ, РЕКУРСИВНО (правка ревью, итерация 6).
+//!
+//! ★ЗАБИРАЕТ ДЕСКРИПТОР СЕБЕ и закрывает его сам (через `closedir` либо
+//! напрямую): владение одно, поэтому «кто закрывает» не зависит от того, каким
+//! путём функция вышла.
+inline void SweepDirectoryDescriptor(
+  const int directoryDescriptor, const int depthLeft) noexcept
+{
+  DIR* const stream = ::fdopendir(directoryDescriptor);
+  if (stream == nullptr)
+  {
+    CloseKeepingErrno(directoryDescriptor);
+    return;
+  }
+
+  for (;;)
+  {
+    errno = 0;
+    const struct ::dirent* const entry = ::readdir(stream);
+    if (entry == nullptr)
+      break;   // конец каталога либо ошибка: уборка молчит и в том, и в другом
+
+    const std::string_view name(entry->d_name);
+    if (name == "." || name == "..")
+      continue;
+
+    // Тип берётся `fstatat` без перехода по ссылке: `d_type` на части файловых
+    // систем всегда `DT_UNKNOWN`.
+    struct ::stat entryStat{};
+    if (::fstatat(
+          directoryDescriptor, entry->d_name, &entryStat,
+          AT_SYMLINK_NOFOLLOW) != 0)
+    {
+      continue;
+    }
+
+    if (S_ISDIR(entryStat.st_mode))
+    {
+      if (depthLeft <= 0)
+        continue;
+      const int child = ::openat(
+        directoryDescriptor, entry->d_name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (child < 0)
+        continue;
+      SweepDirectoryDescriptor(child, depthLeft - 1);
+      continue;
+    }
+
+    if (not S_ISREG(entryStat.st_mode))
+      continue;
+    // Тот же фильтр, что у прежнего сравнения расширения с «.tmp»: имя РОВНО
+    // `.tmp` расширения не имеет и уборке не подлежит.
+    if (name.size() <= 4 || name.substr(name.size() - 4) != ".tmp")
+      continue;
+
+    ::unlinkat(directoryDescriptor, entry->d_name, 0);
+  }
+
+  ::closedir(stream);
 }
 
 } // namespace detail
@@ -1347,19 +1675,34 @@ inline void HardenOneSecretFile(
   if (listing.files.empty())
     return result;
 
-  detail::DescriptorGuard directory{
-    detail::OpenDirectoryNoSymlinks(listing.directory)};
-  if (directory.descriptor < 0)
+  // ★ТОТ ЖЕ ДЕСКРИПТОР, ЧТО У ОБХОДА, А НЕ ПОВТОРНОЕ РАЗРЕШЕНИЕ ПУТИ (правка
+  // ревью, итерация 6). Прежде здесь стоял свой `OpenDirectoryNoSymlinks`, то
+  // есть между перечислением и сужением каталог можно было подменить ДРУГИМ
+  // НАСТОЯЩИМ каталогом: ссылок нет, `ELOOP` не сработает, а сужали бы мы уже не
+  // те иноды, которые перечислили. Дескриптор держит инод — окна не остаётся.
+  if (listing.descriptor.descriptor < 0)
   {
-    // Каталог, который только что обходили, перестал открываться (подменён,
-    // снят, закрыт правами). «Мы не смотрели» — это неполнота, а не чистый
-    // проход.
+    // Обход отдал файлы, но не отдал дескриптор: смотреть нечем. «Мы не
+    // смотрели» — это неполнота, а не чистый проход, и ни одно из этих имён
+    // публиковать нельзя.
     result.incomplete = true;
+    for (const auto& file : listing.files)
+    {
+      try
+      {
+        result.unsecured.push_back(file);
+      }
+      catch (...)
+      {
+        result.incomplete = true;
+        break;
+      }
+    }
     return result;
   }
 
   for (const auto& file : listing.files)
-    detail::HardenOneSecretFile(directory.descriptor, file, result);
+    detail::HardenOneSecretFile(listing.descriptor.descriptor, file, result);
 #else
   (void)listing;
 #endif
@@ -1441,6 +1784,11 @@ struct ManagedFileRead
 //! не будучи прочитанным: общий читатель складывает файл в память ДО разбора, и
 //! без потолка одна попытка входа именем, под которым лежит гигабайтный файл,
 //! стоила бы контейнеру всей памяти (обе правки — ревью, итерация 5).
+//!
+//! ★ПОРЯДОК ЭТИХ ДВУХ ОТКАЗОВ — СВОЙСТВО, А НЕ СЛУЧАЙНОСТЬ (правка ревью,
+//! итерация 6): принуждение секрета идёт ПЕРВЫМ, потолок размера вторым. Отказ
+//! в обслуживании не освобождает от обязанности привести инод к политике, иначе
+//! «слишком большой» становится способом оставить хеш пароля открытым.
 //!
 //! ★НЕ БРОСАЕТ. Политику отказа выбирает вызывающий: `FileDataSource` бросает
 //! своим прежним текстом (это маркеры лесенки прошлых раундов), вход отвечает
@@ -1545,26 +1893,16 @@ struct ManagedFileRead
     return result;
   }
 
-  // ★ПОТОЛОК РАЗМЕРА ПРОВЕРЯЕТСЯ ДО ЧТЕНИЯ И ЕЩЁ РАЗ ВО ВРЕМЯ (правка ревью,
-  // итерация 5). Один `st_size` не гарантия: разрежённый файл вправе вырасти
-  // между `fstat` и последним `read`, а «прочитали 4 ГиБ, потому что в момент
-  // проверки было 4 КиБ» — тот же исчерпанный контейнер. Проверка до чтения
-  // делает отказ дешёвым, проверка во время делает его ВЕРНЫМ.
-  if (fileStat.st_size < 0
-    || static_cast<std::uintmax_t>(fileStat.st_size) > kMaxManagedRecordBytes)
-  {
-    ::close(descriptor);
-    result.status = ManagedReadStatus::Refused;
-    static WarningThrottle oversizeThrottle;
-    ReportFileWarning(oversizeThrottle,
-      "Data file '{}' is {} bytes, beyond the {} byte ceiling for a single "
-      "record, and was refused without being read",
-      LogPath(path), static_cast<std::uintmax_t>(fileStat.st_size < 0
-        ? 0 : fileStat.st_size),
-      kMaxManagedRecordBytes);
-    return result;
-  }
-
+  // ★СУЖЕНИЕ ПЕРЕД ЛЮБЫМ ДРУГИМ РЕШЕНИЕМ, А НЕ ТОЛЬКО ПЕРЕД ЧТЕНИЕМ (правка
+  // ревью, итерация 6). Итерация 5 поставила потолок размера ВЫШЕ этого блока, и
+  // тем самым завела путь, на котором файл аккаунта отвергается, НИ РАЗУ не
+  // пройдя принуждение: положить рядом с работающим сервером `Alice.json` с
+  // режимом 0644 и добить его нулями за 4 МиБ — и вход честно отказывает, а хеш
+  // пароля остаётся читаемым для group/other до перезапуска или до перестройки
+  // индекса, то есть неограниченно долго. Отказ обслуживать не отменяет
+  // обязанности привести инод к политике: принуждение не читает НИ ОДНОГО байта
+  // содержимого, поэтому ставить его первым ничего не стоит.
+  //
   // ★СУЖЕНИЕ ДО ЧТЕНИЯ, А НЕ ПОСЛЕ. Если бы оно стояло после, между выдачей
   // содержимого и правкой режима существовало бы окно, в котором сервер уже
   // ПОЛЬЗУЕТСЯ секретом из файла, доступного посторонним.
@@ -1585,6 +1923,26 @@ struct ManagedFileRead
       return result;   // ни одного байта содержимого
     }
     result.narrowed = enforcement == SecretEnforcement::Narrowed;
+  }
+
+  // ★ПОТОЛОК РАЗМЕРА ПРОВЕРЯЕТСЯ ДО ЧТЕНИЯ И ЕЩЁ РАЗ ВО ВРЕМЯ (правка ревью,
+  // итерация 5). Один `st_size` не гарантия: разрежённый файл вправе вырасти
+  // между `fstat` и последним `read`, а «прочитали 4 ГиБ, потому что в момент
+  // проверки было 4 КиБ» — тот же исчерпанный контейнер. Проверка до чтения
+  // делает отказ дешёвым, проверка во время делает его ВЕРНЫМ.
+  if (fileStat.st_size < 0
+    || static_cast<std::uintmax_t>(fileStat.st_size) > kMaxManagedRecordBytes)
+  {
+    ::close(descriptor);
+    result.status = ManagedReadStatus::Refused;
+    static WarningThrottle oversizeThrottle;
+    ReportFileWarning(oversizeThrottle,
+      "Data file '{}' is {} bytes, beyond the {} byte ceiling for a single "
+      "record, and was refused without being read",
+      LogPath(path), static_cast<std::uintmax_t>(fileStat.st_size < 0
+        ? 0 : fileStat.st_size),
+      kMaxManagedRecordBytes);
+    return result;
   }
 
   try
@@ -1695,6 +2053,22 @@ struct ManagedFileRead
 //! уборка нужна, чтобы мусор не копился годами.
 inline void SweepStaleTemporaries(const std::filesystem::path& root) noexcept
 {
+#ifndef WIN32
+  // ★ОБХОД ПРИКРЕПЛЁН К ДЕСКРИПТОРАМ, А НЕ К ПУТЯМ (правка ревью, итерация 6).
+  // `recursive_directory_iterator` по умолчанию в ссылки не заходит, но
+  // `std::filesystem::remove(entry.path())` разрешает ПУТЬ целиком заново: ссылка
+  // на месте промежуточного каталога (`data/characters/equipment ->
+  // /tmp/theirs`) превращала уборку своего мусора в удаление ЧУЖИХ файлов,
+  // подходящих под `*.tmp`. Здесь каждый шаг — `openat(O_DIRECTORY|O_NOFOLLOW)`
+  // от дескриптора предыдущего, а удаление — `unlinkat` от каталога, в котором
+  // запись и была перечислена.
+  const int descriptor = detail::OpenDirectoryNoSymlinks(root);
+  if (descriptor < 0)
+    return;   // уборка — не повод не стартовать
+  // Глубина ограничена: дерево данных двухуровневое (`characters/equipment/items`),
+  // потолок 32 недостижим честными данными и делает рекурсию заведомо конечной.
+  detail::SweepDirectoryDescriptor(descriptor, 32);
+#else
   try
   {
     if (not std::filesystem::is_directory(root))
@@ -1716,6 +2090,7 @@ inline void SweepStaleTemporaries(const std::filesystem::path& root) noexcept
   {
     // Уборка — не повод не стартовать.
   }
+#endif
 }
 
 } // namespace server::util

@@ -107,7 +107,7 @@ bool WriteUserJsonAtomic(const std::filesystem::path& path, const nlohmann::json
   catch (const std::exception& x)
   {
     server::util::QuietLogError(
-      "Failed to write the user file '{}': {}", path.string(), x.what());
+      "Failed to write the user file '{}': {}", server::util::LogPath(path), x.what());
     return false;
   }
 }

@@ -137,17 +137,30 @@ nlohmann::json ReadManagedJson(
   if (read.status != server::util::ManagedReadStatus::Ok)
   {
     throw std::runtime_error(
-      std::format("{} '{}' not accessible", what, path.string()));
+      std::format("{} '{}' not accessible", what, server::util::LogPath(path)));
   }
   return nlohmann::json::parse(read.content);
 }
 
+//! ★СОЗДАНИЕ КАТАЛОГА ТОЖЕ НЕ ХОДИТ ПО ССЫЛКАМ (правка ревью, итерация 6).
+//!
+//! Прежняя редакция звала `exists` + `create_directories` ПО ПУТИ, то есть
+//! инвариант «под `data/` не ходят по ссылкам» держался у чтения, записи и
+//! обхода, но не у создания: подмена `data/characters/equipment` ссылкой на
+//! чужое дерево заставляла сервер СОЗДАТЬ там `items` — и всё дальнейшее шло
+//! мимо `data/`. Здесь единственное место, через которое рождаются ВСЕ пути
+//! данных этого класса, поэтому и правка одна.
 std::filesystem::path ProduceDataFilePath(
   const std::filesystem::path& root,
   const std::string& filename)
 {
-  if (not std::filesystem::exists(root))
-    std::filesystem::create_directories(root);
+  if (not server::util::CreateManagedDirectories(root))
+  {
+    throw std::runtime_error(
+      std::format(
+        "Data directory '{}' could not be created without following a symbolic "
+        "link", server::util::LogPath(root)));
+  }
   return root / (filename + ".json");
 }
 
@@ -304,7 +317,16 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   const auto prepareDataPath = [this](const std::filesystem::path& folder)
   {
     const auto path = _dataPath / folder;
-    create_directories(path);
+    // ★БЕЗ ПЕРЕХОДА ПО ССЫЛКАМ (правка ревью, итерация 6): `create_directories`
+    // разрешала путь именами, и ссылка на месте промежуточного каталога уводила
+    // создание — а с ним и все записи и удаления — за пределы `data/`.
+    if (not server::util::CreateManagedDirectories(path))
+    {
+      throw std::runtime_error(
+        std::format(
+          "Data directory '{}' could not be created without following a "
+          "symbolic link", server::util::LogPath(path)));
+    }
     return path;
   };
 
@@ -341,7 +363,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   {
     server::util::QuietLogError(
       "Data directory '{}': could not restrict the directory permissions to {:o}",
-      _userDataPath.string(), 0700);
+      server::util::LogPath(_userDataPath), 0700);
   }
 
   // ★И САМИ ИНОДЫ, А НЕ ТОЛЬКО КАТАЛОГ (LOA-fix R73-2b, правка ревью 1).
@@ -365,7 +387,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
     server::util::QuietLogWarn(
       "Account files in '{}': {} of {} examined were group/other-readable and "
       "were narrowed to owner-only",
-      _userDataPath.string(), hardening.narrowed, hardening.examined);
+      server::util::LogPath(_userDataPath), hardening.narrowed, hardening.examined);
   }
 
   // ★ССЫЛКА В КАТАЛОГЕ АККАУНТОВ НАЗЫВАЕТСЯ ВСЛУХ, А НЕ ПРОПУСКАЕТСЯ (правка
@@ -383,7 +405,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
     server::util::QuietLogWarn(
       "Account files in '{}': {} entry(ies) are symbolic links and were refused; "
       "they are neither hardened, indexed nor authenticated from",
-      _userDataPath.string(), hardening.refusedLinks);
+      server::util::LogPath(_userDataPath), hardening.refusedLinks);
   }
 
   // ★ОТКАЗ СУЖЕНИЯ ОСТАНАВЛИВАЕТ СТАРТ (правка ревью, итерация 2). Прежняя
@@ -402,14 +424,14 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
     server::util::QuietLogError(
       "Account files in '{}': {} of {} examined could not be secured{}; "
       "refusing to start with password hashes readable beyond their owner",
-      _userDataPath.string(), hardening.failed, hardening.examined,
+      server::util::LogPath(_userDataPath), hardening.failed, hardening.examined,
       hardening.incomplete ? ", and the directory scan did not finish" : "");
 
     throw std::runtime_error(
       std::format(
         "Account files in '{}' could not be restricted to owner-only "
         "({} failed, {} examined, scan {})",
-        _userDataPath.string(), hardening.failed, hardening.examined,
+        server::util::LogPath(_userDataPath), hardening.failed, hardening.examined,
         hardening.incomplete ? "incomplete" : "complete"));
   }
 
@@ -435,7 +457,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
     // следующий персонаж получал uid 1 и затирал файл старейшего игрока.
     server::util::QuietLogError(
       "Sequential uid metadata '{}' is missing. Uid counters will be derived from "
-      "the data on disk", metaFilePath.string());
+      "the data on disk", server::util::LogPath(metaFilePath));
   }
   else
   {
@@ -448,7 +470,7 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
       // Битый мета тоже не повод падать: пол из данных сильнее любого файла.
       server::util::QuietLogError(
         "Sequential uid metadata '{}' is unreadable ({}). Uid counters will be "
-        "derived from the data on disk", metaFilePath.string(), x.what());
+        "derived from the data on disk", server::util::LogPath(metaFilePath), x.what());
       meta = nlohmann::json::object();
     }
   }
@@ -494,11 +516,11 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
         "Uid floor: the scan of '{}' did not finish; the highest uid on disk is "
         "unknown, so the next entity could be handed an occupied uid and "
         "overwrite a live record",
-        root.string());
+        server::util::LogPath(root));
 
       throw std::runtime_error(
         std::format(
-          "Uid floor scan of '{}' did not finish", root.string()));
+          "Uid floor scan of '{}' did not finish", server::util::LogPath(root)));
     }
     return scan.highest;
   };
@@ -526,6 +548,9 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   // «сперва счётчики, потом индекс» держит стартовые инварианты в одном месте.
   RebuildCharacterNameIndex();
   RebuildUserNameIndex();
+  // ★И ИНДЕКС ГИЛЬДИЙ (правка ревью, итерация 6): пока его не было, проверка
+  // уникальности имени обходила каталог гильдий на каждый пакет создания.
+  RebuildGuildNameIndex();
 }
 
 void server::FileDataSource::Terminate()
@@ -833,6 +858,40 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
     _userIndexScanInFlight = true;
   }
 
+  // ★ФЛАГ ОБХОДА СНИМАЕТСЯ НА ЛЮБОМ ВЫХОДЕ, А НЕ ТОЛЬКО НА УСПЕШНОЙ ПУБЛИКАЦИИ
+  // (правка ревью, итерация 6).
+  //
+  // Между установкой флага и публикацией стоят `push_back`, преобразования
+  // путей и вставки в множество — каждая умеет бросить `bad_alloc`. Прежняя
+  // редакция снимала флаг ТОЛЬКО в блоке публикации, поэтому бросок посреди
+  // обхода оставлял `_userIndexScanInFlight` истинным НАВСЕГДА: каждое
+  // последующее сохранение аккаунта продолжало наполнять
+  // `_userNamesAddedDuringScan`, который никто уже не сливал и не чистил, —
+  // то есть утечка, растущая ровно на пути, который раунд удешевлял.
+  // Обязательство, которое умеет не выполниться, — не обязательство.
+  struct ScanFlagGuard
+  {
+    server::FileDataSource* owner;
+    bool armed = true;
+
+    ~ScanFlagGuard()
+    {
+      if (not armed)
+        return;
+      try
+      {
+        const std::unique_lock indexLock(owner->_userNameIndexMutex);
+        owner->_userNamesAddedDuringScan.clear();
+        owner->_userIndexScanInFlight = false;
+      }
+      catch (...)
+      {
+        // Деструктор не имеет права бросить: отказ самого замка — это уже
+        // остановка процесса другими средствами, а не наша.
+      }
+    }
+  } scanFlagGuard{this};
+
   // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ОБХОДА, А НЕ ПОСЛЕ. Файл, положенный рядом ВО ВРЕМЯ
   // обхода, обязан оставить отпечаток «устаревшим», иначе он потерялся бы до
   // перезапуска. Снимок «до» ошибается только в безопасную сторону — лишняя
@@ -862,7 +921,7 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
     server::util::QuietLogWarn(
       "Account name index: {} of {} account files in '{}' were group/other-"
       "readable and were narrowed to owner-only before being indexed",
-      hardening.narrowed, hardening.examined, _userDataPath.string());
+      hardening.narrowed, hardening.examined, server::util::LogPath(_userDataPath));
   }
   if (hardening.failed > 0)
   {
@@ -874,14 +933,14 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
       "Account name index: {} account file(s) in '{}' could not be narrowed to "
       "owner-only; they are refused, not indexed, and cannot be authenticated "
       "from until they are secured",
-      hardening.failed, _userDataPath.string());
+      hardening.failed, server::util::LogPath(_userDataPath));
   }
   if (hardening.refusedLinks > 0)
   {
     server::util::QuietLogWarn(
       "Account name index: {} entry(ies) in '{}' are symbolic links and were "
       "refused; they are not indexed and cannot be authenticated from",
-      hardening.refusedLinks, _userDataPath.string());
+      hardening.refusedLinks, server::util::LogPath(_userDataPath));
   }
 
   if (listing.incomplete || hardening.incomplete)
@@ -897,7 +956,7 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
     // чужих прав.
     server::util::QuietLogError(
       "Account name index: the scan of '{}' did not finish, the index is "
-      "incomplete and will be rebuilt on the next miss", _userDataPath.string());
+      "incomplete and will be rebuilt on the next miss", server::util::LogPath(_userDataPath));
   }
 
   std::unordered_set<std::string> keys;
@@ -949,6 +1008,8 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
       keys.insert(late);
     _userNamesAddedDuringScan.clear();
     _userIndexScanInFlight = false;
+    // Публикация состоялась — сторожу больше нечего откатывать.
+    scanFlagGuard.armed = false;
 
     _userNameKeys = std::move(keys);
     _userIndexStampValid = not stampError && not listing.incomplete
@@ -981,14 +1042,32 @@ void server::FileDataSource::IndexUserName(const std::string& name)
   auto key = server::util::AsciiLowerKey(name);
 
   const std::unique_lock indexLock(_userNameIndexMutex);
-  // ★ЕСЛИ ПРЯМО СЕЙЧАС ИДЁТ ОБХОД — ИМЯ ЗАПОМИНАЕТСЯ ОТДЕЛЬНО (правка ревью,
-  // итерация 5). Обход теперь работает СНАРУЖИ замка индекса и публикует
-  // готовый набор; набор снят ДО этой регистрации, поэтому без этой строки
-  // публикация затёрла бы только что зарегистрированного игрока и он остался
-  // бы ненаходимым до следующей сверки.
-  if (_userIndexScanInFlight)
-    _userNamesAddedDuringScan.insert(key);
-  _userNameKeys.insert(std::move(key));
+
+  // ★НЕУДАЧА ИНДЕКСАЦИИ НЕ ИМЕЕТ ПРАВА ВЫЙТИ НАРУЖУ (правка ревью, итерация 6).
+  // Нас зовут ПОСЛЕ успешной записи файла (`StoreUser`), поэтому бросок отсюда
+  // сообщил бы вызывающему «сохранить не удалось» про запись, которая на диске
+  // уже лежит, — то есть соврал бы в самую вредную сторону. Индекс — это КЭШ
+  // диска: честный ответ на нехватку памяти — объявить отпечаток недействительным
+  // и заставить следующий промах перечитать каталог, а не отменять сохранение.
+  try
+  {
+    // ★ЕСЛИ ПРЯМО СЕЙЧАС ИДЁТ ОБХОД — ИМЯ ЗАПОМИНАЕТСЯ ОТДЕЛЬНО (правка ревью,
+    // итерация 5). Обход теперь работает СНАРУЖИ замка индекса и публикует
+    // готовый набор; набор снят ДО этой регистрации, поэтому без этой строки
+    // публикация затёрла бы только что зарегистрированного игрока и он остался
+    // бы ненаходимым до следующей сверки.
+    if (_userIndexScanInFlight)
+      _userNamesAddedDuringScan.insert(key);
+    _userNameKeys.insert(std::move(key));
+  }
+  catch (const std::exception& x)
+  {
+    _userIndexStampValid = false;
+    server::util::QuietLogError(
+      "Account name index: '{}' could not be indexed ({}); the index is marked "
+      "stale and will be rebuilt from disk on the next miss", name, x.what());
+    return;
+  }
 
   // ★СВОЯ ЗАПИСЬ НЕ ДЕЛАЕТ ИНДЕКС УСТАРЕВШИМ (правка ревью, итерация 3). Ключ
   // уже внесён строкой выше — индекс СОГЛАСОВАН с диском, — но mtime каталога
@@ -1049,7 +1128,10 @@ void server::FileDataSource::DeleteInfraction(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _infractionDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateCharacter(data::Character& character)
@@ -1670,7 +1752,10 @@ void server::FileDataSource::DeleteCharacter(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
   ForgetCharacterName(uid);
 }
 
@@ -1697,12 +1782,12 @@ void server::FileDataSource::RebuildCharacterNameIndex()
     server::util::QuietLogError(
       "Character name index: the scan of '{}' did not finish; refusing to start "
       "with live characters unaddressable by name and their names readable as free",
-      _characterDataPath.string());
+      server::util::LogPath(_characterDataPath));
 
     throw std::runtime_error(
       std::format(
         "Character name index scan of '{}' did not finish",
-        _characterDataPath.string()));
+        server::util::LogPath(_characterDataPath)));
   }
 
   // ★ОТВЕРГНУТАЯ ССЫЛКА НАЗЫВАЕТСЯ ВСЛУХ И ЗДЕСЬ (правка ревью, итерация 4).
@@ -1715,7 +1800,7 @@ void server::FileDataSource::RebuildCharacterNameIndex()
     server::util::QuietLogWarn(
       "Character name index: {} entry(ies) in '{}' are symbolic links and were "
       "refused; they are not indexed and their uids stay reserved",
-      listing.refusedSymlinks.size(), _characterDataPath.string());
+      listing.refusedSymlinks.size(), server::util::LogPath(_characterDataPath));
   }
 
   for (const auto& filePath : listing.files)
@@ -1745,7 +1830,7 @@ void server::FileDataSource::RebuildCharacterNameIndex()
       // name» ОБЯЗАНА исчезнуть из бинаря, это маркер лесенки.
       server::util::QuietLogWarn(
         "Character file '{}' is unreadable ({}) and was skipped while building "
-        "the character name index", filePath.string(), x.what());
+        "the character name index", server::util::LogPath(filePath), x.what());
       ++skipped;
       continue;
     }
@@ -2099,7 +2184,10 @@ void server::FileDataSource::DeleteHorse(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _horseDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateItem(data::Item& item)
@@ -2146,7 +2234,10 @@ void server::FileDataSource::DeleteItem(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _itemDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateStorageItem(data::StorageItem& item)
@@ -2228,7 +2319,10 @@ void server::FileDataSource::DeleteStorageItem(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _storageItemPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateEgg(data::Egg& egg)
@@ -2278,7 +2372,10 @@ void server::FileDataSource::DeleteEgg(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _eggDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreatePet(data::Pet& pet)
@@ -2325,7 +2422,10 @@ void server::FileDataSource::DeletePet(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _petDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateHousing(data::Housing& housing)
@@ -2369,7 +2469,10 @@ void server::FileDataSource::DeleteHousing(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _housingDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateGuild(data::Guild& guild)
@@ -2422,82 +2525,171 @@ void server::FileDataSource::StoreGuild(data::Uid uid, const data::Guild& guild)
   server::util::WriteFileAtomically(
     dataFilePath, json.dump(2), "Guild file",
     server::util::FileSensitivity::Public);
+
+  // ★ИНДЕКС ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, как у персонажей и аккаунтов: бросок
+  // оставляет диск в прежнем состоянии, и индекс обязан остаться согласованным
+  // с диском, а не с намерением.
+  IndexGuildName(uid, guild.name());
 }
 
 void server::FileDataSource::DeleteGuild(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _guildDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
+  ForgetGuildName(uid);
 }
 
 bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
 {
-  const auto equalsIgnoreCase = [](std::string_view lhs, std::string_view rhs)
-  {
-    return std::ranges::equal(
-      lhs, rhs,
-      [](unsigned char a, unsigned char b)
-      {
-        return std::tolower(a) == std::tolower(b);
-      });
-  };
+  // ★ИНДЕКС ВМЕСТО ОБХОДА КАТАЛОГА (LOA-fix R73-13, правка ревью, итерация 6).
+  //
+  // Прежняя редакция ЛИСТАЛА каталог гильдий и разбирала каждый файл на каждый
+  // пакет создания гильдии. Итерация 5 сделала этот обход безопасным (общий
+  // список вместо бросающего итератора), но безопасный обход — всё ещё обход:
+  // проверка стоит ДО списания 3000 морковок, поэтому повторение занятого имени
+  // покупало полный проход по файловой системе за ноль. Класс закрывается тем
+  // же способом, что у персонажей и аккаунтов, — индексом, а не третьим частным
+  // случаем: ответ теперь стоит один хеш, независимо от числа гильдий.
+  //
+  // Сравнение по-прежнему ASCII-регистронезависимое: ключ индекса и есть имя в
+  // нижнем ASCII-регистре, ровно то, что делал прежний `equalsIgnoreCase`.
+  const auto key = server::util::AsciiLowerKey(name);
 
-  // ★ОБХОД ЧЕРЕЗ ОБЩИЙ СПИСОК, А НЕ ЧЕРЕЗ `directory_iterator` (правка ревью,
-  // итерация 5). Здесь оставались ДВА дефекта класса, который раунд объявил
-  // закрытым: продвижение итератора в range-for БРОСАЕТ (самоссылающийся
-  // `guilds/x.json` рвал бы честное создание гильдии вместо ответа), а
-  // `is_regular_file()` без `error_code` ходит ПО ССЫЛКЕ и бросает на висячей.
-  // Один обход на весь раунд — и этот тоже.
+  const std::shared_lock indexLock(_guildNameIndexMutex);
+  return not _guildNameToUid.contains(key);
+}
+
+void server::FileDataSource::RebuildGuildNameIndex()
+{
+  const std::unique_lock indexLock(_guildNameIndexMutex);
+  _guildNameToUid.clear();
+  _guildUidToName.clear();
+
+  std::size_t skipped = 0;
+  std::size_t duplicates = 0;
+
   const auto listing = server::util::ListRegularFiles(_guildDataPath);
   if (listing.incomplete)
   {
-    // ★ОБОРВАННЫЙ ОБХОД ОТВЕЧАЕТ «ЗАНЯТО», А НЕ «СВОБОДНО». «Мы не смогли
-    // посмотреть» и «там ничего нет» — разные ответы, и путать их здесь значит
-    // разрешить вторую гильдию с тем же именем. Прежняя редакция на этом месте
-    // БРОСАЛА (итератор), то есть тоже не отвечала «свободно»; отказ сохранён,
-    // но теперь он не рвёт запрос.
+    // ★НЕПОЛНЫЙ ИНДЕКС НА СТАРТЕ ФАТАЛЕН, как и у персонажей. Прежний обход на
+    // запросе отвечал на оборванный проход «имя занято» — отказ, безопасный по
+    // направлению. Индекс на старте такого ответа дать не может: имя, которого
+    // мы не увидели, читалось бы как СВОБОДНОЕ, и вторая гильдия легла бы на
+    // имя первой. Перестройка зовётся ровно из `Initialize`, поэтому бросок
+    // здесь останавливает старт, а не рвёт живой запрос.
     server::util::QuietLogError(
-      "Guild name uniqueness: the scan of '{}' did not finish; the name is "
-      "reported as taken rather than free", _guildDataPath.string());
-    return false;
+      "Guild name index: the scan of '{}' did not finish; refusing to start "
+      "with taken guild names readable as free",
+      server::util::LogPath(_guildDataPath));
+
+    throw std::runtime_error(
+      std::format(
+        "Guild name index scan of '{}' did not finish",
+        server::util::LogPath(_guildDataPath)));
   }
+
   if (not listing.refusedSymlinks.empty())
   {
     server::util::QuietLogWarn(
-      "Guild name uniqueness: {} entry(ies) in '{}' are symbolic links and were "
-      "refused; they do not reserve a guild name",
-      listing.refusedSymlinks.size(), _guildDataPath.string());
+      "Guild name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they are not indexed and do not reserve a guild name",
+      listing.refusedSymlinks.size(), server::util::LogPath(_guildDataPath));
   }
 
   for (const auto& filePath : listing.files)
   {
-    // LOA-fix (R58-9, round58, backlog #175): перехват разбора здесь уже есть, а
-    // фильтра расширения не было — временный файл разбирался бы наравне с данными.
+    // Тот же фильтр, что у прежнего обхода (R58-9): осиротевший `7.json.tmp` не
+    // имеет права занять имя.
     if (filePath.extension() != ".json")
       continue;
 
     const auto read = server::util::ReadManagedFile(
       filePath, server::util::FileSensitivity::Public);
     if (read.status != server::util::ManagedReadStatus::Ok)
-      continue;
+    { ++skipped; continue; }
 
+    std::string existingName;
+    data::Uid existingUid = data::InvalidUid;
     try
     {
       const auto json = nlohmann::json::parse(read.content);
-      const auto existingGuildName = json.value("name", std::string{});
-
-      if (equalsIgnoreCase(existingGuildName, name))
-        return false;
+      existingName = json.value("name", std::string{});
+      existingUid = json.value("uid", data::InvalidUid);
     }
-    catch (const std::exception&)
+    catch (const std::exception& x)
     {
-      // Skip malformed guild files rather than aborting the uniqueness check.
+      // Один битый файл не имеет права сломать создание гильдий У ВСЕХ — тот же
+      // выбор, что и в индексе персонажей.
+      server::util::QuietLogWarn(
+        "Guild file '{}' is unreadable ({}) and was skipped while building the "
+        "guild name index", server::util::LogPath(filePath), x.what());
+      ++skipped;
       continue;
     }
+
+    if (existingName.empty() || existingUid == data::InvalidUid)
+    { ++skipped; continue; }
+
+    auto key = server::util::AsciiLowerKey(existingName);
+
+    // Один uid живёт ровно в одном списке (см. индекс персонажей).
+    const auto alreadyIndexed = _guildUidToName.find(existingUid);
+    if (alreadyIndexed != _guildUidToName.end())
+    {
+      if (alreadyIndexed->second == key)
+        continue;
+      DetachNameKey(_guildNameToUid, alreadyIndexed->second, existingUid);
+    }
+
+    const std::size_t collisions =
+      AttachNameKey(_guildNameToUid, key, existingUid);
+    if (collisions > 1)
+      ++duplicates;
+    _guildUidToName[existingUid] = std::move(key);
   }
 
-  return true;
+  server::util::QuietLogInfo(
+    "Guild name index: {} names indexed, {} files skipped, {} duplicates",
+    _guildNameToUid.size(), skipped, duplicates);
+}
+
+void server::FileDataSource::IndexGuildName(
+  const data::Uid uid, const std::string& name)
+{
+  // ★ПУСТОЕ ИМЯ СНИМАЕТ ЗАПИСЬ, А НЕ ЗАВОДИТ КЛЮЧ "" — перестройка такие файлы
+  // пропускает, и без этой строки рантайм и диск разошлись бы после рестарта.
+  if (name.empty())
+  {
+    ForgetGuildName(uid);
+    return;
+  }
+
+  auto key = server::util::AsciiLowerKey(name);
+  const std::unique_lock indexLock(_guildNameIndexMutex);
+  const auto previous = _guildUidToName.find(uid);
+  if (previous != _guildUidToName.end())
+  {
+    if (previous->second == key)
+      return;                                   // имя не менялось
+    DetachNameKey(_guildNameToUid, previous->second, uid);
+  }
+  AttachNameKey(_guildNameToUid, key, uid);
+  _guildUidToName[uid] = std::move(key);
+}
+
+void server::FileDataSource::ForgetGuildName(const data::Uid uid)
+{
+  const std::unique_lock indexLock(_guildNameIndexMutex);
+  const auto previous = _guildUidToName.find(uid);
+  if (previous == _guildUidToName.end())
+    return;
+  // Снятие одной гильдии поднимает следующую, носящую то же имя, а не гасит имя.
+  DetachNameKey(_guildNameToUid, previous->second, uid);
+  _guildUidToName.erase(previous);
 }
 
 void server::FileDataSource::CreateSettings(data::Settings& settings)
@@ -2623,7 +2815,10 @@ void server::FileDataSource::DeleteSettings(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _settingsDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateDailyQuestGroup(data::DailyQuestGroup& group)
@@ -2719,7 +2914,10 @@ void server::FileDataSource::DeleteDailyQuestGroup(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _dailyQuestGroupDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateMail(data::Mail& mail)
@@ -2781,7 +2979,10 @@ void server::FileDataSource::DeleteMail(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _mailDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateQuest(data::Quest& quest)
@@ -2823,7 +3024,10 @@ void server::FileDataSource::DeleteQuest(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _questDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 void server::FileDataSource::CreateStallion(data::Stallion& stallion)
@@ -2875,7 +3079,10 @@ void server::FileDataSource::DeleteStallion(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _stallionDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }
 
 std::vector<server::data::Uid> server::FileDataSource::ListRegisteredStallions()
@@ -2893,13 +3100,13 @@ std::vector<server::data::Uid> server::FileDataSource::ListRegisteredStallions()
   {
     server::util::QuietLogWarn(
       "Registered stallions: the scan of '{}' did not finish; the returned list "
-      "is incomplete", _stallionDataPath.string());
+      "is incomplete", server::util::LogPath(_stallionDataPath));
   }
   if (not listing.refusedSymlinks.empty())
   {
     server::util::QuietLogWarn(
       "Registered stallions: {} entry(ies) in '{}' are symbolic links and were "
-      "refused", listing.refusedSymlinks.size(), _stallionDataPath.string());
+      "refused", listing.refusedSymlinks.size(), server::util::LogPath(_stallionDataPath));
   }
 
   for (const auto& filePath : listing.files)
@@ -2971,5 +3178,8 @@ void server::FileDataSource::DeleteReward(data::Uid claimUid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _rewardDataPath, std::format("{}", claimUid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА (правка ревью, итерация 6): `remove`
+  // снимает конечную ссылку саму, но промежуточные компоненты проходит
+  // насквозь — то есть удаляла бы чужой файл через подменённый каталог.
+  server::util::RemoveManagedFile(dataFilePath);
 }

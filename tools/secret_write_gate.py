@@ -55,6 +55,25 @@ WHAT ITERATION 5 OF THE REVIEW ADDED
         text is still read from the untouched source, and lengths match so the two
         views share offsets).
 
+WHAT ITERATION 6 OF THE REVIEW ADDED
+    Two direct probes showed the gate still answering by SPELLING rather than by the
+    meaning the compiler assigns:
+      * `#define Secret Public` followed by an otherwise perfect Secret call compiles
+        as Public and was reported clean — the gate read the token `Secret` in the
+        source and never asked what that token MEANS after preprocessing.
+      * `WriteFileAtom` + backslash + newline + `ically(...)` is ONE identifier
+        (translation phase 2 splices the line before anything else looks at it) and
+        was not seen at all.
+    The gate now performs the compiler's own first two phases in the compiler's own
+    order: line splices are joined FIRST (phase 2), comments are blanked SECOND
+    (phase 3), and only then are identifiers and literals read.  Line numbers are
+    carried through the splice so a report still points at the source line.
+    Redefinition is refused outright rather than emulated: a `#define`/`#undef` of
+    `WriteFileAtomically`, `FileSensitivity`, `Secret` or `Public`, and any `##`
+    pasting that touches one of those names, is a violation by itself — the gate
+    cannot know what a macro means without being a preprocessor, and "cannot know"
+    must be loud, not silent.
+
 HOW IT PROVES IT CAN FAIL
     `--selftest` runs the same analyser over in-memory fixtures: a clean pair, a
     "User file" written as Public, a non-user file written as Secret, and a
@@ -81,6 +100,59 @@ IDENTIFIER = "WriteFileAtomically"
 SECRET_KIND = "User file"
 # The tree is small; a floor keeps "0 violations" from meaning "I read nothing".
 MIN_CALLS = int(os.environ.get("SECRET_MIN_CALLS", "18"))
+
+
+#! ИМЕНА, ПЕРЕОПРЕДЕЛЕНИЕ КОТОРЫХ ГЕЙТ ОТКАЗЫВАЕТСЯ ЧИТАТЬ (правка ревью,
+#  итерация 6). `#define Secret Public` компилируется как `Public`, а гейт видел
+#  бы букву `Secret`. Эмулировать препроцессор здесь значило бы написать второй
+#  компилятор; честный ответ — объявить такое переопределение нарушением само по
+#  себе: в этом дереве оно не нужно ни для чего.
+GUARDED_NAMES = ("WriteFileAtomically", "FileSensitivity", "Secret", "Public")
+MACRO_PATTERN = re.compile(
+    r"^[ \t]*#[ \t]*(define|undef)[ \t]+(" + "|".join(GUARDED_NAMES) + r")\b",
+    re.MULTILINE)
+#! ЛЮБАЯ СКЛЕЙКА ТОКЕНОВ — НАРУШЕНИЕ, А НЕ ТОЛЬКО СКЛЕЙКА С ОХРАНЯЕМЫМ ИМЕНЕМ.
+#  `Sec ## ret` не содержит ни одного охраняемого имени и даёт `Secret`; правило
+#  «## рядом с охраняемым именем» такую форму не видит по построению — то есть
+#  было бы списком написаний, а не свойством. Гейт читает ИДЕНТИФИКАТОРЫ;
+#  склейка строит идентификатор, которого в тексте нет, и прочитать его гейт не
+#  может. В продакшн-дереве сегодня НОЛЬ склеек (проверено), поэтому запрет
+#  ничего не стоит: тот, кому она понадобится, обязан сперва научить гейт её
+#  читать.
+PASTE_PATTERN = re.compile(r"##")
+
+
+def splice_line_continuations(text: str) -> tuple[str, list[int]]:
+    """Выполняет ФАЗУ 2 трансляции: снимает `\\` перед переводом строки.
+
+    ★ЗАЧЕМ (правка ревью, итерация 6). `WriteFileAtom\\<перевод строки>ically(...)`
+    — для компилятора ОДИН идентификатор, а для поиска по тексту два куска,
+    которых гейт не видел вовсе. Проба ревью возвращала ноль вызовов и ноль
+    нарушений на файле, который пишет хеш пароля как `Public`.
+
+    ★ПОРЯДОК ФАЗ — КОМПИЛЯТОРНЫЙ: сначала склейка (фаза 2), потом комментарии
+    (фаза 3). Обратный порядок читал бы `// комментарий, заканчивающийся \\`
+    иначе, чем компилятор.
+
+    Возвращает склеенный текст и НОМЕР ИСХОДНОЙ СТРОКИ для каждого символа:
+    отчёт обязан указывать на строку файла, а не на строку своего внутреннего
+    представления."""
+    out: list[str] = []
+    lines: list[int] = []
+    line = 1
+    index = 0
+    size = len(text)
+    while index < size:
+        if text[index] == "\\" and index + 1 < size and text[index + 1] == "\n":
+            line += 1
+            index += 2
+            continue
+        out.append(text[index])
+        lines.append(line)
+        if text[index] == "\n":
+            line += 1
+        index += 1
+    return "".join(out), lines
 
 
 def strip_comments(text: str) -> str:
@@ -343,13 +415,38 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
     """Return (violations, number of calls seen) for one translation unit."""
     violations: list[tuple[str, str]] = []
     seen = 0
-    code = strip_comments(text)
+    # ★ФАЗЫ В ПОРЯДКЕ КОМПИЛЯТОРА: склейка строк, затем комментарии, затем
+    # содержимое литералов (правка ревью, итерация 6).
+    spliced, source_line = splice_line_continuations(text)
+
+    def where(offset: int) -> str:
+        line = source_line[offset] if offset < len(source_line) else 0
+        return f"{origin}:{line}"
+
+    code = strip_comments(spliced)
     # ★ИДЕНТИФИКАТОР ИЩЕТСЯ В ТЕКСТЕ БЕЗ СОДЕРЖИМОГО ЛИТЕРАЛОВ, А АРГУМЕНТЫ
     # РАЗБИРАЮТСЯ ПО ИСХОДНОМУ (правка ревью, итерация 5). Длина сохранена, то
     # есть смещения у обоих видов одни и те же.
     scan = blank_literal_contents(code)
+
+    # ★ПЕРЕОПРЕДЕЛЕНИЕ ОХРАНЯЕМОГО ИМЕНИ — НАРУШЕНИЕ САМО ПО СЕБЕ. Гейт не
+    # препроцессор и не может сказать, во что превратится `Secret` после
+    # `#define Secret Public`; «не могу прочитать» обязано звучать, а не
+    # молчать.
+    for macro in MACRO_PATTERN.finditer(scan):
+        violations.append(
+            (where(macro.start()),
+             f"переопределение охраняемого имени `{macro.group(2)}` "
+             f"(#{macro.group(1)}) — после препроцессора класс файла означает "
+             f"не то, что написано в исходнике"))
+    for paste in PASTE_PATTERN.finditer(scan):
+        violations.append(
+            (where(paste.start()),
+             "склейка токенов (##) — гейт читает идентификаторы, а склейка "
+             "строит идентификатор, которого в тексте нет"))
+
     for match in IDENTIFIER_PATTERN.finditer(scan):
-        location = f"{origin}:{scan.count(chr(10), 0, match.start()) + 1}"
+        location = where(match.start())
 
         # The declaration itself is not a call.
         declaration = DECLARATION_PATTERN.search(scan, max(0, match.start() - 32))
@@ -524,6 +621,25 @@ SELFTEST_FIXTURES = [
   server::util::WriteFileAtomically(
     p, json.dump(2), "User file", server::util::FileSensitivity::Secret);
 '''),
+    # ★ДВЕ ФИКСТУРЫ ИТЕРАЦИИ 6 — ровно те две формы, на которых прямая проба
+    # ревью получила «ноль нарушений» от компилирующегося как `Public` кода.
+    ("redefining Secret makes the source spelling meaningless", 1, '''
+#define Secret Public
+  server::util::WriteFileAtomically(
+    p, q, "User file", server::util::FileSensitivity::Secret);
+'''),
+    ("a line splice inside the identifier is still one identifier", 1,
+     "\n  server::util::WriteFileAtom\\\nically(\n"
+     "    p, q, \"User file\", server::util::FileSensitivity::Public);\n"),
+    ("pasting tokens to build the class is unreadable", 1, '''
+#define CLASS(x) server::util::FileSensitivity::Sec ## ret
+'''),
+    ("an ordinary line splice in an unrelated macro is not a violation", 0, '''
+#define LOG_TWICE(x) \\
+  do { log(x); log(x); } while (false)
+  server::util::WriteFileAtomically(
+    p, q, "User file", server::util::FileSensitivity::Secret);
+'''),
     ("the declaration itself is not a call", 0, '''
 inline void WriteFileAtomically(
   const std::filesystem::path& path,
@@ -575,7 +691,14 @@ def main() -> int:
     calls = 0
     for path in sources:
         text = path.read_text(encoding="utf-8", errors="replace")
-        if IDENTIFIER not in text:
+        # ★РАННИЙ ВЫХОД СЧИТАЕТ СКЛЕЕННЫЙ ТЕКСТ, А НЕ СЫРОЙ (правка ревью,
+        # итерация 6): `WriteFileAtom\<перевод строки>ically` в сыром тексте
+        # идентификатора НЕ содержит, и файл не читался бы вовсе. Охраняемые
+        # имена проверяются в том же тексте — переопределение обязано быть
+        # видно даже в файле без единого вызова.
+        spliced_text, _ = splice_line_continuations(text)
+        if IDENTIFIER not in spliced_text and not any(
+                name in spliced_text for name in GUARDED_NAMES[1:]):
             continue
         found, seen = analyse(text, str(path.relative_to(root)))
         violations += found
