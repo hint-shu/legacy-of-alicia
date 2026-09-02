@@ -72,24 +72,6 @@ public:
     protocol::QuestRewardType rewardType,
     uint32_t unk2,
     uint32_t mountExp);
-  //! Отправляет персонажу нотификацию достижения ГОНОЧНЫМ сокетом.
-  //!
-  //! ★ПОЧЕМУ ВТОРАЯ ТОЧКА ОТПРАВКИ, А НЕ `RanchDirector::SendAchievementEvent`.
-  //! `RaceInstance::Stop()` исполняется на потоке гоночного директора
-  //! (`RaceNetworkHandler::Tick` обходит `_raceInstances` под
-  //! `_raceInstancesMutex` → `RaceInstance::Tick` → `TickFinishing` → `Stop`).
-  //! Ранчевый отправитель читает `RanchDirector::_clients` — карту РАНЧЕВОГО
-  //! потока, не защищённую ничем; звать её отсюда значило бы завести гонку
-  //! класса #96/R34. `_clients` ЭТОГО обработчика трогает тот же поток, что и
-  //! `Stop()`.
-  //! ★Форма — дословная копия `SendDailyQuestNotificationToCharacter`: тот же
-  //! `try` вокруг `GetClientIdByCharacterUid` (он БРОСАЕТ, если игрок уже ушёл),
-  //! тот же `QueueCommand`, тот же глухой перехват. Путь «из Stop() в сокет
-  //! заезда» этим методом уже проложен и обкатан.
-  void SendAchievementNotificationToCharacter(
-    uint32_t characterUid,
-    const protocol::AcCmdRCAchievementUpdateNotify& notify);
-
 
   void HandleClientConnected(ClientId clientId) override;
   void HandleClientDisconnected(ClientId clientId) override;
@@ -127,6 +109,54 @@ public:
               return command;
             });
       });
+  }
+
+  //! Отправляет команду ОДНОМУ клиенту по УЖЕ ИЗВЕСТНОМУ `ClientId`.
+  //!
+  //! ★СМЫСЛ МЕТОДА — В ТОМ, ЧЕГО В НЁМ НЕТ: обращения к `_clients`.
+  //! `RaceInstance::Stop()` исполняется на потоке ГОНОЧНОГО ДИРЕКТОРА
+  //! (`ServerInstance::_raceDirectorThread` → `RaceNetworkHandler::Tick` →
+  //! `RaceInstance::Tick` → `TickFinishing` → `Stop`), а `_clients` мутирует
+  //! СЕТЕВОЙ поток команд (`CommandServer::BeginHost` заводит собственный
+  //! `_serverThread`, с него приходят `HandleClientConnected`/
+  //! `HandleClientDisconnected` и все `Handle*`). Значит любой поиск по
+  //! `_clients` из `Stop()` — гонка на `unordered_map` с параллельными
+  //! `try_emplace`/`erase`, то есть UB, а не «редкая неточность». Первая
+  //! редакция достижений R70 звала оттуда `GetClientIdByCharacterUid`, копируя
+  //! форму `SendDailyQuestNotificationToCharacter`; ревью (итерация 2) поймало
+  //! это как BLOCK, и утверждение «оба на одном потоке» оказалось ложным.
+  //! ★ЧЕМ ЗАМЕНЕНО: `ClientId` берётся ИЗ КОМНАТЫ — `RoomSystem::GetRoom`
+  //! держит per-room `std::mutex` на всё время колбэка, и ровно этим путём
+  //! `Broadcast`/`BroadcastExceptCharacterUid` уже ходят с этого же потока на
+  //! каждом пакете заезда. То есть это не новый механизм, а тот, что уже
+  //! доказан в проде.
+  //! ★УСТАРЕВШИЙ `ClientId` БЕЗОПАСЕН: `CommandServer::SendCommand` идёт в
+  //! `Server::GetClient`, а тот ищет под разделяемым замком и БРОСАЕТ на
+  //! неизвестном клиенте — здесь этот бросок глушится, потому что «игрок уже
+  //! вышел» не должно стоить остальным ни заезда, ни достижений. Прогресс к
+  //! этому моменту уже записан в БД, теряется только уведомление.
+  template <WritableStruct C>
+  void SendToClient(
+    const ClientId clientId,
+    const C& command) noexcept
+  {
+    try
+    {
+      _commandServer.QueueCommand<C>(
+        clientId,
+        [command]()
+        {
+          return command;
+        });
+    }
+    catch (const std::exception&)
+    {
+      // Клиента уже нет — уведомление теряется, состояние нет.
+    }
+    catch (...)
+    {
+      // То же самое для не-std броска.
+    }
   }
 
   template <WritableStruct C>

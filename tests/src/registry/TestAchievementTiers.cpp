@@ -28,10 +28,14 @@
 #include <libserver/registry/AchievementRegistry.hpp>
 #include <libserver/util/Util.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <string_view>
+#include <vector>
 
 namespace
 {
@@ -48,6 +52,14 @@ void Check(const bool condition, const char* const what)
 
 using server::registry::AchievementCompareType;
 using server::registry::AchievementInfo;
+
+//! Форма записи каталога, на которую опираются проверки состава.
+struct CatalogShape
+{
+  uint32_t tid;
+  uint32_t gameModeFlag;
+  uint32_t numPlayer;
+};
 
 //! Ёмкость массива отметок тиров в записи персонажа — та самая четвёрка,
 //! которой R70 перестал мерить потолок.
@@ -193,8 +205,6 @@ void TestCountsInMode()
 //! в проде повторяемой чеканкой `Win`.
 void TestCatalogShapesOfRankConditions()
 {
-  struct CatalogShape { uint32_t tid; uint32_t gameModeFlag; uint32_t numPlayer; };
-
   // Шесть записей условий Win / TeamWin — единственные с ненулевым numPlayer
   // среди тех, что раунд может зажечь.
   constexpr std::array<CatalogShape, 6> rankEntries{{
@@ -260,6 +270,130 @@ void TestCatalogShapesOfRankConditions()
   }
 }
 
+//! ★ТОТ ЖЕ ВОПРОС, НО К НАСТОЯЩЕМУ КАТАЛОГУ, А НЕ К ЛИТЕРАЛАМ (находка ревью,
+//! итерация 2). Проверка выше гоняет `CountsInMode` на ФОРМАХ, переписанных в
+//! исходник руками: пока каталог с ними совпадает, она верна, но перегенерация
+//! `achievements.yaml` её не разбудит — а именно перегенерацией и приезжает
+//! дрейф. Здесь тот же счёт делается ЧТЕНИЕМ ФАЙЛА каталога (только чтение,
+//! ничего не пишем и не правим):
+//!   * записей события 2, которые раунд ВООБЩЕ может двинуть, ровно 23;
+//!   * ненулевой `numPlayer` ровно у шести, и это ровно те шесть tid;
+//!   * у оставшихся семнадцати `numPlayer` нулевой, и их очки дают 53, а очки
+//!     шести — 24. Это и есть заявленная приёмка раунда, посчитанная по данным.
+//! ★«МОЖЕТ ДВИНУТЬ» ПОВТОРЯЕТ ФИЛЬТРЫ `AchievementSystem::OnServerEvent`
+//! ОДИН В ОДИН: источник `server`, не `neverAward`, без сброса (`resetEvent` и
+//! `resetFunction`), и функция — либо простой счётчик (`TRUE`), либо одно из
+//! условий, которые называет блок `RaceInstance::Stop()`. Список условий —
+//! копия того, что стоит в `Stop()`; любое НОВОЕ условие раунда обязано попасть
+//! и сюда, иначе счёт разойдётся и тест это покажет.
+//! ★ФАЙЛ НЕ ПРОЧИТАЛСЯ = ПРОВАЛ, а не «пропустим проверку»: непрочитанный вход
+//! обязан быть красным, иначе гейт зелен на пустом множестве.
+void TestCatalogConsistency()
+{
+#ifndef LOA_ACHIEVEMENTS_CATALOG
+  Check(false, "путь к каталогу достижений не передан сборкой");
+#else
+  server::registry::AchievementRegistry registry;
+  try
+  {
+    registry.ReadConfig(LOA_ACHIEVEMENTS_CATALOG);
+  }
+  catch (const std::exception& x)
+  {
+    std::fprintf(stderr, "FAIL: каталог '%s' не прочитан: %s\n",
+      LOA_ACHIEVEMENTS_CATALOG, x.what());
+    ++g_failures;
+    return;
+  }
+
+  Check(registry.GetAchievementCount() > 0, "каталог не пуст");
+
+  // Условия, которые называет блок достижений в `RaceInstance::Stop()`.
+  constexpr std::array<std::string_view, 18> roundConditions{
+    "Retire", "GoalIn",
+    "GoalIn_8h_13h", "GoalIn_14h_16h", "GoalIn_16h_18h", "GoalIn_19h_22h",
+    "RiLand01Mastery", "RiLand02Mastery", "RiLand03Mastery", "RiLand04Mastery",
+    "RiFore01Mastery", "RiFore02Mastery", "RiDorf04Mastery",
+    "Win", "MyFirstWin", "PerfectWin", "TeamWin", "Revenge"};
+
+  const auto isPlainCounter = [](const std::string& function)
+  {
+    return function == "TRUE" or function == "True" or function == "true";
+  };
+
+  std::vector<const AchievementInfo*> movable;
+  for (const auto* const info : registry.GetAchievementsByEvent(2))
+  {
+    if (info->neverAward)
+      continue;
+    if (info->source != server::registry::AchievementSource::Server)
+      continue;
+    if (info->resetEvent != 0 or not info->resetFunction.empty())
+      continue;
+    const bool named = std::ranges::find(roundConditions, info->function)
+      != roundConditions.end();
+    if (not named and not isPlainCounter(info->function))
+      continue;
+    movable.push_back(info);
+  }
+
+  Check(movable.size() == 23, "раунд может двинуть ровно 23 записи события 2");
+
+  constexpr std::array<CatalogShape, 6> expectedRankEntries{{
+    {10054, 5, 8},
+    {10060, 10, 8},
+    {10225, 1, 4},
+    {10226, 4, 4},
+    {10227, 2, 4},
+    {10228, 8, 4}}};
+
+  std::vector<uint32_t> rankTids;
+  uint32_t rankPoints = 0;
+  uint32_t plainPoints = 0;
+  size_t plainCount = 0;
+  for (const auto* const info : movable)
+  {
+    if (info->numPlayer != 0)
+    {
+      rankTids.push_back(info->tid);
+      rankPoints += info->points;
+    }
+    else
+    {
+      ++plainCount;
+      plainPoints += info->points;
+    }
+  }
+  std::ranges::sort(rankTids);
+
+  Check(rankTids.size() == expectedRankEntries.size(),
+    "ненулевой numPlayer ровно у шести записей раунда");
+  Check(plainCount == 17, "остальных записей раунда ровно семнадцать");
+  Check(plainPoints == 53, "семнадцать записей дают 53 очка");
+  Check(rankPoints == 24, "шесть записей Win/TeamWin дают 24 очка");
+
+  for (size_t index = 0; index < expectedRankEntries.size(); ++index)
+  {
+    const auto& expected = expectedRankEntries[index];
+    Check(
+      index < rankTids.size() and rankTids[index] == expected.tid,
+      "состав шестёрки записей с numPlayer не изменился");
+
+    const auto* const info = registry.GetAchievement(
+      static_cast<uint16_t>(expected.tid));
+    Check(info != nullptr, "запись с numPlayer есть в каталоге");
+    if (info == nullptr)
+      continue;
+    Check(info->gameModeFlag == expected.gameModeFlag,
+      "gameModeFlag записи Win/TeamWin совпал с формой, на которой стоит тест");
+    Check(info->numPlayer == expected.numPlayer,
+      "numPlayer записи Win/TeamWin совпал с формой, на которой стоит тест");
+    Check(info->function == "Win" or info->function == "TeamWin",
+      "запись с numPlayer зажигается условием Win либо TeamWin");
+  }
+#endif
+}
+
 //! Игровой час = UTC + 3 (Europe/Moscow, постоянный сдвиг с 2014 года).
 //! Негатив negF обнуляет смещение — тогда равенство ниже станет ложным.
 void TestGameLocalHour()
@@ -303,6 +437,7 @@ int main()
   TestReachedNeverExceedsAvailable();
   TestCountsInMode();
   TestCatalogShapesOfRankConditions();
+  TestCatalogConsistency();
   TestGameLocalHour();
 
   if (g_failures != 0)

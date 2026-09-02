@@ -30,6 +30,7 @@
 
 #include <chrono>
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace server
@@ -232,6 +233,20 @@ public:
 
 private:
   void PrepareItemDecks();
+
+  //! Снимок «персонаж → клиент» по игрокам комнаты.
+  //!
+  //! ★ЗАЧЕМ ОТДЕЛЬНЫЙ СНИМОК, А НЕ ПОИСК ПО `RaceNetworkHandler::_clients`.
+  //! `RaceInstance` тикает на потоке ГОНОЧНОГО ДИРЕКТОРА, а карту клиентов
+  //! обработчика мутирует СЕТЕВОЙ поток команд (`CommandServer::_serverThread`:
+  //! `HandleClientConnected`/`HandleClientDisconnected`). Поиск по ней отсюда —
+  //! гонка на `unordered_map`, то есть UB. Комната же читается под собственным
+  //! замком (`RoomSystem::GetRoom`), и это тот же путь, которым отсюда уже ходят
+  //! `Broadcast` и рассылка баланса.
+  //! Снимок может устареть к моменту отправки — это безопасно: отправка по
+  //! несуществующему `ClientId` глушится (`RaceNetworkHandler::SendToClient`).
+  [[nodiscard]] std::unordered_map<data::Uid, network::ClientId>
+    SnapshotRoomClientIds() const;
 
   const uint32_t _roomUid{};
 

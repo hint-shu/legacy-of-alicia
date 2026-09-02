@@ -45,6 +45,33 @@ constexpr registry::MapBlockId HotMapsCourseId = 10002;
 //! Номер шины достижений «финиш заезда» (UserAchvEvent = 2).
 constexpr uint16_t RaceAchievementEvent = 2;
 
+//! LOA (R70 итерация 2, backlog #58): СКОЛЬКО ТРАССЫ НАДО ПРОЙТИ, ЧТОБЫ
+//! СЧИТАТЬСЯ УЧАСТНИКОМ для ранговых условий достижений (доля 0..1).
+//!
+//! ★ЗАЧЕМ ЭТО ВООБЩЕ. Первая редакция считала составом «всех НЕотключившихся»,
+//! и ревью (итерация 2) показало дыру: подключённый, но МОЛЧАЩИЙ альт ростер
+//! всё равно покупает. Три (семь) таких аккаунтов, просто вошедших в заезд и не
+//! приславших ни одного пакета, дают `numPlayer` 4 (8) — а это ПОВТОРЯЕМЫЕ тиры
+//! `Win`/`TeamWin` (10225/10226/10054/10227/10228/10060, 24 очка) после
+//! 15-секундного таймаута финиширования.
+//! ★ЧЕМ МЕРЯЕМ: `Racer::trustedProgress` — СЕРВЕРНАЯ копия прогресса (R-revenge,
+//! #13). Она растёт только после зелёного света, только в состоянии `Racing`, не
+//! быстрее правдоподобного темпа (вся трасса за `MinPlausibleCourseTime`) и
+//! никогда не убывает. Молчащий гонщик остаётся на нуле по построению: сервер
+//! сам прогресс не выдаёт.
+//! ★ПОЧЕМУ 0.1, А НЕ «БОЛЬШЕ НУЛЯ». Ноль отсекает только полное молчание, а
+//! «больше нуля» покупается ОДНИМ пакетом позиции. Десятая часть трассы при
+//! потолке темпа стоит не меньше трёх секунд отчётов о движении. Честному
+//! гонщику этот порог не мешает никогда: круг в игре идёт полторы-три минуты, а
+//! к моменту `Stop()` заезд уже отработал либо лимит карты, либо 15 секунд после
+//! первого финиша.
+//! ★ЧЕГО ЭТОТ ПОРОГ НЕ ДЕЛАЕТ (говорим прямо, чтобы не читалось шире): отличить
+//! человека от скрипта сервер не может в принципе. Порог поднимает цену альта с
+//! «войти и стоять» до «весь заезд слать правдоподобные пакеты движения» —
+//! ровно ту, что платит игрок. Полностью закрыть чеканку `Win` сговором живых
+//! аккаунтов нельзя ничем, кроме отказа от записи с `numPlayer`.
+constexpr float MinMeaningfulRaceProgress = 0.1f;
+
 //! Одна карта мастерства: имя условия каталога, ИМЯ КАРТЫ и потолок времени.
 //!
 //! ★ЕДИНИЦЫ. `racer.courseTime` — МИЛЛИСЕКУНДЫ (`tracker::MinPlausibleCourseTime
@@ -133,6 +160,19 @@ void RaceInstance::GetRoom(const std::function<void(const Room&)>& consumer) con
   _raceNetworkHandler.GetServerInstance().GetRoomSystem().GetRoom(
     _roomUid,
     consumer);
+}
+
+std::unordered_map<data::Uid, network::ClientId>
+RaceInstance::SnapshotRoomClientIds() const
+{
+  std::unordered_map<data::Uid, network::ClientId> clientIds;
+  this->GetRoom(
+    [&clientIds](const Room& room)
+    {
+      for (const auto& [characterUid, player] : room.GetPlayers())
+        clientIds.emplace(characterUid, player.GetClientId());
+    });
+  return clientIds;
 }
 
 bool RaceInstance::Start(
@@ -579,18 +619,30 @@ void RaceInstance::Stop()
     const auto questGameMode = QuestSystem::ToGameModeFlag(
       _parameters.gameMode, _parameters.teamMode);
 
-    const auto sendNotifies = [this](
+    // ★ОТПРАВКА ПО `ClientId` ИЗ КОМНАТЫ, А НЕ ПО ПОИСКУ В КАРТЕ КЛИЕНТОВ
+    // (R70 итерация 2). Прежняя форма звала
+    // `SendDailyQuestNotificationToCharacter`, а тот перебирает
+    // `RaceNetworkHandler::_clients` — карту, которую мутирует СЕТЕВОЙ поток,
+    // тогда как `Stop()` идёт на потоке гоночного директора. Это была гонка на
+    // `unordered_map` (UB), и достижения R70 её сперва СКОПИРОВАЛИ; ревью
+    // поймало копию, а чинить надо оба места, иначе правка — про место, а не
+    // про причину. Снимок берётся под замком комнаты, устаревший `ClientId`
+    // безопасен (`SendToClient` глушит бросок «клиента нет»).
+    // ПАКЕТ НЕ ИЗМЕНИЛСЯ: у `AcCmdRCUpdateDailyQuestNotify` ровно те семь
+    // полей, которые прежний хелпер перекладывал по одному, — теперь
+    // отправляется тот же самый объект целиком.
+    const auto dailyQuestClientIds = SnapshotRoomClientIds();
+
+    const auto sendNotifies = [this, &dailyQuestClientIds](
       const std::vector<protocol::AcCmdRCUpdateDailyQuestNotify>& notifies)
     {
       for (const auto& notify : notifies)
-        _raceNetworkHandler.SendDailyQuestNotificationToCharacter(
-          notify.characterUid,
-          notify.questId,
-          notify.objectiveProgress,
-          notify.carrotsReward,
-          notify.rewardType,
-          notify.unk2,
-          notify.mountExp);
+      {
+        const auto clientIdIter = dailyQuestClientIds.find(notify.characterUid);
+        if (clientIdIter == dailyQuestClientIds.cend())
+          continue;
+        _raceNetworkHandler.SendToClient(clientIdIter->second, notify);
+      }
     };
 
     // LOA-fix (F7, quest-batch-1): места 1-3 среди ФАКТИЧЕСКИ доехавших. Индекс
@@ -1038,35 +1090,67 @@ void RaceInstance::Stop()
         and racer.courseTime >= tracker::MinPlausibleCourseTime;
     };
 
+    // ★ИСХОД, ДОКАЗАННЫЙ СЕРВЕРОМ: гонщик либо доехал за правдоподобное время,
+    // либо СОШЁЛ с заезда, который к тому моменту реально шёл (проверка стоит в
+    // `HandleUserRaceFinal`). Всё остальное — молчание или отвергнутая попытка.
+    const auto hasProvenOutcome = [&isPlausibleFinish](
+      const tracker::RaceTracker::Racer& racer)
+    {
+      return isPlausibleFinish(racer)
+        or racer.finishOutcome == FinishOutcome::Retired;
+    };
+
+    // ★СОСТАВ СЧИТАЕТСЯ ПО ТЕМ, КТО РЕАЛЬНО ЕХАЛ, и обе половины условия
+    // обязательны.
+    // (1) ПОДКЛЮЧЁН. Ростер (`GetRacers().size()`) стабилен от старта до
+    //     `Stop()` — `RaceTracker::RemoveRacer` не вызывается нигде, а обрыв
+    //     лишь ставит `state = Disconnected`. По ростеру «человек» равен
+    //     «аккаунт когда-то вошёл», и состав покупается вошедшими и вышедшими.
+    // (2) ЕХАЛ. Одной подключённости мало — это находка ревью (итерация 2):
+    //     подключённый МОЛЧУН ростер покупает ровно так же, ему не нужно даже
+    //     отключаться. Три (семь) молчащих альтов дают `numPlayer` 4 (8) у
+    //     записей `Win`/`TeamWin` (10225, 10226, 10054, 10227, 10228, 10060) —
+    //     а это ПОВТОРЯЕМЫЕ тиры. Поэтому спрашиваем СЕРВЕРНУЮ улику движения:
+    //     `trustedProgress >= MinMeaningfulRaceProgress` (см. константу) либо
+    //     правдоподобный финиш, который сам по себе означает 30+ секунд заезда.
+    //     Второе слагаемое — страховка: если бы клиент по какой-то причине не
+    //     слал `progress`, доехавшие всё равно остались бы составом, и ранговые
+    //     условия не выключились бы у честной игры целиком.
+    // ЦЕНА УЖЕСТОЧЕНИЯ, ЗАПИСАННАЯ ЧЕСТНО: честный игрок, чей единственный
+    // соперник вылетел или простоял заезд, за ЭТОТ заезд ранговых условий не
+    // получит (10003 `MyFirstWin`, разовая, 1 очко) — получит за следующий. Это
+    // дешевле повторяемой чеканки `Win`.
+    const auto countsInRoster = [&isPlausibleFinish](
+      const tracker::RaceTracker::Racer& racer)
+    {
+      return racer.state != State::Disconnected
+        and (racer.trustedProgress >= MinMeaningfulRaceProgress
+          or isPlausibleFinish(racer));
+    };
+
     for (const auto& [characterUid, racer] : racers)
     {
-      // ★СОСТАВ СЧИТАЕТСЯ ПО ПОДКЛЮЧЁННЫМ, А НЕ ПО РАЗМЕРУ РОСТЕРА, и это
-      // ИСПРАВЛЕНИЕ, а не вкусовщина. Ростер (`GetRacers().size()`) стабилен от
-      // старта до `Stop()` — `RaceTracker::RemoveRacer` не вызывается нигде, а
-      // обрыв лишь ставит `state = Disconnected`. Значит по ростеру «человек»
-      // равен «аккаунт когда-то вошёл», и состав ПОКУПАЕТСЯ альтами: четыре
-      // (восемь) аккаунтов входят, заезд стартует, все, кроме одного,
-      // отваливаются — а `numPlayer` 4/8 у записей `Win`/`TeamWin` (10225,
-      // 10226, 10054, 10227, 10228, 10060) считался бы выполненным, и
-      // оставшийся забирал бы ПОВТОРЯЕМЫЕ тиры в фактически соло-заезде.
-      // Одного дропнутого альта для этого мало (спека §7.2 считала цену именно
-      // для одного) — четырёх достаточно, а порог `>= 2` у ранговых условий
-      // ростер обходил и вовсе одним альтом.
-      // ЦЕНА УЖЕСТОЧЕНИЯ, ЗАПИСАННАЯ ЧЕСТНО: честный игрок, чей единственный
-      // соперник вылетел из игры, за ЭТОТ заезд ранговых условий не получит
-      // (10003 `MyFirstWin`, разовая, 1 очко) — получит за следующий. Это
-      // дешевле повторяемой чеканки `Win`.
-      if (racer.state == State::Disconnected)
-        continue;
-      ++humanCount;
+      if (countsInRoster(racer))
+        ++humanCount;
 
+      // ★ФИНИШЁРЫ И СХОДЫ СЧИТАЮТСЯ У ВСЕХ, ВКЛЮЧАЯ ОТКЛЮЧИВШИХСЯ, и это
+      // ВТОРАЯ находка ревью (итерация 2). Отключение — это не отмена уже
+      // доказанного исхода: гонщик доехал (сервер сам замерил время) либо сошёл
+      // (сервер сам подтвердил), а `HandleLeaveRoom` лишь переписал `state`.
+      // Пропуск таких записей стоил бы дважды:
+      //   * честный ПОБЕДИТЕЛЬ, закрывший игру сразу после финиша, исчезал бы
+      //     из `finishers` — и `Win`/`MyFirstWin` уходили бы ВТОРОМУ месту,
+      //     то есть тому, кто не выигрывал. Это чеканка, а не потеря;
+      //   * честный сход не считался бы сходом.
+      // Состав (выше) — другое дело: там вопрос «сколько людей ехало», и
+      // отключившийся на него отвечает «уже нисколько».
       if (isPlausibleFinish(racer))
       {
         finishers.push_back({racer.courseTime, characterUid, racer.team});
       }
       // ★СХОД ДОКАЗЫВАЕТСЯ ПОЛОЖИТЕЛЬНО. «Нет правдоподобного времени» — это
       // ТРИ разных события (см. `Racer::FinishOutcome`), и два из них сходом не
-      // являются: отвергнутый античитом финиш и «не прислал ничего». Считать
+      // являются: отвергнутый сервером исход и «не прислал ничего». Считать
       // сходом только `Retired` обязательно и здесь, а не только у условия
       // `Retire`: `retireCount` кормит `PerfectWin` (10008), и без этого альт,
       // простоявший заезд или пытавшийся мгновенно финишировать, ПЕЧАТАЛ БЫ
@@ -1092,9 +1176,22 @@ void RaceInstance::Stop()
         : Team::Solo;
 
     // --- пер-гонщик ---------------------------------------------------------
+    // ★СНИМОК «ПЕРСОНАЖ → КЛИЕНТ» СНИМАЕТСЯ ОДИН РАЗ И БЕРЁТСЯ ИЗ КОМНАТЫ.
+    // `Stop()` идёт на потоке гоночного директора, а карту клиентов
+    // (`RaceNetworkHandler::_clients`) мутирует СЕТЕВОЙ поток — искать в ней
+    // отсюда значит гонять `unordered_map` под параллельными
+    // `try_emplace`/`erase`. `RoomSystem::GetRoom` держит замок комнаты на всё
+    // время колбэка, и ровно этим путём ходит `Broadcast` (см.
+    // `RaceNetworkHandler::SendToClient`).
+    const auto clientIds = SnapshotRoomClientIds();
+
     for (const auto& [characterUid, racer] : racers)
     {
-      if (racer.state == State::Disconnected)
+      // ★ОБРАБАТЫВАЕМ ПОДКЛЮЧЁННЫХ И ТЕХ, ЧЕЙ ИСХОД УЖЕ ДОКАЗАН. Честный
+      // финишёр (или сошедший), закрывший игру до `Stop()`, теряет только
+      // УВЕДОМЛЕНИЕ — прогресс обязан быть записан, он его заработал. Из
+      // СОСТАВА (`humanCount`) отключившиеся при этом по-прежнему исключены.
+      if (racer.state == State::Disconnected and not hasProvenOutcome(racer))
         continue;
 
       std::vector<std::string_view> conditions;
@@ -1196,9 +1293,12 @@ void RaceInstance::Stop()
             AchievementSystem::EventContext{
               .modeBit = modeBit, .playerCount = humanCount});
 
-        for (const auto& notify : notifies)
-          _raceNetworkHandler.SendAchievementNotificationToCharacter(
-            characterUid, notify);
+        const auto clientIdIter = clientIds.find(characterUid);
+        if (clientIdIter != clientIds.cend())
+        {
+          for (const auto& notify : notifies)
+            _raceNetworkHandler.SendToClient(clientIdIter->second, notify);
+        }
       }
       catch (const std::exception& x)
       {

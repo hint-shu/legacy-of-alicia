@@ -73,6 +73,10 @@ target_sources(registry_test_achievement_tiers PRIVATE
         src/registry/TestAchievementTiers.cpp)
 target_link_libraries(registry_test_achievement_tiers
         PRIVATE project-properties alicia-libserver)
+# Каталог достижений читается тестом ТОЛЬКО НА ЧТЕНИЕ — так проверка форм
+# состава перестаёт зависеть от литералов в исходнике и ловит дрейф данных.
+target_compile_definitions(registry_test_achievement_tiers
+        PRIVATE LOA_ACHIEVEMENTS_CATALOG="${CMAKE_SOURCE_DIR}/resources/config/game/achievements.yaml")
 
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)

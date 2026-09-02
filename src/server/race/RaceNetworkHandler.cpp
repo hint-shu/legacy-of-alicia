@@ -441,27 +441,6 @@ void RaceNetworkHandler::SendDailyQuestNotificationToCharacter(
   }
 }
 
-void RaceNetworkHandler::SendAchievementNotificationToCharacter(
-  const uint32_t characterUid,
-  const protocol::AcCmdRCAchievementUpdateNotify& notify)
-{
-  try
-  {
-    const ClientId clientId = GetClientIdByCharacterUid(characterUid);
-    _commandServer.QueueCommand<protocol::AcCmdRCAchievementUpdateNotify>(
-      clientId,
-      [notify]()
-      {
-        return notify;
-      });
-  }
-  catch (const std::exception&)
-  {
-    // Ignore: игрок уже отключился. Прогресс к этому моменту ЗАПИСАН — потеряна
-    // только нотификация, и достижение будет видно в списке 0xe6 (R69).
-  }
-}
-
 void RaceNetworkHandler::HandleClientConnected(ClientId clientId)
 {
   _clients.try_emplace(clientId);
@@ -2980,6 +2959,30 @@ void RaceNetworkHandler::HandleUserRaceFinal(
   // (нельзя ехать дольше, чем идёт заезд, и нельзя финишировать до старта) —
   // в этом случае берём серверное измерение.
   uint32_t finishCourseTime = static_cast<uint32_t>(command.courseTime.count());
+
+  // LOA-fix (R70 итерация 2, backlog #58): СЕРВЕРНЫЙ ЗАМЕР — ОДИН НА ОБЕ ВЕТКИ
+  // ПАКЕТА. Раньше он жил ВНУТРИ ветки заявленного финиша, и ветка схода
+  // (`raceTrackProgress > 0`) не проверялась сервером ВООБЩЕ — ни на «заезд
+  // вообще стартовал», ни на «сколько он идёт». Ревью (итерация 2) показало
+  // цену: модклиент, войдя в Racing, шлёт мгновенный DNF и чеканит «Обидный
+  // сход» (10036, 4 тира, 10 очков), а напарнику этим же пакетом печатает
+  // `PerfectWin` (10008). Форма пакета у первой правки поменялась, а чеканка —
+  // нет.
+  // ЧТО ЭТО ЗА ВЕЛИЧИНЫ: `raceHasStarted` — зелёный свет уже был (метка
+  // выставлена И не лежит в будущем: предстартовый отсчёт держит её ВПЕРЕДИ,
+  // см. R15-1); `serverElapsedMs` — сколько миллисекунд заезд идёт ПО ЧАСАМ
+  // СЕРВЕРА. Оба считаются от ОДНОГО `now()` — второго вызова нет, дрейфа
+  // между проверкой и вычислением тоже (инвариант R15-1).
+  const auto nowTp = std::chrono::steady_clock::now();
+  const auto raceStartTimePoint = raceInstance.GetRaceStartTimePoint();
+  const bool raceHasStarted =
+    raceStartTimePoint != std::chrono::steady_clock::time_point::max()
+    && nowTp >= raceStartTimePoint;
+  const int64_t serverElapsedMs = raceHasStarted
+    ? std::chrono::duration_cast<std::chrono::milliseconds>(
+        nowTp - raceStartTimePoint).count()
+    : 0;
+
   if (not didNotFinish)
   {
     // LOA-fix (B5, round4): было 3000 мс. Честное расхождение — задержка
@@ -2988,12 +2991,13 @@ void RaceNetworkHandler::HandleUserRaceFinal(
     // логе пойдут строки «reported course time … while the server measured …»
     // у честных игроков, порог поднять.
     constexpr int64_t CourseTimeToleranceMs = 1000;
-    const auto raceStartTimePoint = raceInstance.GetRaceStartTimePoint();
     // LOA-fix (R15-1, quest-batch-2): ОДИН замер now() на обе ветки. Иначе
     // проверка «финиш до старта» и вычисление elapsedMs смотрят на РАЗНЫЕ
     // моменты времени, и на границе зелёного света можно получить
-    // отрицательный elapsedMs уже ПОСЛЕ пройденной проверки.
-    const auto nowTp = std::chrono::steady_clock::now();
+    // отрицательный elapsedMs уже ПОСЛЕ пройденной проверки. ★R70 итерация 2:
+    // тот же замер поднят выше по функции и теперь обслуживает и ветку схода
+    // (`raceHasStarted`/`serverElapsedMs`) — вычисление то же самое, место
+    // одно, значение одно.
 
     // LOA-fix (R15-1, quest-batch-2): БЫЛО `if (raceStartTimePoint == max())`, а
     // внутри `finishCourseTime = 0`. ДВЕ ошибки в одной ветке.
@@ -3027,8 +3031,7 @@ void RaceNetworkHandler::HandleUserRaceFinal(
     // ⚠️ ПАРНАЯ ОПЕРАЦИЯ — R15-2 НИЖЕ. InvalidCourseTime == UINT32_MAX, то
     // есть он БОЛЬШЕ порога MinPlausibleCourseTime; без R15-2 эта правка
     // закрыла бы кражу подиума, но открыла бы бесплатный сюжетный прогресс.
-    if (raceStartTimePoint == std::chrono::steady_clock::time_point::max()
-        || nowTp < raceStartTimePoint)
+    if (not raceHasStarted)
     {
       server::util::QuietLogWarn(
         "AcCmdUserRaceFinal: character {} reported a finish before the race has "
@@ -3042,8 +3045,7 @@ void RaceNetworkHandler::HandleUserRaceFinal(
       // (nowTp >= raceStartTimePoint), то есть elapsedMs >= 0. Берём ТОТ ЖЕ
       // nowTp, что и в проверке выше: второго вызова now() нет, дрейфа между
       // условием и вычислением тоже.
-      const int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        nowTp - raceStartTimePoint).count();
+      const int64_t elapsedMs = serverElapsedMs;
       const uint32_t serverCourseTime = elapsedMs <= 0
         ? 0u
         : static_cast<uint32_t>(std::min<int64_t>(
@@ -3154,11 +3156,44 @@ void RaceNetworkHandler::HandleUserRaceFinal(
     // читало бы попытку обмана как обидный сход.
     // ПОРЯДОК ВЕТОК: `didNotFinish` — поле пакета, оно первично; античит правит
     // только `finishCourseTime` и только на ветке заявленного финиша.
+    //
+    // ★СХОД ТОЖЕ ПРОВЕРЯЕТ СЕРВЕР (R70 итерация 2). `didNotFinish` — это
+    // `command.raceTrackProgress > 0`, то есть ЧИСТО КЛИЕНТСКОЕ поле, и первая
+    // редакция верила ему на слово: мгновенный DNF сразу после входа в Racing
+    // давал `Retired` и чеканил 10036 (4 тира, 10 очков), а через `retireCount`
+    // — ещё и `PerfectWin` (10008) напарнику. Пакет невозможно подтвердить по
+    // содержимому, но МОЖНО потребовать, чтобы заезд, с которого «сходят», к
+    // этому моменту РЕАЛЬНО ШЁЛ: тот же пол правдоподобия
+    // `MinPlausibleCourseTime`, что стоит на финише, только применённый к
+    // серверному замеру. Заявленный сход, пришедший раньше, — не сход, а
+    // `Rejected`: он не движет ни `Retire`, ни `retireCount`.
+    // ПОЧЕМУ ТОТ ЖЕ ПОРОГ, А НЕ НОВАЯ РУЧКА: см. R15-1b — константа одна на все
+    // гейты правдоподобия заезда, и «сход» не может быть правдоподобнее финиша.
+    // ЦЕНА, ЗАПИСАННАЯ ЧЕСТНО: честный игрок, вышедший из заезда в первые 30
+    // секунд, за ЭТОТ заезд «Обидного схода» не получит. Он его получит в
+    // следующем — а чеканка четырёх тиров пакетом без езды закрыта.
+    const bool retirementIsProven = raceHasStarted
+      && serverElapsedMs >= static_cast<int64_t>(tracker::MinPlausibleCourseTime);
+
     racer.finishOutcome = didNotFinish
-      ? tracker::RaceTracker::Racer::FinishOutcome::Retired
+      ? (retirementIsProven
+          ? tracker::RaceTracker::Racer::FinishOutcome::Retired
+          : tracker::RaceTracker::Racer::FinishOutcome::Rejected)
       : (finishCourseTime == tracker::InvalidCourseTime
           ? tracker::RaceTracker::Racer::FinishOutcome::Rejected
           : tracker::RaceTracker::Racer::FinishOutcome::Finished);
+
+    if (didNotFinish && not retirementIsProven)
+    {
+      // Один раз на гонщика за заезд (мы под латчем `alreadyFinishing`) —
+      // per-packet логирования здесь не появляется.
+      server::util::QuietLogWarn(
+        "AcCmdUserRaceFinal: character {} declared a retirement {} ms after the "
+        "green light (plausible minimum {} ms); the retirement is not counted",
+        clientContext.characterUid,
+        raceHasStarted ? serverElapsedMs : 0,
+        tracker::MinPlausibleCourseTime);
+    }
   }
 
   const protocol::AcCmdUserRaceFinalNotify notify{
