@@ -267,14 +267,15 @@ void RaceTracker::RemoveQuestItem(data::Uid characterUid, Oid oid)
 
 uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
 {
+  // LOA-fix (R71-22, находка ревью 3 #5): ОБОРОТА ЗДЕСЬ БОЛЬШЕ НЕ БЫВАЕТ.
+  //
+  // Флаг «счётчик обернулся» убран вместе с породившей его уступкой: единственный
+  // вызывающий обязан спросить `CanIssueEffectInstances`, а тот отказывает, как
+  // только выдача переступила бы шестнадцатибитную границу. Молчаливой подгонки
+  // (`== 0 -> 1`) тоже не осталось: она существовала только ради жизни ПОСЛЕ
+  // оборота и маскировала бы его, случись он.
   const uint16_t nextId = _nextEffectInstanceId;
-  _nextEffectInstanceId += increment;
-  // LOA-fix (R71-15): оборот шестнадцатибитного счётчика запоминается. Сравнение
-  // именно с ПРЕЖНИМ значением: после оборота новое всегда меньше.
-  if (_nextEffectInstanceId < nextId)
-    _effectInstanceIdWrapped = true;
-  if (_nextEffectInstanceId == 0)
-    _nextEffectInstanceId = 1;
+  _nextEffectInstanceId = static_cast<uint16_t>(_nextEffectInstanceId + increment);
   return nextId;
 }
 
@@ -282,6 +283,22 @@ bool RaceTracker::CanIssueEffectInstances(
   const Oid casterOid,
   const uint16_t count) const
 {
+  // LOA-fix (R71-22, находка ревью 3 #5): СУММАРНАЯ ВЫДАЧА, А НЕ ТОЛЬКО ЖИВЫЕ ЗАПИСИ.
+  //
+  // Первый вопрос — про место под улику (живые записи этого кастера), второй — про
+  // сам номер. Второго не было, и это и был дефект: живая запись освобождается по
+  // слому стены и по её истечению, поэтому «256 живых на кастера» НЕ ограничивало
+  // число ВЫДАННЫХ номеров ничем. Счётчик доходил до оборота, а после оборота
+  // предикат «сервер такой номер выдавал» принимал весь домен.
+  //
+  // ★ГРАНИЦА СТРОГАЯ И БЕЗ ЗАПАСА: последний допустимый номер — 0xFFFE, чтобы
+  // `_nextEffectInstanceId` после инкремента остался представимым и НИКОГДА не стал
+  // нулём. Один потерянный номер из 65 536 — честная цена за то, что оборот
+  // недостижим, а не «маловероятен».
+  if (static_cast<uint32_t>(_nextEffectInstanceId) + count
+      > std::numeric_limits<uint16_t>::max())
+    return false;
+
   size_t ownedCount = 0;
   for (const auto& instance : _effectInstances)
   {
@@ -296,15 +313,25 @@ void RaceTracker::AddEffectInstances(
   const uint16_t firstInstanceId,
   const uint16_t count,
   const uint16_t magicType,
-  const Oid casterOid)
+  const Oid casterOid,
+  const bool serverApplied,
+  const std::vector<Oid>& authorizedTargets)
 {
   for (uint16_t i = 0; i < count; ++i)
   {
     const auto instanceId = static_cast<uint16_t>(firstInstanceId + i);
 
-    // Один номер — одна запись. Совпадение возможно только после оборота
-    // шестнадцатибитного счётчика, и тогда старая запись именно что мертва.
-    RemoveEffectInstance(instanceId);
+    // LOA-fix (R71-22, находка ревью 3 #5): ЧУЖУЮ ЖИВУЮ ЗАПИСЬ НЕ СТИРАЕМ НИКОГДА.
+    //
+    // Здесь стоял `RemoveEffectInstance(instanceId)` с доводом «совпадение бывает
+    // только после оборота, а тогда старая запись мертва». Довод неверен дважды:
+    // после оборота она мертвой быть НЕ ОБЯЗАНА, и сама эта строка была вторым
+    // способом уничтожить улику о живой стене — тем самым, который ревью 2 уже
+    // запретило в другом месте функции. Оборот теперь запрещён в источнике, поэтому
+    // номера внутри заезда уникальны по построению; если совпадение всё-таки
+    // случится, побеждает СТАРАЯ запись, а новая не делается.
+    if (FindEffectInstance(instanceId) != nullptr)
+      continue;
 
     // LOA-fix (R71-21, находка ревью 2 #3): ВЫТЕСНЕНИЯ НЕТ. Прежняя редакция
     // стирала самую старую запись, чтобы освободить место, — то есть уничтожала
@@ -318,8 +345,37 @@ void RaceTracker::AddEffectInstances(
       EffectInstance{
         .instanceId = instanceId,
         .magicType = magicType,
-        .casterOid = casterOid});
+        .casterOid = casterOid,
+        .serverApplied = serverApplied,
+        .authorizedTargets = authorizedTargets});
   }
+}
+
+bool RaceTracker::ConsumeEffectInstanceTarget(
+  const uint16_t instanceId,
+  const Oid targetOid)
+{
+  for (auto& instance : _effectInstances)
+  {
+    if (instance.instanceId != instanceId)
+      continue;
+
+    // LOA-fix (R71-22, находка ревью 3 #1): ОДИН ЭКЗЕМПЛЯР — ОДИН ОТЧЁТ НА ЦЕЛЬ.
+    // Второй отчёт той же цели по тому же номеру — это либо дубль пакета, либо
+    // «переигровка» уже истёкшего эффекта; и то и другое обязано умереть ДО
+    // рассылки, иначе один каст размножается в сколько угодно кадров каждому в
+    // комнате (`ScheduleSkillEffect` рассылает РАНЬШЕ, чем отвергает дубль).
+    for (const Oid consumed : instance.consumedTargets)
+    {
+      if (consumed == targetOid)
+        return false;
+    }
+
+    instance.consumedTargets.push_back(targetOid);
+    return true;
+  }
+
+  return false;
 }
 
 const RaceTracker::EffectInstance* RaceTracker::FindEffectInstance(
@@ -332,6 +388,18 @@ const RaceTracker::EffectInstance* RaceTracker::FindEffectInstance(
   }
 
   return nullptr;
+}
+
+void RaceTracker::MarkEffectInstanceServerApplied(const uint16_t instanceId)
+{
+  for (auto& instance : _effectInstances)
+  {
+    if (instance.instanceId == instanceId)
+    {
+      instance.serverApplied = true;
+      return;
+    }
+  }
 }
 
 void RaceTracker::RemoveEffectInstance(const uint16_t instanceId)
@@ -356,8 +424,8 @@ bool RaceTracker::HasIssuedEffectInstanceId(const uint32_t effectInstanceId) con
   // и у поля в протоколе). Всё, что шире, сервер выдать не мог.
   if (effectInstanceId > std::numeric_limits<uint16_t>::max())
     return false;
-  if (_effectInstanceIdWrapped)
-    return true;
+  // LOA-fix (R71-22, находка ревью 3 #5): ни одной ветки «после оборота принимаем
+  // всё» здесь больше нет — оборот запрещён в источнике выдачи.
   return effectInstanceId < _nextEffectInstanceId;
 }
 
@@ -376,7 +444,6 @@ void RaceTracker::Clear()
   // был всегда; oid'ы персонажей остаются пер-комнатными (клиент их не переназначает).
   _effectInstances.clear();
   _nextEffectInstanceId = 0;
-  _effectInstanceIdWrapped = false;
   _nextItemDeckOid = 1;
   firstPassItemSpawn = true;
 

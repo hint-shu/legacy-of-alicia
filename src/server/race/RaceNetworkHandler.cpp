@@ -655,6 +655,46 @@ constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
   return effectId < tracker::RaceTracker::Racer::EffectCount;
 }
 
+//! LOA-fix (R71-22, находки ревью 3 #1 и #2): КТО ИМЕННО ПРИМЕНЯЕТ ЭФФЕКТ.
+//!
+//! Раунд опирался на «зарегистрирован ли номер экземпляра» и не спрашивал главного:
+//! КТО вешает этот эффект. А ответ у магии ровно трёх видов, и он определяет, что
+//! вообще имеет право сделать клиентский отчёт «на мне сработало»:
+//!
+//!  * `ServerAppliedAtCast` — щиты, бустеры, разгон и командные бафы. Их вешает САМ
+//!    сервер в момент каста (`HandleUseMagicItem`, switch по типу). Клиентский отчёт
+//!    про них не нужен НИКОГДА: он либо повтор, либо кража чужого каста себе —
+//!    ровно та дыра, которой ревью 3 выдавало себе водяной щит.
+//!  * `IceWallObstacle` — препятствие на трассе. Отчёт про него значит «я её сломал»,
+//!    и его вправе прислать любой, кто в стену въехал.
+//!  * `TargetReportedAttack` — атака по гонщику. Геометрии у сервера нет, поэтому
+//!    отчёт жертвы — ЕДИНСТВЕННЫЙ путь применения; всё, что он может сделать, —
+//!    навредить самому отправителю (гард R71-4 не пускает эффект на чужого).
+//!
+//! ★ЭТО ОДИН ИСТОЧНИК ПРАВДЫ НА ДВА МЕСТА (каст и отчёт), а не два похожих списка:
+//! расхождение таких списков — тот самый класс, ради которого затеян раунд. И оно
+//! не «обещано комментарием»: `HandleUseMagicItem` сверяет эту классификацию с ВЕТКОЙ
+//! switch, которая реально исполнилась, и кричит, если они разошлись.
+enum class MagicApplication : uint8_t
+{
+  ServerAppliedAtCast,
+  IceWallObstacle,
+  TargetReportedAttack,
+};
+
+[[nodiscard]] constexpr MagicApplication ClassifyMagicApplication(
+  const uint16_t magicType) noexcept
+{
+  // Границы взяты не с потолка: это метки case из `HandleUseMagicItem` — Shield,
+  // Booster, Phoenix (4-9) и BufPower/BufGauge/BufSpeed (20-25) сервер вешает сам,
+  // IceWall (10-11) кладёт на трассу.
+  if ((magicType >= 4 && magicType <= 9) || (magicType >= 20 && magicType <= 25))
+    return MagicApplication::ServerAppliedAtCast;
+  if (magicType == 10 || magicType == 11)
+    return MagicApplication::IceWallObstacle;
+  return MagicApplication::TargetReportedAttack;
+}
+
 [[nodiscard]] bool IsFiniteIceWallPlacement(
   const protocol::AcCmdCRUseMagicItem::IceWallProperties& properties) noexcept
 {
@@ -5242,7 +5282,10 @@ void RaceNetworkHandler::HandleUseMagicItem(
   if (consumesCritBuff)
     magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfo(magicSlotInfo.criticalType);
 
-  const bool isIceWall = magicSlotInfo.type == 10 || magicSlotInfo.type == 11;
+  // LOA-fix (R71-22): «стена ли это» спрашивается у ЕДИНСТВЕННОЙ классификации,
+  // которой пользуется и хендлер отчёта, — чтобы два места не разъехались.
+  const MagicApplication magicApplication = ClassifyMagicApplication(magicSlotInfo.type);
+  const bool isIceWall = magicApplication == MagicApplication::IceWallObstacle;
 
   // LOA-fix (R71-3, SYNTHESIS item 10 + item 26): ОТВЕТ СОБИРАЕТСЯ ИЗ ДВУХ РАЗНЫХ ЧИСЕЛ.
   //
@@ -5326,32 +5369,6 @@ void RaceNetworkHandler::HandleUseMagicItem(
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
     issuedInstanceCount);
 
-  // LOA-fix (R71-17, находка ревью 2 #2; РАСШИРЕНО R71-20 по находке ревью 2 #1):
-  // СЕРВЕР ЗАПОМИНАЕТ ВСЁ, ЧТО САМ ВЫДАЛ.
-  //
-  // Отчёт «на мне сработал эффект» объявляет КЛИЕНТ, и номер экземпляра в его пакете
-  // до этого раунда ничем не сверялся. Здесь — единственное место, где экземпляры
-  // рождаются, поэтому здесь же они и записываются: тип берётся РАЗРЕШЁННЫЙ
-  // (`magicSlotInfo.type`, уже после крит-подмены), владелец — отправитель, чей oid
-  // сверен гардом R57-5 выше.
-  //
-  // ★ЗАПИСЫВАЮТСЯ ВСЕ ТИПЫ, А НЕ ОДНИ СТЕНЫ. Первая редакция вела реестр только для
-  // ледяной стены — то есть вела СПИСОК МЕСТ вместо правила, и всё остальное
-  // (`effectId = 2` + выдуманный `effectInstanceId` = бесплатный водяной щит) ехало
-  // мимо. Правило теперь одно: экземпляр эффекта существует ровно тогда, когда его
-  // выдал сервер.
-  //
-  // Снимаются записи только по событию, которое сервер объявил сам: по слому стены
-  // (`HandleActivateSkillEffect`) и по её истечению — тем же отложенным вызовом,
-  // который рассылает `AcCmdRCMagicExpire`. Остальные живут до конца заезда
-  // (`RaceTracker::Clear`): у них нет объявленного сервером срока, и выдумывать его
-  // значило бы выбрасывать честные отчёты о попадании.
-  raceInstance.GetTracker().AddEffectInstances(
-    effectInstanceId,
-    issuedInstanceCount,
-    magicSlotInfo.type,
-    racer.oid);
-
   // Darkfire should only affect one target
   // Client sends all targets infront of them but we should only apply the effect to the targeted one (the arrow above their head)
   if (magicSlotInfo.type == 14)
@@ -5389,6 +5406,49 @@ void RaceNetworkHandler::HandleUseMagicItem(
     }
   }
 
+  // LOA-fix (R71-17, находка ревью 2 #2; РАСШИРЕНО R71-20 по находке ревью 2 #1,
+  // затем R71-22 по находкам ревью 3 #1 и #2): СЕРВЕР ЗАПОМИНАЕТ ВСЁ, ЧТО САМ ВЫДАЛ,
+  // И ЗАПОМИНАЕТ ЭТО ЦЕЛИКОМ.
+  //
+  // Отчёт «на мне сработал эффект» объявляет КЛИЕНТ, и номер экземпляра в его пакете
+  // до этого раунда ничем не сверялся. Здесь — единственное место, где экземпляры
+  // рождаются, поэтому здесь же они и записываются: тип берётся РАЗРЕШЁННЫЙ
+  // (`magicSlotInfo.type`, уже после крит-подмены), владелец — отправитель, чей oid
+  // сверен гардом R57-5 выше.
+  //
+  // ★ЗАПИСЫВАЮТСЯ ВСЕ ТИПЫ, А НЕ ОДНИ СТЕНЫ. Первая редакция вела реестр только для
+  // ледяной стены — то есть вела СПИСОК МЕСТ вместо правила, и всё остальное
+  // (`effectId = 2` + выдуманный `effectInstanceId` = бесплатный водяной щит) ехало
+  // мимо. Правило теперь одно: экземпляр эффекта существует ровно тогда, когда его
+  // выдал сервер.
+  //
+  // ★ЗАПИСЬ ПЕРЕЕХАЛА СЮДА, И ЭТО НЕ КОСМЕТИКА (ревью 3 #1). Раньше она делалась ДО
+  // того, как сервер довёл список целей до ума (`resize(1)` у DarkFire, отбраковка
+  // цели у дракона), — то есть запоминать было НЕЧЕГО, кроме номера и типа. Теперь
+  // запись видит ИТОГОВЫЙ список: кого каст назвал целями, знает сервер, и клиентский
+  // отчёт больше не может назвать четвёртого.
+  //
+  // ★У СТЕНЫ ЦЕЛЕЙ НЕТ: там `targetList` — это число сосулек, а не гонщики. Пустой
+  // список означает «привязывать не к кому», и отчёт по стене судится по-другому —
+  // по одноразовому потреблению записи (её ломает тот, кто в неё въехал).
+  //
+  // Снимаются записи только по событию, которое сервер объявил сам: по слому стены
+  // (`HandleActivateSkillEffect`) и по её истечению — тем же отложенным вызовом,
+  // который рассылает `AcCmdRCMagicExpire`. Остальные живут до конца заезда
+  // (`RaceTracker::Clear`): у них нет объявленного сервером срока, и выдумывать его
+  // значило бы выбрасывать честные отчёты о попадании.
+  const std::vector<tracker::Oid> authorizedTargets = isIceWall
+    ? std::vector<tracker::Oid>{}
+    : targetList;
+
+  raceInstance.GetTracker().AddEffectInstances(
+    effectInstanceId,
+    issuedInstanceCount,
+    magicSlotInfo.type,
+    racer.oid,
+    magicApplication == MagicApplication::ServerAppliedAtCast,
+    authorizedTargets);
+
   protocol::AcCmdCRUseMagicItemOK response{
     .characterOid = command.characterOid,
     .magicItemId = magicSlotInfo.type,
@@ -5417,6 +5477,15 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // Send usage notification to other players
   this->BroadcastExceptCharacterUid(raceInstance, usageNotify, clientContext.characterUid);
 
+  // LOA-fix (R71-22, находки ревью 3 #1 и #2): ПРОВЕРКА, ЧТО КЛАССИФИКАЦИЯ НЕ ВРЁТ.
+  //
+  // `ClassifyMagicApplication` — один источник правды на два места (запись экземпляра
+  // здесь и разбор отчёта в `HandleActivateSkillEffect`), но сам по себе он всего лишь
+  // ЕЩЁ ОДИН список типов. Чтобы он не разъехался с веткой, которая реально вешает
+  // эффект, ветка расписывается сама: `switchAppliedEffect` ставит ту строка кода,
+  // что вызвала `ScheduleSkillEffect`. Расхождение — не «маловероятно», оно кричит.
+  bool switchAppliedEffect = false;
+
   // Send effect for items that have instant effects
   switch (magicSlotInfo.type)
   {
@@ -5427,6 +5496,7 @@ void RaceNetworkHandler::HandleUseMagicItem(
     case 7:
     case 8:
     case 9:
+      switchAppliedEffect = true;
       this->ScheduleSkillEffect(raceInstance, command.characterOid, racer.oid, magicSlotInfo, effectInstanceId);
       break;
     // IceWall
@@ -5499,6 +5569,7 @@ void RaceNetworkHandler::HandleUseMagicItem(
     case 24:
     case 25:
     {
+      switchAppliedEffect = true;
       for (auto& otherRacer : raceInstance.GetTracker().GetRacers() | std::views::values)
       {
         if (racer.oid == otherRacer.oid
@@ -5509,6 +5580,30 @@ void RaceNetworkHandler::HandleUseMagicItem(
       }
       break;
     }
+  }
+
+  // ★СВЕРКА, КОТОРАЯ УМЕЕТ ПРОВАЛИТЬСЯ. Слева — что сказала классификация (её видит
+  // хендлер отчёта), справа — что произошло НА САМОМ ДЕЛЕ. Разошлись — значит в
+  // `magic.yaml` или в switch появился тип, о котором знает только одна половина, и
+  // запись экземпляра врёт. Чиним состояние сразу и фейл-клоузом: помечаем экземпляры
+  // как уже применённые сервером, то есть клиентские отчёты по ним запрещаем.
+  if (switchAppliedEffect != (magicApplication == MagicApplication::ServerAppliedAtCast))
+  {
+    uint64_t suppressed = 0;
+    if (_magicClassificationThrottle.Allow(suppressed))
+      server::util::QuietLogError(
+        "Magic type {} is classified as {} but the cast switch {} apply it; "
+        "client activation reports for instance {} are refused (suppressed {})",
+        magicSlotInfo.type,
+        magicApplication == MagicApplication::ServerAppliedAtCast
+          ? "server-applied" : "client-reported",
+        switchAppliedEffect ? "did" : "did not",
+        effectInstanceId,
+        suppressed);
+
+    for (uint16_t i = 0; i < issuedInstanceCount; ++i)
+      raceInstance.GetTracker().MarkEffectInstanceServerApplied(
+        static_cast<uint16_t>(effectInstanceId + i));
   }
 
   // LOA-fix (NEW-1, round3): дейлики «попаданий магическим шаром» — 1008 (20) и
@@ -5962,8 +6057,53 @@ void RaceNetworkHandler::HandleStartMagicTarget(
   if (targetRacer.pendingMagicTarget.has_value())
     return;
 
+  // LOA-fix (R71-24, находка ревью 3 #3): НАВОДКА — УЛИКА СЕРВЕРА, А НЕ ПОЛЕ ПАКЕТА.
+  //
+  // ★ЧТО БЫЛО ОТКРЫТО. `pendingMagicTarget` заполнялся прямо из пакета — номер
+  // экземпляра не проверялся вовсе, кастер брался тем, кого назвал отправитель. А
+  // ревью 2 сделало это поле УЛИКОЙ: гард отчёта (`HandleActivateSkillEffect`,
+  // R71-20) разрешал дракону обойти сверку кастера, если цель «держит именно этот
+  // номер». То есть раунд оперся на поле, которое сам же ни разу не авторизовал:
+  // достаточно было прислать сюда чужой (или любой выданный) номер и своего
+  // «кастера», чтобы потом отчитаться о взрыве от чьего угодно имени.
+  // [[transplanted-fix-shape-is-plausible-and-wrong]] — форма гарда была
+  // правдоподобна, опора под ней отсутствовала.
+  //
+  // ★ПРАВИЛО. Наводку ставит только каст, который сервер ДЕЙСТВИТЕЛЬНО обслужил:
+  // экземпляр есть в реестре, он из семейства дракона (`basicType` 16 — то есть 16
+  // или 17), его кастовал отправитель этого пакета, и цель — та, кого каст назвал.
+  // Каждое из четырёх условий знает сервер: номер выдал он, тип и кастера записал он
+  // же, список целей — тот, что уехал в `AcCmdCRUseMagicItemNotify`.
+  //
+  // ★В ПОЛЕ КЛАДЁТСЯ СЕРВЕРНОЕ ЗНАЧЕНИЕ, А НЕ ПРОВЕРЕННОЕ КЛИЕНТСКОЕ. Разница не
+  // косметическая: дальше это поле читают как улику, и оно обязано БЫТЬ уликой —
+  // копией записи реестра, а не совпавшим с ней числом с провода.
+  const auto* effectInstance = raceInstance.GetTracker().FindEffectInstance(
+    command.effectInstanceId);
+
+  const bool instanceIsDragonCast = effectInstance != nullptr
+    && GetServerInstance().GetMagicRegistry().GetSlotInfo(effectInstance->magicType).basicType == 16
+    && effectInstance->casterOid == racer.oid
+    && std::ranges::find(effectInstance->authorizedTargets, command.targetOid)
+      != effectInstance->authorizedTargets.cend();
+
+  if (not instanceIsDragonCast)
+  {
+    uint64_t suppressed = 0;
+    if (_dragonTargetThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} started targeting {} with effect instance {} the server did not "
+        "issue as its summon (issued: {}, suppressed {})",
+        racer.oid,
+        command.targetOid,
+        command.effectInstanceId,
+        effectInstance != nullptr,
+        suppressed);
+    return;
+  }
+
   targetRacer.dragonReceivedAt = std::chrono::steady_clock::now();
-  targetRacer.pendingMagicTarget = {command.casterOid, command.effectInstanceId};
+  targetRacer.pendingMagicTarget = {effectInstance->casterOid, effectInstance->instanceId};
 }
 
 void RaceNetworkHandler::HandleChangeMagicTarget(
@@ -5990,6 +6130,36 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
   if (!racer.pendingMagicTarget.has_value())
   {
     server::util::QuietLogWarn("Caster does not have dragon in HandleChangeMagicTarget");
+    return;
+  }
+
+  // LOA-fix (R71-24, находка ревью 3 #3): ПЕРЕДАЁТСЯ ТОТ ДРАКОН, КОТОРЫЙ У ТЕБЯ ЕСТЬ.
+  //
+  // Хендлер спрашивал только «есть ли у отправителя наводка вообще», а в цель копировал
+  // `effectInstanceId` и `casterOid` ИЗ ПАКЕТА. Значит держатель любого дракона мог
+  // переписать чужой цели номер и кастера на любые — то есть установить улику, которой
+  // сервер потом поверит. Спрашиваем совпадение с тем, что сервер держит сам, и дальше
+  // копируем СЕРВЕРНУЮ пару без изменений: по цепочке передач номер и кастер остаются
+  // теми, что записал каст.
+  //
+  // ★КОПИЯ, А НЕ ССЫЛКА: `racer.pendingMagicTarget` ниже по функции сбрасывается, и
+  // ссылка на содержимое `optional` к тому моменту была бы висячей.
+  const auto heldMagicTarget = racer.pendingMagicTarget.value();
+
+  if (command.effectInstanceId != heldMagicTarget.effectInstanceId
+    || command.casterOid != heldMagicTarget.casterOid)
+  {
+    uint64_t suppressed = 0;
+    if (_dragonTargetThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} tried to pass summon instance {} by caster {} while holding "
+        "instance {} by caster {} (suppressed {})",
+        racer.oid,
+        command.effectInstanceId,
+        command.casterOid,
+        heldMagicTarget.effectInstanceId,
+        heldMagicTarget.casterOid,
+        suppressed);
     return;
   }
 
@@ -6051,7 +6221,9 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
   }
 
   targetRacer.dragonReceivedAt = std::chrono::steady_clock::now();
-  targetRacer.pendingMagicTarget = {command.casterOid, command.effectInstanceId};
+  // ★СЕРВЕРНАЯ ПАРА ПЕРЕЕЗЖАЕТ БЕЗ ИЗМЕНЕНИЙ (R71-24): не «проверенные клиентские
+  // поля», а ровно то, что сервер держал у прежнего владельца.
+  targetRacer.pendingMagicTarget = heldMagicTarget;
   racer.pendingMagicTarget.reset();
 
   // Send OK response
@@ -6183,75 +6355,133 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfoByEffectId(command.effectId);
 
-  // LOA-fix (R71-20, находка ревью 2 #1): ОТЧЁТ ССЫЛАЕТСЯ НА КАСТ, КОТОРЫЙ СЕРВЕР
-  // ДЕЙСТВИТЕЛЬНО ОБСЛУЖИЛ.
+  // LOA-fix (R71-20, находка ревью 2 #1; ПЕРЕПИСАНО R71-22 по находкам ревью 3 #1 и
+  // #2): ОТЧЁТ КЛИЕНТА НЕ УМЕЕТ НИЧЕГО ДАТЬ — ТОЛЬКО ПОДТВЕРДИТЬ ПОПАДАНИЕ ПО СЕБЕ.
   //
-  // ★ЧТО БЫЛО ОТКРЫТО. Проверка выданности стояла ТОЛЬКО внутри ветки ледяной стены,
-  // а всякий другой зарегистрированный эффект ехал прямо в `ScheduleSkillEffect`.
-  // Пакет `targetOid = свой, attackerOid = свой, effectId = 2, effectInstanceId =
-  // 0xBEEF`, посланный до единого каста, проходил гарды R71-4 и R71-5 (цель своя, id
-  // в реестре и планируемый) — и сервер выдавал водяной щит. То есть гард был
-  // СПИСКОМ МЕСТ (одна ветка), а не правилом; ровно тот класс дефекта, ради которого
-  // затеян раунд.
+  // ★ЧТО БЫЛО ОТКРЫТО ПОСЛЕ ИТЕРАЦИИ 2. Гард требовал «экземпляр выдан, тип тот,
+  // кастер тот» — и этого мало, потому что все три величины ПУБЛИЧНЫ: сервер сам
+  // рассылает их в `AcCmdCRUseMagicItemNotify`. Любой, кто видел чужой каст, повторял
+  // его тройку и вешал эффект на СЕБЯ (водяной щит — бесплатно), а сам кастер мог
+  // переиграть свой номер сколько угодно раз, в том числе после истечения эффекта.
+  // Каждый повтор ехал в `ScheduleSkillEffect`, который РАССЫЛАЕТ `AcCmdRCAddSkillEffect`
+  // ДО того, как отвергнет дубль, — то есть усиление трафика жило прямо за гардом.
   //
-  // ★ПРАВИЛО ОДНО И ТОТАЛЬНОЕ: экземпляр эффекта существует ровно тогда, когда его
-  // выдал сервер (реестр наполняется в единственном месте рождения — при касте), он
-  // ТОГО ЖЕ ТИПА, что называет отчёт, и его кастовал ТОТ, кого отчёт называет
-  // атакующим. Ни одно из трёх условий клиент подделать не может: номер выдаёт
-  // сервер, тип и кастера он записывает сам.
+  // ★ПРАВИЛО ТЕПЕРЬ СТРОИТСЯ ОТ ТОГО, КТО ВЕШАЕТ ЭФФЕКТ (`ClassifyMagicApplication`):
+  //  1. Экземпляр, который сервер применил САМ в момент каста (щиты, бустеры, разгон,
+  //     командные бафы), не разрешает НИ ОДНОГО отчёта. Это закрывает весь класс
+  //     «выдать себе полезное»: полезное клиент не сообщает, полезное сервер вешает.
+  //  2. Экземпляр-атака привязан к ЦЕЛЯМ, которые назвал каст. Свидетель чужого
+  //     каста больше не «тоже задет»: сервер помнит список, уехавший в Notify. Если
+  //     каст не назвал никого (см. ниже про `targetingType: 0`), привязки нет, но
+  //     остаётся всё прочее — и кастер по своему же безымянному касту отчитаться не
+  //     может.
+  //  3. Ледяная стена целей не имеет по смыслу (список — это сосульки): её отчёт
+  //     значит «я в неё въехал», и она одноразова — запись снимается тут же.
+  //  4. Пара «экземпляр + цель» ПОТРЕБЛЯЕТСЯ. Второй отчёт той же цели по тому же
+  //     номеру не доходит до рассылки вовсе — ни дубль пакета, ни переигровка после
+  //     истечения.
   //
   // ★ТИП СВЕРЯЕТСЯ ДО КРИТ-ПОДМЕНЫ ПО DARKFIRE — иначе гард бил бы по честной игре:
   // подмену 2->3 и 18->19 делает СЕРВЕР строкой ниже, глядя на эффекты ЦЕЛИ, а
   // клиент присылает базовый `effectId`. Сравнение с уже подменённым типом отвергало
   // бы каждое честное попадание по игроку под тёмным огнём.
   //
-  // ★`attackerOid` БОТА — ЗАКОННЫЙ ВХОД. Пакеты `UseMagicItem` за бота отброшены ещё
-  // R57-5, значит и записи о его касте в реестре нет по построению; гард на такой
-  // отчёт означал бы, что магия ботов перестала действовать на человека — поломка,
-  // которую поймало ревью R57-12. Боты живут только в соло-заезде.
+  // ★АТАКУЮЩИЙ БЕРЁТСЯ ИЗ ЗАПИСИ, А НЕ ИЗ ПАКЕТА. Для не-ботовых отчётов это ровно
+  // тот же oid (сверка выше этого требует), а для дракона — починка: длительность
+  // эффекта считается ПО СТАТАМ АТАКУЮЩЕГО (`ComputeEffectDurationMs`), и жертва,
+  // называя слабого атакующего, укорачивала бы себе оглушение.
   //
-  // ★ЦЕНА ЭТОГО ИСКЛЮЧЕНИЯ НАЗВАНА ВСЛУХ, А НЕ СПРЯТАНА: игрок, назвавший атакующим
-  // oid БОТА, гард обходит. Дальше этого обход не идёт и торговаться тут не с чем:
-  // боты существуют ТОЛЬКО в соло-заезде (`SpawnAiRacers` при единственном гонщике в
-  // трекере), то есть выгода — «сжулить против ботов в одиночку», а закрытие стоило бы
-  // ровно того, что уже ломало игру в R57-12: магия ботов перестала бы действовать на
-  // человека. Правильное закрытие — не гард здесь, а серверная симуляция ботовых
-  // кастов (тогда у бота появятся СВОИ записи в реестре и исключение станет ненужным);
-  // это отдельная работа, не защита от подделки пакета.
+  // ★ДРАКОН (`basicType` 16) ПЕРЕДАЁТСЯ ИЗ РУК В РУКИ, и «кастер» в отчёте у
+  // последнего держателя может быть уже не первым. Послабление осталось, но опора под
+  // ним теперь есть: с R71-24 `pendingMagicTarget` заполняется ТОЛЬКО из записи
+  // реестра (каст дракона отправителем на названную цель) и переезжает по цепочке
+  // передач без изменений. До этого поле писалось прямо из пакета — то есть ревью 2
+  // опёрлось на клиентскую величину, приняв её за улику сервера.
   //
-  // ★ДРАКОН (`basicType` 16) ПЕРЕДАЁТСЯ ИЗ РУК В РУКИ, И «КАСТЕР» В ОТЧЁТЕ УЖЕ НЕ ТОТ.
-  // `HandleChangeMagicTarget` переписывает `pendingMagicTarget` полем `casterOid` ИЗ
-  // ПАКЕТА передающего, поэтому взрыв дракона у последнего держателя честно называет
-  // атакующим не первого кастера. Сверяем то, что сервер про дракона действительно
-  // знает: цель держит наведение ИМЕННО С ЭТИМ номером экземпляра. Номер и тип при
-  // этом всё равно обязаны быть выданными сервером — послабление касается только
-  // личности кастера.
+  // ★ОТЧЁТ, НАЗЫВАЮЩИЙ АТАКУЮЩИМ БОТА, СУЖЕН ДО БЕЗВРЕДНОГО (находка ревью 3 #2).
+  // Прежнее исключение снимало ВЕСЬ гард: `targetOid = свой, effectId = 2 (водяной
+  // щит), attackerOid = <бот>` выдавал щит без единого каста. «Это возможно только в
+  // соло» — не оправдание: правило раунда обязано быть тотальным. Серверной улики о
+  // ботовом касте не существует и выдумать её здесь нельзя — бот у нас декоративный,
+  // его «касты» целиком рисует клиент (пакеты `UseMagicItem` за бота отброшены R57-5,
+  // серверной симуляции ИИ в проекте нет). Поэтому исключение сведено к тому
+  // единственному, что клиент может сообщить про бота без выгоды для себя: АТАКА ПО
+  // САМОМУ СЕБЕ. Эффекты, которые сервер вешает сам, и слом стены по ботовому отчёту
+  // теперь запрещены — а `targetOid` и так обязан быть своим (R71-4). Магия ботов по
+  // человеку продолжает работать (поломка R57-12 не возвращается), выдать же себе
+  // что-либо полезное через имя бота больше нельзя.
   //
   // ★ЧЕГО ЭТО НЕ ЛОВИТ, СКАЗАНО ПРЯМО: гонщик, которого магия ДЕЙСТВИТЕЛЬНО не
-  // задела, всё ещё может объявить попадание по себе — геометрии трасс у сервера нет
-  // (RaceTracker.hpp:49-52), проверить контакт нечем. Закрыты выдуманный номер, чужой
-  // тип, чужой кастер и отчёт до всякого каста.
+  // задела, всё ещё может подтвердить попадание по себе — геометрии трасс у сервера
+  // нет (RaceTracker.hpp:49-52), проверить контакт нечем. Но вред от такого отчёта
+  // достаётся ровно ему.
   //
   // ★ПОБОЧНЫЙ ЭФФЕКТ, НАЗВАННЫЙ ВСЛУХ: у Booster'а обычный и критический варианты
-  // делят один `skillEffectId` (5) в `magic.yaml`, поэтому отчёт о КРИТИЧЕСКОМ
-  // бустере разрешается в обычный тип и гардом отвергается. Игру это не меняет:
-  // эффекты 4-9 и 20-25 сервер вешает САМ в момент каста (`HandleUseMagicItem`,
-  // switch по типу), отчёт клиента для них — повтор. Все типы, для которых отчёт
-  // ЕДИНСТВЕННЫЙ путь применения (2/3, 12/13, 14/15, 16/17, 18/19), имеют различимые
-  // идентификаторы эффектов.
+  // делят один `skillEffectId` (5) в `magic.yaml`. Отчёты о нём и так запрещены
+  // пунктом 1 (бустер сервер вешает сам), так что различать их незачем.
   const uint16_t reportedMagicType = magicSlotInfo.type;
+  const MagicApplication reportedApplication = ClassifyMagicApplication(reportedMagicType);
   const bool attackerIsAiRacer = raceInstance.IsAiRacerOid(command.attackerOid);
 
-  if (not attackerIsAiRacer)
+  // Кого сервер считает источником эффекта. Для отчётов про ботов серверной записи
+  // нет — там остаётся имя из пакета (оно и так может задеть только отправителя).
+  tracker::Oid resolvedAttackerOid = command.attackerOid;
+
+  if (attackerIsAiRacer)
+  {
+    if (reportedApplication != MagicApplication::TargetReportedAttack)
+    {
+      uint64_t suppressed = 0;
+      if (_aiAttackerThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Racer {} claimed AI racer {} applied magic {} to it; only attacks are "
+          "reportable for AI casters (suppressed {})",
+          targetRacer.oid,
+          command.attackerOid,
+          reportedMagicType,
+          suppressed);
+      return;
+    }
+  }
+  else
   {
     const auto* effectInstance = raceInstance.GetTracker().FindEffectInstance(
       command.effectInstanceId);
     const bool holdsThisDragon = magicSlotInfo.basicType == 16
       && targetRacer.pendingMagicTarget.has_value()
       && targetRacer.pendingMagicTarget->effectInstanceId == command.effectInstanceId;
+    const bool namedByTheCast = effectInstance != nullptr
+      && std::ranges::find(effectInstance->authorizedTargets, command.targetOid)
+        != effectInstance->authorizedTargets.cend();
+
+    // ★КАСТ, НЕ НАЗВАВШИЙ НИКОГО, — ЭТО НЕ «ЛЮБОЙ», НО И НЕ «НИКТО».
+    //
+    // Привязка к списку целей стоит там, где список есть. У части атакующей магии
+    // его может не быть: `targetingType: 0` у JumpStun (12/13) — то же значение, что
+    // у самокастуемых бафов, — и сервер не знает, называет ли клиент цели при таком
+    // касте. Отказать всем было бы правкой ради ПУТИ ОТКАЗА за счёт УСПЕШНОГО
+    // ([[dont-trade-success-path-for-failure-path]]): JumpStun просто перестал бы
+    // действовать, а доказательства, что он шлёт список, у раунда нет.
+    //
+    // Поэтому у безымянного каста остаётся более слабое, но НЕ пустое правило:
+    // отчитаться может каждый, КРОМЕ самого кастера, и каждый ровно один раз
+    // (потребление ниже). Что при этом остаётся достижимым, сказано прямо: свидетель
+    // такого каста может подтвердить попадание по СЕБЕ. Новой возможности это не
+    // даёт — тот же результат достижим и с привязкой, если кастер назовёт целью
+    // самого себя, — а эффект в любом случае достаётся заявителю: гард R71-4 не
+    // пускает его на чужого, а `serverApplied` не пускает сюда ничего полезного.
+    const bool castNamedNobody = effectInstance != nullptr
+      && effectInstance->authorizedTargets.empty()
+      && effectInstance->casterOid != command.targetOid;
+
     const bool instanceAuthorized = effectInstance != nullptr
       && effectInstance->magicType == reportedMagicType
-      && (effectInstance->casterOid == command.attackerOid || holdsThisDragon);
+      && not effectInstance->serverApplied
+      && (effectInstance->casterOid == command.attackerOid || holdsThisDragon)
+      && (reportedApplication == MagicApplication::IceWallObstacle
+        || namedByTheCast
+        || holdsThisDragon
+        || castNamedNobody);
 
     if (not instanceAuthorized)
     {
@@ -6259,12 +6489,33 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
       if (_effectInstanceThrottle.Allow(suppressed))
         server::util::QuietLogWarn(
           "Racer {} reported effect instance {} the server never issued for magic {} "
-          "by racer {} (issued: {}, suppressed {})",
+          "by racer {} against it (issued: {}, named by the cast: {}, suppressed {})",
           targetRacer.oid,
           command.effectInstanceId,
           reportedMagicType,
           command.attackerOid,
           effectInstance != nullptr,
+          namedByTheCast,
+          suppressed);
+      return;
+    }
+
+    resolvedAttackerOid = effectInstance->casterOid;
+
+    // ★ПОТРЕБЛЕНИЕ — ПОСЛЕДНИЙ ГАРД И ПЕРВОЕ ИЗМЕНЕНИЕ СОСТОЯНИЯ. Стоит ДО крит-подмены,
+    // ДО рассылки `AcCmdRCMagicExpire` и ДО `ScheduleSkillEffect`: повтор обязан умереть
+    // раньше, чем породит хотя бы один кадр.
+    if (not raceInstance.GetTracker().ConsumeEffectInstanceTarget(
+          command.effectInstanceId, command.targetOid))
+    {
+      uint64_t suppressed = 0;
+      if (_effectReplayThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Racer {} reported effect instance {} (magic {}) more than once "
+          "(suppressed {})",
+          targetRacer.oid,
+          command.effectInstanceId,
+          reportedMagicType,
           suppressed);
       return;
     }
@@ -6277,24 +6528,25 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   }
 
   // only send the magic expire for icewall. other magic cant do anything with it.
-  if (magicSlotInfo.type == 10 || magicSlotInfo.type == 11)
+  if (reportedApplication == MagicApplication::IceWallObstacle)
   {
     // LOA-fix (R71-17, находка ревью 2 #2): СЛОМ ОДНОРАЗОВЫЙ.
     //
     // Проверку «стена выдана сервером, того же типа, от названного кастера» делает
     // общее правило выше — отдельного гарда для стены больше нет и быть не должно:
     // два одинаковых правила рядом расходятся при первой же правке. Здесь остаётся
-    // то, что есть ТОЛЬКО у стены, — ПОТРЕБЛЕНИЕ: запись снимается, поэтому повтор
-    // того же номера (дубль пакета или попытка) тихо отбрасывается уже общим
-    // правилом, и `AcCmdRCMagicExpire` не размножается.
+    // то, что есть ТОЛЬКО у стены, — ПОЛНОЕ снятие записи: сломанной стены больше нет
+    // ни для кого, поэтому и второй гонщик её сломать уже не может, и
+    // `AcCmdRCMagicExpire` не размножается.
     //
     // ★ЧЕГО ЭТО НЕ ЛОВИТ: гонщик, который стену ВИДИТ, но не касался, всё ещё может
     // объявить слом — геометрии трасс у сервера нет.
     //
-    // ★СТЕНА БОТА снимать нечего: её каст в реестр не попадал (R57-5), и общее
-    // правило бота не судит.
-    if (not attackerIsAiRacer)
-      raceInstance.GetTracker().RemoveEffectInstance(command.effectInstanceId);
+    // ★УСЛОВИЕ «не бот» УБРАНО (R71-22, находка ревью 3 #2): отчёт со ссылкой на бота
+    // сюда больше не доходит вовсе — стена не `TargetReportedAttack`. Раньше это
+    // условие оставляло ботовому отчёту бесконечную рассылку истечений по любому
+    // номеру; теперь снятие безусловно, потому что безусловен и путь.
+    raceInstance.GetTracker().RemoveEffectInstance(command.effectInstanceId);
 
     const auto magicExpire = protocol::AcCmdRCMagicExpire{
       .magicType = magicSlotInfo.type,
@@ -6304,7 +6556,9 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     this->Broadcast(raceInstance, magicExpire);
   }
 
-  EffectVerdict verdict = this->ScheduleSkillEffect(raceInstance, command.attackerOid, command.targetOid, magicSlotInfo, command.effectInstanceId);
+  // ★АТАКУЮЩИЙ — СЕРВЕРНЫЙ (R71-22): `resolvedAttackerOid` берётся из записи реестра,
+  // и только для ботовых отчётов остаётся именем из пакета.
+  EffectVerdict verdict = this->ScheduleSkillEffect(raceInstance, resolvedAttackerOid, command.targetOid, magicSlotInfo, command.effectInstanceId);
 
   if (verdict == EffectVerdict::Applied && magicSlotInfo.attackRank > 1 && targetRacer.pendingMagicTarget)
   {

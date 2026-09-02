@@ -489,6 +489,12 @@ private:
   util::LogThrottle _relayReferenceThrottle;
   util::LogThrottle _effectInstanceThrottle;
   util::LogThrottle _effectInstanceCapacityThrottle;
+  //! LOA-fix (R71-22/R71-24, ревью 3 #1-#3): жалобы новых гардов отчёта и наводки.
+  //! Каждая заказывается клиентским пакетом, значит каждая обязана быть задросселена.
+  util::LogThrottle _effectReplayThrottle;
+  util::LogThrottle _aiAttackerThrottle;
+  util::LogThrottle _dragonTargetThrottle;
+  util::LogThrottle _magicClassificationThrottle;
 };
 
 } // namespace server
