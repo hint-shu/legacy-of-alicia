@@ -5298,6 +5298,23 @@ void RaceNetworkHandler::HandleUseMagicItem(
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
     isIceWall ? static_cast<uint16_t>(command.targetList.size()) : 1u);
 
+  // LOA-fix (R71-17, находка ревью 2 #2): СЕРВЕР ЗАПОМИНАЕТ, ЧТО САМ ВЫДАЛ.
+  //
+  // Слом стены объявляет КЛИЕНТ, и номер экземпляра в его пакете до этого раунда
+  // ничем не сверялся. Здесь — единственное место, где экземпляры рождаются, поэтому
+  // здесь же они и записываются: тип берётся РАЗРЕШЁННЫЙ (`magicSlotInfo.type`, уже
+  // после крит-подмены), владелец — отправитель, чей oid сверен гардом R57-5 выше.
+  // Снимаются они в двух местах и только там: по слому (`HandleActivateSkillEffect`)
+  // и по истечению — тем же отложенным вызовом, который рассылает `AcCmdRCMagicExpire`.
+  if (isIceWall)
+  {
+    raceInstance.GetTracker().AddIceWallInstances(
+      effectInstanceId,
+      static_cast<uint16_t>(command.targetList.size()),
+      magicSlotInfo.type,
+      racer.oid);
+  }
+
   // Darkfire should only affect one target
   // Client sends all targets infront of them but we should only apply the effect to the targeted one (the arrow above their head)
   if (magicSlotInfo.type == 14)
@@ -5388,7 +5405,7 @@ void RaceNetworkHandler::HandleUseMagicItem(
           if (raceInstanceIter == _raceInstances.cend())
             return;
 
-          const auto& raceInstance = raceInstanceIter->second;
+          auto& raceInstance = raceInstanceIter->second;
 
           for (uint16_t i = 0; i < obstacleInstanceCount; ++i)
           {
@@ -5400,6 +5417,13 @@ void RaceNetworkHandler::HandleUseMagicItem(
                 .obstacleInstanceCount = 1,
                 .breakdown = 0});
           }
+
+          // LOA-fix (R71-17): стена истекла — экземпляров больше нет. Снятие стоит
+          // ЗДЕСЬ, а не по таймеру в реестре: живым экземпляр считается ровно столько,
+          // сколько сервер сам объявил его живым, и выдумывать второй срок жизни (а с
+          // ним и запас на задержку сети) не приходится.
+          raceInstance.GetTracker().RemoveIceWallInstances(
+            effectInstanceId, obstacleInstanceCount);
         },
         Scheduler::Clock::now() + std::chrono::seconds(4)); // TODO: Change to 4 seconds
       break;
@@ -6104,6 +6128,54 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // only send the magic expire for icewall. other magic cant do anything with it.
   if (magicSlotInfo.type == 10 || magicSlotInfo.type == 11)
   {
+    // LOA-fix (R71-17, находка ревью 2 #2): ЛОМАЕТСЯ ТОЛЬКО СТЕНА, КОТОРУЮ СЕРВЕР
+    // ВЫДАВАЛ.
+    //
+    // `effectInstanceId` приезжает от клиента и до этого раунда уходил в широковещание
+    // как есть: подсмотрев номер чужой стены в `AcCmdCRUseMagicItemNotify`, гонщик
+    // объявлял её слом — на всех экранах она исчезала, не будучи задетой. Сверяются
+    // ТРИ величины, и все три сервер знает сам: экземпляр жив, его тип совпадает с
+    // разрешённым, а владелец — с тем, кого пакет называет атакующим.
+    //
+    // ★СЛОМ ОДНОРАЗОВЫЙ. Запись снимается сразу: повтор того же номера (дубль пакета
+    // или попытка) тихо отбрасывается, и `AcCmdRCMagicExpire` не размножается.
+    //
+    // ★ЧЕГО ЭТО НЕ ЛОВИТ, СКАЗАНО ПРЯМО: гонщик, который стену ВИДИТ, но не касался,
+    // всё ещё может объявить слом — сервер не знает геометрии трасс (RaceTracker.hpp:49-52),
+    // поэтому «а был ли контакт» проверить нечем. Закрыты выдуманный номер, чужой тип,
+    // истёкшая стена и повтор.
+    //
+    // ★СТЕНА БОТА — ЗАКОННЫЙ ВХОД, И ЕЁ СЕРВЕР НЕ ВЫДАВАЛ. Пакеты `UseMagicItem` за
+    // бота отбрасываются (R57-5), значит записи о его стене в реестре нет по
+    // построению. Гард на такой отчёт не ставится — иначе магия ботов перестала бы
+    // действовать на человека, ровно та поломка, которую поймало ревью R57-12. Боты
+    // живут ТОЛЬКО в соло-заезде, где ломать чужое нечего.
+    if (not raceInstance.IsAiRacerOid(command.attackerOid))
+    {
+      const auto* iceWallInstance = raceInstance.GetTracker().FindIceWallInstance(
+        command.effectInstanceId);
+      const bool iceWallMatches = iceWallInstance != nullptr
+        && iceWallInstance->magicType == magicSlotInfo.type
+        && iceWallInstance->casterOid == command.attackerOid;
+
+      if (not iceWallMatches)
+      {
+        uint64_t suppressed = 0;
+        if (_iceWallInstanceThrottle.Allow(suppressed))
+          server::util::QuietLogWarn(
+            "Racer {} reported a breakdown of ice-wall instance {} "
+            "(issued: {}, claimed attacker {}, suppressed {})",
+            targetRacer.oid,
+            command.effectInstanceId,
+            iceWallInstance != nullptr,
+            command.attackerOid,
+            suppressed);
+        return;
+      }
+
+      raceInstance.GetTracker().RemoveIceWallInstance(command.effectInstanceId);
+    }
+
     const auto magicExpire = protocol::AcCmdRCMagicExpire{
       .magicType = magicSlotInfo.type,
       .firstObstacleInstanceId = command.effectInstanceId,

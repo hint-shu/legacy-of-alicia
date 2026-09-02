@@ -278,6 +278,59 @@ uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
   return nextId;
 }
 
+void RaceTracker::AddIceWallInstances(
+  const uint16_t firstInstanceId,
+  const uint16_t count,
+  const uint16_t magicType,
+  const Oid casterOid)
+{
+  for (uint16_t i = 0; i < count; ++i)
+  {
+    const auto instanceId = static_cast<uint16_t>(firstInstanceId + i);
+
+    // Один номер — одна запись. Совпадение возможно только после оборота
+    // шестнадцатибитного счётчика, и тогда старая запись именно что мертва.
+    RemoveIceWallInstance(instanceId);
+
+    if (_iceWallInstances.size() >= MaxIceWallInstances)
+      _iceWallInstances.erase(_iceWallInstances.begin());
+
+    _iceWallInstances.push_back(
+      IceWallInstance{
+        .instanceId = instanceId,
+        .magicType = magicType,
+        .casterOid = casterOid});
+  }
+}
+
+const RaceTracker::IceWallInstance* RaceTracker::FindIceWallInstance(
+  const uint16_t instanceId) const
+{
+  for (const auto& instance : _iceWallInstances)
+  {
+    if (instance.instanceId == instanceId)
+      return &instance;
+  }
+
+  return nullptr;
+}
+
+void RaceTracker::RemoveIceWallInstance(const uint16_t instanceId)
+{
+  std::erase_if(
+    _iceWallInstances,
+    [instanceId](const IceWallInstance& instance)
+    { return instance.instanceId == instanceId; });
+}
+
+void RaceTracker::RemoveIceWallInstances(
+  const uint16_t firstInstanceId,
+  const uint16_t count)
+{
+  for (uint16_t i = 0; i < count; ++i)
+    RemoveIceWallInstance(static_cast<uint16_t>(firstInstanceId + i));
+}
+
 bool RaceTracker::HasIssuedEffectInstanceId(const uint32_t effectInstanceId) const
 {
   // Домен идентификатора — шестнадцать бит по построению (`uint16_t` и у счётчика,
@@ -294,6 +347,9 @@ void RaceTracker::Clear()
   _racers.clear();
   _itemDecks.clear();
   _events.clear();
+  // LOA-fix (R71-17): экземпляры стены живут РОВНО один заезд — как и гонщики,
+  // которые их поставили. Иначе номер из прошлого заезда остался бы «живым».
+  _iceWallInstances.clear();
   _nextItemDeckOid = 1;
   firstPassItemSpawn = true;
 

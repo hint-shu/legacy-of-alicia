@@ -31,6 +31,7 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace server::tracker
 {
@@ -748,6 +749,48 @@ public:
   //! же клиентского пути сразу после `FindQuestItem`.
   void RemoveQuestItem(data::Uid characterUid, Oid oid);
 
+  //! LOA-fix (R71-17, находка ревью 2 #2): ЖИВОЙ ЭКЗЕМПЛЯР ЛЕДЯНОЙ СТЕНЫ, ВЫДАННЫЙ
+  //! СЕРВЕРОМ.
+  //!
+  //! ★ЗАЧЕМ. Слом стены объявляется клиентским пакетом `AcCmdCRActivateSkillEffect`, а
+  //! номер экземпляра в нём был ЧИСТО КЛИЕНТСКИМ: подсмотрев чужой номер в
+  //! `AcCmdCRUseMagicItemNotify`, гонщик присылал слом ЧУЖОЙ стены — сервер верил и
+  //! рассылал `AcCmdRCMagicExpire` всей комнате. Реестр даёт серверу то, чего у него
+  //! не было: собственную запись о том, какие экземпляры он выдал, какого они типа и
+  //! кто их поставил.
+  struct IceWallInstance
+  {
+    //! Номер, выданный `GetNextEffectInstanceIdAndIncrementBy`.
+    uint16_t instanceId{};
+    //! Тип магии, РАЗРЕШЁННЫЙ сервером (10 обычная стена, 11 критическая).
+    uint16_t magicType{};
+    //! Гонщик, поставивший стену.
+    Oid casterOid{};
+  };
+
+  //! Потолок реестра. ★ЧИСЛО ПО ПОСТРОЕНИЮ, А НЕ С ПОТОЛКА: восемь мест в комнате
+  //! (`MaxRoomPlayerCount`) на восемь сегментов одного каста
+  //! (`MaxMagicTargetListSize`). Стена живёт четыре секунды, и её записи снимает тот
+  //! же отложенный вызов, что рассылает истечение, — то есть в норме реестр даже до
+  //! потолка не доходит. Переполнение вытесняет САМЫЕ СТАРЫЕ записи: они и так ближе
+  //! всех к истечению, а отказ в записи новых означал бы, что свежая честная стена
+  //! перестала ломаться.
+  static constexpr size_t MaxIceWallInstances = 64;
+
+  //! Записывает выданные сервером экземпляры стены (`count` подряд с `firstInstanceId`).
+  void AddIceWallInstances(
+    uint16_t firstInstanceId,
+    uint16_t count,
+    uint16_t magicType,
+    Oid casterOid);
+  //! Ищет живой экземпляр. НЕ бросает: путь клиентский, «такого нет» — обычное дело.
+  //! @returns Указатель на запись либо `nullptr`.
+  [[nodiscard]] const IceWallInstance* FindIceWallInstance(uint16_t instanceId) const;
+  //! Снимает экземпляр (сломан или истёк). Молчит, если его уже нет.
+  void RemoveIceWallInstance(uint16_t instanceId);
+  //! Снимает `count` экземпляров подряд — форма, в которой они выдавались.
+  void RemoveIceWallInstances(uint16_t firstInstanceId, uint16_t count);
+
   //! Returns the next object instance ID and increments the internal counter.
   //! @param increment The value to increment the internal counter by.
   //! @returns The next object instance ID before incrementing.
@@ -791,6 +834,8 @@ private:
   //! «выдан» пришлось бы читать как «меньше счётчика» и после оборота — то есть
   //! честный клиент, назвавший свой же старый идентификатор, получал бы отказ.
   bool _effectInstanceIdWrapped = false;
+  //! LOA-fix (R71-17): живые экземпляры ледяной стены этого заезда.
+  std::vector<IceWallInstance> _iceWallInstances;
 };
 
 } // namespace server::tracker
