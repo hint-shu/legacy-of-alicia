@@ -778,30 +778,60 @@ bool server::FileDataSource::RefreshUserNameIndexIfDirectoryChanged()
       return false;
   }
 
-  const std::unique_lock indexLock(_userNameIndexMutex);
-  // ★ПОВТОРНАЯ ПРОВЕРКА ПОД ЭКСКЛЮЗИВНЫМ ЗАМКОМ — ЭТО И ЕСТЬ КОАЛЕСЦЕНЦИЯ
+  // ★ОБХОД ФАЙЛОВОЙ СИСТЕМЫ ИДЁТ ПОД СВОИМ ЗАМКОМ, А НЕ ПОД ЗАМКОМ ИНДЕКСА
+  // (правка ревью, итерация 5).
+  //
+  // Прежняя редакция держала ЭКСКЛЮЗИВНЫЙ `_userNameIndexMutex` всё время
+  // обхода: одна staff-команда после порога устаревания открывала каталог,
+  // делала `open`/`fstat`/`close` на каждом аккаунте — а `IndexUserName`, то
+  // есть путь сохранения `DataDirector`, стоял в очереди за ней. На живом
+  // шарде в 13 аккаунтов это доли миллисекунды, но стоимость держится не
+  // числом аккаунтов сегодня, а формой: замок, под которым делают ввод-вывод,
+  // рано или поздно останавливает того, кто просто пишет в память.
+  //
+  // Отдельный `_userIndexRebuildMutex` даёт ровно два свойства: обход в один
+  // момент времени ровно один (коалесценция сохранена) и индекс всё это время
+  // ЧИТАЕМ И ПИШЕМ — под замок индекса уходит только публикация готового
+  // набора, то есть один `move` и четыре присваивания.
+  const std::unique_lock rebuildGuard(_userIndexRebuildMutex);
+
+  // ★ПОВТОРНАЯ ПРОВЕРКА ПОД ЗАМКОМ ПЕРЕСТРОЙКИ — ЭТО И ЕСТЬ КОАЛЕСЦЕНЦИЯ
   // (правка ревью, итерация 3). Прежняя редакция отпускала общий замок и звала
   // перестройку безусловно: несколько потоков, промахнувшихся одновременно,
   // проходили проверку все, а потом ПО ОЧЕРЕДИ делали по полному обходу.
   // Вопрос задаётся тем же `now`, что и снаружи, поэтому перестройка, успевшая
   // завершиться после нашего входа, гарантированно закрывает нам дорогу.
-  if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
-    return false;
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
+      return false;
+  }
 
-  RebuildUserNameIndexLocked();
+  RebuildUserNameIndexUnderRebuildGuard();
   return true;
 }
 
 void server::FileDataSource::RebuildUserNameIndex()
 {
-  const std::unique_lock indexLock(_userNameIndexMutex);
-  RebuildUserNameIndexLocked();
+  const std::unique_lock rebuildGuard(_userIndexRebuildMutex);
+  RebuildUserNameIndexUnderRebuildGuard();
 }
 
-void server::FileDataSource::RebuildUserNameIndexLocked()
+void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
 {
-  _userNameKeys.clear();
   RaiseNameCeiling(_loginNameCeiling, server::util::kMaxLoginNameBytes);
+
+  // ★ЗАЯВКА НА ПРОПАЖУ: пока идёт обход, `IndexUserName` вправе внести имя,
+  // которого в снимке каталога ещё не было. Публикация набора, снятого ДО этой
+  // регистрации, потеряла бы её до следующей сверки — то есть замена «строим
+  // под замком» на «строим снаружи» стоила бы только что зарегистрированному
+  // игроку ответа `//infraction list`. Поэтому такие имена собираются отдельно
+  // и вливаются в набор при публикации.
+  {
+    const std::unique_lock indexLock(_userNameIndexMutex);
+    _userNamesAddedDuringScan.clear();
+    _userIndexScanInFlight = true;
+  }
 
   // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ОБХОДА, А НЕ ПОСЛЕ. Файл, положенный рядом ВО ВРЕМЯ
   // обхода, обязан оставить отпечаток «устаревшим», иначе он потерялся бы до
@@ -842,7 +872,8 @@ void server::FileDataSource::RebuildUserNameIndexLocked()
     // остаётся без остановки там, где остановка возможна.
     server::util::QuietLogError(
       "Account name index: {} account file(s) in '{}' could not be narrowed to "
-      "owner-only; their password hashes stay readable beyond their owner",
+      "owner-only; they are refused, not indexed, and cannot be authenticated "
+      "from until they are secured",
       hardening.failed, _userDataPath.string());
   }
   if (hardening.refusedLinks > 0)
@@ -853,7 +884,7 @@ void server::FileDataSource::RebuildUserNameIndexLocked()
       hardening.refusedLinks, _userDataPath.string());
   }
 
-  if (listing.incomplete)
+  if (listing.incomplete || hardening.incomplete)
   {
     // ★ЗДЕСЬ ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ — И ЭТО НЕ НЕПОСЛЕДОВАТЕЛЬНОСТЬ
     // (пояснение к правке ревью, итерация 3). Каталог `data/users` на старте
@@ -869,12 +900,28 @@ void server::FileDataSource::RebuildUserNameIndexLocked()
       "incomplete and will be rebuilt on the next miss", _userDataPath.string());
   }
 
+  std::unordered_set<std::string> keys;
   for (const auto& filePath : listing.files)
   {
     // Тот же фильтр, что у прежнего обхода (R58-7): `.json` и только он —
     // осиротевший `Вася.json.tmp` не имеет права занять имя «Вася».
     if (filePath.extension() != ".json")
       continue;
+
+    // ★ФАЙЛ, КОТОРЫЙ НЕ УДАЛОСЬ ПРИВЕСТИ К ПОЛИТИКЕ, В ИНДЕКС НЕ ПОПАДАЕТ
+    // (правка ревью, итерация 5). Прежде перестройка индексировала ВСЕ имена
+    // независимо от того, что сказал проход сужения, и тем самым объявляла
+    // рабочей запись, чтение которой отказано (`ReadManagedFile` теперь даёт
+    // `Failed`). Три потребителя снова разошлись бы в ответе «существует ли
+    // Alice» — то самое расхождение, ради устранения которого заведён общий
+    // вход в чтение. Регистрации это не открывает: `LocalAuthenticationBackend`
+    // спрашивает не индекс, а сам файл, и получает `Failed`, то есть отказ, а
+    // не «имя свободно».
+    if (std::ranges::find(hardening.unsecured, filePath)
+      != hardening.unsecured.end())
+    {
+      continue;
+    }
 
     // ★КЛЮЧ БЕРЁТСЯ ИЗ ИМЕНИ ФАЙЛА, а не из JSON: именно по имени файла
     // `LocalAuthenticationBackend` открывает аккаунт, и именно оно решало исход
@@ -884,21 +931,38 @@ void server::FileDataSource::RebuildUserNameIndexLocked()
     if (stem.empty())
       continue;
     RaiseNameCeiling(_loginNameCeiling, stem.size());
-    _userNameKeys.insert(server::util::AsciiLowerKey(stem));
+    keys.insert(server::util::AsciiLowerKey(stem));
   }
 
   // Отпечаток считается действительным ТОЛЬКО у полной перестройки: иначе
   // «совпал» означало бы «мы уже смотрели», хотя посмотрели не всё.
-  _userIndexStampValid = not stampError && not listing.incomplete;
-  _userIndexDirectoryStamp = stamp;
+  // ★И ОТКАЗ СУЖЕНИЯ ТОЖЕ ДЕЛАЕТ ОТПЕЧАТОК НЕДЕЙСТВИТЕЛЬНЫМ (правка ревью,
+  // итерация 5). Прежде неудача `fchmod` записывалась в лог, а отпечаток
+  // объявлялся действительным — то есть следующая сверка откладывалась до
+  // изменения каталога, и файл, чей режим сузить не удалось, мог остаться
+  // непопробованным сколь угодно долго. Пока хоть один файл вне политики,
+  // сверка обязана повторяться.
+  const std::size_t indexed = keys.size();
+  {
+    const std::unique_lock indexLock(_userNameIndexMutex);
+    for (const auto& late : _userNamesAddedDuringScan)
+      keys.insert(late);
+    _userNamesAddedDuringScan.clear();
+    _userIndexScanInFlight = false;
 
-  // ★ВРЕМЯ ОКОНЧАНИЯ, А НЕ НАЧАЛА. Именно оно ограничивает частоту: поток,
-  // вошедший ДО конца этой перестройки, увидит `now - _userIndexLastScan`
-  // отрицательным и перестраивать не станет.
-  _userIndexLastScan = std::chrono::steady_clock::now();
+    _userNameKeys = std::move(keys);
+    _userIndexStampValid = not stampError && not listing.incomplete
+      && not hardening.incomplete && hardening.failed == 0;
+    _userIndexDirectoryStamp = stamp;
+
+    // ★ВРЕМЯ ОКОНЧАНИЯ, А НЕ НАЧАЛА. Именно оно ограничивает частоту: поток,
+    // вошедший ДО конца этой перестройки, увидит `now - _userIndexLastScan`
+    // отрицательным и перестраивать не станет.
+    _userIndexLastScan = std::chrono::steady_clock::now();
+  }
 
   server::util::QuietLogInfo(
-    "Account name index: {} account names indexed", _userNameKeys.size());
+    "Account name index: {} account names indexed", indexed);
 }
 
 void server::FileDataSource::IndexUserName(const std::string& name)
@@ -914,8 +978,17 @@ void server::FileDataSource::IndexUserName(const std::string& name)
   std::error_code stampError;
   const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
 
+  auto key = server::util::AsciiLowerKey(name);
+
   const std::unique_lock indexLock(_userNameIndexMutex);
-  _userNameKeys.insert(server::util::AsciiLowerKey(name));
+  // ★ЕСЛИ ПРЯМО СЕЙЧАС ИДЁТ ОБХОД — ИМЯ ЗАПОМИНАЕТСЯ ОТДЕЛЬНО (правка ревью,
+  // итерация 5). Обход теперь работает СНАРУЖИ замка индекса и публикует
+  // готовый набор; набор снят ДО этой регистрации, поэтому без этой строки
+  // публикация затёрла бы только что зарегистрированного игрока и он остался
+  // бы ненаходимым до следующей сверки.
+  if (_userIndexScanInFlight)
+    _userNamesAddedDuringScan.insert(key);
+  _userNameKeys.insert(std::move(key));
 
   // ★СВОЯ ЗАПИСЬ НЕ ДЕЛАЕТ ИНДЕКС УСТАРЕВШИМ (правка ревью, итерация 3). Ключ
   // уже внесён строкой выше — индекс СОГЛАСОВАН с диском, — но mtime каталога
@@ -2370,15 +2443,42 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
       });
   };
 
-  for (const auto& file : std::filesystem::directory_iterator(_guildDataPath))
+  // ★ОБХОД ЧЕРЕЗ ОБЩИЙ СПИСОК, А НЕ ЧЕРЕЗ `directory_iterator` (правка ревью,
+  // итерация 5). Здесь оставались ДВА дефекта класса, который раунд объявил
+  // закрытым: продвижение итератора в range-for БРОСАЕТ (самоссылающийся
+  // `guilds/x.json` рвал бы честное создание гильдии вместо ответа), а
+  // `is_regular_file()` без `error_code` ходит ПО ССЫЛКЕ и бросает на висячей.
+  // Один обход на весь раунд — и этот тоже.
+  const auto listing = server::util::ListRegularFiles(_guildDataPath);
+  if (listing.incomplete)
+  {
+    // ★ОБОРВАННЫЙ ОБХОД ОТВЕЧАЕТ «ЗАНЯТО», А НЕ «СВОБОДНО». «Мы не смогли
+    // посмотреть» и «там ничего нет» — разные ответы, и путать их здесь значит
+    // разрешить вторую гильдию с тем же именем. Прежняя редакция на этом месте
+    // БРОСАЛА (итератор), то есть тоже не отвечала «свободно»; отказ сохранён,
+    // но теперь он не рвёт запрос.
+    server::util::QuietLogError(
+      "Guild name uniqueness: the scan of '{}' did not finish; the name is "
+      "reported as taken rather than free", _guildDataPath.string());
+    return false;
+  }
+  if (not listing.refusedSymlinks.empty())
+  {
+    server::util::QuietLogWarn(
+      "Guild name uniqueness: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they do not reserve a guild name",
+      listing.refusedSymlinks.size(), _guildDataPath.string());
+  }
+
+  for (const auto& filePath : listing.files)
   {
     // LOA-fix (R58-9, round58, backlog #175): перехват разбора здесь уже есть, а
     // фильтра расширения не было — временный файл разбирался бы наравне с данными.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
+    if (filePath.extension() != ".json")
       continue;
 
     const auto read = server::util::ReadManagedFile(
-      file.path(), server::util::FileSensitivity::Public);
+      filePath, server::util::FileSensitivity::Public);
     if (read.status != server::util::ManagedReadStatus::Ok)
       continue;
 
@@ -2782,20 +2882,35 @@ std::vector<server::data::Uid> server::FileDataSource::ListRegisteredStallions()
 {
   std::vector<data::Uid> stallionUids;
 
-  if (!std::filesystem::exists(_stallionDataPath))
+  // ★ОБХОД ЧЕРЕЗ ОБЩИЙ СПИСОК (правка ревью, итерация 5). Прежняя редакция
+  // ходила `directory_iterator`, и оба её шага БРОСАЛИ: продвижение итератора и
+  // `is_regular_file()` без `error_code` (последний — ещё и ПО ССЫЛКЕ). Эта
+  // функция зовётся при инициализации рынка разведения, то есть самоссылающийся
+  // `stallions/x.json` мешал бы подняться службе ранчо. Ссылка не запись, и
+  // ронять из-за неё старт нечем.
+  const auto listing = server::util::ListRegularFiles(_stallionDataPath);
+  if (listing.incomplete)
   {
-    return stallionUids;
+    server::util::QuietLogWarn(
+      "Registered stallions: the scan of '{}' did not finish; the returned list "
+      "is incomplete", _stallionDataPath.string());
+  }
+  if (not listing.refusedSymlinks.empty())
+  {
+    server::util::QuietLogWarn(
+      "Registered stallions: {} entry(ies) in '{}' are symbolic links and were "
+      "refused", listing.refusedSymlinks.size(), _stallionDataPath.string());
   }
 
-  for (const auto& entry : std::filesystem::directory_iterator(_stallionDataPath))
+  for (const auto& filePath : listing.files)
   {
-    if (!entry.is_regular_file() || entry.path().extension() != ".json")
+    if (filePath.extension() != ".json")
       continue;
 
     try
     {
       // Extract stallion UID from filename (e.g., "123.json" -> 123)
-      data::Uid stallionUid = std::stoul(entry.path().stem().string());
+      data::Uid stallionUid = std::stoul(filePath.stem().string());
       stallionUids.push_back(stallionUid);
     }
     catch (const std::exception&)

@@ -629,6 +629,263 @@ void TestNewSecretAdoptsDirectoryOwner(const std::filesystem::path& sandbox)
   std::filesystem::remove_all(directory, cleanup);
 }
 
+//! ★ОТКАЗ СУЖЕНИЯ — ЭТО ОТКАЗ ЧТЕНИЯ, А НЕ СТРОЧКА В ЛОГЕ.
+//!
+//! Ревью (итерация 5) показало ложно-зелёное по построению: `EnsureSecretOnOpen`
+//! возвращал `false` И на «уже узкий», И на «`fchmod` провалился», поэтому
+//! чтение печатало «хеш остаётся открытым» и ТУТ ЖЕ отдавало этот хеш, а
+//! перестройка индекса заводила такое имя как рабочее. Здесь отказ вызывается
+//! по-настоящему: файл принадлежит ТРЕТЬЕМУ пользователю, а мы смотрим на него
+//! из-под непривилегированного euid — открыть его можно (0644), а сузить нельзя.
+//!
+//! ★УТВЕРЖДЕНИЕ ПРОПУСКАЕТСЯ ПОД НЕ-ROOT, А НЕ ТЕСТ. Разложить владельцев умеет
+//! только root; под обычным пользователем проверять было бы нечего, и «зелёный»
+//! означал бы «не проверяли».
+void TestUnenforceableSecretIsRefusedNotServed(const std::filesystem::path& sandbox)
+{
+  if (::geteuid() != 0)
+    return;
+
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  const auto directory = sandbox / "unenforceable";
+  std::filesystem::create_directories(directory);
+  assert(::chmod(directory.c_str(), 0755) == 0);
+
+  const auto account = directory / "Dave.json";
+  SeedFile(account, 0644);
+  // Владелец — ЧУЖОЙ и для каталога, и для того, кем мы станем ниже: только
+  // тогда `fchmod` действительно отказывает, а не «мог бы отказать».
+  assert(::chown(account.c_str(), 1001, 1001) == 0);
+
+  // ★КОНТРОЛЬНЫЙ ФАЙЛ В СОСЕДНЕМ КАТАЛОГЕ — ЭТО ДОКАЗАТЕЛЬСТВО, ЧТО ХАРНЕСС
+  // ВИДИТ. Без него тест был бы зелёным и там, где до каталога вообще не
+  // добраться: `Failed` от `EACCES` на пути и `Failed` от несостоявшегося
+  // `fchmod` — один и тот же исход, а проверяем мы ВТОРОЙ. (Ровно так этот
+  // тест и провалился в контейнере: `TMPDIR` лежал под `/root` с режимом 0700,
+  // и uid 1000 не мог войти в песочницу.) Каталог отдельный, чтобы контроль не
+  // попал в тот же проход сужения и не сдвинул число отказов.
+  const auto controlDirectory = sandbox / "unenforceable-control";
+  std::filesystem::create_directories(controlDirectory);
+  assert(::chmod(controlDirectory.c_str(), 0755) == 0);
+  const auto control = controlDirectory / "Readable.json";
+  SeedFile(control, 0644);
+  assert(::chown(control.c_str(), 1001, 1001) == 0);
+
+  // Сохранённый uid остаётся нулевым, поэтому вернуться сможем.
+  assert(::seteuid(1000) == 0);
+
+  const auto controlRead = server::util::ReadManagedFile(
+    control, FileSensitivity::Public);
+  const bool harnessCanSee =
+    controlRead.status == server::util::ManagedReadStatus::Ok
+    && not controlRead.content.empty();
+
+  const auto read = server::util::ReadManagedFile(account, FileSensitivity::Secret);
+  const bool refusedRead = read.status == server::util::ManagedReadStatus::Failed;
+  const bool withoutContent = read.content.empty();
+  const bool notNarrowed = not read.narrowed;
+
+  const auto listing = server::util::ListRegularFiles(directory);
+  const bool listingComplete = not listing.incomplete && listing.files.size() == 1;
+  const auto hardening = server::util::HardenSecretFiles(listing);
+  const bool countedFailed = hardening.failed == 1;
+  const bool namedFailed = hardening.unsecured.size() == 1
+    && hardening.unsecured.front() == account;
+
+  assert(::seteuid(0) == 0);
+
+  // ★СНАЧАЛА КОНТРОЛЬ: если он красный, всё остальное ничего не значит.
+  assert(harnessCanSee);
+  assert(listingComplete);
+
+  // ★СОДЕРЖИМОЕ НЕ ОТДАНО. Именно это и было сломано: строка в лог уходила, а
+  // хеш — вызывающему.
+  assert(refusedRead);
+  assert(withoutContent);
+  assert(notNarrowed);
+  // ★И ПРОХОД СУЖЕНИЯ НАЗЫВАЕТ ФАЙЛ ПОИМЁННО, а не только считает: перестройка
+  // индекса обязана уметь ОБОЙТИ его стороной, а числу это не под силу.
+  assert(countedFailed);
+  assert(namedFailed);
+  assert(ModeOf(account) == 0644);   // сузить и вправду не удалось
+
+  SinkMessages().clear();
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+  std::filesystem::remove_all(controlDirectory, cleanup);
+}
+
+//! ★ВЛАДЕЛЕЦ УСЫНОВЛЯЕТСЯ И У ФАЙЛА, КОТОРЫЙ УЖЕ УЗОК.
+//!
+//! Ревью (итерация 5): ранний выход «режим и так owner-only» пропускал ПРОВЕРКУ
+//! ВЛАДЕЛЬЦА целиком, поэтому восстановленный из копии `root:root 0600`,
+//! положенный в каталог `dev:dev`, не усыновлялся никогда — вход работал, а
+//! помощник администратора не мог открыть файл бессрочно.
+void TestOwnerIsAdoptedEvenWhenModeIsAlreadyNarrow(
+  const std::filesystem::path& sandbox)
+{
+  if (::geteuid() != 0)
+    return;
+
+  const auto directory = sandbox / "adoption-on-read";
+  std::filesystem::create_directories(directory);
+  assert(::chown(directory.c_str(), 1000, 1000) == 0);
+
+  const auto account = directory / "Eve.json";
+  SeedFile(account, 0600);
+  assert(::chown(account.c_str(), 0, 0) == 0);
+
+  const auto read = server::util::ReadManagedFile(account, FileSensitivity::Secret);
+  assert(read.status == server::util::ManagedReadStatus::Ok);
+  assert(not read.narrowed);                 // сужать было нечего…
+  assert(OwnerOf(account) == OwnerOf(directory));  // …а владельца всё равно взяли
+  assert(OwnerOf(account).first == 1000u);
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
+//! ★ЗАПИСЬ ДЛИННЕЕ ПОТОЛКА НЕ ЧИТАЕТСЯ ВОВСЕ.
+//!
+//! Общий читатель складывает файл в память ДО разбора, а чтение аккаунта стоит
+//! на пути входа, то есть ДО аутентификации: без потолка одна попытка входа
+//! именем, под которым лежит разрежённый гигабайтный файл, стоила бы контейнеру
+//! всей памяти (ревью, итерация 5).
+void TestOversizedRecordIsRefusedWithoutReading(
+  const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "oversized";
+  std::filesystem::create_directories(directory);
+
+  const auto huge = directory / "Huge.json";
+  {
+    std::ofstream file(huge);
+    assert(file.is_open());
+    file << "{";
+  }
+  // Разрежённый: на диске занимает почти ничего, но `st_size` — за потолком.
+  assert(::truncate(
+    huge.c_str(),
+    static_cast<off_t>(server::util::kMaxManagedRecordBytes) + 1) == 0);
+
+  const auto read = server::util::ReadManagedFile(huge, FileSensitivity::Secret);
+  assert(read.status == server::util::ManagedReadStatus::Refused);
+  assert(read.content.empty());
+
+  // А запись ровно по потолку читается: граница отсекает лишнее, а не живое.
+  const auto atCeiling = directory / "AtCeiling.json";
+  SeedFile(atCeiling, 0600);
+  const auto ok = server::util::ReadManagedFile(atCeiling, FileSensitivity::Public);
+  assert(ok.status == server::util::ManagedReadStatus::Ok);
+
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
+//! ★ССЫЛКА НА МЕСТЕ САМОГО КАТАЛОГА ТОЖЕ ОТВЕРГАЕТСЯ.
+//!
+//! `O_NOFOLLOW` защищает ТОЛЬКО последний компонент, поэтому `data/users`,
+//! подменённый ссылкой, прежде проходился молча всеми четырьмя потребителями
+//! (ревью, итерация 5). Здесь проверяется, что путь разбирается покомпонентно:
+//! ни обход, ни чтение, ни запись, ни правка режима каталога сквозь ссылку не
+//! ходят — и настоящий каталог остаётся нетронутым.
+void TestSymlinkedDirectoryIsRefused(const std::filesystem::path& sandbox)
+{
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  const auto real = sandbox / "real-accounts";
+  std::filesystem::create_directories(real);
+  assert(::chmod(real.c_str(), 0755) == 0);
+  const auto account = real / "Frank.json";
+  SeedFile(account, 0644);
+
+  const auto linked = sandbox / "linked-accounts-dir";
+  std::error_code linkError;
+  std::filesystem::create_directory_symlink(real, linked, linkError);
+  assert(not linkError);
+
+  // 1) Обход сквозь ссылку-каталог — не пустой список, а НЕПОЛНЫЙ.
+  const auto listing = server::util::ListRegularFiles(linked);
+  assert(listing.files.empty());
+  assert(listing.incomplete);
+
+  // 2) Чтение файла ЧЕРЕЗ ссылку-каталог отвергнуто, содержимого нет, и режим
+  //    настоящего файла не тронут (то есть по ссылке не ходили вовсе).
+  const auto read = server::util::ReadManagedFile(
+    linked / "Frank.json", FileSensitivity::Secret);
+  assert(read.status == server::util::ManagedReadStatus::Refused);
+  assert(read.content.empty());
+  assert(ModeOf(account) == 0644);
+
+  // 3) Запись через ссылку-каталог бросает и НИЧЕГО не создаёт в настоящем.
+  bool threw = false;
+  try
+  {
+    server::util::WriteFileAtomically(
+      linked / "Grace.json", kPayload, "User file", FileSensitivity::Secret);
+  }
+  catch (const std::exception&)
+  {
+    threw = true;
+  }
+  assert(threw);
+  assert(not std::filesystem::exists(real / "Grace.json"));
+  assert(not std::filesystem::exists(real / "Grace.json.tmp"));
+
+  // 4) Правка режима каталога сквозь ссылку — отказ, и режим цели тот же.
+  //    Прежняя редакция звала здесь `chmod` ПО ПУТИ, то есть правила бы права
+  //    чужого каталога.
+  assert(not server::util::EnsureDirectoryMode(linked, 0700));
+  assert(ModeOf(real) == 0755);
+
+  SinkMessages().clear();
+  std::error_code cleanup;
+  std::filesystem::remove(linked, cleanup);
+  std::filesystem::remove_all(real, cleanup);
+}
+
+//! ★ИМЯ ИЗ КАТАЛОГА — ЭТО ВВОД, И В ЛОГ ОНО ПОПАДАЕТ ЭКРАНИРОВАННЫМ.
+//!
+//! Всё, кроме `/` и NUL, годится в имя записи каталога, в том числе перевод
+//! строки. Без экранирования ОДНО задросселированное предупреждение печатало бы
+//! НЕСКОЛЬКО видимых записей лога — дроссель считает вызовы, а не строки,
+//! которые из них вылезли, то есть подделка журнала обходила бы ровно тот пояс,
+//! который заведён против потока строк (ревью, итерация 5).
+void TestFilesystemNamesAreEscapedInWarnings(const std::filesystem::path& sandbox)
+{
+  server::util::SetFileWarningSink(&CapturingSink);
+  SinkMessages().clear();
+
+  const auto directory = sandbox / "hostile-names";
+  std::filesystem::create_directories(directory);
+
+  const std::string hostile = "a\nWARN forged log line\tb.json";
+  std::error_code linkError;
+  std::filesystem::create_symlink(
+    sandbox / "no-such-target", directory / hostile, linkError);
+  assert(not linkError);
+
+  const auto listing = server::util::ListRegularFiles(directory);
+  assert(listing.refusedSymlinks.size() == 1);
+  assert(not SinkMessages().empty());
+
+  const auto& message = SinkMessages().back();
+  // Ни одного СЫРОГО управляющего байта — то есть одна жалоба остаётся одной
+  // строкой, что бы ни лежало в каталоге.
+  assert(message.find('\n') == std::string::npos);
+  assert(message.find('\t') == std::string::npos);
+  // И при этом имя не потеряно: оно видно, просто в экранированном виде.
+  assert(message.find("\\x0a") != std::string::npos);
+  assert(message.find("WARN forged log line") != std::string::npos);
+
+  SinkMessages().clear();
+  std::error_code cleanup;
+  std::filesystem::remove_all(directory, cleanup);
+}
+
 } // namespace
 
 int main()
@@ -645,9 +902,18 @@ int main()
   TestListRegularFiles(sandbox);
   TestNonRegularEntriesAreSkippedNotFatal(sandbox);
   TestWarningSinkIsThrottled();
+  // ★ЭТОТ ТЕСТ ИДЁТ ПЕРВЫМ СРЕДИ ЧИТАЮЩИХ ЖАЛОБЫ, И ЭТО УСЛОВИЕ ЕГО
+  // ОСМЫСЛЕННОСТИ, А НЕ ПОРЯДОК РАДИ ПОРЯДКА: площадка дросселя у обхода одна
+  // на процесс, поэтому вторым он читал бы ПОДАВЛЕННОЕ сообщение и был бы
+  // ложно-красным по причине, к экранированию отношения не имеющей.
+  TestFilesystemNamesAreEscapedInWarnings(sandbox);
   TestSymbolicLinksAreRefusedEverywhere(sandbox);
   TestLateArrivingSecretIsNarrowedOnRead(sandbox);
   TestNewSecretAdoptsDirectoryOwner(sandbox);
+  TestUnenforceableSecretIsRefusedNotServed(sandbox);
+  TestOwnerIsAdoptedEvenWhenModeIsAlreadyNarrow(sandbox);
+  TestOversizedRecordIsRefusedWithoutReading(sandbox);
+  TestSymlinkedDirectoryIsRefused(sandbox);
 
   UnlockTree(sandbox);
   std::error_code ignored;

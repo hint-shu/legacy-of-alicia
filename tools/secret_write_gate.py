@@ -37,6 +37,24 @@ WHY IT KEYS ON THE IDENTIFIER, NOT ON THE STRING "WriteFileAtomically("
     not code.  Adjacent string literals are folded, so the compiler's view of the
     label and the gate's view are the same view.
 
+WHAT ITERATION 5 OF THE REVIEW ADDED
+    Direct probes showed the gate still answering by SPELLING rather than by meaning,
+    in both directions:
+      * `"User\\040file"` written as Public reported ZERO violations — the same label
+        to the compiler, a different byte string to a raw comparison.  Escapes are now
+        DECODED (per literal, because \\x is maximal-munch), and a label carrying an
+        escape the gate cannot decode is refused rather than silently read as
+        "not a User file".
+      * `flag ? Public : Secret` passed as Secret because the expression merely ENDS
+        in `FileSensitivity::Secret`.  The fourth argument must now BE exactly one
+        enumerator; a class chosen at run time is unreadable, and unreadable is a
+        violation.
+      * conversely, the identifier inside an ordinary string — a log line naming the
+        function — was reported as a violation.  A false RED gets a gate switched
+        off, so literal CONTENTS are blanked before the identifier scan (the argument
+        text is still read from the untouched source, and lengths match so the two
+        views share offsets).
+
 HOW IT PROVES IT CAN FAIL
     `--selftest` runs the same analyser over in-memory fixtures: a clean pair, a
     "User file" written as Public, a non-user file written as Secret, and a
@@ -115,6 +133,102 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
+def blank_literal_contents(code: str) -> str:
+    """Заменяет СОДЕРЖИМОЕ строковых и символьных литералов пробелами, сохраняя
+    длину, кавычки и переводы строк.
+
+    ★ЗАЧЕМ (правка ревью, итерация 5). Единица анализа — ИДЕНТИФИКАТОР, и до
+    этой правки его искали в тексте вместе с литералами: обычная диагностика
+    `QuietLogError("WriteFileAtomically failed for {}", path)` объявлялась
+    «использованием без прямого вызова», то есть НАРУШЕНИЕМ. Ложно-красный гейт
+    отключают, поэтому он так же вреден, как ложно-зелёный.
+
+    Длина сохраняется побайтово: смещения совпадают с исходным текстом, и
+    разбор аргументов идёт по НЕТРОНУТОМУ тексту — класс файла читается именно
+    из литералов."""
+    out: list[str] = []
+    index = 0
+    size = len(code)
+    while index < size:
+        symbol = code[index]
+        if symbol in "\"'":
+            quote = symbol
+            out.append(symbol)
+            index += 1
+            while index < size:
+                if code[index] == "\\":
+                    pair = code[index : index + 2]
+                    out.append("".join(
+                        "\n" if character == "\n" else " " for character in pair))
+                    index += 2
+                    continue
+                if code[index] == quote:
+                    out.append(quote)
+                    index += 1
+                    break
+                out.append("\n" if code[index] == "\n" else " ")
+                index += 1
+            continue
+        out.append(symbol)
+        index += 1
+    return "".join(out)
+
+
+SIMPLE_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'",
+    "a": "\a", "b": "\b", "f": "\f", "v": "\v", "?": "?",
+}
+
+
+def decode_escapes(raw: str) -> str | None:
+    """Раскрывает C-экранирование внутри литерала. `None`, если встретилось
+    что-то, чего гейт прочитать не может.
+
+    ★ЗАЧЕМ (правка ревью, итерация 5). `"User\\040file"` — для компилятора ровно
+    та же строка «User file», что и `"User file"`, а для сравнения по сырым
+    байтам — другая. Проба ревью показала ноль нарушений на файле с хешем
+    пароля, объявленном `Public`, ровно из-за этого. Ярлык обязан сравниваться
+    в ТОМ ЖЕ виде, в каком его видит компилятор; всё, что гейт раскрыть не
+    умеет, объявляется нечитаемым, а не «не User file»."""
+    out: list[str] = []
+    index = 0
+    size = len(raw)
+    while index < size:
+        symbol = raw[index]
+        if symbol != "\\":
+            out.append(symbol)
+            index += 1
+            continue
+        index += 1
+        if index >= size:
+            return None
+        escape = raw[index]
+        if escape in SIMPLE_ESCAPES:
+            out.append(SIMPLE_ESCAPES[escape])
+            index += 1
+            continue
+        if escape == "x":
+            index += 1
+            digits = ""
+            while index < size and raw[index] in "0123456789abcdefABCDEF":
+                digits += raw[index]
+                index += 1
+            if not digits:
+                return None
+            out.append(chr(int(digits, 16)))
+            continue
+        if escape in "01234567":
+            digits = ""
+            while index < size and len(digits) < 3 and raw[index] in "01234567":
+                digits += raw[index]
+                index += 1
+            out.append(chr(int(digits, 8)))
+            continue
+        # \u, \U, \e и всё прочее — гейт не берётся это читать.
+        return None
+    return "".join(out)
+
+
 def fold_string_literals(argument: str) -> str | None:
     """Склеивает соседние строковые литералы в один канонический литерал.
 
@@ -151,7 +265,16 @@ def fold_string_literals(argument: str) -> str | None:
         pieces.append("".join(current))
     if not pieces:
         return None
-    return "".join(pieces)
+    # ★РАСКРЫТИЕ ЭКРАНИРОВАНИЯ — ПОСЛЕДНИЙ ШАГ, И ПО ЛИТЕРАЛУ ОТДЕЛЬНО: у `\x`
+    # длина последовательности МАКСИМАЛЬНАЯ, поэтому склеить сперва, а раскрыть
+    # потом значило бы прочитать `"User\x20" "file"` иначе, чем компилятор.
+    decoded: list[str] = []
+    for piece in pieces:
+        value = decode_escapes(piece)
+        if value is None:
+            return None
+        decoded.append(value)
+    return "".join(decoded)
 
 
 def split_arguments(text: str, start: int) -> tuple[list[str], int] | None:
@@ -207,6 +330,11 @@ def split_arguments(text: str, start: int) -> tuple[list[str], int] | None:
 
 
 IDENTIFIER_PATTERN = re.compile(r"\b" + re.escape(IDENTIFIER) + r"\b")
+#! Ровно ОДНО перечислимое значение, возможно с квалификацией пространств имён.
+#  Ни тернарного оператора, ни вызова, ни переменной: класс, выбираемый в
+#  рантайме, гейт прочитать не может и обязан это сказать.
+SENSITIVITY_PATTERN = re.compile(
+    r"(?:::)?(?:[A-Za-z_]\w*::)*FileSensitivity::(Secret|Public)")
 DECLARATION_PATTERN = re.compile(
     r"(?:inline\s+)?(?:void|auto)\s+" + re.escape(IDENTIFIER) + r"\s*\(")
 
@@ -216,11 +344,15 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
     violations: list[tuple[str, str]] = []
     seen = 0
     code = strip_comments(text)
-    for match in IDENTIFIER_PATTERN.finditer(code):
-        location = f"{origin}:{code.count(chr(10), 0, match.start()) + 1}"
+    # ★ИДЕНТИФИКАТОР ИЩЕТСЯ В ТЕКСТЕ БЕЗ СОДЕРЖИМОГО ЛИТЕРАЛОВ, А АРГУМЕНТЫ
+    # РАЗБИРАЮТСЯ ПО ИСХОДНОМУ (правка ревью, итерация 5). Длина сохранена, то
+    # есть смещения у обоих видов одни и те же.
+    scan = blank_literal_contents(code)
+    for match in IDENTIFIER_PATTERN.finditer(scan):
+        location = f"{origin}:{scan.count(chr(10), 0, match.start()) + 1}"
 
         # The declaration itself is not a call.
-        declaration = DECLARATION_PATTERN.search(code, max(0, match.start() - 32))
+        declaration = DECLARATION_PATTERN.search(scan, max(0, match.start() - 32))
         if declaration is not None and declaration.end() >= match.end() \
                 and declaration.start() <= match.start():
             continue
@@ -229,7 +361,7 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
         # ВЫЗОВ. `&WriteFileAtomically`, `auto writer = WriteFileAtomically;`,
         # макрос-псевдоним: класс конфиденциальности такого использования гейт
         # прочитать не может, и молчание здесь и было бы той самой дырой.
-        tail = code[match.end():]
+        tail = scan[match.end():]
         offset = len(tail) - len(tail.lstrip())
         if not tail[offset : offset + 1] == "(":
             violations.append(
@@ -253,12 +385,18 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
         label = fold_string_literals(what)
         if label is None:
             violations.append(
-                (location, f"ярлык файла не строковый литерал ({what}) — гейт не "
-                           f"может решить, секрет это или нет"))
+                (location, f"ярлык файла не читаемый строковый литерал ({what}) — "
+                           f"гейт не может решить, секрет это или нет"))
             continue
         is_user_file = label == SECRET_KIND
-        is_secret = sensitivity.endswith("FileSensitivity::Secret")
-        is_public = sensitivity.endswith("FileSensitivity::Public")
+        # ★ТОЧНОЕ ВЫРАЖЕНИЕ, А НЕ «ЗАКАНЧИВАЕТСЯ НА» (правка ревью, итерация 5).
+        # `flag ? FileSensitivity::Public : FileSensitivity::Secret` кончается на
+        # `::Secret` и проходил как секрет, хотя класс выбирается В РАНТАЙМЕ и
+        # гейт его не знает. Проверка формы принимала выражение за значение.
+        enum_match = SENSITIVITY_PATTERN.fullmatch(
+            "".join(sensitivity.split()))
+        is_secret = enum_match is not None and enum_match.group(1) == "Secret"
+        is_public = enum_match is not None and enum_match.group(1) == "Public"
         if not (is_secret or is_public):
             violations.append(
                 (location, f"четвёртый аргумент не класс конфиденциальности: {sensitivity}"))
@@ -361,6 +499,28 @@ SELFTEST_FIXTURES = [
     ("the name mentioned in a comment is prose, not a call", 0, '''
   // WriteFileAtomically is the only writer; see WriteFileAtomically above.
   /* WriteFileAtomically */
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User file", server::util::FileSensitivity::Secret);
+'''),
+    # ★ЧЕТЫРЕ ФИКСТУРЫ ИТЕРАЦИИ 5 — по одной на каждую форму, на которой пробы
+    # ревью получили НЕ ТОТ вердикт: две ложно-зелёные и одна ложно-красная.
+    ("an octal-escaped label is the same label to the compiler", 1, r'''
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User\040file", server::util::FileSensitivity::Public);
+'''),
+    ("a hex-escaped label is the same label to the compiler", 1, r'''
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User\x20" "file", server::util::FileSensitivity::Public);
+'''),
+    ("a runtime-chosen class is not a class the gate can read", 1, '''
+  server::util::WriteFileAtomically(
+    p, json.dump(2), "User file",
+    flag ? server::util::FileSensitivity::Public
+         : server::util::FileSensitivity::Secret);
+'''),
+    ("the identifier inside an ordinary string is not a use", 0, '''
+  server::util::QuietLogError("WriteFileAtomically failed for {}", p);
+  const char* hint = "see WriteFileAtomically(path, payload, what, class)";
   server::util::WriteFileAtomically(
     p, json.dump(2), "User file", server::util::FileSensitivity::Secret);
 '''),
