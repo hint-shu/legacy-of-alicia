@@ -52,12 +52,34 @@ bool LogThrottle::AllowAt(
           std::memory_order_acq_rel,
           std::memory_order_relaxed))
     {
+      // LOA-fix (R72-fix2-5, round72, находка Codex 5): ★ПАРА ЧИСЕЛ В ОДНОЙ
+      // ВЫПУЩЕННОЙ СТРОКЕ ОБЯЗАНА БЫТЬ СОГЛАСОВАННОЙ.
+      //
+      // Раньше `total` брался из СВОЕГО `fetch_add` в начале функции, а
+      // `suppressed` — из обмена здесь. Между этими двумя точками другие
+      // потоки успевали и посчитаться в `_total`, и записаться в
+      // `_suppressed`, поэтому победитель мог напечатать «проглочено 1, всего
+      // 1» — то есть отчёт, из которого следует, что проглоченного события не
+      // было вовсе. Оракул раунда судит именно по этим числам, и
+      // несогласованная пара — это ложная улика.
+      //
+      // ★ПОРЯДОК ОПЕРАЦИЙ ДАЁТ ГАРАНТИЮ, А НЕ УДАЧУ. Проглотивший поток
+      // увеличивает `_total` (шаг выше по функции), а ЗАТЕМ `_suppressed`
+      // с `release`. Победитель читает `_suppressed` обменом с `acquire` —
+      // значит всё, что проглотивший сделал ДО своей release-операции, ему
+      // видно, — и только после этого перечитывает `_total`. Отсюда
+      // `total >= suppressed + 1` всегда (единица — собственное событие
+      // победителя).
       suppressed = _suppressed.exchange(0, std::memory_order_acq_rel);
+      total = _total.load(std::memory_order_relaxed);
       return true;
     }
   }
 
-  _suppressed.fetch_add(1, std::memory_order_relaxed);
+  // ★`release`, А НЕ `relaxed`: это вторая половина пары синхронизации,
+  // описанной выше. С `relaxed` победитель мог бы увидеть увеличенный
+  // `_suppressed`, но ещё не увидеть увеличенный `_total`.
+  _suppressed.fetch_add(1, std::memory_order_release);
   suppressed = 0;
   return false;
 }

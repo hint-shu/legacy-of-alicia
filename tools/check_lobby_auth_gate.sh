@@ -72,6 +72,25 @@ WANT_PREAUTH_SET="AcCmdCLCheckWaitingSeqno AcCmdCLLogin AcCmdCLQueryServerTime"
 # header defines them, the lobby source uses them, the command server declares the
 # gated entry point they are built on.
 WANT_REGISTRAR_FILES="include/libserver/network/command/CommandServer.hpp include/server/lobby/LobbyNetworkHandler.hpp src/server/lobby/LobbyNetworkHandler.cpp"
+# ★ЧТО ЗАКРЫВАЕТ СЛЕДУЮЩИЙ СПИСОК (находка Codex 2, итерация 2).
+#   Проверка (7) искала по дереву ТОЛЬКО имена обёрток и потому не видела самого
+#   опасного обхода: `_commandServer` — приватное поле, но приватное поле доступно
+#   ЛЮБОМУ члену класса, а член класса можно определить в ДРУГОЙ единице трансляции.
+#   Такой член зовёт СЫРОЙ `RegisterCommandHandler`, имя обёртки в файле не
+#   встречается, конструктор в аудируемом `.cpp` не меняется — и все числа выше
+#   остаются зелёными. То есть тотальность инварианта из находки 3 не была
+#   достигнута, она была объявлена.
+#   Закрывается ДВУМЯ переписями по всему дереву, каждая по своему свойству:
+#     (8) файлы, где вообще есть ВЫЗОВ Register*CommandHandler, известны поимённо —
+#         новая точка регистрации где угодно в дереве обязана быть объявлена здесь;
+#     (9) файлы, где вообще упоминается `LobbyNetworkHandler::` вне комментариев,
+#         известны поимённо — член лобби, определённый в чужой TU, виден сразу,
+#         независимо от того, что он делает внутри;
+#    (10) в заголовке лобби нет ни одного `friend` — иначе приватный диспетчер
+#         доступен и не-члену.
+# Все три — перепись по свойству, а не по форме конкретной регистрации.
+WANT_HANDLER_CALL_FILES="include/libserver/network/chatter/ChatterServer.hpp include/libserver/network/command/CommandServer.hpp include/server/lobby/LobbyNetworkHandler.hpp src/server/chat/AllChatDirector.cpp src/server/chat/PrivateChatDirector.cpp src/server/messenger/MessengerDirector.cpp src/server/race/RaceNetworkHandler.cpp src/server/ranch/RanchDirector.cpp"
+WANT_LOBBY_MEMBER_FILES="src/server/lobby/LobbyNetworkHandler.cpp"
 
 for f in "$SRC" "$HDR"; do
   [ -f "$f" ] || { echo "ОСТАНОВ: нет файла $f — считать нечего"; exit 2; }
@@ -296,9 +315,10 @@ if [ "$HDR_GATED" -ne 1 ] || [ "$HDR_PLAIN" -ne 1 ]; then
   RC=1
 fi
 
-# --- (7) REPOSITORY-WIDE: nobody else registers lobby handlers. Sources are scanned
-# --- stripped, so a mention inside a comment does not count as a registrar.
-REGISTRAR_FILES="$(printf '%s' "$PARSE_PY" | python3 -c '
+# --- (7)-(9) REPOSITORY-WIDE PROPERTIES. Sources are scanned stripped, so a mention
+# --- inside a comment never counts as code.
+scan_files() {
+  printf '%s' "$PARSE_PY" | python3 -c '
 import os
 import re
 import sys
@@ -307,7 +327,7 @@ namespace = {}
 exec(src.split("with open(")[0], namespace)
 strip = namespace["strip_comments_and_strings"]
 root = sys.argv[1]
-names = re.compile(r"\bRegister(?:AuthenticatedHandler|PreAuthHandler|GatedCommandHandler)\b")
+names = re.compile(sys.argv[2])
 found = set()
 for base in ("src", "include"):
     for dirpath, _, filenames in os.walk(os.path.join(root, base)):
@@ -319,7 +339,11 @@ for base in ("src", "include"):
                 if names.search(strip(handle.read())):
                     found.add(os.path.relpath(path, root))
 print(" ".join(sorted(found)))
-' "$ROOT")" || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
+' "$ROOT" "$1"
+}
+
+REGISTRAR_FILES="$(scan_files '\bRegister(?:AuthenticatedHandler|PreAuthHandler|GatedCommandHandler)\b')" \
+  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
 
 echo "файлы-регистраторы   : $REGISTRAR_FILES"
 echo "ожидались            : $WANT_REGISTRAR_FILES"
@@ -327,6 +351,49 @@ if [ "$REGISTRAR_FILES" != "$WANT_REGISTRAR_FILES" ]; then
   echo "  ✗ имена обёрток регистрации встречаются НЕ ТАМ, где раунд их оставил."
   echo "    Свойство «решение об авторизации принимается ровно в одном месте» доказуемо"
   echo "    только пока список файлов известен поимённо."
+  RC=1
+fi
+
+# --- (8) EVERY registration site in the tree is declared by name. A lobby member
+# --- defined in another translation unit would call the RAW RegisterCommandHandler —
+# --- no wrapper name in the file, no change in the audited constructor, and check (7)
+# --- stays green. This one sees it, because it keys on the CALL, not on the wrapper.
+HANDLER_CALL_FILES="$(scan_files '\bRegister[A-Za-z]*CommandHandler\b')" \
+  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
+
+echo "файлы с регистрацией : $HANDLER_CALL_FILES"
+echo "ожидались            : $WANT_HANDLER_CALL_FILES"
+if [ "$HANDLER_CALL_FILES" != "$WANT_HANDLER_CALL_FILES" ]; then
+  echo "  ✗ вызов Register*CommandHandler появился в файле, которого раунд не знает."
+  echo "    Пока список известен поимённо, «в лобби нет сырых регистраций» — свойство"
+  echo "    ДЕРЕВА, а не одного прочитанного файла. Новая точка регистрации обязана"
+  echo "    быть объявлена здесь вместе с решением об авторизации."
+  RC=1
+fi
+
+# --- (9) NO LOBBY MEMBER LIVES OUTSIDE THE AUDITED FILE. `_commandServer` is private,
+# --- and private means "members and friends"; a member defined elsewhere is exactly
+# --- the hole. This check is blind to WHAT such a member does — which is the point.
+LOBBY_MEMBER_FILES="$(scan_files '\bLobbyNetworkHandler\s*::')" \
+  || { echo "ОСТАНОВ: обход дерева упал"; exit 2; }
+
+echo "файлы с членами лобби: $LOBBY_MEMBER_FILES"
+echo "ожидались            : $WANT_LOBBY_MEMBER_FILES"
+if [ "$LOBBY_MEMBER_FILES" != "$WANT_LOBBY_MEMBER_FILES" ]; then
+  echo "  ✗ имя LobbyNetworkHandler:: встречается в коде вне единственного .cpp,"
+  echo "    который читает этот гард. Член класса, определённый в другой единице"
+  echo "    трансляции, имеет доступ к приватному _commandServer и может завести"
+  echo "    регистрацию там, куда гард не смотрит."
+  RC=1
+fi
+
+# --- (10) AND NOBODY IS A FRIEND. A friend declaration hands the private dispatcher
+# --- to a non-member, and then check (9) is not enough either.
+HDR_FRIENDS="$(printf '%s' "$HDR_CLEAN" | grep -c '\bfriend\b')"
+echo "friend в заголовке   : $HDR_FRIENDS (ожидалось 0)"
+if [ "$HDR_FRIENDS" -ne 0 ]; then
+  echo "  ✗ заголовок лобби объявляет friend. Приватный диспетчер становится доступен"
+  echo "    не-члену, и перепись членов класса (9) перестаёт быть исчерпывающей."
   RC=1
 fi
 

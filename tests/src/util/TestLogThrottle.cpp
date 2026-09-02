@@ -20,11 +20,13 @@
 
 #include <libserver/util/LogThrottle.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -158,11 +160,114 @@ void TestNegativeEpochStillEmitsTheFirstLine()
   CHECK(total == 3);
 }
 
+//! ★ПАРА ЧИСЕЛ В ВЫПУЩЕННОЙ СТРОКЕ СОГЛАСОВАНА ПОД НАГРУЗКОЙ
+//! (R72-fix2-5, находка Codex 5).
+//!
+//! Проверяемое свойство одностороннее и потому не флаки: КАЖДАЯ выпущенная
+//! строка обязана удовлетворять `total >= suppressed + 1` — проглоченных не
+//! может быть больше, чем всего событий минус собственное событие
+//! выпускающего, иначе строка утверждает, что проглоченного не было вовсе.
+//!
+//! ★ФОРМА ТЕСТА ВЫБРАНА ПО СЧЁТУ, А НЕ ПО ВИДУ. Простой «четыре потока молотят
+//! один дроссель» НЕ ЛОВИТ дефект и был отброшен прогоном: чтобы победитель
+//! соврал, число проглоченных, набежавших МЕЖДУ его собственным счётом и его
+//! обменом, должно превысить число уже выпущенных строк — а оно растёт, и
+//! окно закрывается почти сразу. Поэтому гонка ставится там, где выпущенных
+//! строк ещё НОЛЬ: каждый круг — СВЕЖИЙ дроссель, и все потоки заходят в него
+//! одновременно. На прежней реализации это даёт ровно ту строку, которую
+//! назвало ревью: «проглочено 1, всего 1» (прогон на сломанной копии — в
+//! отчёте раунда, 10 запусков из 10 красные).
+void TestEmittedPairIsCoherentUnderContention()
+{
+  constexpr int ThreadCount = 4;
+  constexpr int Rounds = 200000;
+
+  // Окно заведомо больше всего прогона: в каждом круге выпускается ровно одна
+  // строка, остальные заходы обязаны быть проглочены.
+  constexpr auto HugeWindow = std::chrono::hours(1);
+
+  std::atomic<int> generation{0};
+  std::atomic<int> arrived{0};
+  std::atomic<server::util::LogThrottle*> current{nullptr};
+  std::atomic<bool> incoherent{false};
+  std::atomic<uint64_t> worstSuppressed{0};
+  std::atomic<uint64_t> worstTotal{0};
+
+  std::vector<std::thread> threads;
+  threads.reserve(ThreadCount);
+
+  for (int threadIdx = 0; threadIdx < ThreadCount; ++threadIdx)
+  {
+    threads.emplace_back(
+      [&, threadIdx]()
+      {
+        for (int round = 0; round < Rounds; ++round)
+        {
+          // Поток 0 — координатор круга: заводит свежий дроссель и открывает
+          // круг. Остальные ждут открытия.
+          if (threadIdx == 0)
+          {
+            current.store(
+              new server::util::LogThrottle(HugeWindow),
+              std::memory_order_release);
+            generation.store(round + 1, std::memory_order_release);
+          }
+          else
+          {
+            while (generation.load(std::memory_order_acquire) != round + 1)
+              std::this_thread::yield();
+          }
+
+          auto* const throttle = current.load(std::memory_order_acquire);
+
+          uint64_t suppressed = 0;
+          uint64_t total = 0;
+          if (throttle->Allow(suppressed, total) && total < suppressed + 1)
+          {
+            worstSuppressed.store(suppressed, std::memory_order_relaxed);
+            worstTotal.store(total, std::memory_order_relaxed);
+            incoherent.store(true, std::memory_order_relaxed);
+          }
+
+          arrived.fetch_add(1, std::memory_order_acq_rel);
+
+          // Координатор закрывает круг: дроссель уничтожается только после
+          // того, как ВСЕ потоки в нём отметились.
+          if (threadIdx == 0)
+          {
+            while (arrived.load(std::memory_order_acquire)
+              < (round + 1) * ThreadCount)
+            {
+              std::this_thread::yield();
+            }
+            delete throttle;
+          }
+        }
+      });
+  }
+
+  for (auto& thread : threads)
+    thread.join();
+
+  if (incoherent.load(std::memory_order_relaxed))
+  {
+    std::fprintf(
+      stderr,
+      "TestLogThrottle.cpp: выпущенная строка несогласована — "
+      "проглочено %llu при полном счёте %llu\n",
+      static_cast<unsigned long long>(worstSuppressed.load()),
+      static_cast<unsigned long long>(worstTotal.load()));
+  }
+
+  CHECK(not incoherent.load(std::memory_order_relaxed));
+}
+
 } // namespace
 
 int main()
 {
   TestFirstLinePassesAndFloodIsSwallowed();
   TestNegativeEpochStillEmitsTheFirstLine();
+  TestEmittedPairIsCoherentUnderContention();
   return 0;
 }

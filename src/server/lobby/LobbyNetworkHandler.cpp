@@ -40,6 +40,31 @@ namespace
 //! A random device for random number generation.
 std::random_device rd;
 
+//! LOA-fix (R72-fix2-4, round72, backlog #170-item-28, находка Codex 4):
+//! ПОТОЛОК ДЛИНЫ ПРЕДСТАВЛЕНИЯ, В БАЙТАХ UTF-8.
+//!
+//! ★ЗАЧЕМ. Входящая команда вправе занять весь допустимый размер полезной
+//! нагрузки (`CommandServer.cpp`, `MaxCommandDataSize = 8192`), то есть текст
+//! представления приезжает длиной почти в восемь килобайт. Исходящее
+//! уведомление ранча (`RanchCommandSetIntroductionNotify`) пишет ТОТ ЖЕ текст
+//! ПЛЮС четырёхбайтный uid персонажа в буфер того же размера — и не влезает.
+//! `SinkStream::Write` бросает `std::overflow_error`, бросок вылетает из
+//! поставщика данных записи, а его ловит `Client::WriteLoop` — и там стоит
+//! `End()`. То есть длинное представление одного клиента ОТКЛЮЧАЛО ЧЕСТНЫХ
+//! соседей по ранчо, по одному на каждого получателя рассылки. Тот же текст
+//! едет и в `AcCmdLCPersonalInfo` рядом с именем гильдии и прочими полями —
+//! там запас нужен ещё больший.
+//!
+//! ★ПОЧЕМУ ЧЕТЫРЕ КИЛОБАЙТА, А НЕ «сколько влезет». Потолок обязан оставлять
+//! запас ОБОИМ путям доставки, а не одному: 4096 + завершающий ноль + ~110
+//! байт скаляров `AcCmdLCPersonalInfo` + имя гильдии — это меньше половины
+//! буфера. И при этом он заведомо выше всего, что способен прислать клиент
+//! 2013 года: поле представления в нём — короткая строка о себе, а не файл.
+//! Проверка идёт по UTF-8-длине, а она НИКОГДА не меньше длины в CP949, в
+//! которой текст уходит на провод (`locale::FromUtf8`: ASCII 1→1, хангыль
+//! 3→2), — значит потолок по UTF-8 гарантирует потолок на проводе.
+constexpr std::size_t MaxIntroductionLength = 4096;
+
 } // anon namespace
 
 // LOA-fix (R72-1, round72, backlog #129-S1): РЕШЕНИЕ ОБ АУТЕНТИФИКАЦИИ ЖИВЁТ
@@ -1229,6 +1254,13 @@ void LobbyNetworkHandler::HandleClientConnected(
     // LOA-fix (R21-4d, round21, backlog #95): и логовую метку ранч-отсрочки —
     // ClientId переиспользуются (зеркало R12-7).
     iter->second.ranchGraceSince = {};
+    // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1): и слот
+    // просьбы о входе. Штатно контекст снимает разрыв (`LockedContextEraser`),
+    // и `try_emplace` заводит чистую запись; но если запись УЦЕЛЕЛА, а
+    // ClientId достался новому подключению, чужой поднятый слот запретил бы
+    // новому клиенту войти НАВСЕГДА — то же зеркало, что у R12-7 и R21-4d, и
+    // цена ошибки здесь выше, чем у логовой метки.
+    iter->second.loginRequestScheduled = false;
   }
 
   server::util::QuietLogDebug(
@@ -1413,14 +1445,64 @@ void LobbyNetworkHandler::HandleLogin(
   // ★По нему ищет `GetClientIdByUserName`, перебирающий карту с ЧУЖОГО потока:
   // запись строки в контекст во время такого перебора — это гонка на самой
   // строке, а не только на структуре карты.
+  //
+  // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1):
+  // ★СХЛОПЫВАНИЕ — ЗДЕСЬ, НА МЕЖПОТОЧНОМ ВХОДЕ, А НЕ ВНУТРИ ЗАДАЧИ.
+  //
+  // Итерация 1 дедуплицировала очередь входа в `LobbyDirector::QueueClientLogin`
+  // — то есть ВНУТРИ задачи планировщика, которую каждый пакет `AcCmdCLLogin`
+  // уже успел завести. Планировщик исполняет не больше ОДНОЙ задачи за тик
+  // (`Scheduler::Tick` снимает один созревший узел), значит флуд входами копил
+  // задачи быстрее, чем они снимались: рост не ограничен ничем, кроме скорости
+  // клиента, а дедуп на дне очереди задач к этому моменту уже опоздал. Хуже
+  // того, задачи с задержкой доходили до директора и ПОСЛЕ того, как исходная
+  // просьба снята с очереди входа, — и каждая снова доезжала до отказа.
+  //
+  // Решение принимается один раз на клиента и ДО постановки задачи: слот
+  // «просьба стоит» захватывается той же мутацией контекста, под тем же
+  // замком, что и запись имени, — то есть проверка и захват атомарны, а не
+  // «посмотрел, потом занял». Слот освобождает сама задача, когда исполнится:
+  // отсюда верхняя граница «не больше одной задачи входа на клиента
+  // одновременно», не зависящая от того, сколько пакетов прислал сокет.
+  //
+  // ★УЧЁТНЫЕ ДАННЫЕ ПИШЕТ ТОЛЬКО ПОБЕДИТЕЛЬ. Пакет, попавший в уже занятый
+  // слот, не переписывает `userName`: иначе второй пакет менял бы имя под уже
+  // отправленной просьбой об аутентификации — ровно то, от чего защищается
+  // `QueueClientLogin`.
+  bool loginRequestClaimed = false;
   if (not MutateClientContext(
         clientId,
-        [&command](ClientContext& clientContext)
+        [&command, &loginRequestClaimed](ClientContext& clientContext)
         {
+          if (clientContext.loginRequestScheduled)
+            return;
+
+          clientContext.loginRequestScheduled = true;
           clientContext.userName = command.loginId;
+          loginRequestClaimed = true;
         }))
   {
     throw std::runtime_error("Lobby client is not available");
+  }
+
+  if (not loginRequestClaimed)
+  {
+    // ★СБРАСЫВАЕМ МОЛЧА ДЛЯ КЛИЕНТА, НО НЕ ДЛЯ ЛОГА. Отбитый пакет обязан
+    // где-то считаться, иначе «схлопнули» неотличимо от «потеряли»: строка
+    // выходит не чаще раза в окно и несёт накопительный счёт.
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_loginRequestCoalesceThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Coalesced a duplicate lobby login request: client {} already has a "
+        "login request pending; {} more coalesced since the previous line; "
+        "{} coalesced login requests total since start",
+        clientId,
+        suppressed,
+        total);
+    }
+    return;
   }
 
   _serverInstance.GetLobbyDirector().GetScheduler().Queue(
@@ -1432,6 +1514,19 @@ void LobbyNetworkHandler::HandleLogin(
         userToken);
 
       //SendWaitingSeqno(clientId, queuePosition);
+
+      // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1): слот
+      // освобождается ПОСЛЕ того, как просьба доехала до директора. Порядок
+      // не косметический: освободи его раньше — и пакет, пришедший между
+      // освобождением и постановкой в очередь, завёл бы вторую задачу на того
+      // же клиента. Клиента могло уже не быть — тогда мутация просто вернёт
+      // false, контекст снят разрывом вместе со слотом.
+      [[maybe_unused]] const bool released = MutateClientContext(
+        clientId,
+        [](ClientContext& clientContext)
+        {
+          clientContext.loginRequestScheduled = false;
+        });
     });
 }
 
@@ -3130,6 +3225,40 @@ void LobbyNetworkHandler::HandleSetIntroduction(
   const protocol::AcCmdCLSetIntroduction& command)
 {
   const auto clientContext = GetClientContext(clientId);
+
+  // LOA-fix (R72-fix2-4, round72, backlog #170-item-28, находка Codex 4):
+  // ★ОТБРАСЫВАЕМ ДО ЗАПИСИ И ДО РАССЫЛКИ, А НЕ ПОСЛЕ.
+  //
+  // Слишком длинное представление нельзя ни сохранить, ни разослать: рассылка
+  // переполнит исходящий буфер, бросок вылетит из поставщика записи и
+  // `Client::WriteLoop` закроет сокет — ЧУЖОЙ, соседа по ранчо. Порядок
+  // важен: запиши мы текст в запись персонажа до проверки, он остался бы
+  // лежать там навсегда и рвал бы соединения дальше — уже на просмотре
+  // профиля, вообще без участия автора.
+  //
+  // ★ЧЕСТНОГО КЛИЕНТА НЕ ОТКЛЮЧАЕМ. Кадр разобран, сессия цела, ответа у
+  // команды нет ни в каком случае (`AcCmdCLSetIntroduction` не имеет OK-формы)
+  // — поэтому единственное последствие для отправителя это то, что его текст
+  // не применён; строка в логе дросселирована и несёт накопительный счёт.
+  if (command.introduction.size() > MaxIntroductionLength)
+  {
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_oversizedIntroductionThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Dropped an oversized introduction from client {}: {} bytes exceed the "
+        "{}-byte limit; {} more dropped since the previous line; {} oversized "
+        "introductions total since start",
+        clientId,
+        command.introduction.size(),
+        MaxIntroductionLength,
+        suppressed,
+        total);
+    }
+    return;
+  }
+
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 

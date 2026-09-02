@@ -163,12 +163,24 @@ class Statement:
 
 
 def collect_statements(clean_text):
-    """Yield (statement_text, line, scope_kind_of_enclosing_scope).
+    """Yield (statement_text, line, scope_kind, inline_type).
 
     Scope kinds: 'agg' (struct/class/union body), 'enum', 'ns', 'func', 'file'.
     A `{` that is a braced INITIALISER is kept inside the statement rather than
     opening a scope, so `data::Clock::duration d{0};` reads as one declaration
     that HAS an initialiser.
+
+    ★`inline_type` IS THE PART THE FIRST VERSION LOST (R72-fix2-3, Codex finding 3,
+    iteration 2). `enum class Part { Body, Mane, Tail } parts;` declares a FIELD, and
+    a scalar one — but the closing brace of the enum body cleared the buffer, so the
+    statement that reached the judge was the bare declarator `parts`, with no type in
+    it at all. `FIELD_NAME_RE` did not match it and the field left through a silent
+    `continue`. It is not hypothetical: `ItemRegistry.hpp` holds six such statements,
+    and one of them (`} parts;`) is a genuine uninitialised enum field that this gate
+    reported as "clean" for as long as it existed. Now the closing brace REMEMBERS
+    what kind of body it closed, and the declarator behind it is judged as a field of
+    that inline type: 'enum' -> scalar, 'agg' -> an aggregate judged by its own
+    fields.
     """
     statements = []
     scopes = ["file"]
@@ -176,6 +188,7 @@ def collect_statements(clean_text):
     buf_line = None
     line = 1
     init_depth = 0
+    inline_type = None
 
     def buf_text():
         return re.sub(r"\s+", " ", "".join(buf)).strip()
@@ -227,12 +240,14 @@ def collect_statements(clean_text):
             scopes.append(kind)
             buf.clear()
             buf_line = None
+            inline_type = None
             i += 1
             continue
 
         if c == "}":
-            if len(scopes) > 1:
-                scopes.pop()
+            closed = scopes.pop() if len(scopes) > 1 else None
+            # A declarator may follow the body of a type defined right here.
+            inline_type = closed if closed in ("enum", "agg") else None
             buf.clear()
             buf_line = None
             i += 1
@@ -241,9 +256,10 @@ def collect_statements(clean_text):
         if c == ";":
             text = buf_text()
             if text:
-                statements.append((text, buf_line, scopes[-1]))
+                statements.append((text, buf_line, scopes[-1], inline_type))
             buf.clear()
             buf_line = None
+            inline_type = None
             i += 1
             continue
 
@@ -337,10 +353,44 @@ METHOD_TAIL_RE = re.compile(
 BITFIELD_RE = re.compile(r"^(?P<decl>.+?)\s*(?<!:):(?!:)\s*(?P<width>[^:]+)$")
 
 
-def classify_statement_with_parens(decl):
-    """'funcptr' | 'method' | None (unclassifiable — the caller must STOP)."""
+# A PARENTHESISED DECLARATOR: `uint32_t (flags);`. Legal C++, and a plain scalar
+# field — the parentheses around the declarator name mean nothing here. It ends with
+# `)` exactly like a method declaration does, so METHOD_TAIL_RE swallowed it and the
+# field left the gate counted as "a method" (Codex finding 3, iteration 2).
+PAREN_DECLARATOR_RE = re.compile(r"^(?P<type>.+?)\s*\(\s*(?P<name>\w+)\s*\)$")
+
+# A top-level comma joins SEVERAL declarators into one statement (`uint32_t a, b;`).
+# Commas inside <>, (), [] or {} belong to a template argument list, a parameter list,
+# an array bound or a braced initialiser and are none of our business.
+def has_top_level_comma(text):
+    depth = 0
+    for char in text:
+        if char in "<([{":
+            depth += 1
+        elif char in ">)]}":
+            depth -= 1
+        elif char == "," and depth <= 0:
+            return True
+    return False
+
+
+def classify_statement_with_parens(decl, aliases, enums, aggregates):
+    """'funcptr' | ('field', type) | 'method' | None (unclassifiable — caller STOPS).
+
+    ★THE AMBIGUITY IS REAL AND IS RESOLVED THE WAY A COMPILER RESOLVES IT.
+    `uint32_t (flags);` and `void Handle(Payload);` have the same shape: a type, then
+    a parenthesised single identifier. What separates them is whether that identifier
+    NAMES A TYPE. `Payload` is a struct in the alias/aggregate tables, so the second
+    is a method declaration with an unnamed parameter; `flags` is nothing of the kind,
+    so the first is a field whose declarator merely wears parentheses. Guessing by
+    form alone is what let a scalar field out of the gate.
+    """
     if FUNCTION_POINTER_RE.search(decl):
         return "funcptr"
+    paren = PAREN_DECLARATOR_RE.match(decl)
+    if paren is not None and classify(
+            paren.group("name"), aliases, enums, aggregates) is None:
+        return ("field", paren.group("type"))
     if METHOD_TAIL_RE.search(decl):
         return "method"
     return None
@@ -349,8 +399,22 @@ def classify_statement_with_parens(decl):
 def scan_file(path, aliases, enums, aggregates, report):
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         clean = strip_comments_and_strings(handle.read())
-    for text, line, scope in collect_statements(clean):
+    for text, line, scope, inline_type in collect_statements(clean):
         if scope != "agg":
+            continue
+
+        # ★ДЕКЛАРАТОР ПРИ ВСТРОЕННОМ ОПРЕДЕЛЕНИИ ТИПА (R72-fix2-3, Codex finding 3).
+        # Тип определён прямо здесь и уже съеден закрывающей скобкой; судить
+        # остаётся по ВИДУ тела: перечисление — скаляр (ровно та же дыра, что
+        # #174), агрегат — сам себе гард.
+        if inline_type is not None:
+            report["fields"] += 1
+            if "{" in text or "=" in text:
+                continue
+            report["without_init"] += 1
+            if inline_type == "enum":
+                report["offenders"].append(
+                    (path, line, text, "перечисление, объявленное на месте"))
             continue
         # An access specifier can sit on the same statement as the first field
         # (`public: uint32_t a;`) — strip it, do not lose the field with it.
@@ -365,6 +429,21 @@ def scan_file(path, aliases, enums, aggregates, report):
             report["methods"] += 1
             continue
 
+        # ★НЕСКОЛЬКО ДЕКЛАРАТОРОВ В ОДНОМ ОБЪЯВЛЕНИИ — ОСТАНОВ, А НЕ ТИШИНА
+        # (R72-fix2-3, Codex finding 3, iteration 2). `uint32_t a, b;` — законное
+        # объявление ДВУХ скалярных полей; прежний разбор ловил из него в лучшем
+        # случае одно, а `uint32_t a[2], b;` не ловил ни одного и молча уходил
+        # через `continue`. Разбирать общий случай (у каждого декларатора могут
+        # быть свои `*`, `[]` и свой инициализатор) — это писать парсер
+        # деклараторов; вместо этого гард ГРОМКО требует разнести объявление по
+        # одному полю на строку. Тихо пропустить нельзя: ровно так поле и уходит
+        # из-под гарда.
+        if has_top_level_comma(text):
+            report["unparsed"].append(
+                (path, line, text,
+                 "несколько деклараторов в одном объявлении — разнеси по одному на строку"))
+            continue
+
         has_init = "{" in text or "=" in text
         decl = text.split("=")[0].split("{")[0].strip()
 
@@ -376,18 +455,29 @@ def scan_file(path, aliases, enums, aggregates, report):
         # judged as the initialised field it is, not thrown away as "a functional
         # cast".
         if "(" in decl or ")" in decl:
-            kind = classify_statement_with_parens(decl)
+            kind = classify_statement_with_parens(decl, aliases, enums, aggregates)
             if kind == "method":
                 report["methods"] += 1
                 continue
             if kind is None:
-                report["unparsed"].append((path, line, text))
+                report["unparsed"].append(
+                    (path, line, text,
+                     "объявление со скобками не отнесено ни к методу, ни к полю"))
                 continue
             report["fields"] += 1
             if has_init:
                 continue
             report["without_init"] += 1
-            report["offenders"].append((path, line, text, "указатель на функцию"))
+            if kind == "funcptr":
+                report["offenders"].append((path, line, text, "указатель на функцию"))
+                continue
+            # ('field', type): скобки стояли вокруг ИМЕНИ, а не вокруг параметров —
+            # судим по типу, как любое другое поле.
+            verdict = classify(kind[1], aliases, enums, aggregates)
+            if verdict is None:
+                report["unknown"].append((path, line, text, kind[1]))
+            elif verdict == "scalar":
+                report["offenders"].append((path, line, text, normalise_type(kind[1])))
             continue
 
         # ★BIT-FIELDS ARE JUDGED, NOT SKIPPED (R72-fix-5, Codex finding 5). The width
@@ -399,6 +489,11 @@ def scan_file(path, aliases, enums, aggregates, report):
 
         match = FIELD_NAME_RE.match(decl)
         if not match:
+            # ★И ЗДЕСЬ ТОЖЕ НЕ ТИШИНА (R72-fix2-3, Codex finding 3, iteration 2).
+            # Прежде необнаруженная форма молча уходила через `continue` — то
+            # есть гард отвечал «чисто» про объявление, которого он не прочитал.
+            report["unparsed"].append(
+                (path, line, text, "объявление не разобрано как «тип имя»"))
             continue
         report["fields"] += 1
         if has_init:
@@ -463,10 +558,10 @@ def run_tree(directory, repo_root):
         print("ОСТАНОВ: полей без инициализатора меньше порога — разбор поехал")
         invalid = True
     if report["unparsed"]:
-        print(f"ОСТАНОВ: объявлений со скобками, которые разбор не смог отнести "
+        print(f"ОСТАНОВ: объявлений, которые разбор не смог отнести "
               f"ни к методу, ни к полю: {len(report['unparsed'])}")
-        for path, line, text in report["unparsed"]:
-            print(f"  {relpath(path, repo_root)}:{line}: {text};")
+        for path, line, text, reason in report["unparsed"]:
+            print(f"  {relpath(path, repo_root)}:{line}: {text};   [{reason}]")
         print("  молча пропустить такую форму нельзя — именно так поле уходит из-под гарда")
         invalid = True
     if report["unknown"]:
@@ -511,6 +606,12 @@ SELFTEST_EXPECTATIONS = {
     "bitfield_bad.hpp":            {"code": 1, "offenders": [("flags", 18)]},
     "bitfield_init_ok.hpp":        {"code": 0, "offenders": []},
     "trailing_return_stop.hpp":    {"code": 2, "offenders": []},
+    # R72-fix2-3 (Codex finding 3, iteration 2): the three forms that were STILL
+    # silent after iteration 1 — a parenthesised declarator, several declarators in
+    # one statement, and a declarator behind an inline enum body.
+    "paren_declarator_bad.hpp":    {"code": 1, "offenders": [("flags", 19)]},
+    "multi_declarator_stop.hpp":   {"code": 2, "offenders": []},
+    "inline_enum_bad.hpp":         {"code": 1, "offenders": [("part", 28)]},
 }
 
 
@@ -526,6 +627,9 @@ def offender_field_name(text):
     pointer = re.search(r"\(\s*\*+\s*(\w+)\s*\)", decl)
     if pointer:
         return pointer.group(1)
+    paren = PAREN_DECLARATOR_RE.match(decl)
+    if paren is not None:
+        return paren.group("name")
     bitfield = BITFIELD_RE.match(decl)
     if bitfield is not None:
         decl = bitfield.group("decl").strip()
@@ -580,7 +684,7 @@ def selftest(repo_root):
             found = None
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 clean = strip_comments_and_strings(handle.read())
-            for text, line, scope in collect_statements(clean):
+            for text, line, scope, _inline in collect_statements(clean):
                 if scope == "agg" and text.split("=")[0].split("{")[0].strip().endswith(probe[0]):
                     found = line
             if found != probe[1]:
