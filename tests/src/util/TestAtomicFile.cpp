@@ -276,12 +276,60 @@ void TestHardenSecretFilesInDirectory(const std::filesystem::path& sandbox)
   assert(third.failed == 0);
   assert(ModeOf(outsider) == 0644);
 
-  // Каталога нет — не ошибка и не бросок.
+  // Каталога нет — не ошибка и не бросок, но и НЕ «всё проверено»: этот случай
+  // обязан быть отличим от пустого читаемого каталога, иначе «0 отказов»
+  // означало бы «чисто» там, где мы вообще не смотрели.
   const auto absent =
     server::util::HardenSecretFilesInDirectory(sandbox / "no-such-dir");
   assert(absent.examined == 0);
   assert(absent.narrowed == 0);
   assert(absent.failed == 0);
+  assert(absent.incomplete);
+
+  // ...а пустой СУЩЕСТВУЮЩИЙ каталог — это полный обход с нулём находок.
+  const auto emptyDirectory = sandbox / "empty-accounts";
+  std::filesystem::create_directories(emptyDirectory);
+  const auto empty = server::util::HardenSecretFilesInDirectory(emptyDirectory);
+  assert(empty.examined == 0);
+  assert(not empty.incomplete);
+}
+
+//! ★ОБЩИЙ ОБХОД КАТАЛОГА (правка ревью, итерация 2). Проверяется РОВНО то
+//! свойство, ради которого он заведён: полный обход отличим от оборванного, а
+//! нечитаемый каталог не выглядит как пустой.
+void TestListRegularFiles(const std::filesystem::path& sandbox)
+{
+  const auto directory = sandbox / "listing";
+  std::filesystem::create_directories(directory);
+  SeedFile(directory / "a.json", 0600);
+  SeedFile(directory / "b.json", 0600);
+  std::filesystem::create_directories(directory / "nested");
+
+  const auto listing = server::util::ListRegularFiles(directory);
+  assert(listing.files.size() == 2);   // подкаталог — не обычный файл
+  assert(not listing.incomplete);
+
+  // Каталога нет — пусто И неполно, а не просто пусто.
+  const auto absent = server::util::ListRegularFiles(sandbox / "no-such-listing");
+  assert(absent.files.empty());
+  assert(absent.incomplete);
+
+  // ★НЕЧИТАЕМЫЙ КАТАЛОГ НЕ ИМЕЕТ ПРАВА ВЫГЛЯДЕТЬ ПУСТЫМ. Под root права не
+  // ограничивают, и утверждение молча стало бы ложно-зелёным, поэтому оно
+  // выполняется только под обычным пользователем.
+  if (::geteuid() != 0)
+  {
+    const auto locked = sandbox / "locked-listing";
+    std::filesystem::create_directories(locked);
+    SeedFile(locked / "hidden.json", 0600);
+    assert(::chmod(locked.c_str(), 0000) == 0);
+
+    const auto blind = server::util::ListRegularFiles(locked);
+    assert(blind.files.empty());
+    assert(blind.incomplete);
+
+    assert(::chmod(locked.c_str(), 0700) == 0);
+  }
 }
 
 } // namespace
@@ -297,6 +345,7 @@ int main()
   TestHostileUmask(sandbox);
   TestEnsureDirectoryMode(sandbox);
   TestHardenSecretFilesInDirectory(sandbox);
+  TestListRegularFiles(sandbox);
 
   UnlockTree(sandbox);
   std::error_code ignored;

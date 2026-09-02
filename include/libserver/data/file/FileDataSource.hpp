@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <filesystem>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -231,16 +232,30 @@ private:
   std::unordered_set<std::string> _userNameKeys;
   mutable std::shared_mutex _userNameIndexMutex;
 
+  //! Отпечаток каталога аккаунтов на момент последней ПОЛНОЙ перестройки
+  //! индекса. Промах индекса переспрашивает диск только когда отпечаток
+  //! разошёлся, поэтому регистронезависимость сохраняется без обхода на пакет.
+  //! Оба поля живут под `_userNameIndexMutex`.
+  std::filesystem::file_time_type _userIndexDirectoryStamp{};
+  //! Отпечаток снят полной перестройкой (а не оборванной) и ему можно верить.
+  bool _userIndexStampValid = false;
+
   //! Потолки длины имени для СТРУКТУРНОГО ГЕЙТА, поднятые до самой длинной
   //! записи, которая реально лежит в индексе (правка ревью, итерация 1).
   //! Ниже `kMaxStoredNameBytes`/`kMaxLoginNameBytes` не опускаются никогда:
   //! это пол, а не значение.
-  //! ★ЛИТЕРАЛЫ, А НЕ `kMaxStoredNameBytes`/`kMaxLoginNameBytes`: этот заголовок
-  //! намеренно не тянет `NameGuard.hpp` (инлайн-бюджет TU — см. лесенку).
-  //! Расхождение ловится `static_assert` в `FileDataSource.cpp`, то есть
-  //! КОМПИЛЯЦИЕЙ, а не внимательностью.
-  std::atomic_size_t _characterNameCeiling{64};
-  std::atomic_size_t _loginNameCeiling{48};
+  //! ★ИМЕНОВАННЫЕ КОНСТАНТЫ, А НЕ ЛИТЕРАЛЫ В ИНИЦИАЛИЗАТОРЕ (правка ревью,
+  //! итерация 2). Заголовок намеренно не тянет `NameGuard.hpp` (инлайн-бюджет
+  //! TU — см. лесенку), поэтому пол объявлен здесь. Но прежняя редакция
+  //! сверяла `static_assert`'ом гейт с ЛИТЕРАЛОМ 64, а инициализатор нёс СВОЙ
+  //! литерал 64: правка `{64}` -> `{32}` компилировалась молча, и заявленная
+  //! защита от расхождения не срабатывала. Теперь значение ОДНО, и
+  //! `static_assert` в `FileDataSource.cpp` сверяет с гейтом именно его —
+  //! разъехаться стало нечему.
+  static constexpr std::size_t kCharacterNameCeilingFloor = 64;
+  static constexpr std::size_t kLoginNameCeilingFloor = 48;
+  std::atomic_size_t _characterNameCeiling{kCharacterNameCeilingFloor};
+  std::atomic_size_t _loginNameCeiling{kLoginNameCeilingFloor};
 
   //! Сколько обращений отбито структурным гейтом имени. Читается РОВНО ОДИН раз,
   //! на `Terminate` — счётчик существует затем, чтобы гейт был проверкой, чей
@@ -253,10 +268,16 @@ private:
   void IndexCharacterName(data::Uid uid, const std::string& name);
   //! Убрать запись индекса.
   void ForgetCharacterName(data::Uid uid);
-  //! Перестроить индекс имён аккаунтов с диска. Зовётся только из `Initialize`.
+  //! Перестроить индекс имён аккаунтов с диска. Зовётся из `Initialize` и с
+  //! промаха `IsUserNameUnique`, когда каталог аккаунтов изменился.
   void RebuildUserNameIndex();
   //! Внести одну запись индекса аккаунтов (регистрация и любое сохранение).
   void IndexUserName(const std::string& name);
+  //! Перестроить индекс аккаунтов, ЕСЛИ каталог изменился с последней полной
+  //! перестройки. Возвращает `true`, если перестройка состоялась (тогда индекс
+  //! имеет смысл переспросить). Замок внутри не удерживается через вызов
+  //! `RebuildUserNameIndex`: `shared_mutex` не рекурсивный.
+  bool RefreshUserNameIndexIfDirectoryChanged();
 };
 
 } // namespace server

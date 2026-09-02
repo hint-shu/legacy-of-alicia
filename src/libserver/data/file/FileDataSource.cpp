@@ -155,15 +155,13 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
 {
   uint32_t highest = 0;
 
-  std::error_code error;
-  if (not std::filesystem::is_directory(root, error) || error)
-    return highest;
-
-  for (const auto& entry : std::filesystem::directory_iterator(root, error))
+  // ★ОБХОД ЧЕРЕЗ `ListRegularFiles` (правка ревью, итерация 2): продвижение
+  // итератора в range-for бросает, а счётчик uid считается на СТАРТЕ — исключение
+  // отсюда роняло бы процесс до первого игрока.
+  const auto listing = server::util::ListRegularFiles(root);
+  for (const auto& entryPath : listing.files)
   {
-    if (error)
-      break;
-    if (not entry.is_regular_file() || entry.path().extension() != ".json")
+    if (entryPath.extension() != ".json")
       continue;
 
     // ★РАЗБОР СТРОГИЙ, И ЭТО НЕ ПЕДАНТИЗМ. `std::stoul` принимает знак и
@@ -171,7 +169,7 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
     // UINT32_MAX — а следующий `++счётчик` завернул бы его в 0, то есть в
     // `InvalidUid`. Фикс, поставленный ПРОТИВ обнуления счётчиков, сам открыл
     // бы дорогу к обнулению. Найдено ревью (итерация 1).
-    const auto stem = entry.path().stem().string();
+    const auto stem = entryPath.stem().string();
     if (stem.empty() || stem.size() > 10
       || not std::ranges::all_of(stem, [](const unsigned char symbol)
         {
@@ -197,16 +195,22 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
 
 } // anon namespace
 
-// ★ПОЛЫ ПОТОЛКОВ ОБЪЯВЛЕНЫ В ЗАГОЛОВКЕ ЛИТЕРАЛАМИ (он не включает NameGuard.hpp).
-// Расхождение с самим гейтом обязано быть ошибкой КОМПИЛЯЦИИ, а не сюрпризом в
-// рантайме: разъехавшись, они сделали бы часть живых имён неадресуемыми.
-static_assert(server::util::kMaxStoredNameBytes == 64,
-  "FileDataSource.hpp initialises _characterNameCeiling with the literal 64");
-static_assert(server::util::kMaxLoginNameBytes == 48,
-  "FileDataSource.hpp initialises _loginNameCeiling with the literal 48");
-
 void server::FileDataSource::Initialize(const std::filesystem::path& path)
 {
+  // ★СВЕРКА ИДЁТ С ТЕМ, ЧЕМ ЧЛЕН РЕАЛЬНО ИНИЦИАЛИЗИРУЕТСЯ (правка ревью,
+  // итерация 2). Прежняя редакция сверяла гейт с ЛИТЕРАЛОМ, написанным в самом
+  // `static_assert`, а инициализатор члена нёс свой собственный литерал: правка
+  // `{64}` -> `{32}` проходила компиляцию молча, то есть защита от расхождения
+  // была объявлена, но не работала. Теперь сверяется именно та константа,
+  // которой инициализируется потолок.
+  //
+  // Утверждения стоят В ТЕЛЕ МЕТОДА, а не в области имён файла, потому что
+  // константы приватные: членская функция имеет к ним доступ, свободная — нет.
+  static_assert(server::util::kMaxStoredNameBytes == kCharacterNameCeilingFloor,
+    "the character name ceiling floor has drifted from the name guard's bound");
+  static_assert(server::util::kMaxLoginNameBytes == kLoginNameCeilingFloor,
+    "the login name ceiling floor has drifted from the name guard's bound");
+
   _dataPath = path;
   _metaFilePath = _dataPath;
 
@@ -260,13 +264,39 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   // единой перезаписи содержимого.
   const auto hardening =
     server::util::HardenSecretFilesInDirectory(_userDataPath);
-  if (hardening.narrowed > 0 || hardening.failed > 0)
+  if (hardening.narrowed > 0)
   {
     server::util::QuietLogWarn(
       "Account files in '{}': {} of {} examined were group/other-readable and "
-      "were narrowed to owner-only, {} could not be secured",
-      _userDataPath.string(), hardening.narrowed, hardening.examined,
-      hardening.failed);
+      "were narrowed to owner-only",
+      _userDataPath.string(), hardening.narrowed, hardening.examined);
+  }
+
+  // ★ОТКАЗ СУЖЕНИЯ ОСТАНАВЛИВАЕТ СТАРТ (правка ревью, итерация 2). Прежняя
+  // редакция считала отказы и печатала строку, после чего сервер начинал
+  // обслуживать игроков — то есть при `EPERM`/`EROFS`/`EIO` хеш пароля
+  // оставался читаемым для group/other, а корневой инвариант раунда («секрет не
+  // лежит в файле, доступном кому-то кроме владельца») держался бы только на
+  // том, что кто-то прочитает лог. Инвариант, который умеет не выполниться и
+  // никого не остановить, — не инвариант.
+  //
+  // ★НЕЗАВЕРШЁННЫЙ ОБХОД ТОЖЕ ФАТАЛЕН. `incomplete` означает, что часть файлов
+  // мы НЕ ОСМОТРЕЛИ: «0 отказов» тогда говорит не «всё чисто», а «мы не знаем».
+  // Отличить эти два случая обязан код, а не читатель лога.
+  if (hardening.failed > 0 || hardening.incomplete)
+  {
+    server::util::QuietLogError(
+      "Account files in '{}': {} of {} examined could not be secured{}; "
+      "refusing to start with password hashes readable beyond their owner",
+      _userDataPath.string(), hardening.failed, hardening.examined,
+      hardening.incomplete ? ", and the directory scan did not finish" : "");
+
+    throw std::runtime_error(
+      std::format(
+        "Account files in '{}' could not be restricted to owner-only "
+        "({} failed, {} examined, scan {})",
+        _userDataPath.string(), hardening.failed, hardening.examined,
+        hardening.incomplete ? "incomplete" : "complete"));
   }
 
   // Read the meta-data file and parse the sequential UIDs.
@@ -501,23 +531,57 @@ bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
   // класс «имя с провода не вызывает обхода файловой системы» оставался
   // открытым. Сравнение по-прежнему ASCII-регистронезависимое — ключ индекса
   // и есть имя в нижнем ASCII-регистре, поэтому смысл ответа не изменился.
+  const auto key = server::util::AsciiLowerKey(name);
+
   {
     const std::shared_lock indexLock(_userNameIndexMutex);
-    if (_userNameKeys.contains(server::util::AsciiLowerKey(name)))
+    if (_userNameKeys.contains(key))
       return false;
   }
 
-  // ★ОДИН `stat`, А НЕ ВОЗВРАТ ОБХОДА. Файл аккаунта могут положить рядом с
-  // работающим сервером (скрипт заведения друга на ВПС), и индекс о нём узнает
-  // только после перезапуска. Прежний обход такой аккаунт видел; менять путь
-  // успеха ради пути отказа нельзя, поэтому промах индекса стоит РОВНО одну
-  // проверку одного пути — константу, а не O(число аккаунтов). Имя уже прошло
-  // `IsLoginNameSafe`, то есть в нём нет ни `/`, ни точек: собрать из него путь
-  // наружу каталога невозможно.
+  // ★ПРОМАХ ПЕРЕСПРАШИВАЕТ ИНДЕКС, А НЕ ФАЙЛОВУЮ СИСТЕМУ ПО ТОЧНОМУ ИМЕНИ
+  // (правка ревью, итерация 2). Прежняя редакция добирала промах одним
+  // `stat` пути `<name>.json` — и этим МОЛЧА теряла регистронезависимость:
+  // индекс сравнивает по ASCII-нижнему регистру (и прежний обход сравнивал
+  // регуляркой с `icase`), а `stat` на ext4 регистрозависим. Аккаунт
+  // `Alice.json`, заведённый скриптом рядом с работающим сервером, на команду
+  // `//infraction list alice` отвечал бы «такого игрока нет», хотя обход,
+  // который мы заменили, его находил. Это потеря пути успеха у честного
+  // администратора — ровно то, чего замена обхода индексом делать не должна.
+  //
+  // ★И ЭТО НЕ ВОЗВРАТ ОБХОДА НА ПАКЕТ. Перестройка запускается только когда
+  // отпечаток каталога ОТЛИЧАЕТСЯ от снятого при последней полной перестройке,
+  // то есть когда файлы действительно появлялись. Промах при неизменившемся
+  // каталоге стоит один `last_write_time` — константу. Изменить mtime каталога
+  // `data/users` с провода нельзя: аккаунты там заводит не игрок, так что
+  // повторную перестройку никто не «закажет» пакетами.
+  if (RefreshUserNameIndexIfDirectoryChanged())
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    if (_userNameKeys.contains(key))
+      return false;
+  }
+
+  return true;
+}
+
+bool server::FileDataSource::RefreshUserNameIndexIfDirectoryChanged()
+{
   std::error_code error;
-  const bool onDisk = std::filesystem::is_regular_file(
-    _userDataPath / (std::string(name) + ".json"), error);
-  return not onDisk || static_cast<bool>(error);
+  const auto stamp = std::filesystem::last_write_time(_userDataPath, error);
+
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    // Отпечаток совпал — каталог не менялся с последней ПОЛНОЙ перестройки,
+    // значит промах индекса и есть ответ «такого аккаунта нет».
+    if (not error && _userIndexStampValid && stamp == _userIndexDirectoryStamp)
+      return false;
+  }
+
+  // Замок здесь НЕ держится: `RebuildUserNameIndex` берёт тот же мьютекс
+  // эксклюзивно, а `shared_mutex` не рекурсивный — удержание было бы дедлоком.
+  RebuildUserNameIndex();
+  return true;
 }
 
 void server::FileDataSource::RebuildUserNameIndex()
@@ -526,35 +590,43 @@ void server::FileDataSource::RebuildUserNameIndex()
   _userNameKeys.clear();
   RaiseNameCeiling(_loginNameCeiling, server::util::kMaxLoginNameBytes);
 
-  std::error_code error;
-  if (not std::filesystem::is_directory(_userDataPath, error) || error)
+  // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ОБХОДА, А НЕ ПОСЛЕ. Файл, положенный рядом ВО ВРЕМЯ
+  // обхода, обязан оставить отпечаток «устаревшим», иначе он потерялся бы до
+  // перезапуска. Снимок «до» ошибается только в безопасную сторону — лишняя
+  // перестройка, а не пропущенный аккаунт.
+  std::error_code stampError;
+  const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
+
+  const auto listing = server::util::ListRegularFiles(_userDataPath);
+  if (listing.incomplete)
   {
     server::util::QuietLogError(
-      "Account name index: '{}' is not a directory, staff lookups by account "
-      "name will find nothing", _userDataPath.string());
-    return;
+      "Account name index: the scan of '{}' did not finish, the index is "
+      "incomplete and will be rebuilt on the next miss", _userDataPath.string());
   }
 
-  for (const auto& file :
-    std::filesystem::directory_iterator(_userDataPath, error))
+  for (const auto& filePath : listing.files)
   {
-    if (error)
-      break;
     // Тот же фильтр, что у прежнего обхода (R58-7): `.json` и только он —
     // осиротевший `Вася.json.tmp` не имеет права занять имя «Вася».
-    if (not file.is_regular_file() || file.path().extension() != ".json")
+    if (filePath.extension() != ".json")
       continue;
 
     // ★КЛЮЧ БЕРЁТСЯ ИЗ ИМЕНИ ФАЙЛА, а не из JSON: именно по имени файла
     // `LocalAuthenticationBackend` открывает аккаунт, и именно оно решало исход
     // прежнего обхода. Читать здесь содержимое значило бы разобрать все
     // аккаунты на старте ради поля, которое ни на что не влияет.
-    const auto stem = file.path().stem().string();
+    const auto stem = filePath.stem().string();
     if (stem.empty())
       continue;
     RaiseNameCeiling(_loginNameCeiling, stem.size());
     _userNameKeys.insert(server::util::AsciiLowerKey(stem));
   }
+
+  // Отпечаток считается действительным ТОЛЬКО у полной перестройки: иначе
+  // «совпал» означало бы «мы уже смотрели», хотя посмотрели не всё.
+  _userIndexStampValid = not stampError && not listing.incomplete;
+  _userIndexDirectoryStamp = stamp;
 
   server::util::QuietLogInfo(
     "Account name index: {} account names indexed", _userNameKeys.size());
@@ -1259,25 +1331,22 @@ void server::FileDataSource::RebuildCharacterNameIndex()
   std::size_t skipped = 0;
   std::size_t duplicates = 0;
 
-  std::error_code error;
-  if (not std::filesystem::is_directory(_characterDataPath, error) || error)
+  const auto listing = server::util::ListRegularFiles(_characterDataPath);
+  if (listing.incomplete)
   {
     server::util::QuietLogError(
-      "Character name index: '{}' is not a directory, lookups by name will find "
-      "nothing", _characterDataPath.string());
-    return;
+      "Character name index: the scan of '{}' did not finish, some characters "
+      "will not be addressable by name until the next restart",
+      _characterDataPath.string());
   }
 
-  for (const auto& file :
-    std::filesystem::directory_iterator(_characterDataPath, error))
+  for (const auto& filePath : listing.files)
   {
-    if (error)
-      break;
     // Тот же фильтр, что у прежнего обхода (R58-8): `.json` и только он.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
+    if (filePath.extension() != ".json")
       continue;
 
-    std::ifstream dataFile(file.path());
+    std::ifstream dataFile(filePath);
     if (not dataFile.is_open())
     { ++skipped; continue; }
 
@@ -1297,7 +1366,7 @@ void server::FileDataSource::RebuildCharacterNameIndex()
       // name» ОБЯЗАНА исчезнуть из бинаря, это маркер лесенки.
       server::util::QuietLogWarn(
         "Character file '{}' is unreadable ({}) and was skipped while building "
-        "the character name index", file.path().string(), x.what());
+        "the character name index", filePath.string(), x.what());
       ++skipped;
       continue;
     }

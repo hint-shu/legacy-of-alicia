@@ -87,8 +87,43 @@ if [ "$CANARY_HITS" -lt 3 ]; then
 fi
 
 # Blindness guard #2: how many files exist vs how many grep actually opened.
-FOUND="$(cd "$ROOT" && find $SCOPE -type f | wc -l)"
-SCANNED="$(cd "$ROOT" && grep -rac --binary-files=text '' $SCOPE 2>/dev/null | wc -l)"
+#
+# ★ОШИБКИ ОБХОДА ЛОВЯТСЯ, А НЕ ГЛУШАТСЯ (правка ревью, итерация 2). Прежняя
+# редакция брала `find ... | wc -l` и `grep ... 2>/dev/null`: нечитаемый подкаталог
+# выпадал ИЗ ОБОИХ чисел разом, равенство «просканировано == найдено» продолжало
+# держаться, и при достаточном остатке читаемых файлов гейт печатал «ЧИСТО ✓» —
+# хотя нарушитель мог лежать ровно в том подкаталоге, куда мы не заглянули.
+# Симметричная слепота не видна по числам ПО ПОСТРОЕНИЮ, поэтому её ловит не
+# сверка счётчиков, а код возврата и непустой stderr обхода.
+#
+# ★КОД ВОЗВРАТА ЧИТАЕТСЯ БЕЗ ТРУБЫ. `find ... | wc -l` отдал бы код `wc`, то есть
+# всегда ноль: труба глотает статус того, кто нас интересует.
+SCAN_ERR="$(mktemp 2>/dev/null)" || SCAN_ERR=""
+if [ -z "$SCAN_ERR" ] || [ ! -f "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: не удалось создать файл для ошибок обхода (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$SCAN_ERR"' EXIT
+
+FILE_LIST="$(cd "$ROOT" && find $SCOPE -type f 2>"$SCAN_ERR")"
+FIND_RC=$?
+if [ "$FIND_RC" -ne 0 ] || [ -s "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: обход дерева (find) завершился с кодом $FIND_RC и сообщениями:"
+  sed 's/^/         /' "$SCAN_ERR"
+  echo "         часть дерева недоступна — «ноль нарушителей» читать нельзя."
+  exit 2
+fi
+FOUND="$(printf '%s\n' "$FILE_LIST" | grep -c . || true)"
+
+SCAN_LIST="$(cd "$ROOT" && grep -rac --binary-files=text '' $SCOPE 2>"$SCAN_ERR")"
+SCAN_RC=$?
+if [ "$SCAN_RC" -gt 1 ] || [ -s "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: подсчёт открытых файлов (grep) завершился с кодом $SCAN_RC и сообщениями:"
+  sed 's/^/         /' "$SCAN_ERR"
+  echo "         часть дерева не прочитана — «ноль нарушителей» читать нельзя."
+  exit 2
+fi
+SCANNED="$(printf '%s\n' "$SCAN_LIST" | grep -c . || true)"
 
 if [ "$FOUND" -lt "$REGEX_MIN_FILES" ]; then
   echo "ОСТАНОВ: под «$SCOPE» найдено $FOUND файлов, ожидалось не меньше $REGEX_MIN_FILES"
@@ -100,7 +135,13 @@ if [ "$SCANNED" -ne "$FOUND" ]; then
   exit 2
 fi
 
-OFFENDERS="$(cd "$ROOT" && grep -rnE --binary-files=text "$PATTERN" $SCOPE || true)"
+OFFENDERS="$(cd "$ROOT" && grep -rnE --binary-files=text "$PATTERN" $SCOPE 2>"$SCAN_ERR")"
+GREP_RC=$?
+if [ "$GREP_RC" -gt 1 ] || [ -s "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: сканирование (grep) завершилось с кодом $GREP_RC и сообщениями:"
+  sed 's/^/         /' "$SCAN_ERR"
+  exit 2
+fi
 if [ -z "$OFFENDERS" ]; then
   COUNT=0
 else

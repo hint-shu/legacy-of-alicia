@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace server::util
 {
@@ -408,6 +409,76 @@ inline void WriteFileAtomically(
 #endif
 }
 
+//! СПИСОК ОБЫЧНЫХ ФАЙЛОВ КАТАЛОГА, снятый без бросающего продвижения итератора
+//! (LOA-fix R73-3b, правка ревью, итерация 2).
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНЫЙ ИНСТРУМЕНТ, А НЕ ПРАВКА НА МЕСТЕ. `for (auto& e :
+//! directory_iterator(dir, error))` выглядит защищённым, но `error_code` здесь
+//! покрывает ТОЛЬКО открытие каталога: range-for продвигает итератор бросающим
+//! `operator++`, а `directory_entry::is_regular_file()` без `error_code` бросает
+//! тоже. Раунд завёл ТРИ таких обхода; чинить их поштучно значит оставить класс
+//! открытым для четвёртого, который напишут через полгода. Поэтому обход ровно
+//! один — здесь, — а места вызова получают готовый список и сохраняют свою
+//! логику пропусков (`continue`) нетронутой.
+//!
+//! ★НЕПОЛНОТА — ЭТО ЗНАЧЕНИЕ, А НЕ МОЛЧАНИЕ. Оборванный обход возвращает то же,
+//! что и пустой каталог, поэтому «ничего не нашли» обязано отличаться от «не
+//! смогли посмотреть» полем, а не интонацией лога.
+struct DirectoryListing
+{
+  //! Пути обычных файлов каталога (без каталогов, ссылок и прочего).
+  std::vector<std::filesystem::path> files;
+  //! Обход не дошёл до конца: список НЕПОЛОН.
+  bool incomplete = false;
+};
+
+[[nodiscard]] inline DirectoryListing ListRegularFiles(
+  const std::filesystem::path& directory) noexcept
+{
+  DirectoryListing listing;
+
+  std::error_code error;
+  if (not std::filesystem::is_directory(directory, error) || error)
+  {
+    listing.incomplete = true;
+    return listing;
+  }
+
+  std::filesystem::directory_iterator entry(directory, error);
+  if (error)
+  {
+    listing.incomplete = true;
+    return listing;
+  }
+
+  const std::filesystem::directory_iterator end;
+  try
+  {
+    while (entry != end)
+    {
+      std::error_code entryError;
+      if (entry->is_regular_file(entryError) && not entryError)
+        listing.files.push_back(entry->path());
+
+      entry.increment(error);
+      if (error)
+      {
+        listing.incomplete = true;
+        break;
+      }
+    }
+  }
+  catch (...)
+  {
+    // `push_back` умеет бросить `bad_alloc`, а функция помечена `noexcept`:
+    // без этого перехвата нехватка памяти звала бы `std::terminate`. Честный
+    // ответ — «список неполон», а не падение процесса.
+    listing.incomplete = true;
+  }
+
+  return listing;
+}
+
 //! Итог сужения режимов у СУЩЕСТВУЮЩИХ файлов с секретом (LOA-fix, R73-2b, #206).
 struct SecretFileHardening
 {
@@ -417,7 +488,67 @@ struct SecretFileHardening
   std::size_t narrowed = 0;
   //! Сколько не удалось ни осмотреть, ни сузить.
   std::size_t failed = 0;
+  //! ★ОБХОД МОГ ОБОРВАТЬСЯ НА СЕРЕДИНЕ (правка ревью, итерация 2). Без этого
+  //! флага прерванный проход возвращает «0 отказов», и вызывающий читает его
+  //! как «все файлы осмотрены» — ложно-зелёное ровно того рода, ради которого
+  //! этот проход и заведён. Незавершённость — НЕ то же самое, что отказ на
+  //! конкретном файле, поэтому это отдельное поле, а не ++failed.
+  bool incomplete = false;
 };
+
+#ifndef WIN32
+namespace detail
+{
+
+//! Сужает права ОДНОГО файла каталога аккаунтов. Вынесено из
+//! `HardenSecretFilesInDirectory` затем, чтобы пропуск записи был `return`, а не
+//! `continue`: в цикле с ЯВНЫМ `increment` (см. ниже) `continue` перепрыгнул бы
+//! продвижение итератора и подвесил старт навсегда.
+inline void HardenOneSecretFile(
+  const std::filesystem::path& file,
+  SecretFileHardening& result) noexcept
+{
+  const int descriptor = ::open(
+    file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (descriptor < 0)
+  {
+    // ELOOP = это символическая ссылка; она не аккаунт, это не отказ.
+    if (errno != ELOOP)
+      ++result.failed;
+    return;
+  }
+
+  struct ::stat fileStat{};
+  if (::fstat(descriptor, &fileStat) != 0)
+  {
+    ++result.failed;
+    ::close(descriptor);
+    return;
+  }
+  if (not S_ISREG(fileStat.st_mode))
+  {
+    ::close(descriptor);
+    return;
+  }
+
+  ++result.examined;
+  if ((fileStat.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+  {
+    // Та же арифметика, что у `Secret` в `WriteFileAtomically`: сужение маской
+    // плюс пол для владельца, а не жёсткое назначение 0600.
+    mode_t narrowed = static_cast<mode_t>(fileStat.st_mode & 07777);
+    narrowed &= ~static_cast<mode_t>(S_IRWXG | S_IRWXO);
+    narrowed |= static_cast<mode_t>(S_IRUSR | S_IWUSR);
+    if (::fchmod(descriptor, narrowed) == 0)
+      ++result.narrowed;
+    else
+      ++result.failed;
+  }
+  ::close(descriptor);
+}
+
+} // namespace detail
+#endif
 
 //! Снимает биты group/other со ВСЕХ обычных файлов каталога (R73-2b, #206).
 //!
@@ -445,51 +576,35 @@ struct SecretFileHardening
 #ifndef WIN32
   std::error_code error;
   if (not std::filesystem::is_directory(directory, error) || error)
-    return result;
-
-  for (const auto& entry :
-    std::filesystem::directory_iterator(directory, error))
   {
+    result.incomplete = true;
+    return result;
+  }
+
+  // ★ЯВНЫЙ `increment(error)`, А НЕ range-for (правка ревью, итерация 2).
+  // range-for продвигает итератор БРОСАЮЩИМ `operator++`; `error_code`,
+  // отданный конструктору, покрывает только ОТКРЫТИЕ каталога, но не переход к
+  // следующей записи. Функция помечена `noexcept`, поэтому `EIO` на середине
+  // каталога звал бы `std::terminate` — то есть отказ в обслуживании на старте
+  // вместо диагностики.
+  std::filesystem::directory_iterator entry(directory, error);
+  if (error)
+  {
+    result.incomplete = true;
+    return result;
+  }
+
+  const std::filesystem::directory_iterator end;
+  while (entry != end)
+  {
+    detail::HardenOneSecretFile(entry->path(), result);
+
+    entry.increment(error);
     if (error)
+    {
+      result.incomplete = true;
       break;
-
-    const int descriptor = ::open(
-      entry.path().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (descriptor < 0)
-    {
-      // ELOOP = это символическая ссылка; она не аккаунт, это не отказ.
-      if (errno != ELOOP)
-        ++result.failed;
-      continue;
     }
-
-    struct ::stat fileStat{};
-    if (::fstat(descriptor, &fileStat) != 0)
-    {
-      ++result.failed;
-      ::close(descriptor);
-      continue;
-    }
-    if (not S_ISREG(fileStat.st_mode))
-    {
-      ::close(descriptor);
-      continue;
-    }
-
-    ++result.examined;
-    if ((fileStat.st_mode & (S_IRWXG | S_IRWXO)) != 0)
-    {
-      // Та же арифметика, что у `Secret` в `WriteFileAtomically`: сужение маской
-      // плюс пол для владельца, а не жёсткое назначение 0600.
-      mode_t narrowed = static_cast<mode_t>(fileStat.st_mode & 07777);
-      narrowed &= ~static_cast<mode_t>(S_IRWXG | S_IRWXO);
-      narrowed |= static_cast<mode_t>(S_IRUSR | S_IWUSR);
-      if (::fchmod(descriptor, narrowed) == 0)
-        ++result.narrowed;
-      else
-        ++result.failed;
-    }
-    ::close(descriptor);
   }
 #else
   (void)directory;

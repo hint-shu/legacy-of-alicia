@@ -54,6 +54,16 @@ duplicates_in() {
     | sed 's/[[:space:]]*$//' | sort | uniq -d
 }
 
+# ★ЧИТАЕМОСТЬ ФАЙЛА — ОТДЕЛЬНЫЙ ВОПРОС К `duplicates_in` (правка ревью,
+# итерация 2). `duplicates_in` глушит stderr и на нечитаемом файле возвращает
+# ПУСТО — ровно то же, что «дублей нет». Прежняя редакция считала такой файл
+# просканированным, поэтому счётчик «просканировано» сходился с «найдено», и
+# гейт печатал «ЧИСТО ✓», ни разу не заглянув внутрь. Пустой результат обязан
+# отличаться от непрочитанного файла ПРОВЕРКОЙ, а не надеждой.
+readable_file() {
+  [ -r "$1" ] && head -c 1 "$1" >/dev/null 2>&1
+}
+
 # Blindness guard #1: the canary must come back dirty.
 # Создание и запись канарейки проверяются по тому же правилу, что и в
 # `no_name_regex_gate.sh`: непроверенный `mktemp` — это класс, а не сайт.
@@ -78,7 +88,26 @@ if [ -z "$(duplicates_in "$CANARY")" ]; then
 fi
 
 # Blindness guard #2: count what will actually be read.
-FILES="$(cd "$ROOT" && find $SCOPE -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.inl' \) | sort)"
+#
+# ★КОД ВОЗВРАТА `find` ЧИТАЕТСЯ БЕЗ ТРУБЫ (правка ревью, итерация 2): в
+# `find ... | sort` статус принадлежит `sort` и всегда равен нулю, поэтому
+# нечитаемый подкаталог выпадал из обхода молча.
+SCAN_ERR="$(mktemp 2>/dev/null)" || SCAN_ERR=""
+if [ -z "$SCAN_ERR" ] || [ ! -f "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: не удалось создать файл для ошибок обхода (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$SCAN_ERR"' EXIT
+
+FILES_RAW="$(cd "$ROOT" && find $SCOPE -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.inl' \) 2>"$SCAN_ERR")"
+FIND_RC=$?
+if [ "$FIND_RC" -ne 0 ] || [ -s "$SCAN_ERR" ]; then
+  echo "ОСТАНОВ: обход дерева (find) завершился с кодом $FIND_RC и сообщениями:"
+  sed 's/^/         /' "$SCAN_ERR"
+  echo "         часть дерева недоступна — «ноль дублей» читать нельзя."
+  exit 2
+fi
+FILES="$(printf '%s\n' "$FILES_RAW" | sort)"
 FOUND="$(printf '%s\n' "$FILES" | grep -c . || true)"
 if [ "$FOUND" -lt "$DUP_MIN_FILES" ]; then
   echo "ОСТАНОВ: найдено $FOUND исходников, ожидалось не меньше $DUP_MIN_FILES —"
@@ -90,6 +119,11 @@ OFFENDERS=""
 SCANNED=0
 while IFS= read -r relative; do
   [ -n "$relative" ] || continue
+  if ! readable_file "$ROOT/$relative"; then
+    echo "ОСТАНОВ: файл '$relative' не читается — duplicates_in вернул бы по нему"
+    echo "         пусто, что неотличимо от «дублей нет». Слепое «чисто» запрещено."
+    exit 2
+  fi
   SCANNED=$((SCANNED + 1))
   DUPS="$(duplicates_in "$ROOT/$relative")"
   if [ -n "$DUPS" ]; then
