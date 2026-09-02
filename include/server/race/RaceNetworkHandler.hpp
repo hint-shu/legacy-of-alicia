@@ -486,6 +486,7 @@ private:
   util::LogThrottle _relayPayloadTypeThrottle;
   util::LogThrottle _scheduleEffectRangeThrottle;
   util::LogThrottle _itemDeckUnknownThrottle;
+  util::LogThrottle _relayReferenceThrottle;
 };
 
 } // namespace server

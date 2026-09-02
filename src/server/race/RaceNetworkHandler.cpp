@@ -4837,7 +4837,7 @@ void RaceNetworkHandler::HandleRelay(
       //
       // До этой строки ветка только ЖАЛОВАЛАСЬ и падала дальше — на широковещание.
       // Правило раунда «кто действует, тот и отправитель» проверяется по действующему
-      // лицу ВНУТРИ нагрузки (`GetRelayActor`), а у неразобранного типа его нет: класс
+      // лицу ВНУТРИ нагрузки (`GetRelayClaim`), а у неразобранного типа его нет: класс
       // `Unparsed` не может быть авторизован в принципе. Значит канал оставался
       // фейл-оупен: `fromOid = свой` + неизвестный `payloadType` + до 65 535 байт
       // (размер читается `uint16`, RaceMessageDefinitions.cpp:1201-1209) = усиление
@@ -4908,22 +4908,22 @@ void RaceNetworkHandler::HandleRelay(
   // самоотчётным типам.
   //
   // ★ПРАВИЛО ТОТАЛЬНО ПО ТИПАМ, А НЕ ПО СПИСКУ МЕСТ: классификация — в
-  // `race::GetRelayActor` (RelayAuthz.hpp), её полноту доказывает
+  // `race::GetRelayClaim` (RelayAuthz.hpp), её полноту доказывает
   // `tools/check_relay_authz.sh` (каждый элемент перечисления назван) и юнит-тест
   // (взято ТО поле). Неизвестный тип нагрузки сервер не разбирал вовсе — сверять
   // нечего, кадр идёт дальше с уже проверенным конвертом.
-  const auto relayActor = race::GetRelayActor(command);
+  const auto relayClaim = race::GetRelayClaim(command);
   const bool relayActorMismatch =
-    (relayActor.kind == race::RelayActorKind::RacerOid
-      && relayActor.claimedId != senderRacer.oid)
-    || (relayActor.kind == race::RelayActorKind::CharacterUid
-      && relayActor.claimedId != clientContext.characterUid);
+    (relayClaim.actorKind == race::RelayActorKind::RacerOid
+      && relayClaim.actorId != senderRacer.oid)
+    || (relayClaim.actorKind == race::RelayActorKind::CharacterUid
+      && relayClaim.actorId != clientContext.characterUid);
 
   if (relayActorMismatch)
   {
     // oid бота — тот же законный вход, что и в конверте, и так же нечего вещать.
-    if (relayActor.kind == race::RelayActorKind::RacerOid
-      && raceInstance.IsAiRacerOid(static_cast<tracker::Oid>(relayActor.claimedId)))
+    if (relayClaim.actorKind == race::RelayActorKind::RacerOid
+      && raceInstance.IsAiRacerOid(static_cast<tracker::Oid>(relayClaim.actorId)))
       return;
 
     uint64_t suppressed = 0;
@@ -4932,7 +4932,33 @@ void RaceNetworkHandler::HandleRelay(
         "Relay from racer {} carried payload type {:#04x} acting as {} (suppressed {})",
         senderRacer.oid,
         static_cast<uint16_t>(command.payloadType),
-        relayActor.claimedId,
+        relayClaim.actorId,
+        suppressed);
+    return;
+  }
+
+  // LOA-fix (R71-15, находка ревью 2 #3): «С ЧЕМ» — ВТОРАЯ ПОЛОВИНА ПРАВИЛА.
+  //
+  // Гард выше отвечает только на «кто». У `SetTargetState` рядом с проверенным
+  // `invokerRacerOid` лежит `magicEffectId` (RelayMessageDefinitions.hpp:153-162), и он
+  // уходил соседям как есть: `fromOid = свой`, `invoker = свой`, `magicEffectId =
+  // 0xDEADBEEF` — конверт чист, действующее лицо своё, а названная величина выдумана.
+  // Сервер этот тип нагрузки не интерпретирует, поэтому проверяется РОВНО ТО, ЧТО
+  // СЕРВЕР ЗНАЕТ: идентификаторы экземпляров эффектов выдаёт он сам, значит честный
+  // клиент может назвать только уже выданный (`HasIssuedEffectInstanceId`).
+  //
+  // ★НЕ БОЛЬШЕ ТОГО: «выдан» — не «жив» и не «твой». Сильная проверка живого
+  // экземпляра есть там, где сервер знает семантику (ледяная стена, R71-17); здесь
+  // выдумывать её значило бы поставить гард на догадку.
+  if (relayClaim.referenceKind == race::RelayReferenceKind::EffectInstanceId
+    && not raceInstance.GetTracker().HasIssuedEffectInstanceId(relayClaim.referencedId))
+  {
+    uint64_t suppressed = 0;
+    if (_relayReferenceThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Relay from racer {} named an unissued effect instance {} (suppressed {})",
+        senderRacer.oid,
+        relayClaim.referencedId,
         suppressed);
     return;
   }

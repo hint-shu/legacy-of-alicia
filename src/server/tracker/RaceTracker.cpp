@@ -18,6 +18,7 @@
  **/
 
 #include "server/tracker/RaceTracker.hpp"
+#include <limits>
 
 namespace server::tracker
 {
@@ -268,9 +269,24 @@ uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
 {
   const uint16_t nextId = _nextEffectInstanceId;
   _nextEffectInstanceId += increment;
+  // LOA-fix (R71-15): оборот шестнадцатибитного счётчика запоминается. Сравнение
+  // именно с ПРЕЖНИМ значением: после оборота новое всегда меньше.
+  if (_nextEffectInstanceId < nextId)
+    _effectInstanceIdWrapped = true;
   if (_nextEffectInstanceId == 0)
     _nextEffectInstanceId = 1;
   return nextId;
+}
+
+bool RaceTracker::HasIssuedEffectInstanceId(const uint32_t effectInstanceId) const
+{
+  // Домен идентификатора — шестнадцать бит по построению (`uint16_t` и у счётчика,
+  // и у поля в протоколе). Всё, что шире, сервер выдать не мог.
+  if (effectInstanceId > std::numeric_limits<uint16_t>::max())
+    return false;
+  if (_effectInstanceIdWrapped)
+    return true;
+  return effectInstanceId < _nextEffectInstanceId;
 }
 
 void RaceTracker::Clear()

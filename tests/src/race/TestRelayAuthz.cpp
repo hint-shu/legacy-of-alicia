@@ -1,9 +1,15 @@
 //! Юнит-тест классификатора действующего лица relay-нагрузки (LOA-fix, R71-6b, #31).
 //!
-//! ★ЗАЧЕМ. `GetRelayActor` — единственное место, где решается «кто действует» внутри
-//! ретранслируемой нагрузки. Гейт `tools/check_relay_authz.sh` доказывает, что назван
-//! КАЖДЫЙ тип; этот тест доказывает, что у каждого типа взято ТО поле — форма и
-//! полнота ловятся разными проверками намеренно.
+//! ★ЗАЧЕМ. `GetRelayClaim` — единственное место, где решается «кто действует» и «на
+//! какую серверную величину ссылается» внутри ретранслируемой нагрузки. Гейт
+//! `tools/check_relay_authz.sh` доказывает, что назван КАЖДЫЙ тип; этот тест
+//! доказывает, что у каждого типа взято ТО поле — форма и полнота ловятся разными
+//! проверками намеренно.
+//!
+//! ★ССЫЛКА ПРОВЕРЯЕТСЯ ОТДЕЛЬНОЙ ГРАФОЙ (R71-15): у `SetTargetState` рядом с
+//! инвокером лежит `magicEffectId`, и тест ловит, что классификатор отдаёт ИМЕННО
+//! его, а у остальных типов — `None` с нулём. Иначе «ссылка есть» проверялось бы
+//! той же переменной, что «лицо есть», и одна ошибка прятала бы другую.
 //!
 //! ★`assert` НЕ ИСПОЛЬЗУЕТСЯ: боевой образ собирается с -DNDEBUG.
 #include "server/race/RelayAuthz.hpp"
@@ -16,6 +22,7 @@ namespace
 
 using server::protocol::relay::RelayCommandId;
 using server::race::RelayActorKind;
+using server::race::RelayReferenceKind;
 
 int failures = 0;
 
@@ -40,6 +47,7 @@ server::protocol::AcCmdCRRelay MakeRelay(const RelayCommandId type)
   c.syncProgress.racerOid = 12;
   c.setTargetState.invokerRacerOid = 13;
   c.setTargetState.targetRacerOid = 99;
+  c.setTargetState.magicEffectId = 777;
   c.netSetState.racerOid = 14;
   c.netSetLayerAnimation.racerOid = 15;
   c.syncGoalIn.racerOid = 16;
@@ -54,10 +62,17 @@ void Expect(
   const RelayCommandId type,
   const RelayActorKind kind,
   const uint32_t id,
-  const char* what)
+  const char* what,
+  const RelayReferenceKind referenceKind = RelayReferenceKind::None,
+  const uint32_t referencedId = 0)
 {
-  const auto actor = server::race::GetRelayActor(MakeRelay(type));
-  Check(actor.kind == kind && actor.claimedId == id, what);
+  const auto claim = server::race::GetRelayClaim(MakeRelay(type));
+  Check(
+    claim.actorKind == kind
+      && claim.actorId == id
+      && claim.referenceKind == referenceKind
+      && claim.referencedId == referencedId,
+    what);
 }
 
 } // namespace
@@ -66,8 +81,10 @@ int main()
 {
   Expect(RelayCommandId::Snapshot,               RelayActorKind::RacerOid,       11, "Snapshot");
   Expect(RelayCommandId::SyncProgress,           RelayActorKind::RacerOid,       12, "SyncProgress");
-  Expect(RelayCommandId::SetTargetStateEnabled,  RelayActorKind::RacerOid,       13, "SetTargetStateEnabled");
-  Expect(RelayCommandId::SetTargetStateDisabled, RelayActorKind::RacerOid,       13, "SetTargetStateDisabled");
+  Expect(RelayCommandId::SetTargetStateEnabled,  RelayActorKind::RacerOid,       13, "SetTargetStateEnabled",
+    RelayReferenceKind::EffectInstanceId, 777);
+  Expect(RelayCommandId::SetTargetStateDisabled, RelayActorKind::RacerOid,       13, "SetTargetStateDisabled",
+    RelayReferenceKind::EffectInstanceId, 777);
   Expect(RelayCommandId::NetSetState,            RelayActorKind::RacerOid,       14, "NetSetState");
   Expect(RelayCommandId::NetSetLayerAnimation,   RelayActorKind::RacerOid,       15, "NetSetLayerAnimation");
   Expect(RelayCommandId::SyncGoalIn,             RelayActorKind::RacerOid,       16, "SyncGoalIn");
