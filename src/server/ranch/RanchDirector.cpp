@@ -1187,6 +1187,13 @@ void RanchDirector::HandleNetworkTick()
     // помечен noexcept — исключение мимо него было бы std::terminate.
     DrainPendingDisconnects();
 
+    // LOA-fix (R72-fix-3, round72, находка Codex 2): отложенные уведомления о
+    // представлении — ВТОРЫМ, сразу после разрывов и по той же причине, по
+    // которой разрывы идут первыми: мёртвые клиенты уже убраны из `_clients`,
+    // и уведомление не адресуется трупу.
+    // ★Бросить отсюда безопасно: обрамляющий catch на месте (см. R34-5).
+    DrainPendingIntroductionNotifies();
+
     // LOA-fix (R35-4, round35, backlog #124): ПРОХОД ПО СОЗРЕВШИМ ЖЕРЕБЯТАМ —
     // здесь и только здесь. Мы на РАНЧ-СЕТЕВОМ потоке, единственном владельце
     // `_clients`/`_ranches`, поэтому обход и мутация контекстов законны.
@@ -1258,7 +1265,8 @@ void RanchDirector::HandleClientDisconnected(ClientId clientId)
   // `HandleRanchLeave` — самая бросающая работа во всём разрыве (реестры ранчо,
   // рассылки соседям), а `_clients.erase` стоял ПОСЛЕ неё. Осиротевший контекст
   // остаётся аутентифицированным и с `characterUid`, поэтому:
-  //   • `GetClientContextByCharacterUid` отдаёт ПЕРВОЕ совпадение — то есть
+  //   • `TryGetClientContextByCharacterUid` (до R72 —
+  //     `GetClientContextByCharacterUid`) отдаёт ПЕРВОЕ совпадение — то есть
   //     может вернуть мёртвый сокет вместо живого;
   //   • на следующем входе персонажа `DedupeStaleCharacterSessions` находит
   //     призрака и пытается разорвать его через `DisconnectClient`, а того уже
@@ -1707,19 +1715,112 @@ void RanchDirector::DrainPendingDisconnects()
 }
 
 void RanchDirector::BroadcastSetIntroductionNotify(
-  uint32_t characterUid,
+  const uint32_t characterUid,
   const std::string& introduction)
 {
-  const auto& clientContext = GetClientContextByCharacterUid(characterUid);
+  // LOA-fix (R72-fix-3, round72, находка Codex 2): МАРШРУТИЗАЦИЯ ВМЕСТО
+  // ПРЯМОЙ РАССЫЛКИ. Зовут отсюда с ЛОББИ-сетевого потока, а `_clients` и
+  // `_ranches` принадлежат ранч-сетевому — читать их здесь значит гоняться с
+  // владельцем карт (см. разбор у объявления метода и у `Disconnect`, R34-4).
+  // Кладём ЗНАЧЕНИЯ под ЛИСТОВЫМ локом — одна операция с контейнером, ни
+  // одного вызова наружу — и уходим. Рассылку сделает
+  // DrainPendingIntroductionNotifies на ранч-сетевом тике.
+  //
+  // ★СХЛОПЫВАНИЕ ПО ПЕРСОНАЖУ ОСОЗНАННОЕ: побеждает ПОСЛЕДНЕЕ представление,
+  // а промежуточные редакции текста рассылать некому и незачем. Это и есть
+  // верхняя граница памяти очереди — число персонажей онлайн.
+  {
+    std::lock_guard lock(_pendingIntroductionNotifiesMutex);
+    _pendingIntroductionNotifies[characterUid] = introduction;
+  }
+}
+
+void RanchDirector::DrainPendingIntroductionNotifies()
+{
+  // LOA-fix (R72-fix-3, round72, находка Codex 2): исполнение отложенных
+  // уведомлений о представлении.
+  // ★ПОТОК: только РАНЧ-СЕТЕВОЙ (единственный вызов — из HandleNetworkTick).
+  // Здесь и только здесь законно трогать `_clients`, `_ranches` и
+  // `_commandServer` по просьбе чужого потока.
+
+  // Снимаем очередь ЦЕЛИКОМ и ОТПУСКАЕМ лок до любых действий: под листовым
+  // локом не должно оставаться ни одного вызова наружу.
+  std::unordered_map<data::Uid, std::string> pendingNotifies;
+  {
+    std::lock_guard lock(_pendingIntroductionNotifiesMutex);
+    if (_pendingIntroductionNotifies.empty())
+      return;
+
+    pendingNotifies.swap(_pendingIntroductionNotifies);
+  }
+
+  for (const auto& [characterUid, introduction] : pendingNotifies)
+  {
+    try
+    {
+      BroadcastSetIntroductionOnRanchThread(characterUid, introduction);
+    }
+    catch (const std::exception& x)
+    {
+      // ★ПЕРЕХВАТ НА КАЖДОЙ ЗАПИСИ, а не один на весь слив — тот же приём, что
+      // в DrainPendingDisconnects, и по той же причине: очередь УЖЕ снята, и
+      // осечка на одном персонаже иначе съела бы уведомления всех остальных,
+      // второй попытки для них не будет.
+      server::util::QuietLogWarn(
+        "Failed to broadcast the introduction of character {}: {}",
+        characterUid,
+        x.what());
+    }
+  }
+}
+
+void RanchDirector::BroadcastSetIntroductionOnRanchThread(
+  const uint32_t characterUid,
+  const std::string& introduction)
+{
+  // LOA-fix (R72-2, round72, backlog #170-item-28): «ПЕРСОНАЖ НЕ НА РАНЧО» —
+  // ШТАТНОЕ СОСТОЯНИЕ, А НЕ ОТКАЗ.
+  //
+  // Представление к этому моменту УЖЕ записано в запись персонажа
+  // (`LobbyNetworkHandler::HandleSetIntroduction`), рассылка — лучшая попытка:
+  // рассылать некому, значит выходим молча. У 0x171 нет OK-варианта, поэтому
+  // клиенту ранний выход ничего не ломает. Прежний бросок не защищал ничего —
+  // единственным его эффектом была строка [error] на КАЖДЫЙ пакет 0x171,
+  // полностью управляемая клиентом (игрок в лобби или в комнате заезда).
+  // ★МОЛЧА, А НЕ QuietLogDebug: уровень debug в проде ВКЛЮЧЁН, и «понизить
+  // уровень» дало бы тот же флуд другой буквой.
+  ClientId authorClientId = 0;
+  const ClientContext* clientContext =
+    TryGetClientContextByCharacterUid(characterUid, authorClientId);
+  if (clientContext == nullptr)
+    return;
+
+  // LOA-fix (R72-3, round72, backlog #170-item-28b): `_ranches` ИЩЕМ, А НЕ
+  // ИНДЕКСИРУЕМ. `operator[]` ВСТАВЛЯЕТ, и на `visitingRancherUid`,
+  // указывающем в никуда (`data::InvalidUid` или ранчо, из которого клиент уже
+  // вышел), плодил пустые инстансы чужих ранчо — ровно то, о чём предупреждает
+  // комментарий R13-9 ниже в этом файле.
+  const auto ranchIter = _ranches.find(clientContext->visitingRancherUid);
+  if (ranchIter == _ranches.cend())
+    return;
 
   protocol::RanchCommandSetIntroductionNotify notify{
     .characterUid = characterUid,
     .introduction = introduction};
 
-  for (const ClientId& ranchClientId : _ranches[clientContext.visitingRancherUid].clients)
+  for (const ClientId& ranchClientId : ranchIter->second.clients)
   {
-    // Prevent broadcast to self.
-    if (ranchClientId == clientContext.characterUid)
+    // LOA-fix (R72-4, round72, backlog #170-item-28b): ПУТАНИЦА ТИПОВ.
+    // Здесь стояло `ranchClientId == clientContext.characterUid` — сравнение
+    // ClientId (network::ClientId = size_t) с characterUid (data::Uid =
+    // uint32_t): величины из РАЗНЫХ пространств, совпадающие лишь случайно.
+    // Следствия оба: автор получал своё же уведомление, а посторонний клиент,
+    // чей ClientId численно равен чужому characterUid, — не получал.
+    // ★СРАВНИВАЕМ ClientId С ClientId, а не «приводим к форме соседей»
+    // (соседние широковещалки берут GetClientContext на каждого посетителя):
+    // тот способ добавил бы N чужепоточных чтений `_clients` на успешном
+    // пути, а этот — ни одного, потому что ClientId автора отдал ТОТ ЖЕ поиск.
+    if (ranchClientId == authorClientId)
       continue;
 
     _commandServer.QueueCommand<decltype(notify)>(
@@ -2120,17 +2221,22 @@ ClientId RanchDirector::GetClientIdByCharacterUid(data::Uid characterUid)
   throw std::runtime_error("Character not associated with any client");
 }
 
-RanchDirector::ClientContext& RanchDirector::GetClientContextByCharacterUid(
-  data::Uid characterUid)
+RanchDirector::ClientContext* RanchDirector::TryGetClientContextByCharacterUid(
+  data::Uid characterUid,
+  ClientId& clientId)
 {
-  for (auto& clientContext : _clients | std::views::values)
+  // ★Перебор по ПАРАМ, а не по `views::values`: нужен и ключ (ClientId).
+  for (auto& [candidateClientId, clientContext] : _clients)
   {
     if (clientContext.characterUid == characterUid
       && clientContext.isAuthenticated)
-      return clientContext;
+    {
+      clientId = candidateClientId;
+      return &clientContext;
+    }
   }
 
-  throw std::runtime_error("Character not associated with any client");
+  return nullptr;
 }
 
 bool RanchDirector::HandleEnterRanch(
@@ -2617,7 +2723,8 @@ bool RanchDirector::HandleEnterRanch(
   // не в начале функции. Пока вход лежал в деферрере, visitingRancherUid уже
   // указывал на ранчо, в котором клиента нет: широковещалки вроде
   // BroadcastSetIntroductionNotify лезли по нему в _ranches[...] и operator[]
-  // плодил пустые инстансы чужих ранчо.
+  // плодил пустые инстансы чужих ранчо. (R72-3: сама
+  // BroadcastSetIntroductionNotify с тех пор ИЩЕТ, а не индексирует.)
   clientContext.visitingRancherUid = command.rancherUid;
 
   // LOA-fix (R21-2e, round21, backlog #95): ЗАВОДИМ запись в реестре активности.

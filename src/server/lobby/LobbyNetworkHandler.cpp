@@ -40,212 +40,270 @@ namespace
 //! A random device for random number generation.
 std::random_device rd;
 
+//! LOA-fix (R72-fix2-4, round72, backlog #170-item-28, находка Codex 4):
+//! ПОТОЛОК ДЛИНЫ ПРЕДСТАВЛЕНИЯ, В БАЙТАХ UTF-8.
+//!
+//! ★ЗАЧЕМ. Входящая команда вправе занять весь допустимый размер полезной
+//! нагрузки (`CommandServer.cpp`, `MaxCommandDataSize = 8192`), то есть текст
+//! представления приезжает длиной почти в восемь килобайт. Исходящее
+//! уведомление ранча (`RanchCommandSetIntroductionNotify`) пишет ТОТ ЖЕ текст
+//! ПЛЮС четырёхбайтный uid персонажа в буфер того же размера — и не влезает.
+//! `SinkStream::Write` бросает `std::overflow_error`, бросок вылетает из
+//! поставщика данных записи, а его ловит `Client::WriteLoop` — и там стоит
+//! `End()`. То есть длинное представление одного клиента ОТКЛЮЧАЛО ЧЕСТНЫХ
+//! соседей по ранчо, по одному на каждого получателя рассылки. Тот же текст
+//! едет и в `AcCmdLCPersonalInfo` рядом с именем гильдии и прочими полями —
+//! там запас нужен ещё больший.
+//!
+//! ★ПОЧЕМУ ЧЕТЫРЕ КИЛОБАЙТА, А НЕ «сколько влезет». Потолок обязан оставлять
+//! запас ОБОИМ путям доставки, а не одному: 4096 + завершающий ноль + ~110
+//! байт скаляров `AcCmdLCPersonalInfo` + имя гильдии — это меньше половины
+//! буфера. И при этом он заведомо выше всего, что способен прислать клиент
+//! 2013 года: поле представления в нём — короткая строка о себе, а не файл.
+//! Проверка идёт по UTF-8-длине, а она НИКОГДА не меньше длины в CP949, в
+//! которой текст уходит на провод (`locale::FromUtf8`: ASCII 1→1, хангыль
+//! 3→2), — значит потолок по UTF-8 гарантирует потолок на проводе.
+constexpr std::size_t MaxIntroductionLength = 4096;
+
 } // anon namespace
 
+// LOA-fix (R72-1, round72, backlog #129-S1): РЕШЕНИЕ ОБ АУТЕНТИФИКАЦИИ ЖИВЁТ
+// НА РЕГИСТРАЦИИ, А НЕ В ТЕЛЕ ХЕНДЛЕРА.
+//
+// Лобби отвечало ЛЮБОМУ сокету, завершившему TCP-рукопожатие: перепись по
+// дереву дала 13 командных хендлеров из 36, которые не смотрели на контекст
+// клиента вообще. Среди них `HandleRequestPersonalInfo` (имя гильдии, текст
+// представления, уровень и опыт по ПРОИЗВОЛЬНОМУ characterUid, перечислимому
+// инкрементом), подделка отказа от приглашения в гильдию от имени любого
+// персонажа и два пред-логинных лог-флуда.
+//
+// ★КОРЕНЬ — НЕ ЗАБЫТЫЙ ВЫЗОВ, А ТО, ЧТО РЕШЕНИЕ ПРИНИМАЛ КАЖДЫЙ ХЕНДЛЕР САМ.
+// Список мест обязательно отстанет от кода, поэтому решение перенесено туда,
+// где оно принимается ровно один раз на команду и физически не может быть
+// пропущено: в регистрацию.
+//
+// Арифметика этого конструктора: 36 = 33 аутентифицированных + 3
+// пред-логинных. Пред-логинных ровно три, каждая с обоснованием рядом с
+// вызовом, и весь их список виден отсюда, не собирается по файлу.
+//
+// ★Новый хендлер, зарегистрированный сырым RegisterCommandHandler, валит гард
+// tools/check_lobby_auth_gate.sh: сырых регистраций в этом файле должно быть
+// ноль, а множество пред-логинных команд сверяется ДОСЛОВНО, потому что числа
+// сходятся и у неверного множества.
 LobbyNetworkHandler::LobbyNetworkHandler(
   ServerInstance& serverInstance)
   : _serverInstance(serverInstance)
   , _commandServer(*this)
 {
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLogin>(
+  // ПРЕД-ЛОГИННАЯ #1 из ТРЁХ: это и есть сам логин. Гейт на ней означал бы,
+  // что залогиниться не может никто.
+  RegisterPreAuthHandler<protocol::AcCmdCLLogin>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleLogin(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRoomList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRoomList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRoomList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLHeartbeat>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLHeartbeat>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleHeartbeat(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLMakeRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLMakeRoom>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleMakeRoom(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoom>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoom(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLeaveRoom>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLLeaveRoom>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleLeaveRoom(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterChannel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterChannel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterChannel(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLLeaveChannel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLLeaveChannel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleLeaveChannel(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLCreateNickname>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLCreateNickname>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleCreateNickname(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLShowInventory>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLShowInventory>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleShowInventory(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLUpdateUserSettings>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLUpdateUserSettings>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleUpdateUserSettings(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoomQuick>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoomQuick>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoomQuick(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLGoodsShopList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLGoodsShopList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleGoodsShopList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLAchievementCompleteList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLAchievementCompleteList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleAchievementCompleteList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestPersonalInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestPersonalInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestPersonalInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRanch>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRanch>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRanch(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRanchRandomly>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRanchRandomly>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRanchRandomly(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLFeatureCommand>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLFeatureCommand>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleFeatureCommand(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestFestivalResult>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestFestivalResult>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestFestivalResult(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLSetIntroduction>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLSetIntroduction>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleSetIntroduction(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLGetMessengerInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLGetMessengerInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleGetMessengerInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLCheckWaitingSeqno>(
+  // ПРЕД-ЛОГИННАЯ #2 из ТРЁХ: опрос ОЧЕРЕДИ логина. Ответ строится
+  // `LobbyDirector::GetClientQueuePosition(clientId)`, то есть клиент по
+  // определению ещё не аутентифицирован — гейт сделал бы очередь невидимой.
+  RegisterPreAuthHandler<protocol::AcCmdCLCheckWaitingSeqno>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleCheckWaitingSeqno(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLUpdateSystemContent>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLUpdateSystemContent>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleUpdateSystemContent(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLEnterRoomQuickStop>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLEnterRoomQuickStop>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleEnterRoomQuickStop(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestFestivalPrize>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestFestivalPrize>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestFestivalPrize(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLQueryServerTime>(
+  // ПРЕД-ЛОГИННАЯ #3 из ТРЁХ: отдаёт ТОЛЬКО системные часы, нулевое
+  // разглашение. Оставлена пред-логинной СОЗНАТЕЛЬНО — как якорь живости
+  // сокета для стенда и как страховка от регрессии, если клиент 2013 года
+  // спрашивает время до логина. Единственная уступка риску совместимости:
+  // не меняем успешный путь ради пути отказа.
+  RegisterPreAuthHandler<protocol::AcCmdCLQueryServerTime>(
     [this](const ClientId clientId, [[maybe_unused]] const auto& command)
     {
       HandleQueryServerTime(clientId);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestMountInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestMountInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestMountInfo(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLInquiryTreecash>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLInquiryTreecash>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleInquiryTreecash(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdLCInviteGuildJoinOK>(
+  RegisterAuthenticatedHandler<protocol::AcCmdLCInviteGuildJoinOK>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleAcceptInviteToGuild(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdLCInviteGuildJoinCancel>(
+  RegisterAuthenticatedHandler<protocol::AcCmdLCInviteGuildJoinCancel>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleDeclineInviteToGuild(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdClientNotify>(
+  RegisterAuthenticatedHandler<protocol::AcCmdClientNotify>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleClientNotify(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLChangeRanchOption>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLChangeRanchOption>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleChangeRanchOption(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestDailyQuestList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestDailyQuestList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestDailyQuestList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestLeagueInfo>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestLeagueInfo>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestLeagueInfo(clientId, command);
@@ -254,13 +312,13 @@ LobbyNetworkHandler::LobbyNetworkHandler(
   // todo: AcCmdCLMakeGuildParty, AcCmdCLGuildPartyList, AcCmdCLEnterGuildParty,
   //       AcCmdCLLeaveGuildParty, AcCmdCLStartGuildPartyMatch, AcCmdCLStopGuildPartyMatch
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestQuestList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestQuestList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestQuestList(clientId, command);
     });
 
-  _commandServer.RegisterCommandHandler<protocol::AcCmdCLRequestSpecialEventList>(
+  RegisterAuthenticatedHandler<protocol::AcCmdCLRequestSpecialEventList>(
     [this](const ClientId clientId, const auto& command)
     {
       HandleRequestSpecialEventList(clientId, command);
@@ -606,9 +664,20 @@ void LobbyNetworkHandler::NotifyMatchmakeResult(
   }
 }
 
-CommandServer& LobbyNetworkHandler::GetCommandServer() noexcept
+std::string LobbyNetworkHandler::GetClientAddress(const ClientId clientId) noexcept
 {
-  return _commandServer;
+  // LOA-fix (R72-fix-2, round72, находка Codex 3): наружу уходит СТРОКА, а не
+  // диспетчер. `CommandServer::GetClientAddress` бросает, если клиента уже нет
+  // (`Server::GetClient`), а единственный вызывающий — строка лога об успешном
+  // входе. Терять из-за неё соединение или ронять поток директора нельзя.
+  try
+  {
+    return _commandServer.GetClientAddress(clientId).to_string();
+  }
+  catch (const std::exception&)
+  {
+    return {};
+  }
 }
 
 ClientId LobbyNetworkHandler::GetClientIdByUserName(
@@ -705,6 +774,45 @@ LobbyNetworkHandler::ClientContext LobbyNetworkHandler::GetClientContext(
   // отдавать ничего, что указывает внутрь карты.
   const std::shared_lock lock(_clientsMutex);
   return GetClientContextLocked(clientId, requireAuthentication);
+}
+
+bool LobbyNetworkHandler::IsClientAuthenticated(const ClientId clientId) const
+{
+  // ★КОПИЯ ФЛАГА, А НЕ ССЫЛКА В КАРТУ: замок снимается на выходе.
+  // ★И НЕ БРОСАЕТ. Этот вопрос задаётся на КАЖДОМ входящем пакете, в том
+  // числе от сокета, который не логинился; бросок здесь означал бы строку
+  // [error] на пакет — тот самый флуд, который раунд убирает.
+  const std::shared_lock lock(_clientsMutex);
+  const auto clientContextIter = _clients.find(clientId);
+  return clientContextIter != _clients.cend()
+    && clientContextIter->second.isAuthenticated;
+}
+
+void LobbyNetworkHandler::NoteRefusedPreAuthCommand(
+  const ClientId clientId,
+  const protocol::Command command) noexcept
+{
+  uint64_t suppressed = 0;
+  uint64_t total = 0;
+  if (not _preAuthRefusalThrottle.Allow(suppressed, total))
+    return;
+
+  // ★ЛОГИРУЕМ clientId, А НЕ АДРЕС. `CommandServer::GetClientAddress` идёт в
+  // `_server.GetClient(...)` и УМЕЕТ БРОСИТЬ, а мы стоим в `noexcept` на пути
+  // пакета. clientId — тот же идентификатор, которым пользуются остальные
+  // строки лобби. Не «улучшать» это обратно на адрес.
+  // ★`total` ПЕЧАТАЕТСЯ НЕ ДЛЯ КРАСОТЫ: дроссель глушит строки, и без
+  // накопительного счёта «отказ случился и честному клиенту тоже» был бы
+  // ненаблюдаем — оракул регрессии раунда считает именно по нему.
+  server::util::QuietLogWarn(
+    "Refused a lobby command(s) from unauthenticated clients: "
+    "client {} sent '{}' (0x{:x}); {} more refusals suppressed since the "
+    "previous line; {} refusals total since start",
+    clientId,
+    protocol::GetCommandName(command),
+    static_cast<uint32_t>(command),
+    suppressed,
+    total);
 }
 
 bool LobbyNetworkHandler::MutateClientContext(
@@ -1146,6 +1254,13 @@ void LobbyNetworkHandler::HandleClientConnected(
     // LOA-fix (R21-4d, round21, backlog #95): и логовую метку ранч-отсрочки —
     // ClientId переиспользуются (зеркало R12-7).
     iter->second.ranchGraceSince = {};
+    // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1): и слот
+    // просьбы о входе. Штатно контекст снимает разрыв (`LockedContextEraser`),
+    // и `try_emplace` заводит чистую запись; но если запись УЦЕЛЕЛА, а
+    // ClientId достался новому подключению, чужой поднятый слот запретил бы
+    // новому клиенту войти НАВСЕГДА — то же зеркало, что у R12-7 и R21-4d, и
+    // цена ошибки здесь выше, чем у логовой метки.
+    iter->second.loginRequestScheduled = false;
   }
 
   server::util::QuietLogDebug(
@@ -1330,14 +1445,64 @@ void LobbyNetworkHandler::HandleLogin(
   // ★По нему ищет `GetClientIdByUserName`, перебирающий карту с ЧУЖОГО потока:
   // запись строки в контекст во время такого перебора — это гонка на самой
   // строке, а не только на структуре карты.
+  //
+  // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1):
+  // ★СХЛОПЫВАНИЕ — ЗДЕСЬ, НА МЕЖПОТОЧНОМ ВХОДЕ, А НЕ ВНУТРИ ЗАДАЧИ.
+  //
+  // Итерация 1 дедуплицировала очередь входа в `LobbyDirector::QueueClientLogin`
+  // — то есть ВНУТРИ задачи планировщика, которую каждый пакет `AcCmdCLLogin`
+  // уже успел завести. Планировщик исполняет не больше ОДНОЙ задачи за тик
+  // (`Scheduler::Tick` снимает один созревший узел), значит флуд входами копил
+  // задачи быстрее, чем они снимались: рост не ограничен ничем, кроме скорости
+  // клиента, а дедуп на дне очереди задач к этому моменту уже опоздал. Хуже
+  // того, задачи с задержкой доходили до директора и ПОСЛЕ того, как исходная
+  // просьба снята с очереди входа, — и каждая снова доезжала до отказа.
+  //
+  // Решение принимается один раз на клиента и ДО постановки задачи: слот
+  // «просьба стоит» захватывается той же мутацией контекста, под тем же
+  // замком, что и запись имени, — то есть проверка и захват атомарны, а не
+  // «посмотрел, потом занял». Слот освобождает сама задача, когда исполнится:
+  // отсюда верхняя граница «не больше одной задачи входа на клиента
+  // одновременно», не зависящая от того, сколько пакетов прислал сокет.
+  //
+  // ★УЧЁТНЫЕ ДАННЫЕ ПИШЕТ ТОЛЬКО ПОБЕДИТЕЛЬ. Пакет, попавший в уже занятый
+  // слот, не переписывает `userName`: иначе второй пакет менял бы имя под уже
+  // отправленной просьбой об аутентификации — ровно то, от чего защищается
+  // `QueueClientLogin`.
+  bool loginRequestClaimed = false;
   if (not MutateClientContext(
         clientId,
-        [&command](ClientContext& clientContext)
+        [&command, &loginRequestClaimed](ClientContext& clientContext)
         {
+          if (clientContext.loginRequestScheduled)
+            return;
+
+          clientContext.loginRequestScheduled = true;
           clientContext.userName = command.loginId;
+          loginRequestClaimed = true;
         }))
   {
     throw std::runtime_error("Lobby client is not available");
+  }
+
+  if (not loginRequestClaimed)
+  {
+    // ★СБРАСЫВАЕМ МОЛЧА ДЛЯ КЛИЕНТА, НО НЕ ДЛЯ ЛОГА. Отбитый пакет обязан
+    // где-то считаться, иначе «схлопнули» неотличимо от «потеряли»: строка
+    // выходит не чаще раза в окно и несёт накопительный счёт.
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_loginRequestCoalesceThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Coalesced a duplicate lobby login request: client {} already has a "
+        "login request pending; {} more coalesced since the previous line; "
+        "{} coalesced login requests total since start",
+        clientId,
+        suppressed,
+        total);
+    }
+    return;
   }
 
   _serverInstance.GetLobbyDirector().GetScheduler().Queue(
@@ -1349,6 +1514,19 @@ void LobbyNetworkHandler::HandleLogin(
         userToken);
 
       //SendWaitingSeqno(clientId, queuePosition);
+
+      // LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1): слот
+      // освобождается ПОСЛЕ того, как просьба доехала до директора. Порядок
+      // не косметический: освободи его раньше — и пакет, пришедший между
+      // освобождением и постановкой в очередь, завёл бы вторую задачу на того
+      // же клиента. Клиента могло уже не быть — тогда мутация просто вернёт
+      // false, контекст снят разрывом вместе со слотом.
+      [[maybe_unused]] const bool released = MutateClientContext(
+        clientId,
+        [](ClientContext& clientContext)
+        {
+          clientContext.loginRequestScheduled = false;
+        });
     });
 }
 
@@ -3047,6 +3225,40 @@ void LobbyNetworkHandler::HandleSetIntroduction(
   const protocol::AcCmdCLSetIntroduction& command)
 {
   const auto clientContext = GetClientContext(clientId);
+
+  // LOA-fix (R72-fix2-4, round72, backlog #170-item-28, находка Codex 4):
+  // ★ОТБРАСЫВАЕМ ДО ЗАПИСИ И ДО РАССЫЛКИ, А НЕ ПОСЛЕ.
+  //
+  // Слишком длинное представление нельзя ни сохранить, ни разослать: рассылка
+  // переполнит исходящий буфер, бросок вылетит из поставщика записи и
+  // `Client::WriteLoop` закроет сокет — ЧУЖОЙ, соседа по ранчо. Порядок
+  // важен: запиши мы текст в запись персонажа до проверки, он остался бы
+  // лежать там навсегда и рвал бы соединения дальше — уже на просмотре
+  // профиля, вообще без участия автора.
+  //
+  // ★ЧЕСТНОГО КЛИЕНТА НЕ ОТКЛЮЧАЕМ. Кадр разобран, сессия цела, ответа у
+  // команды нет ни в каком случае (`AcCmdCLSetIntroduction` не имеет OK-формы)
+  // — поэтому единственное последствие для отправителя это то, что его текст
+  // не применён; строка в логе дросселирована и несёт накопительный счёт.
+  if (command.introduction.size() > MaxIntroductionLength)
+  {
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_oversizedIntroductionThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Dropped an oversized introduction from client {}: {} bytes exceed the "
+        "{}-byte limit; {} more dropped since the previous line; {} oversized "
+        "introductions total since start",
+        clientId,
+        command.introduction.size(),
+        MaxIntroductionLength,
+        suppressed,
+        total);
+    }
+    return;
+  }
+
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
     clientContext.characterUid);
 

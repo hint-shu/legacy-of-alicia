@@ -77,12 +77,21 @@ struct Item
   {
     uint32_t cleanPoints{};
     uint32_t polishPoints{};
+    //! LOA-fix (R72-fix2-3, round72, backlog #174, находка Codex 3): ЗНАЧЕНИЕ
+    //! ПО УМОЛЧАНИЮ. Поле заполняет `ReadCareParameters` из YAML, но запись
+    //! идёт УЖЕ ПОСЛЕ `emplace()`, и любой бросок при разборе секции оставлял
+    //! объект жить с мусором в этом поле — а по нему `RanchDirector` выбирает
+    //! ветку ухода (`switch (itemTemplate->careParameters->parts)`).
+    //! ★Гард `tools/check_field_init.py` этого поля НЕ ВИДЕЛ: перечисление
+    //! объявлено на месте, и закрывающая скобка его тела уносила тип из
+    //! разбираемого объявления. Поле нашлось ровно тогда, когда молчаливый
+    //! пропуск в гарде заменили на остановку.
     enum class Part
     {
       Body = 0,
       Mane = 1,
       Tail = 2
-    } parts;
+    } parts{Part::Body};
   };
 
   struct CureParameters

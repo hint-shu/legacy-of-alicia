@@ -25,6 +25,9 @@
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/network/command/CommandServer.hpp>
 #include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
+#include <libserver/util/LogThrottle.hpp>
+
+#include <string>
 
 namespace server
 {
@@ -71,7 +74,23 @@ public:
     const data::Uid characterUid,
     const MatchmakingSystem::Result& result);
 
-  [[nodiscard]] CommandServer& GetCommandServer() noexcept;
+  //! LOA-fix (R72-fix-2, round72, backlog #129-S1, находка Codex 3):
+  //! ★СЫРОЙ `CommandServer` БОЛЬШЕ НЕ ВЫХОДИТ ИЗ КЛАССА.
+  //!
+  //! Здесь стоял `GetCommandServer()`, отдававший наружу диспетчер целиком —
+  //! то есть и `RegisterCommandHandler`. Пока он существовал, инвариант
+  //! «у лобби нет регистрации без решения об авторизации» держался только на
+  //! том, что никто не воспользовался публичным входом: регистрацию можно было
+  //! завести из ЛЮБОЙ единицы трансляции, а гард смотрит один `.cpp`. Это
+  //! ровно [[a-gate-must-prove-itself-first]]: числа зелены, а свойство не
+  //! тотально. Границу закрывает не гард, а тип: диспетчер приватен, наружу
+  //! отдаётся ровно то, что единственному вызывающему было нужно, — адрес.
+  //!
+  //! Единственный бывший потребитель — `LobbyDirector::ProcesLoginResponse`,
+  //! которому нужен адрес клиента для строки лога.
+  //! @param clientId ID клиента.
+  //! @returns Адрес клиента строкой; пустая строка, если клиента уже нет.
+  [[nodiscard]] std::string GetClientAddress(ClientId clientId) noexcept;
 
 private:
   struct ClientContext
@@ -109,6 +128,24 @@ private:
     std::chrono::steady_clock::time_point ranchGraceSince{};
 
     std::string userName{};
+
+    //! LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1):
+    //! ★«ПРОСЬБА О ВХОДЕ УЖЕ СТОИТ В ПЛАНИРОВЩИКЕ И ЕЩЁ НЕ ИСПОЛНЕНА».
+    //!
+    //! `AcCmdCLLogin` — команда ПРЕД-ЛОГИННАЯ по построению, и каждый её пакет
+    //! заводил СВОЮ задачу планировщика. Планировщик исполняет не больше одной
+    //! задачи за тик, то есть флуд входами копил очередь задач без всякой
+    //! верхней границы — а дедупликация, стоявшая ВНУТРИ задачи
+    //! (`LobbyDirector::QueueClientLogin`), к этому моменту уже опоздала:
+    //! память съедена, задачи заведены. Схлопывать надо на ВХОДЕ, до постановки
+    //! в планировщик, — здесь.
+    //!
+    //! ★ФЛАГ ЖИВЁТ В КОНТЕКСТЕ КЛИЕНТА, А НЕ В ОТДЕЛЬНОМ МНОЖЕСТВЕ: контекст
+    //! снимается при разрыве (`LockedContextEraser`), то есть слот
+    //! освобождается тем же путём, каким освобождается всё остальное о
+    //! клиенте, и отдельного «места, где не забыть убрать» не появляется.
+    bool loginRequestScheduled{false};
+
     data::Uid characterUid = data::InvalidUid;
     data::Uid rancherVisitPreference = data::InvalidUid;
   };
@@ -336,6 +373,74 @@ private:
     ClientId clientId,
     bool requireAuthentication = true);
 
+  //! LOA-fix (R72-1, round72, backlog #129-S1): НЕБРОСАЮЩИЙ вопрос «этот
+  //! клиент залогинен?».
+  //!
+  //! Существует отдельно от `GetClientContext` потому, что ворота регистрации
+  //! спрашивают его на КАЖДОМ входящем пакете, в том числе от сокета, который
+  //! не логинился: бросок там означал бы строку [error] на пакет
+  //! (`CommandServer.cpp`, блок catch вокруг вызова хендлера) — то есть новый
+  //! флуд вместо закрытой дыры.
+  //! @param clientId ID клиента.
+  //! @returns true, если у клиента есть контекст и он аутентифицирован.
+  [[nodiscard]] bool IsClientAuthenticated(ClientId clientId) const;
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ЕДИНСТВЕННАЯ ЗАПИСЬ ОБ ОТКАЗЕ.
+  //! Дросселирована и несёт НАКОПИТЕЛЬНЫЙ счётчик, чтобы проглоченный отказ
+  //! нельзя было потерять.
+  //! @param clientId ID клиента, приславшего команду.
+  //! @param command Команда, которой отказано.
+  void NoteRefusedPreAuthCommand(
+    ClientId clientId,
+    protocol::Command command) noexcept;
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ★РЕГИСТРАЦИЯ ХЕНДЛЕРА,
+  //! ТРЕБУЮЩЕГО ЛОГИНА.
+  //!
+  //! Решение об аутентификации принимается ЗДЕСЬ, ОДИН РАЗ НА КОМАНДУ, и
+  //! хендлер физически не может его «забыть»: до тела он не доходит. Корень
+  //! дефекта #129-S1 был не в одном забытом вызове, а в том, что решение
+  //! принимал каждый хендлер сам — 13 из 36 не спрашивали контекст вовсе.
+  //! Список мест обязательно отстаёт от кода; инвариант диспетчеризации — нет.
+  //! @param handler Обработчик команды.
+  //! ★★ВОРОТА СТОЯТ ДО РАЗБОРА ПАКЕТА (R72-fix-1, находка Codex 1).
+  //! Первая редакция раунда проверяла аутентификацию в обёртке НАД хендлером,
+  //! то есть уже после `C::Read`. Незалогиненный сокет мог прислать
+  //! зарегистрированную команду с УКОРОЧЕННЫМ телом: разбор бросал раньше
+  //! ворот, счётчик отказов не рос, дроссель не звался, а диспетчер писал
+  //! [error] на каждый пакет — новый флуд вместо закрытой дыры, ровно того
+  //! класса, который раунд убирает. Поэтому регистрация идёт через
+  //! `RegisterGatedCommandHandler`: решение принимается по clientId, до
+  //! десериализации, а отказанный кадр поглощается целиком.
+  template <ReadableCommandStruct C>
+  void RegisterAuthenticatedHandler(
+    std::function<void(ClientId, const C&)> handler)
+  {
+    _commandServer.RegisterGatedCommandHandler<C>(
+      [this](const ClientId clientId, const protocol::Command command)
+      {
+        if (IsClientAuthenticated(clientId))
+          return true;
+
+        NoteRefusedPreAuthCommand(clientId, command);
+        return false;
+      },
+      std::move(handler));
+  }
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): ★РЕГИСТРАЦИЯ ХЕНДЛЕРА,
+  //! ЗАКОННОГО ДО ЛОГИНА.
+  //!
+  //! Каждое использование обязано нести письменное обоснование рядом с
+  //! вызовом. Их ТРИ, и весь список виден в одном месте — в конструкторе.
+  //! @param handler Обработчик команды.
+  template <ReadableCommandStruct C>
+  void RegisterPreAuthHandler(
+    std::function<void(ClientId, const C&)> handler)
+  {
+    _commandServer.RegisterCommandHandler<C>(std::move(handler));
+  }
+
   ServerInstance& _serverInstance;
   //! A command server.
   CommandServer _commandServer;
@@ -373,6 +478,31 @@ private:
   //! означает «ещё ни разу» — первая уборка случится на первом же тике и
   //! пройдёт по пустому реестру.
   std::chrono::steady_clock::time_point _lastRanchActivitySweep{};
+
+  //! LOA-fix (R72-1, round72, backlog #129-S1): дроссель строк об отказе.
+  //! Окно 10 с выбрано так, чтобы сканер портов оставлял в логе след (одна
+  //! строка + счётчики), а не мегабайты. Общий на весь лобби-сервер: бороться
+  //! надо с ОБЪЁМОМ, а не обеспечивать каждой команде свою строку.
+  //! ★Полный счёт отказов дроссель ведёт САМ и не обнуляет — именно по нему
+  //! судится «честной сессии не отказано ни разу».
+  util::LogThrottle _preAuthRefusalThrottle{std::chrono::seconds(10)};
+
+  //! LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1): дроссель
+  //! строк о СХЛОПНУТЫХ просьбах о входе.
+  //!
+  //! Отдельный от `_preAuthRefusalThrottle` намеренно: это разные события и
+  //! разные счётчики. Отказ пред-логинной команде означает «сокет полез туда,
+  //! куда ему нельзя»; схлопнутый вход — «сокет торопит уже принятую просьбу».
+  //! Слить их в один дроссель значило бы, что одно событие глушит строку о
+  //! другом, а накопительные счета, по которым судит оракул раунда, перестают
+  //! отвечать каждый за своё.
+  util::LogThrottle _loginRequestCoalesceThrottle{std::chrono::seconds(10)};
+
+  //! LOA-fix (R72-fix2-4, round72, backlog #170-item-28, находка Codex 4):
+  //! дроссель строк о представлениях, не влезающих в исходящий кадр. Тоже
+  //! отдельный: событие порождает клиент, счёт по нему судится сам по себе, и
+  //! глушить им строки об отказах авторизации было бы смешиванием улик.
+  util::LogThrottle _oversizedIntroductionThrottle{std::chrono::seconds(10)};
 };
 
 } // namespace server
