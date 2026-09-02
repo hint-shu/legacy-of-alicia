@@ -3193,6 +3193,18 @@ void RaceNetworkHandler::HandleUserRaceFinal(
       && serverElapsedMs >= static_cast<int64_t>(tracker::MinPlausibleCourseTime)
       && traversalIsProven;
 
+    // ★ПОЧЕМУ У КОНЪЮНКТА `traversalIsProven` НА ВЕТКЕ ФИНИША НЕТ НЕГАТИВА
+    // (R70 итерация 4, решение лида — записано, чтобы следующий не искал
+    // пропавшую ступень лесенки). Снять его поведением НЕЛЬЗЯ НАБЛЮДАТЬ:
+    // `racer.finishOutcome` читает единственное место — блок достижений в
+    // `RaceInstance::Stop`, и оба его цикла начинаются с `participated(racer)`,
+    // то есть с ТОГО ЖЕ предиката. Гонщик, чей исход снятие конъюнкта изменило
+    // бы, до чтения исхода просто не доходит. Развести две величины во времени
+    // тоже нельзя: `finishCounted` и `state = Finishing` ставятся ЭТИМ пакетом
+    // ДО вычисления исхода, а обе улики копятся только под `not finishCounted`
+    // и только в состоянии `Racing`, — значит в `Stop()` предикат ровно тот же.
+    // Конъюнкт оставлен как защита в глубину: если исход когда-нибудь начнут
+    // читать вторым местом БЕЗ гарда участия, дыра не откроется молча.
     racer.finishOutcome = didNotFinish
       ? (retirementIsProven
           ? tracker::RaceTracker::Racer::FinishOutcome::Retired
