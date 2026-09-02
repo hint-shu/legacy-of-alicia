@@ -4910,8 +4910,8 @@ void RaceNetworkHandler::HandleRelay(
   // ★ПРАВИЛО ТОТАЛЬНО ПО ТИПАМ, А НЕ ПО СПИСКУ МЕСТ: классификация — в
   // `race::GetRelayClaim` (RelayAuthz.hpp), её полноту доказывает
   // `tools/check_relay_authz.sh` (каждый элемент перечисления назван) и юнит-тест
-  // (взято ТО поле). Неизвестный тип нагрузки сервер не разбирал вовсе — сверять
-  // нечего, кадр идёт дальше с уже проверенным конвертом.
+  // (взято ТО поле). Неизвестный тип нагрузки сюда уже не доходит: с R71-14 такой кадр
+  // отбрасывается выше, в самом switch'е, — авторизовать `Unparsed` нечем.
   const auto relayClaim = race::GetRelayClaim(command);
   const bool relayActorMismatch =
     (relayClaim.actorKind == race::RelayActorKind::RacerOid
