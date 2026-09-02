@@ -6156,6 +6156,85 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   }
 
   auto magicSlotInfo = GetServerInstance().GetMagicRegistry().GetSlotInfoByEffectId(command.effectId);
+
+  // LOA-fix (R71-20, находка ревью 2 #1): ОТЧЁТ ССЫЛАЕТСЯ НА КАСТ, КОТОРЫЙ СЕРВЕР
+  // ДЕЙСТВИТЕЛЬНО ОБСЛУЖИЛ.
+  //
+  // ★ЧТО БЫЛО ОТКРЫТО. Проверка выданности стояла ТОЛЬКО внутри ветки ледяной стены,
+  // а всякий другой зарегистрированный эффект ехал прямо в `ScheduleSkillEffect`.
+  // Пакет `targetOid = свой, attackerOid = свой, effectId = 2, effectInstanceId =
+  // 0xBEEF`, посланный до единого каста, проходил гарды R71-4 и R71-5 (цель своя, id
+  // в реестре и планируемый) — и сервер выдавал водяной щит. То есть гард был
+  // СПИСКОМ МЕСТ (одна ветка), а не правилом; ровно тот класс дефекта, ради которого
+  // затеян раунд.
+  //
+  // ★ПРАВИЛО ОДНО И ТОТАЛЬНОЕ: экземпляр эффекта существует ровно тогда, когда его
+  // выдал сервер (реестр наполняется в единственном месте рождения — при касте), он
+  // ТОГО ЖЕ ТИПА, что называет отчёт, и его кастовал ТОТ, кого отчёт называет
+  // атакующим. Ни одно из трёх условий клиент подделать не может: номер выдаёт
+  // сервер, тип и кастера он записывает сам.
+  //
+  // ★ТИП СВЕРЯЕТСЯ ДО КРИТ-ПОДМЕНЫ ПО DARKFIRE — иначе гард бил бы по честной игре:
+  // подмену 2->3 и 18->19 делает СЕРВЕР строкой ниже, глядя на эффекты ЦЕЛИ, а
+  // клиент присылает базовый `effectId`. Сравнение с уже подменённым типом отвергало
+  // бы каждое честное попадание по игроку под тёмным огнём.
+  //
+  // ★`attackerOid` БОТА — ЗАКОННЫЙ ВХОД. Пакеты `UseMagicItem` за бота отброшены ещё
+  // R57-5, значит и записи о его касте в реестре нет по построению; гард на такой
+  // отчёт означал бы, что магия ботов перестала действовать на человека — поломка,
+  // которую поймало ревью R57-12. Боты живут только в соло-заезде.
+  //
+  // ★ДРАКОН (`basicType` 16) ПЕРЕДАЁТСЯ ИЗ РУК В РУКИ, И «КАСТЕР» В ОТЧЁТЕ УЖЕ НЕ ТОТ.
+  // `HandleChangeMagicTarget` переписывает `pendingMagicTarget` полем `casterOid` ИЗ
+  // ПАКЕТА передающего, поэтому взрыв дракона у последнего держателя честно называет
+  // атакующим не первого кастера. Сверяем то, что сервер про дракона действительно
+  // знает: цель держит наведение ИМЕННО С ЭТИМ номером экземпляра. Номер и тип при
+  // этом всё равно обязаны быть выданными сервером — послабление касается только
+  // личности кастера.
+  //
+  // ★ЧЕГО ЭТО НЕ ЛОВИТ, СКАЗАНО ПРЯМО: гонщик, которого магия ДЕЙСТВИТЕЛЬНО не
+  // задела, всё ещё может объявить попадание по себе — геометрии трасс у сервера нет
+  // (RaceTracker.hpp:49-52), проверить контакт нечем. Закрыты выдуманный номер, чужой
+  // тип, чужой кастер и отчёт до всякого каста.
+  //
+  // ★ПОБОЧНЫЙ ЭФФЕКТ, НАЗВАННЫЙ ВСЛУХ: у Booster'а обычный и критический варианты
+  // делят один `skillEffectId` (5) в `magic.yaml`, поэтому отчёт о КРИТИЧЕСКОМ
+  // бустере разрешается в обычный тип и гардом отвергается. Игру это не меняет:
+  // эффекты 4-9 и 20-25 сервер вешает САМ в момент каста (`HandleUseMagicItem`,
+  // switch по типу), отчёт клиента для них — повтор. Все типы, для которых отчёт
+  // ЕДИНСТВЕННЫЙ путь применения (2/3, 12/13, 14/15, 16/17, 18/19), имеют различимые
+  // идентификаторы эффектов.
+  const uint16_t reportedMagicType = magicSlotInfo.type;
+  const bool attackerIsAiRacer = raceInstance.IsAiRacerOid(command.attackerOid);
+
+  if (not attackerIsAiRacer)
+  {
+    const auto* effectInstance = raceInstance.GetTracker().FindEffectInstance(
+      command.effectInstanceId);
+    const bool holdsThisDragon = magicSlotInfo.basicType == 16
+      && targetRacer.pendingMagicTarget.has_value()
+      && targetRacer.pendingMagicTarget->effectInstanceId == command.effectInstanceId;
+    const bool instanceAuthorized = effectInstance != nullptr
+      && effectInstance->magicType == reportedMagicType
+      && (effectInstance->casterOid == command.attackerOid || holdsThisDragon);
+
+    if (not instanceAuthorized)
+    {
+      uint64_t suppressed = 0;
+      if (_effectInstanceThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Racer {} reported effect instance {} the server never issued for magic {} "
+          "by racer {} (issued: {}, suppressed {})",
+          targetRacer.oid,
+          command.effectInstanceId,
+          reportedMagicType,
+          command.attackerOid,
+          effectInstance != nullptr,
+          suppressed);
+      return;
+    }
+  }
+
   // If the target has a DarkFire effect active and the magic crits by dark fire, use the critical type instead
   if ((targetRacer.effects[12] || targetRacer.effects[13]) && magicSlotInfo.criticalByDarkFire)
   {
@@ -6165,53 +6244,22 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // only send the magic expire for icewall. other magic cant do anything with it.
   if (magicSlotInfo.type == 10 || magicSlotInfo.type == 11)
   {
-    // LOA-fix (R71-17, находка ревью 2 #2): ЛОМАЕТСЯ ТОЛЬКО СТЕНА, КОТОРУЮ СЕРВЕР
-    // ВЫДАВАЛ.
+    // LOA-fix (R71-17, находка ревью 2 #2): СЛОМ ОДНОРАЗОВЫЙ.
     //
-    // `effectInstanceId` приезжает от клиента и до этого раунда уходил в широковещание
-    // как есть: подсмотрев номер чужой стены в `AcCmdCRUseMagicItemNotify`, гонщик
-    // объявлял её слом — на всех экранах она исчезала, не будучи задетой. Сверяются
-    // ТРИ величины, и все три сервер знает сам: экземпляр жив, его тип совпадает с
-    // разрешённым, а владелец — с тем, кого пакет называет атакующим.
+    // Проверку «стена выдана сервером, того же типа, от названного кастера» делает
+    // общее правило выше — отдельного гарда для стены больше нет и быть не должно:
+    // два одинаковых правила рядом расходятся при первой же правке. Здесь остаётся
+    // то, что есть ТОЛЬКО у стены, — ПОТРЕБЛЕНИЕ: запись снимается, поэтому повтор
+    // того же номера (дубль пакета или попытка) тихо отбрасывается уже общим
+    // правилом, и `AcCmdRCMagicExpire` не размножается.
     //
-    // ★СЛОМ ОДНОРАЗОВЫЙ. Запись снимается сразу: повтор того же номера (дубль пакета
-    // или попытка) тихо отбрасывается, и `AcCmdRCMagicExpire` не размножается.
+    // ★ЧЕГО ЭТО НЕ ЛОВИТ: гонщик, который стену ВИДИТ, но не касался, всё ещё может
+    // объявить слом — геометрии трасс у сервера нет.
     //
-    // ★ЧЕГО ЭТО НЕ ЛОВИТ, СКАЗАНО ПРЯМО: гонщик, который стену ВИДИТ, но не касался,
-    // всё ещё может объявить слом — сервер не знает геометрии трасс (RaceTracker.hpp:49-52),
-    // поэтому «а был ли контакт» проверить нечем. Закрыты выдуманный номер, чужой тип,
-    // истёкшая стена и повтор.
-    //
-    // ★СТЕНА БОТА — ЗАКОННЫЙ ВХОД, И ЕЁ СЕРВЕР НЕ ВЫДАВАЛ. Пакеты `UseMagicItem` за
-    // бота отбрасываются (R57-5), значит записи о его стене в реестре нет по
-    // построению. Гард на такой отчёт не ставится — иначе магия ботов перестала бы
-    // действовать на человека, ровно та поломка, которую поймало ревью R57-12. Боты
-    // живут ТОЛЬКО в соло-заезде, где ломать чужое нечего.
-    if (not raceInstance.IsAiRacerOid(command.attackerOid))
-    {
-      const auto* iceWallInstance = raceInstance.GetTracker().FindEffectInstance(
-        command.effectInstanceId);
-      const bool iceWallMatches = iceWallInstance != nullptr
-        && iceWallInstance->magicType == magicSlotInfo.type
-        && iceWallInstance->casterOid == command.attackerOid;
-
-      if (not iceWallMatches)
-      {
-        uint64_t suppressed = 0;
-        if (_iceWallInstanceThrottle.Allow(suppressed))
-          server::util::QuietLogWarn(
-            "Racer {} reported a breakdown of ice-wall instance {} "
-            "(issued: {}, claimed attacker {}, suppressed {})",
-            targetRacer.oid,
-            command.effectInstanceId,
-            iceWallInstance != nullptr,
-            command.attackerOid,
-            suppressed);
-        return;
-      }
-
+    // ★СТЕНА БОТА снимать нечего: её каст в реестр не попадал (R57-5), и общее
+    // правило бота не судит.
+    if (not attackerIsAiRacer)
       raceInstance.GetTracker().RemoveEffectInstance(command.effectInstanceId);
-    }
 
     const auto magicExpire = protocol::AcCmdRCMagicExpire{
       .magicType = magicSlotInfo.type,
