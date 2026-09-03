@@ -570,84 +570,7 @@ void RaceInstance::Stop()
       // Поле «store in metres, displayed in kilometres» → метры.
       const uint32_t distanceMetres = static_cast<uint32_t>(
         racer.distanceMetres + 0.5);
-      // === LOA-fix (R75, #14 Ф2): ВЕЧНЫЕ РЕКОРДЫ ЛОШАДИ ====================
-      // ★ЕДИНСТВЕННЫЙ ПОТОЛОК ПРАВДОПОДОБИЯ СТОИТ ЗДЕСЬ, А НЕ В ХЕНДЛЕРАХ.
-      // Обе величины приходят из клиентских полей (member5 «в воздухе» и
-      // самообъявленная оплата рывка), обе уезжают в ВЕЧНЫЕ поля лошади, и
-      // проверка правдоподобия у них ОДНА ПО СМЫСЛУ. Ставим её в единственной
-      // точке, где пер-заездное становится вечным, — тогда «забыть применить
-      // потолок в одной из веток» невозможно, а негативная арка снимает его
-      // одним ханком у ОБЕИХ величин.
-      // ★ОТБРАСЫВАЕМ, А НЕ КЛАМПИМ. Кламп позволил бы модифицированному клиенту
-      // ПРИКОЛОТИТЬ вечный рекорд ровно к потолку; отброс означает, что
-      // неправдоподобная величина не даёт НИЧЕГО. Та же дисциплина, что у
-      // бюджета шага R24 (`if (step <= budget)` — отбросить, не обрезать).
-      //
-      // ★ВТОРАЯ УЛИКА — ДОКАЗАННЫЙ СЕРВЕРОМ ФИНИШ (R75 ит.2, Codex #2/#3/#4).
-      // Потолок правдоподобия ограничивает ВЕЛИЧИНУ лжи, но не отвечает на
-      // вопрос «а этот заезд вообще ехали?». На него в дереве уже есть ответ,
-      // построенный R70 (#58): `FinishOutcome::Finished` ставится только когда
-      // заявленный финиш пережил зелёный свет, пол `MinPlausibleCourseTime` И
-      // улику пройденного пути, а `HasProvenTraversal()` — это метры, которые
-      // сервер посчитал САМ из разниц позиций (>= 200 м), плюс зажатый
-      // храповиком прогресс (>= 0.1). Объявить их нельзя, их можно только
-      // проехать. Без этого гейта клиент, простоявший тридцать секунд и
-      // приславший один пакет финиша, чеканил бы себе ВЕЧНЫЙ рекорд лошади.
-      // ★ПОЧЕМУ ГЕЙТ ТОЛЬКО НА НОВЫХ ПОЛЯХ. `topSpeed`/`totalDistance` (Ф1,
-      // R24) стоят на прежнем гейте и здесь НЕ трогаются: расширять радиус
-      // пред-существующего античита — не задача этого раунда, а поведение фазы
-      // 1 обязано остаться прежним. Честной игры гейт не задевает: гонщик,
-      // доехавший до финиша, набирает 200 м и прогресс 0.1 в первые же секунды.
-      const bool outcomeProven =
-        racer.finishOutcome
-          == tracker::RaceTracker::Racer::FinishOutcome::Finished
-        && racer.HasProvenTraversal();
-      const bool glidePlausible =
-        racer.longestGlideMetres <= tracker::MaxPlausibleGlideMetres;
-      const bool chainPlausible =
-        racer.boostComboMax <= tracker::MaxPlausibleBoostChain;
-      const bool glideAccepted = outcomeProven && glidePlausible;
-      const bool chainAccepted = outcomeProven && chainPlausible;
-      const float glideMetres = glideAccepted ? racer.longestGlideMetres : 0.0f;
-      // ★ЕДИНИЦЫ ЗДЕСЬ ДРУГИЕ, ЧЕМ У totalDistance, И ЭТО ЛОВУШКА.
-      // У totalDistance — «store in metres»; у longestGlideDistance — «whole
-      // number, divided by 10», ровно тот же комментарий, что у topSpeed, чьи
-      // десятые доказаны pcap'ом R24. Поэтому здесь ДЕСЯТЫЕ ДОЛИ МЕТРА.
-      const uint64_t glideTenthsRaw = static_cast<uint64_t>(
-        static_cast<double>(glideMetres) * 10.0 + 0.5);
-      const uint32_t glideTenths = glideTenthsRaw > 0xFFFFFFFFull
-        ? 0xFFFFFFFFu
-        : static_cast<uint32_t>(glideTenthsRaw);
-      // Wire-поле boostsInARow — uint16, и read-back режет его кастом. Клампим
-      // на ЗАПИСИ, иначе хранимое и показанное разойдутся. Потолок
-      // правдоподобия (50) и так ниже 65535 — кламп остаётся страховкой формы,
-      // а не логикой.
-      const uint32_t boostsInARow = chainAccepted
-        ? std::min<uint32_t>(racer.boostComboMax, 65535u)
-        : 0u;
-      if (not glidePlausible || not chainPlausible)
-        server::util::QuietLogWarn(
-          "Room {}: character {} reported an implausible per-race record "
-          "(glide {} m, boost chain {}); the implausible value is discarded",
-          this->GetRoomUid(),
-          characterUid,
-          racer.longestGlideMetres,
-          racer.boostComboMax);
-      // ★ОТДЕЛЬНАЯ СТРОКА, А НЕ ОБЩАЯ С ПОТОЛКОМ: «величина неправдоподобна» и
-      // «заезд не доказан» — разные диагнозы, и слипшись в одну строку они
-      // сделали бы лог бесполезным ровно там, где по нему будут разбираться.
-      else if (not outcomeProven
-        && (racer.longestGlideMetres > 0.0f || racer.boostComboMax > 0))
-        server::util::QuietLogWarn(
-          "Room {}: character {} has no server-proven finish, the per-race "
-          "record is not persisted",
-          this->GetRoomUid(),
-          characterUid);
-
-      // ★Гейт «нечего писать» обязан считать ВСЕ величины раунда: без glide и
-      // boosts гонщик с рывками, но без телеметрии, был бы молча пропущен.
-      if (topSpeedTenths == 0 && distanceMetres == 0
-        && glideTenths == 0 && boostsInARow == 0)
+      if (topSpeedTenths == 0 && distanceMetres == 0)
         continue;
 
       data::Uid mountUid = data::InvalidUid;
@@ -662,8 +585,7 @@ void RaceInstance::Stop()
 
       _raceNetworkHandler.GetServerInstance().GetDataDirector().GetHorse(
         mountUid).Mutable(
-        [topSpeedTenths, distanceMetres, glideTenths, boostsInARow](
-          data::Horse& horse)
+        [topSpeedTenths, distanceMetres](data::Horse& horse)
         {
           // Рекорд = максимум, пробег = сумма. ★Насыщающее сложение: totalDistance
           // это uint32, обычный += за 2^32 обернулся бы и превратил near-limit пробег
@@ -675,7 +597,121 @@ void RaceInstance::Stop()
           horse.mountInfo.totalDistance() = newTotalDistance > 0xFFFFFFFFull
             ? 0xFFFFFFFFu
             : static_cast<uint32_t>(newTotalDistance);
+        });
+    }
+  }
 
+  // === LOA-fix (R75, #14 Ф2): ВЕЧНЫЕ РЕКОРДЫ ЛОШАДИ — ОТДЕЛЬНЫМ ПРОХОДОМ ====
+  //
+  // ★ПОЧЕМУ ОТДЕЛЬНЫЙ ПРОХОД, А НЕ ДОПИСКА В ЦИКЛ Ф1 ВЫШЕ (R75 ит.3, Codex #1).
+  // Первая редакция раунда дописала эти две величины в цикл фазы 1 — и тем самым
+  // поставила их ПОД ЧУЖОЙ ГЕЙТ `state == Disconnected`. Гонщик, который доехал
+  // (сервер сам замерил и время, и путь) и закрыл игру, не дождавшись последнего
+  // соперника, терял свой рекорд планирования и цепочку. Отключение — не отмена
+  // уже ДОКАЗАННОГО исхода; тот же довод записан у блока достижений R70
+  // («состояние соединения — не история заезда»).
+  // ★ГЕЙТ Ф1 ПРИ ЭТОМ НЕ ТРОГАЕМ, И ЭТО НАМЕРЕННО. Он пред-существующий (R24),
+  // у него своя причина — прямой `Record::Mutable` на записи, которая может
+  // рушиться в teardown, — и расширять радиус чужого античита раунд не вправе.
+  // Блок фазы 1 выше остался ПОБАЙТНО таким же, как на `origin/main`.
+  // ★ЦЕНА ОТДЕЛЬНОГО ПРОХОДА — ВТОРАЯ ЗАПИСЬ В ТУ ЖЕ ЛОШАДЬ, и она оплачена:
+  // здесь доступ идёт ЧЕРЕЗ ПОЯС (`util::TryImmutable`/`util::TryMutate`), то
+  // есть непрогруженная запись даёт отказ со строкой в логе, а не бросок,
+  // уносящий весь хвост `Stop()`. Именно поэтому проход и может позволить себе
+  // не спрашивать соединение.
+  //
+  // ★ДВЕ УЛИКИ, И ОНИ ОТВЕЧАЮТ НА РАЗНЫЕ ВОПРОСЫ.
+  //  (1) «ЭТОТ ЗАЕЗД ВООБЩЕ ЕХАЛИ?» — `FinishOutcome::Finished` (финиш пережил
+  //      зелёный свет, пол `MinPlausibleCourseTime` и улику пути) плюс
+  //      `HasProvenTraversal()` (>= 200 м, посчитанных СЕРВЕРОМ из разниц
+  //      позиций, и прогресс >= 0.1 под храповиком). Обе построены R70 (#58),
+  //      обе серверные, объявить их нельзя — можно только проехать.
+  //  (2) «А ЭТО ЧИСЛО ПРАВДОПОДОБНО?» — два потолка. Они ограничивают РАЗМЕР
+  //      лжи, пережившей первую улику.
+  // Ни одна не заменяет другую.
+  // ★ОТБРАСЫВАЕМ, А НЕ КЛАМПИМ. Кламп позволил бы модифицированному клиенту
+  // ПРИКОЛОТИТЬ вечный рекорд ровно к потолку; отброс означает, что
+  // неправдоподобная величина не даёт НИЧЕГО. Та же дисциплина, что у бюджета
+  // шага R24 (`if (step <= budget)` — отбросить, не обрезать).
+  {
+    for (const auto& [characterUid, racer] : _tracker.GetRacers())
+    {
+      const bool outcomeProven =
+        racer.finishOutcome
+          == tracker::RaceTracker::Racer::FinishOutcome::Finished
+        && racer.HasProvenTraversal();
+      if (not outcomeProven)
+      {
+        // Молчим у того, кому и писать было нечего: иначе строка пойдёт на
+        // КАЖДОГО сошедшего в каждом заезде и утопит собой диагностику.
+        if (racer.longestGlideMetres > 0.0f || racer.boostComboMax > 0)
+          server::util::QuietLogWarn(
+            "Room {}: character {} has no server-proven finish, the per-race "
+            "record is not persisted",
+            this->GetRoomUid(),
+            characterUid);
+        continue;
+      }
+      // Санитарная проверка самого времени оставлена вторым сомножителем
+      // нарочно — тот же довод, что у `isProvenFinish` в блоке достижений:
+      // читать время без неё было бы приглашением к регрессии, если исход
+      // когда-нибудь начнут ставить в другом месте.
+      if (racer.courseTime == tracker::InvalidCourseTime
+        || racer.courseTime < tracker::MinPlausibleCourseTime)
+        continue;
+
+      const bool glidePlausible =
+        racer.longestGlideMetres <= tracker::MaxPlausibleGlideMetres;
+      const bool chainPlausible =
+        racer.boostComboMax <= tracker::MaxPlausibleBoostChain;
+      if (not glidePlausible || not chainPlausible)
+        server::util::QuietLogWarn(
+          "Room {}: character {} reported an implausible per-race record "
+          "(glide {} m, boost chain {}); the implausible value is discarded",
+          this->GetRoomUid(),
+          characterUid,
+          racer.longestGlideMetres,
+          racer.boostComboMax);
+
+      const float glideMetres = glidePlausible ? racer.longestGlideMetres : 0.0f;
+      // ★ЕДИНИЦЫ ЗДЕСЬ ДРУГИЕ, ЧЕМ У totalDistance, И ЭТО ЛОВУШКА.
+      // У totalDistance — «store in metres»; у longestGlideDistance — «whole
+      // number, divided by 10», ровно тот же комментарий, что у topSpeed, чьи
+      // десятые доказаны pcap'ом R24. Поэтому здесь ДЕСЯТЫЕ ДОЛИ МЕТРА.
+      const uint64_t glideTenthsRaw = static_cast<uint64_t>(
+        static_cast<double>(glideMetres) * 10.0 + 0.5);
+      const uint32_t glideTenths = glideTenthsRaw > 0xFFFFFFFFull
+        ? 0xFFFFFFFFu
+        : static_cast<uint32_t>(glideTenthsRaw);
+      // Wire-поле boostsInARow — uint16, и read-back режет его кастом. Клампим
+      // на ЗАПИСИ, иначе хранимое и показанное разойдутся. Потолок
+      // правдоподобия (50) и так ниже 65535 — кламп остаётся страховкой формы,
+      // а не логикой.
+      const uint32_t boostsInARow = chainPlausible
+        ? std::min<uint32_t>(racer.boostComboMax, 65535u)
+        : 0u;
+      if (glideTenths == 0 && boostsInARow == 0)
+        continue;
+
+      data::Uid mountUid = data::InvalidUid;
+      if (not server::util::TryImmutable(
+            _raceNetworkHandler.GetServerInstance().GetDataDirector()
+              .GetCharacter(characterUid),
+            "read the mount of the per-race record holder",
+            [&mountUid](const data::Character& character) noexcept
+            {
+              mountUid = character.mountUid();
+            }))
+        continue;
+      if (mountUid == data::InvalidUid)
+        continue;
+
+      const auto outcome = server::util::TryMutate(
+        _raceNetworkHandler.GetServerInstance().GetDataDirector().GetHorse(
+          mountUid),
+        "credit the per-race horse record",
+        [glideTenths, boostsInARow](data::Horse& horse) noexcept
+        {
           // ★ОБА ПОЛЯ — ВЕЧНЫЕ РЕКОРДЫ, ПОЭТОМУ ТОЛЬКО МАКСИМУМ И ТОЛЬКО ВВЕРХ.
           // Безусловное присваивание стирало бы чужой рекорд КАЖДЫМ медленным
           // заездом, а снять последствие можно только правкой файлов при
@@ -685,6 +721,12 @@ void RaceInstance::Stop()
           if (boostsInARow > horse.mountInfo.boostsInARow())
             horse.mountInfo.boostsInARow() = boostsInARow;
         });
+
+      if (outcome == server::util::MutateOutcome::NotApplied)
+        server::util::QuietLogWarn(
+          "Room {}: the per-race horse record of character {} was not credited",
+          this->GetRoomUid(),
+          characterUid);
     }
   }
 
