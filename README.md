@@ -20,6 +20,7 @@ Plain-language summary of the gameplay and reliability work we built on top of t
 - **Horse racing that actually works** — fixes to race start, the countdown, in-race item pickups, and matchmaking so races run correctly for multiple players.
 - **Horse care skills** — the grooming/feeding care activities and their progression.
 - **Breeding and horse market fixes** — breeding, the stallion market, and horse handling behave correctly.
+- **Breeding fairness fixes** — coat/mane/tail tables are read by the right key, the rarest coat is kept out of breeding, the emblem chance is driven by data instead of always firing, and foal potential is weighted by coat tier.
 - **Economy protection** — closed a number of exploits that let players gain free or negative currency, and reworked how rewards are paid out.
 - **Moderation and chat** — improvements to in-game moderation tools and chat.
 - **Crash and stability fixes** — the server no longer crashes on malformed or unexpected client data; it logs and keeps running.
