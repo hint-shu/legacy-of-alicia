@@ -34,6 +34,7 @@
 #include <chrono>
 #include <format>
 #include <optional>
+#include <string_view>
 
 #include <spdlog/spdlog.h>
 
@@ -62,6 +63,18 @@ constexpr auto kUserIndexReconcileGap = std::chrono::seconds(5);
 //! — и при этом «файл починили» становится «имя снова находится в течение
 //! минуты», а не «до следующего перезапуска».
 constexpr auto kScheduledNameIndexRepairGap = std::chrono::seconds(60);
+
+//! ПОЛ ЧАСТОТЫ ПРОХОДА — ЭТО `kScheduledNameIndexRepairGap` ВЫШЕ; а это —
+//! ПЕРИОД, с которым проход случается САМ, без чьей-либо просьбы.
+//!
+//! ★ЗАЧЕМ ДВЕ ВЕЛИЧИНЫ, А НЕ ОДНА (правка ревью, итерация 11). Пол отвечает на
+//! вопрос «как часто это МОЖНО делать» и обязан быть неснижаемым: его читает
+//! путь, до которого достаёт имя с провода. Период отвечает на другой вопрос —
+//! «как часто это надо делать, если никто не просил», и он вправе быть реже:
+//! неполный индекс уже отвечает безопасно, а просьба (флаг) всё равно поднимет
+//! осмотр до пола. Одна величина на два вопроса означала бы, что ускорить
+//! ремонт можно только ускорив холостые обходы.
+constexpr auto kPeriodicNameIndexSweepGap = std::chrono::minutes(5);
 
 //! ПОЛ ЧАСТОТЫ: раз в минуту промах сверяется с диском ДАЖЕ при совпавшем
 //! отпечатке.
@@ -120,7 +133,7 @@ constexpr auto kUserIndexStaleAfter = std::chrono::seconds(60);
 //! алиасы, индекс их НЕ ПРИЗНАЁТ.
 std::optional<server::data::Uid> ParseUidLikeStem(const std::string& stem)
 {
-  if (stem.empty() || stem.size() > 10
+  if (stem.empty()
     || not std::ranges::all_of(stem, [](const unsigned char symbol)
       {
         return symbol >= '0' && symbol <= '9';
@@ -129,8 +142,21 @@ std::optional<server::data::Uid> ParseUidLikeStem(const std::string& stem)
     return std::nullopt;
   }
 
+  // ★ВЕДУЩИЕ НУЛИ СНИМАЮТСЯ ДО ГРАНИЦЫ ДЛИНЫ (правка ревью, итерация 11).
+  // Прежде граница в десять байт стояла ПЕРВОЙ, и `00000000007.json`
+  // (одиннадцать байт) не был ни записью, ни АЛИАСОМ: пол счётчика его не
+  // резервировал, то есть следующему персонажу выдался бы uid 7, а `7.json` лёг бы
+  // рядом с уже живым файлом на ту же личность. Граница судит ЗНАЧЕНИЕ, а не
+  // ширину написания: сколько бы нулей ни дописали слева, это то же число.
+  std::string_view digits(stem);
+  while (digits.size() > 1 && digits.front() == '0')
+    digits.remove_prefix(1);
+
+  if (digits.size() > 10)
+    return std::nullopt;
+
   uint64_t parsed = 0;
-  for (const char symbol : stem)
+  for (const char symbol : digits)
     parsed = parsed * 10 + static_cast<uint64_t>(symbol - '0');
 
   if (parsed == 0 || parsed >= std::numeric_limits<uint32_t>::max())
@@ -1173,12 +1199,10 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
     // ПОЗДНЕМУ (правка ревью, итерация 9). Без этого условия обход, снявший
     // список ДО неудачи, перезаписывал её `false` своим `true` — то есть
     // отметка о пропавшем аккаунте стиралась тем, кто этого аккаунта не видел.
-    _userIndexStampValid.store(
+    StoreUserIndexStampValidLocked(
       not stampError && not listing.incomplete
-        && not hardening.incomplete && hardening.failed == 0
-        && _userIndexFailedGeneration.load(std::memory_order::relaxed)
-             < generation,
-      std::memory_order::relaxed);
+        && not hardening.incomplete && hardening.failed == 0,
+      generation);
     _userIndexDirectoryStamp = stamp;
 
     // ★ВРЕМЯ ОКОНЧАНИЯ, А НЕ НАЧАЛА. Именно оно ограничивает частоту: поток,
@@ -1189,6 +1213,103 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
 
   server::util::QuietLogInfo(
     "Account name index: {} account names indexed", indexed);
+}
+
+//! ЕДИНСТВЕННЫЙ ПИСАТЕЛЬ ОТМЕТКИ `_userIndexStampValid` (правка ревью,
+//! итерация 11). Зовётся ТОЛЬКО с уже взятым `_userNameIndexMutex`.
+//!
+//! ★ЗАЧЕМ ОДНО МЕСТО. Отметку писали двое — публикация обхода и путь отказа
+//! регистрации, — и решение «действительна ли она» СОБИРАЛОСЬ у каждого своё:
+//! публикация читала поколение неудач, а неудача просто клала `false` и
+//! ПОСЛЕ этого поднимала поколение. Между двумя её записями помещался целый
+//! обход: он читал ЕЩЁ НЕ поднятое поколение и клал `true` — то есть отметка
+//! объявляла индекс полным при пропавшем аккаунте. Пока писателей двое,
+//! «правило публикации» существует в двух экземплярах и умеет разъехаться
+//! молча; здесь оно одно, и вопрос «под замком ли» задаётся к одной строке.
+void server::FileDataSource::StoreUserIndexStampValidLocked(
+  const bool scanWasClean, const std::size_t generation) noexcept
+{
+  // Отпечаток действителен, только если обход прошёл целиком И ни одна
+  // неудача регистрации не принадлежит этому поколению или более позднему.
+  _userIndexStampValid.store(
+    scanWasClean
+      && _userIndexFailedGeneration.load(std::memory_order::relaxed)
+           < generation,
+    std::memory_order::relaxed);
+}
+
+//! ОТМЕТИТЬ НЕУДАЧУ РЕГИСТРАЦИИ ИМЕНИ — ОДНОЙ КРИТИЧЕСКОЙ СЕКЦИЕЙ (правка
+//! ревью, итерация 11).
+//!
+//! ★ЗАЧЕМ ЗАМОК ЗДЕСЬ. Поднять поколение и снять отметку — это ОДНО
+//! утверждение («индексу верить нельзя»), и разорванное надвое оно
+//! опровергается обходом, успевшим между половинами: он читает старое
+//! поколение и публикует `true`. Под общим замком чередовки нет: любой
+//! публикующий обход видит либо обе половины, либо ни одной, и в первом случае
+//! его собственное поколение уже не старше отмеченного.
+//!
+//! ★ЗАМОК ВЗЯТЬ ЕСТЬ ЧЕМ, ДАЖЕ ЕСЛИ ПАМЯТИ НЕТ. Сюда приходят с пути
+//! `bad_alloc`; взятие `std::shared_mutex` не выделяет памяти, а стек к этому
+//! моменту уже раскручен — то есть замок свободен.
+void server::FileDataSource::MarkUserIndexFailure() noexcept
+{
+  const std::unique_lock indexLock(_userNameIndexMutex);
+  // Порядок половин внутри секции безразличен — снаружи она неделима.
+  StoreUserIndexStampValidLocked(false, std::size_t{0});
+  //! ★ШОВ ДЛЯ НАБЛЮДАТЕЛЯ ЧЕРЕДОВКИ, и он стоит ИМЕННО ЗДЕСЬ — в той точке,
+  //! где у прежней редакции секция кончалась. Тест подставляет сюда попытку
+  //! опоздавшего обхода опубликовать `true`; пока замок наш, попытка не
+  //! проходит, и это наблюдаемо детерминированно, без гонки. В бою указатель
+  //! пуст, и цена — одно расслабленное чтение на пути отказа.
+  if (const auto hook =
+        _userIndexFailureInterleaveHook.load(std::memory_order::relaxed))
+  {
+    hook();
+  }
+  RaiseAtomicWatermark(
+    _userIndexFailedGeneration,
+    _userIndexScanGeneration.load(std::memory_order::relaxed));
+}
+
+//! ШОВ: попытка ОПОЗДАВШЕГО обхода объявить отпечаток действительным.
+//!
+//! Возвращает `false`, если замок индекса занят — то есть публикация в этот
+//! момент НЕВОЗМОЖНА. Именно это и утверждает фикс: пока отметка о неудаче
+//! ставится, опубликовать поверх неё нечего.
+bool server::FileDataSource::TryPublishStaleUserIndexStampForTest(
+  const std::size_t generation) noexcept
+{
+  std::unique_lock indexLock(_userNameIndexMutex, std::try_to_lock);
+  if (not indexLock.owns_lock())
+    return false;
+  StoreUserIndexStampValidLocked(true, generation);
+  return true;
+}
+
+bool server::FileDataSource::UserIndexStampValidForTest() const noexcept
+{
+  return _userIndexStampValid.load(std::memory_order::relaxed);
+}
+
+void server::FileDataSource::SetUserIndexFailureInterleaveHookForTest(
+  void (*hook)()) noexcept
+{
+  _userIndexFailureInterleaveHook.store(hook, std::memory_order::relaxed);
+}
+
+std::size_t server::FileDataSource::BeginUserIndexScanForTest() noexcept
+{
+  return _userIndexScanGeneration.fetch_add(1, std::memory_order::relaxed) + 1;
+}
+
+void server::FileDataSource::MarkUserIndexFailureForTest() noexcept
+{
+  MarkUserIndexFailure();
+}
+
+void server::FileDataSource::RequestScheduledNameIndexRepairForTest() noexcept
+{
+  RequestScheduledNameIndexRepair();
 }
 
 void server::FileDataSource::IndexUserName(const std::string& name)
@@ -1249,19 +1370,11 @@ void server::FileDataSource::IndexUserName(const std::string& name)
   }
   catch (const std::exception& x)
   {
-    // ★ФЛАГ АТОМАРНЫЙ ИМЕННО РАДИ ЭТОЙ СТРОКИ (правка ревью, итерация 7): к
-    // моменту перехвата замок индекса УЖЕ отпущен раскруткой стека, а объявить
-    // отпечаток недействительным обязано быть возможно и тогда, когда взять
-    // замок снова нечем.
-    _userIndexStampValid.store(false, std::memory_order::relaxed);
-    // ★И ОТМЕТКА ПРИВЯЗЫВАЕТСЯ К ПОКОЛЕНИЮ, А НЕ ТОЛЬКО К БИТУ (правка ревью,
-    // итерация 9). Бит умеет быть перезаписан обходом, начавшимся раньше нас;
-    // поколение — нет: любой обход, чей номер не больше этого, опубликует
-    // `false`, а следующий обход (номер больше) читает каталог с диска уже
-    // ПОСЛЕ нашей записи файла и потому вправе объявить себя полным.
-    RaiseAtomicWatermark(
-      _userIndexFailedGeneration,
-      _userIndexScanGeneration.load(std::memory_order::relaxed));
+    // ★ОТМЕТКА О НЕУДАЧЕ — ОДНА КРИТИЧЕСКАЯ СЕКЦИЯ, А НЕ ДВЕ ЗАПИСИ (правка
+    // ревью, итерация 11): подробности в `MarkUserIndexFailure`. К моменту
+    // перехвата замок индекса УЖЕ отпущен раскруткой стека, поэтому взять его
+    // снова здесь и можно, и нужно.
+    MarkUserIndexFailure();
     server::util::QuietLogError(
       "Account name index: '{}' could not be indexed ({}); the index is marked "
       "stale and will be rebuilt from disk on the next miss", name, x.what());
@@ -1952,31 +2065,58 @@ void server::FileDataSource::DeleteCharacter(data::Uid uid)
   ForgetCharacterName(uid);
 }
 
+std::size_t server::FileDataSource::ScheduledNameIndexPassCount() const noexcept
+{
+  return _nameIndexMaintenancePasses.load(std::memory_order::relaxed);
+}
+
 void server::FileDataSource::RequestScheduledNameIndexRepair() noexcept
 {
-  // Сдвигаем срок ближайшего планового прохода в прошлое: следующий тик
-  // директора данных осмотрит индексы, не дожидаясь минуты. Ввода-вывода здесь
-  // нет и быть не должно — этот путь достижим именем с провода.
-  _nameIndexMaintenanceLastRun.store(
-    std::chrono::steady_clock::time_point{}, std::memory_order::relaxed);
+  // ★ЗАПРОС ПОДНИМАЕТ ФЛАГ И БОЛЬШЕ НИЧЕГО (правка ревью, итерация 11).
+  //
+  // Прежняя редакция сдвигала СРОК ближайшего прохода в прошлое — то есть путь,
+  // достижимый именем с провода, отменял шестидесятисекундный пол. При
+  // постоянно битом файле клиент, повторяющий запрос после каждого неудачного
+  // прохода, покупал полный обход каталога на КАЖДОМ тике директора (50 Гц):
+  // ремонт асинхронный, но оплачен он всё равно вводом клиента. Здесь флаг
+  // только ПРОСИТ, а разрешает по-прежнему часы: `TickNameIndexMaintenance`
+  // не запускает проход раньше пола ни по чьей просьбе.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
 }
 
 void server::FileDataSource::TickNameIndexMaintenance() noexcept
 {
+  TickNameIndexMaintenanceAt(std::chrono::steady_clock::now());
+}
+
+void server::FileDataSource::TickNameIndexMaintenanceAt(
+  const std::chrono::steady_clock::time_point now) noexcept
+{
   try
   {
-    const auto now = std::chrono::steady_clock::now();
     const auto last =
       _nameIndexMaintenanceLastRun.load(std::memory_order::relaxed);
     // Эпоха означает «планового прохода ещё не было»: первый тик после старта
     // осматривает индексы сразу — ровно тот случай, когда стартовая сборка
     // вышла неполной и ждать минуту незачем.
-    if (last != std::chrono::steady_clock::time_point{}
-      && now - last < kScheduledNameIndexRepairGap)
-    {
+    const bool never = last == std::chrono::steady_clock::time_point{};
+    // ★ПОЛ — ЭТО КОНЪЮНКЦИЯ, А НЕ ВЫБОР ИЗ ДВУХ ПОВОДОВ. Проход идёт, только
+    // если с прошлого прошло не меньше пола И есть повод: чья-то просьба или
+    // наступивший срок периодического осмотра. Просьба УСКОРЯЕТ ожидание
+    // периода, но не умеет опустить пол.
+    const bool floorPassed = never || now - last >= kScheduledNameIndexRepairGap;
+    const bool periodicDue = never || now - last >= kPeriodicNameIndexSweepGap;
+    const bool requested =
+      _nameIndexRepairPending.load(std::memory_order::relaxed);
+    if (not floorPassed || not (requested || periodicDue))
       return;
-    }
+
+    // ★ФЛАГ СНИМАЕТСЯ ПЕРЕД ПРОХОДОМ, А НЕ ПОСЛЕ: просьба, пришедшая ПОКА мы
+    // осматриваем, обязана дожить до следующего прохода — иначе ремонт
+    // оказался бы потерян ровно на том, кто попросил вовремя.
+    _nameIndexRepairPending.store(false, std::memory_order::relaxed);
     _nameIndexMaintenanceLastRun.store(now, std::memory_order::relaxed);
+    _nameIndexMaintenancePasses.fetch_add(1, std::memory_order::relaxed);
 
     // Оба индекса, а не только тот, о который кто-то споткнулся: повод здесь
     // общий и не знает, чьё имя спрашивали.

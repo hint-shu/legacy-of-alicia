@@ -67,6 +67,26 @@ void WriteRaw(const std::filesystem::path& path, const std::string& payload)
   file << payload;
 }
 
+//! ★ПРОВЕРКА, КОТОРАЯ НЕ УМЕЕТ ИСЧЕЗНУТЬ (правка ревью, итерация 11).
+//!
+//! `assert` выше жив только потому, что файл снимает `NDEBUG` первой строкой;
+//! снимут её (или соберут этот файл иначе) — и утверждения станут пустыми, а
+//! тест «зелёным» ровно там, где перестал смотреть. `CHECK` вычисляет условие
+//! ВСЕГДА, печатает место и валит прогон кодом возврата.
+int g_failures = 0;
+
+void CheckImpl(const bool condition, const char* const expression,
+  const char* const what, const int line)
+{
+  if (condition)
+    return;
+  ++g_failures;
+  std::fprintf(stderr, "TestFileDataSource.cpp:%d: НАРУШЕНО (%s): %s\n",
+    line, expression, what);
+}
+
+#define CHECK(condition, what) CheckImpl((condition), #condition, (what), __LINE__)
+
 server::data::Guild MakeGuild(
   const server::data::Uid uid, const std::string& name)
 {
@@ -485,6 +505,183 @@ void TestIncompleteIndexNeverAnswersFree()
   std::filesystem::remove_all(root, error);
 }
 
+
+//! ★ПРОСЬБА С ПРОВОДА НЕ УМЕЕТ ОПУСТИТЬ ПОЛ (ревью, итерация 11, находка 1).
+//!
+//! `RequestScheduledNameIndexRepair` ставила срок ближайшего прохода в прошлое,
+//! а плановый проход читал это как «пора». То есть путь, до которого достаёт
+//! имя с провода, ОТМЕНЯЛ шестидесятисекундный предел: при постоянно битом
+//! файле клиент, повторяющий запрос после каждого неудачного прохода, покупал
+//! полный обход каталога на каждом тике директора данных (50 Гц). Здесь
+//! проверено обратное утверждение: сколько ни проси, раньше пола проход не
+//! случится, а на полу случится РОВНО ОДИН — просьбы не копятся в очередь
+//! проходов.
+void TestRequestsCannotLowerTheRepairFloor()
+{
+  const auto root = MakeSandbox("repair-floor");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "1.json", "{ this is not json");
+  WriteRaw(root / "characters" / "2.json", R"({"uid": 2, "name": "Beta"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  const auto base = std::chrono::steady_clock::now();
+  CHECK(source.ScheduledNameIndexPassCount() == 0,
+    "до первого тика проходов быть не может");
+
+  // Первый проход после старта идёт без ожидания — неполная стартовая сборка
+  // не имеет права ждать минуту.
+  source.TickNameIndexMaintenanceAt(base);
+  CHECK(source.ScheduledNameIndexPassCount() == 1,
+    "первый тик после старта обязан осмотреть индексы сразу");
+
+  // ТРИ ПРОСЬБЫ ВНУТРИ МИНУТЫ — и между ними тики, как у живого директора.
+  for (int second = 1; second <= 3; ++second)
+  {
+    source.RequestScheduledNameIndexRepairForTest();
+    for (int tick = 0; tick < 50; ++tick)
+      source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(second));
+  }
+  CHECK(source.ScheduledNameIndexPassCount() == 1,
+    "просьба с провода опустила пол: проход случился раньше минуты");
+
+  // За секунду до пола — всё ещё нет.
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(59));
+  CHECK(source.ScheduledNameIndexPassCount() == 1,
+    "проход случился до истечения пола");
+
+  // НА ПОЛУ — ровно один проход на все три просьбы.
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(60));
+  CHECK(source.ScheduledNameIndexPassCount() == 2,
+    "на полу отложенная просьба обязана быть исполнена");
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(61));
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(120));
+  CHECK(source.ScheduledNameIndexPassCount() == 2,
+    "три просьбы дали больше одного прохода — они копятся в очередь");
+
+  // И БЕЗ ПРОСЬБ проход всё равно приходит сам — реже, по периоду.
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(60 + 300));
+  CHECK(source.ScheduledNameIndexPassCount() == 3,
+    "периодический осмотр перестал случаться сам");
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★ОТМЕТКА О НЕУДАЧЕ И ПУБЛИКАЦИЯ — ОДИН ПРОТОКОЛ (ревью, итерация 11, 2).
+//!
+//! Прежде путь отказа `IndexUserName` писал `false`, а поколение неудачи
+//! поднимал ПОСЛЕ — и между двумя записями помещался целый обход: он читал ещё
+//! не поднятое поколение и клал `true`. Итог — «индекс полон» при пропавшем
+//! аккаунте.
+//!
+//! ★ЧЕРЕДОВКА ВОСПРОИЗВОДИТСЯ, А НЕ ВЫЖИДАЕТСЯ. Гонка двух потоков дала бы
+//! тест, который молчит чаще, чем ловит. Крючок стоит РОВНО в точке бывшего
+//! разрыва, и опоздавший обход пробует опубликовать оттуда `true`
+//! неблокирующе: отказ `try_lock` — это и есть «чередовки нет».
+server::FileDataSource* g_interleaveSource = nullptr;
+std::size_t g_interleaveGeneration = 0;
+bool g_interleaveHookRan = false;
+bool g_interleavePublished = false;
+
+void AttemptStalePublicationFromInsideTheFailure()
+{
+  g_interleaveHookRan = true;
+  g_interleavePublished =
+    g_interleaveSource->TryPublishStaleUserIndexStampForTest(
+      g_interleaveGeneration);
+}
+
+void TestStaleScanCannotPublishOverAFailure()
+{
+  server::FileDataSource source;
+
+  // Обход УЖЕ идёт: его поколение — то самое, которое отметит наша неудача.
+  const std::size_t generation = source.BeginUserIndexScanForTest();
+  CHECK(generation == 1, "поколение обхода обязано начинаться с единицы");
+
+  g_interleaveSource = &source;
+  g_interleaveGeneration = generation;
+  g_interleaveHookRan = false;
+  g_interleavePublished = false;
+  source.SetUserIndexFailureInterleaveHookForTest(
+    &AttemptStalePublicationFromInsideTheFailure);
+
+  source.MarkUserIndexFailureForTest();
+
+  source.SetUserIndexFailureInterleaveHookForTest(nullptr);
+  g_interleaveSource = nullptr;
+
+  CHECK(g_interleaveHookRan,
+    "наблюдатель не был позван — тест не смотрел на предмет");
+  CHECK(not g_interleavePublished,
+    "опоздавший обход опубликовал отметку ВНУТРИ отметки о неудаче");
+  CHECK(not source.UserIndexStampValidForTest(),
+    "после неудачи регистрации индекс объявлен полным");
+
+  // И ПОСЛЕ секции — замок свободен, публикация физически возможна, но
+  // поколение уже отмечено, поэтому её вердикт всё равно «не полон».
+  CHECK(source.TryPublishStaleUserIndexStampForTest(generation),
+    "замок остался занят после отметки о неудаче");
+  CHECK(not source.UserIndexStampValidForTest(),
+    "обход своего поколения объявил индекс полным поверх отметки о неудаче");
+
+  // А обход СЛЕДУЮЩЕГО поколения читает каталог уже после нашей записи и
+  // потому вправе объявить себя полным — иначе фикс запер бы индекс навсегда.
+  const std::size_t later = source.BeginUserIndexScanForTest();
+  CHECK(source.TryPublishStaleUserIndexStampForTest(later),
+    "замок остался занят");
+  CHECK(source.UserIndexStampValidForTest(),
+    "следующий обход больше не умеет объявить индекс полным");
+}
+
+//! ★АЛИАС ЛЮБОЙ ШИРИНЫ — ЭТО ТО ЖЕ ЧИСЛО (ревью, итерация 11, находка W5).
+//!
+//! Граница в десять байт стояла ПЕРЕД снятием ведущих нулей, поэтому
+//! `00000000007.json` (одиннадцать байт) не был ни записью, ни алиасом: пол
+//! счётчика uid его не резервировал. Следующему персонажу выдался бы uid 7,
+//! `ProduceDataFilePath` написал бы `7.json` — и рядом остались бы два живых
+//! файла на одну личность, ровно тот исход, который закрывала W5.
+void TestWidelyPaddedAliasIsStillReserved()
+{
+  const auto root = MakeSandbox("padded-alias");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "00000000007.json",
+    R"({"uid": 7, "name": "PaddedAlias"})");
+  WriteRaw(root / "characters" / "3.json", R"({"uid": 3, "name": "Real"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  // Алиас — НЕ запись, каким бы широким ни было написание.
+  CHECK(source.RetrieveCharacterUidByName("PaddedAlias")
+      == server::data::InvalidUid,
+    "неканоническое имя файла снова читается как запись");
+  CHECK(source.RetrieveCharacterUidByName("Real") == server::data::Uid{3},
+    "соседняя каноническая запись перестала находиться");
+  CHECK(source.IsCharacterNameUnique("Delta"),
+    "посторонний файл сделал индекс неполным");
+
+  // ★НО ПОЛ СЧЁТЧИКА ЕГО РЕЗЕРВИРУЕТ.
+  server::data::Character created;
+  source.CreateCharacter(created);
+  CHECK(created.uid() > server::data::Uid{7},
+    "широко дополненный алиас не зарезервирован: uid выдан занятым");
+
+  // И имя, чьё ЗНАЧЕНИЕ не представимо, записью по-прежнему не становится —
+  // снятие нулей не превратило границу в «любая длина».
+  WriteRaw(root / "characters" / "99999999999.json",
+    R"({"uid": 5, "name": "TooBig"})");
+  server::FileDataSource second;
+  second.Initialize(root);
+  CHECK(second.RetrieveCharacterUidByName("TooBig") == server::data::InvalidUid,
+    "непредставимое число стало записью");
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
 } // namespace
 
 int main()
@@ -499,5 +696,14 @@ int main()
   TestLegacyNameIsFindableButNotCreatable();
   TestNoncanonicalFileNameIsNotARecord();
   TestIncompleteIndexNeverAnswersFree();
+  TestRequestsCannotLowerTheRepairFloor();
+  TestStaleScanCannotPublishOverAFailure();
+  TestWidelyPaddedAliasIsStillReserved();
+  if (g_failures > 0)
+  {
+    std::fprintf(stderr, "TestFileDataSource: %d НАРУШЕНИЙ\n", g_failures);
+    return 1;
+  }
   std::puts("TestFileDataSource: ok");
+  return 0;
 }
