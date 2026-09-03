@@ -17,6 +17,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  **/
 
+#include "libserver/registry/BreedingOdds.hpp"
 #include "libserver/registry/HorseRegistry.hpp"
 #include "libserver/util/QuietLog.hpp"
 
@@ -63,6 +64,24 @@ Color ParseManeTailColorId(int id)
   }
 }
 
+//! ★R77-fix-2 (Codex finding 2). `static_cast<Coat::Tier>(anyInteger)` accepted
+//! ANY YAML integer, and the value then travelled all the way into
+//! `CoatTierToOddsIndex`, whose silent `default` mapped it onto the common-coat
+//! column. The cast is validated HERE, at the only place the value enters the
+//! program, so the enum can never hold a value outside its own range.
+Coat::Tier ParseCoatTier(const int32_t id)
+{
+  switch (id)
+  {
+    case 1: return Coat::Tier::Common;
+    case 2: return Coat::Tier::Uncommon;
+    case 3: return Coat::Tier::Rare;
+    default:
+      throw std::runtime_error(
+        "coats: star tier " + std::to_string(id) + " is outside 1..3");
+  }
+}
+
 } // anon namespace
 
 HorseRegistry::HorseRegistry()
@@ -70,6 +89,103 @@ HorseRegistry::HorseRegistry()
 }
 
 void HorseRegistry::ReadConfig(const std::filesystem::path& configPath)
+{
+  // ★ALL-OR-NOTHING (Codex finding 1, iteration 1). Everything is parsed into a
+  // scratch registry that nobody else can see; the live tables are replaced only
+  // after the parse AND the validation have both succeeded. The move-assignment
+  // is the implicitly generated one on purpose: a hand-written per-member swap
+  // would silently stop covering a member the day someone adds one, and a
+  // registry missing one table is exactly the state this fix exists to forbid.
+  HorseRegistry parsed;
+  parsed.LoadTables(configPath);
+  parsed.ValidateTables();
+  *this = std::move(parsed);
+}
+
+void HorseRegistry::ValidateTables() const
+{
+  const auto refuse = [](const std::string& what)
+  {
+    throw std::runtime_error("horse tables refused: " + what);
+  };
+
+  // Rolls that index these tables have no meaningful behaviour on an empty one.
+  if (_coats.empty() || _possibleCoats.empty())
+    refuse("no coats");
+  if (_faces.empty() || _possibleFaces.empty())
+    refuse("no faces");
+  if (_manes.empty() || _tails.empty())
+    refuse("no manes or no tails");
+  if (_grades.empty())
+    refuse("no grades");
+
+  // ★The state Codex finding 1 could reach: an empty potential table behind a
+  // roll that computes size() - 1. Refused here, so it cannot become live.
+  if (_potentials.empty() || _potentialTypes.empty())
+    refuse("no potential types");
+
+  // ★Codex finding 2 -- every column the coat-tier roll can select must have at
+  // least one positive weight, otherwise the breeding roll has no candidates and
+  // the only remaining behaviours are "no potential at all" or a fallback.
+  for (std::size_t column = 0; column < 3; ++column)
+  {
+    bool positive = false;
+    for (const auto& [type, info] : _potentials)
+    {
+      if (info.oddsByCoatTier[column] > 0)
+      {
+        positive = true;
+        break;
+      }
+    }
+    if (not positive)
+      refuse("no potential type has a positive weight for coat tier column "
+             + std::to_string(column + 1));
+  }
+
+  // ★Codex finding 3 -- the emblem roll must never have to invent a tier or an
+  // emblem at runtime. Everything it needs is proved present HERE, at load.
+  if (_emblems.empty())
+    refuse("no emblems");
+  if (_emblemRatios.empty())
+    refuse("no emblem ratios");
+
+  bool anyPositiveRatio = false;
+  for (const auto& [odds, ratio] : _emblemRatios)
+  {
+    if (ratio.ratio < 0)
+      refuse("emblem ratio for tier " + std::to_string(odds) + " is negative");
+    if (ratio.ratio == 0)
+      continue;
+
+    // ★fix-3 (Codex iteration 2, BLOCK 2). Tier 0 is the RESERVED sentinel that
+    // BreedingOdds uses for "this foal gets no emblem". A configured tier 0 with
+    // a positive ratio would be rolled and then read as the sentinel, so real
+    // emblems would silently turn into no emblem. The name is reserved; refuse it.
+    if (odds == kNoEmblemTier)
+      refuse("emblem tier 0 is the reserved \"no emblem\" sentinel and cannot carry a ratio");
+
+    anyPositiveRatio = true;
+
+    // A tier that CAN be rolled must have emblems to hand out. Without this the
+    // roll picked a tier and then returned the invented emblem id 1.
+    const bool covered = std::ranges::any_of(
+      _emblems, [odds](const auto& entry) { return entry.second.odds == odds; });
+    if (not covered)
+      refuse("emblem tier " + std::to_string(odds) + " has no emblems");
+  }
+  if (not anyPositiveRatio)
+    refuse("every emblem ratio is zero");
+
+  // ★fix-3 (Codex iteration 2, WARN 3). A sum ABOVE 100 is deliberately NOT
+  // refused, and no sum is accumulated here at all. The documented contract of
+  // BuildEmblemTierChoices is that ratios are WEIGHTS and that a sum of 100 or
+  // more simply means "no no-emblem share"; refusing it contradicted the helper's
+  // own header, and an accumulator that exists only for a rule we do not want is
+  // just an int32 overflow waiting to happen (Codex iteration 2, BLOCK 1).
+}
+
+void HorseRegistry::LoadTables(const std::filesystem::path& configPath)
 {
   // Horse tables are split across category files under the config directory.
   // Merge their top-level sections into a single node so the parsing below
@@ -104,7 +220,7 @@ void HorseRegistry::ReadConfig(const std::filesystem::path& configPath)
       .tid = tid,
       .faceType = node["faceType"].as<int32_t>(),
       .minGrade = node["minGrade"].as<int32_t>(),
-      .tier = static_cast<Coat::Tier>(node["tier"].as<int32_t>()),
+      .tier = ParseCoatTier(node["tier"].as<int32_t>()),
       .inheritanceRate = node["inheritanceRate"].as<float>(),
       .allowedColorGroups = node["allowedColorGroups"].as<int32_t>(),
     };
@@ -188,6 +304,14 @@ void HorseRegistry::ReadConfig(const std::filesystem::path& configPath)
     _potentials[type] = PotentialInfo{
       .type = type,
       .name = node["name"].as<std::string>(),
+      // Mandatory on purpose: no .as<int32_t>(0) and no "if (node[...])".
+      // A missing oddsRare key must throw here and stop the server, because the
+      // silent alternative is every weight reading 0, which puts the potential
+      // type roll back on a uniform coin flip that nothing would ever report.
+      .oddsByCoatTier = {
+        node["oddsRare1"].as<int32_t>(),
+        node["oddsRare2"].as<int32_t>(),
+        node["oddsRare3"].as<int32_t>()},
     };
     _potentialTypes.push_back(type);
   }
@@ -378,9 +502,26 @@ void HorseRegistry::BuildRandomHorse(
   appearance.bodyVolume = scale;
 }
 
+//! ROUND BOUNDARY (R77). This is the admin path (//horse potential, ChatSystem),
+//! and it stays a uniform roll ON PURPOSE. R77 made the BREEDING roll depend on
+//! the foal's coat star tier (Genetics::CalculateFoalPotential); this function has
+//! no coat context to key off, and it doubles as the round's non-growing control
+//! symbol. It is not an unfixed defect -- do not "harmonise" it without a coat.
 void HorseRegistry::GiveHorseRandomPotential(
   data::Horse::Potential& potential)
 {
+  // ★R77-fix-2 (Codex finding 1). `size() - 1` on an EMPTY vector is not -1, it is
+  // SIZE_MAX: the distribution would then index a vector of length zero. Load-time
+  // validation makes an empty table unreachable; this guard is the second lock, so
+  // the out-of-bounds read cannot happen even if a future path builds a registry
+  // without going through ReadConfig. Refusing loudly beats rolling garbage.
+  if (_potentialTypes.empty())
+  {
+    server::util::QuietLogError(
+      "HorseRegistry: refusing a random potential, no potential types are loaded");
+    return;
+  }
+
   std::uniform_int_distribution<size_t> typeDist(0, _potentialTypes.size() - 1);
   std::uniform_int_distribution<uint32_t> randomDist(0, 255);
   potential.type = _potentialTypes[typeDist(server::util::GetRandomEngine())];

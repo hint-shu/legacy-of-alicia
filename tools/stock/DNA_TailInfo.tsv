@@ -1,0 +1,7 @@
+ShapeID	Name	FileName	InheritanceRate	LimitGrade	ChildGrade0	CalibRatio0	ChildGrade1	CalibRatio1	ChildGrade2	CalibRatio2	ChildGrade3	CalibRatio3	ChildGrade4	CalibRatio4	Rare	PCBangExcept
+1	средний	h000_htl000_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0
+2	длинный густой	h000_htl001_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0
+3	подрезанный	h000_htl002_thumbnail.png	20.000000	7	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	2	0
+4	длинный редкий	h000_htl003_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	1
+5	короткий редкий	h000_htl004_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	1
+6	длинный волнистый	h000_htl005_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0

@@ -48,6 +48,25 @@ target_sources(race_test_p2did_pool PRIVATE
 target_link_libraries(race_test_p2did_pool
         PRIVATE project-properties alicia-libserver)
 
+# R77. Both need the shipped horse tables, so they get the config dir by path.
+# The tables ARE the change in this round: a test built against a fixture copy
+# would go green while the shipped YAML rotted.
+add_executable(registry_test_horse_tables)
+target_sources(registry_test_horse_tables PRIVATE
+        src/registry/TestHorseTables.cpp)
+target_link_libraries(registry_test_horse_tables
+        PRIVATE project-properties alicia-libserver)
+target_compile_definitions(registry_test_horse_tables
+        PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
+
+add_executable(ranch_test_genetics)
+target_sources(ranch_test_genetics PRIVATE
+        src/ranch/TestGenetics.cpp)
+target_link_libraries(ranch_test_genetics
+        PRIVATE project-properties alicia-libserver)
+target_compile_definitions(ranch_test_genetics
+        PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -56,6 +75,8 @@ add_test(NAME UtilTestAliciaShopTime COMMAND util_test_alicia_shop_time)
 add_test(NAME UtilTestProfiler COMMAND util_test_profiler)
 add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
 add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
+add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
+add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -78,6 +99,21 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_field_init.py --selftest)
     add_test(NAME ToolFieldInitGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_field_init.py)
+    # R77. Same reasoning as the two gates above: an oracle nobody runs is not an
+    # oracle. The expected finding count is a property of the BRANCH -- 0 on the
+    # candidate, non-zero on the data negatives -- so the round builder passes
+    # --expect, while here it guards the tree that ships.
+    add_test(NAME ToolDnaVsStockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py --selftest)
+    add_test(NAME ToolDnaVsStockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py)
+    # R77-fix-2 (Codex finding 6). The breeding potential roll lives in the
+    # alicia-server EXECUTABLE and cannot be linked into a test binary, so neg-d
+    # -- the negative that puts the uniform roll back -- was provable only by the
+    # stand and the ladder, i.e. only for one SHA. This source gate states the
+    # property durably; it proves itself on two fixtures before judging the tree.
+    add_test(NAME ToolPotentialRollGate
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_potential_roll.sh)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

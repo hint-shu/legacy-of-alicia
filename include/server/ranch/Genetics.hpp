@@ -155,8 +155,10 @@ private:
   //! Rolls a foal tendency weighted by horses.yaml -> tendencyRatios.breedingRatio.
   uint32_t RollTendency();
 
-  //! Rolls a foal emblem: a rarity tier weighted by emblems.yaml -> emblemRatios,
-  //! then a uniform emblem within that tier. Always returns an emblem.
+  //! Rolls a foal emblem: a rarity tier weighted by emblems.yaml -> emblemRatios
+  //! plus the "no emblem" sentinel for the shortfall to 100, then a uniform emblem
+  //! within the chosen tier.
+  //! @returns The emblem id, or 0 when the foal gets no emblem at all.
   uint32_t RollEmblem();
 
   //! Selects which body part of a horse to read.
