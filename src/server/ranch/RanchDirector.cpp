@@ -1194,6 +1194,12 @@ void RanchDirector::HandleNetworkTick()
     // ★Бросить отсюда безопасно: обрамляющий catch на месте (см. R34-5).
     DrainPendingIntroductionNotifies();
 
+    // LOA (R70, backlog #58): отложенные нотификации достижений заезда —
+    // сразу за представлениями и по той же причине: мёртвые клиенты уже
+    // убраны из `_clients`, попап не адресуется трупу.
+    // ★Бросить отсюда безопасно: обрамляющий catch на месте (см. R34-5).
+    DrainPendingAchievementNotifies();
+
     // LOA-fix (R35-4, round35, backlog #124): ПРОХОД ПО СОЗРЕВШИМ ЖЕРЕБЯТАМ —
     // здесь и только здесь. Мы на РАНЧ-СЕТЕВОМ потоке, единственном владельце
     // `_clients`/`_ranches`, поэтому обход и мутация контекстов законны.
@@ -1770,6 +1776,87 @@ void RanchDirector::DrainPendingIntroductionNotifies()
         "Failed to broadcast the introduction of character {}: {}",
         characterUid,
         x.what());
+    }
+  }
+}
+
+void RanchDirector::QueueAchievementNotifies(
+  const data::Uid characterUid,
+  std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies) noexcept
+{
+  // LOA (R70, backlog #58): МАРШРУТИЗАЦИЯ ВМЕСТО ПРЯМОЙ ОТПРАВКИ.
+  // Зовут с потока гоночного директора (`RaceInstance::Stop`), а `_clients`
+  // принадлежит ранч-сетевому. Кладём ЗНАЧЕНИЯ под ЛИСТОВЫМ локом — одна
+  // операция с контейнером, ни одного вызова наружу — и уходим.
+  // ★noexcept и глухой перехват: значок не имеет права стоить игроку
+  // результата заезда (R48-11), а `Stop()` к этому моменту уже выплатил
+  // морковки.
+  if (notifies.empty())
+    return;
+
+  try
+  {
+    std::lock_guard lock(_pendingAchievementNotifiesMutex);
+    auto& queued = _pendingAchievementNotifies[characterUid];
+    queued.insert(
+      queued.end(),
+      std::make_move_iterator(notifies.begin()),
+      std::make_move_iterator(notifies.end()));
+  }
+  catch (...)
+  {
+    // Очередь не приняла (bad_alloc) — теряется только попап, прогресс уже
+    // записан и виден в списке достижений.
+  }
+}
+
+void RanchDirector::DrainPendingAchievementNotifies()
+{
+  // LOA (R70, backlog #58): исполнение отложенных нотификаций достижений.
+  // ★ПОТОК: только РАНЧ-СЕТЕВОЙ (единственный вызов — из HandleNetworkTick).
+  std::unordered_map<data::Uid, std::vector<protocol::AcCmdRCAchievementUpdateNotify>>
+    pendingNotifies;
+  {
+    std::lock_guard lock(_pendingAchievementNotifiesMutex);
+    if (_pendingAchievementNotifies.empty())
+      return;
+
+    pendingNotifies.swap(_pendingAchievementNotifies);
+  }
+
+  for (const auto& [characterUid, notifies] : pendingNotifies)
+  {
+    // ★ПЕРЕХВАТ НА КАЖДОМ ПЕРСОНАЖЕ, а не один на весь слив: очередь УЖЕ
+    // снята, и осечка на одном съела бы попапы всех остальных.
+    try
+    {
+      ClientId clientId = 0;
+      const ClientContext* clientContext =
+        TryGetClientContextByCharacterUid(characterUid, clientId);
+      // ★«ПЕРСОНАЖ НЕ НА РАНЧО» — ШТАТНОЕ СОСТОЯНИЕ, А НЕ ОТКАЗ (R72-2):
+      // после заезда игрок мог закрыть игру. Пропускаем МОЛЧА.
+      if (clientContext == nullptr)
+        continue;
+
+      for (const auto& notify : notifies)
+      {
+        _commandServer.QueueCommand<protocol::AcCmdRCAchievementUpdateNotify>(
+          clientId, [notify]() { return notify; });
+      }
+    }
+    catch (const std::exception& x)
+    {
+      server::util::QuietLogWarn(
+        "Failed to deliver the race achievement notifications of character {}: {}",
+        characterUid,
+        x.what());
+    }
+    catch (...)
+    {
+      server::util::QuietLogWarn(
+        "Failed to deliver the race achievement notifications of character {}: {}",
+        characterUid,
+        "unknown exception");
     }
   }
 }

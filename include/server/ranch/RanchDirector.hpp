@@ -29,6 +29,7 @@
 #include "libserver/network/command/CommandServer.hpp"
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
+#include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 
 // LOA-fix (R34-9, round34, backlog #96): <atomic> — под
@@ -172,6 +173,37 @@ public:
   void BroadcastSetIntroductionNotify(
     uint32_t characterUid,
     const std::string& introduction);
+
+  //! LOA (R70, backlog #58): ★ПРОСИТ ДОСТАВИТЬ ЗНАЧКИ ЗАЕЗДА ПО РАНЧЕВОМУ
+  //! СОЕДИНЕНИЮ. НЕ отправляет здесь и НЕ трогает `_clients`.
+  //!
+  //! Зовут отсюда с потока ГОНОЧНОГО директора (`RaceInstance::Stop`), а
+  //! `_clients` принадлежит РАНЧ-СЕТЕВОМУ — приём тот же, что у
+  //! `BroadcastSetIntroductionNotify` (R72-fix-3) и `Disconnect` (R34-4):
+  //! кладём ЗНАЧЕНИЯ под ЛИСТОВЫМ локом и уходим, доставку делает
+  //! `DrainPendingAchievementNotifies` на ранч-сетевом тике (задержка ≤1 c).
+  //!
+  //! ★ПОЧЕМУ ВООБЩЕ РАНЧЕВОЕ СОЕДИНЕНИЕ, А НЕ ГОНОЧНОЕ (пара опкод/сокет).
+  //! `AcCmdRCAchievementUpdateNotify` (0xe4) до этого раунда отправлял ровно
+  //! один путь — `SendAchievementEvent` ранч-директора, в ранчевую очередь; это
+  //! ЕДИНСТВЕННАЯ пара «опкод — сокет», доказанная живым клиентом. Структура
+  //! лежит в `RaceMessageDefinitions.hpp`, но этот файл — свалка, а не
+  //! утверждение о канале. Первая редакция R70 слала 0xe4 по ГОНОЧНОМУ сокету;
+  //! что делает клиент с командой, которой его гоночный диспетчер не знает, не
+  //! измерено, а прецедент в проекте плохой — на неверно смаршрутизированном
+  //! `UpdateGameMoney` клиент рвал соединение. Значок не имеет права стоить
+  //! игроку результата заезда (R48-11), поэтому канал берётся доказанный.
+  //!
+  //! ★ОЧЕРЕДЬ КОПИТ, А НЕ СХЛОПЫВАЕТ (в отличие от очереди представлений):
+  //! каждый 0xe4 — отдельный значок/тир, потерять промежуточный значит потерять
+  //! попап. Верхняя граница памяти — заезд (≤8 персонажей × ≤17 записей) на
+  //! один тик ранча: слив опустошает очередь ЦЕЛИКОМ каждый тик, независимо от
+  //! того, нашёлся клиент или нет.
+  //! @param characterUid UID персонажа-получателя.
+  //! @param notifies Готовые нотификации (значения, без ссылок и ClientId).
+  void QueueAchievementNotifies(
+    data::Uid characterUid,
+    std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies) noexcept;
 
   //!
   void BroadcastUpdateMountInfoNotify(
@@ -849,6 +881,17 @@ private:
   //! (дисциплина раундов 21/34).
   void DrainPendingIntroductionNotifies();
 
+  //! LOA (R70, backlog #58): СЛИВ ОЧЕРЕДИ ОТЛОЖЕННЫХ НОТИФИКАЦИЙ ДОСТИЖЕНИЙ.
+  //! Зовётся ТОЛЬКО из HandleNetworkTick, то есть строго на РАНЧ-СЕТЕВОМ
+  //! потоке — единственном, которому законно трогать `_clients` и
+  //! `_commandServer`.
+  //! ★Очередь снимается целиком, лок ОТПУСКАЕТСЯ, и только потом идут поиски и
+  //! отправки (дисциплина раундов 21/34/72).
+  //! ★Персонаж без ранчевого соединения пропускается МОЛЧА: прогресс уже
+  //! записан в его данные и виден в списке достижений (0xe6), теряется только
+  //! попап.
+  void DrainPendingAchievementNotifies();
+
   //! LOA-fix (R72-fix-3, round72, находка Codex 2): САМА РАССЫЛКА нового
   //! представления — тело, которое до правки жило прямо в
   //! `BroadcastSetIntroductionNotify` и исполнялось на ЛОББИ-потоке.
@@ -1000,6 +1043,19 @@ private:
   //! map, а не vector: повторные правки одного персонажа схлопываются, что и
   //! даёт верхнюю границу памяти = числу персонажей онлайн.
   std::unordered_map<data::Uid, std::string> _pendingIntroductionNotifies;
+
+  //! LOA (R70, backlog #58): ★ЛИСТОВОЙ мьютекс очереди отложенных нотификаций
+  //! достижений. Правило то же, нарушение = deadlock: под ним НЕ берётся ни
+  //! один другой лок и НЕ делается ни одного вызова наружу.
+  std::mutex _pendingAchievementNotifiesMutex;
+
+  //! LOA (R70, backlog #58): очередь отложенных нотификаций достижений —
+  //! UID персонажа → его нотификации в порядке появления.
+  //! Пишется потоком ГОНОЧНОГО директора (`QueueAchievementNotifies`),
+  //! читается и опустошается РАНЧ-СЕТЕВЫМ в HandleNetworkTick.
+  //! ★ТОЛЬКО ЗНАЧЕНИЯ: ни указателей, ни ссылок, ни ClientId.
+  std::unordered_map<data::Uid, std::vector<protocol::AcCmdRCAchievementUpdateNotify>>
+    _pendingAchievementNotifies;
 
   //! A command deferrer for the `AcCmdCRMountFamilyTree` command.
   CommandDeferrer<protocol::AcCmdCRMountFamilyTree> _mountFamilyTreeDeferrer;
