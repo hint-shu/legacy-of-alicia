@@ -2127,10 +2127,23 @@ void server::FileDataSource::IndexCharacterName(
     RaiseNameCeiling(_characterNameCeiling, name.size());
     const std::unique_lock indexLock(_characterNameIndexMutex);
     const auto previous = _characterUidToName.find(uid);
+    if (previous != _characterUidToName.end() && previous->second == key)
+      return;                                   // имя не менялось, мутаций нет
+
+    // ★ПОЛНОТА СНИМАЕТСЯ ПОД ТЕМ ЖЕ ЗАМКОМ И ДО ПЕРВОЙ МУТАЦИИ (правка ревью,
+    // итерация 9). Прежде `Mark*NameIndexBroken` стоял в `catch`, то есть ПОСЛЕ
+    // того, как раскрутка стека отпустила уникальный замок: между отпусканием
+    // замка и записью `false` в флаг помещался целый чужой читатель — он брал
+    // общий замок, видел ПОЛУПЕРЕПИСАННЫЕ карты (старый ключ снят, новый ещё
+    // нет) при полноте, всё ещё равной `true`, и отвечал «имя свободно». Теперь
+    // окна нет: пока идут мутации, индекс объявлен НЕПОЛНЫМ, и прежнее значение
+    // возвращается только после того, как ВСЕ вставки удались. Бросок оставляет
+    // `false`, а плановый проход (`TickNameIndexMaintenance`) это чинит.
+    const bool wasComplete = _characterNameIndexComplete.exchange(
+      false, std::memory_order::relaxed);
+
     if (previous != _characterUidToName.end())
     {
-      if (previous->second == key)
-        return;                                 // имя не менялось
       // ★СНИМАЕТСЯ РОВНО НАШ uid, а список старого имени остаётся жить. Если под
       // тем же именем стоял ещё кто-то (столкновение регистров), он МОЛЧА
       // становится тем, кто это имя разрешает, — вместо того чтобы имя исчезло.
@@ -2138,6 +2151,9 @@ void server::FileDataSource::IndexCharacterName(
     }
     AttachNameKey(_characterNameToUid, key, uid);
     _characterUidToName[uid] = std::move(key);
+
+    // Все вставки удались — индекс снова ровно настолько полон, насколько был.
+    _characterNameIndexComplete.store(wasComplete, std::memory_order::relaxed);
   }
   catch (const std::exception& x)
   {
@@ -3208,14 +3224,27 @@ void server::FileDataSource::IndexGuildName(
     RaiseNameCeiling(_guildNameCeiling, name.size());
     const std::unique_lock indexLock(_guildNameIndexMutex);
     const auto previous = _guildUidToName.find(uid);
+    if (previous != _guildUidToName.end() && previous->second == key)
+      return;                                   // имя не менялось, мутаций нет
+
+    // ★ПОЛНОТА СНИМАЕТСЯ ПОД ТЕМ ЖЕ ЗАМКОМ И ДО ПЕРВОЙ МУТАЦИИ (правка ревью,
+    // итерация 9). Прежде `Mark*NameIndexBroken` стоял в `catch`, то есть ПОСЛЕ
+    // того, как раскрутка стека отпустила уникальный замок: между отпусканием
+    // замка и записью `false` в флаг помещался целый чужой читатель — он брал
+    // общий замок, видел ПОЛУПЕРЕПИСАННЫЕ карты (старый ключ снят, новый ещё
+    // нет) при полноте, всё ещё равной `true`, и отвечал «имя свободно». Теперь
+    // окна нет: пока идут мутации, индекс объявлен НЕПОЛНЫМ, и прежнее значение
+    // возвращается только после того, как ВСЕ вставки удались. Бросок оставляет
+    // `false`, а плановый проход (`TickNameIndexMaintenance`) это чинит.
+    const bool wasComplete = _guildNameIndexComplete.exchange(
+      false, std::memory_order::relaxed);
+
     if (previous != _guildUidToName.end())
-    {
-      if (previous->second == key)
-        return;                                 // имя не менялось
       DetachNameKey(_guildNameToUid, previous->second, uid);
-    }
     AttachNameKey(_guildNameToUid, key, uid);
     _guildUidToName[uid] = std::move(key);
+
+    _guildNameIndexComplete.store(wasComplete, std::memory_order::relaxed);
   }
   catch (const std::exception& x)
   {
