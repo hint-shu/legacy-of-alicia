@@ -54,19 +54,45 @@ extract_body() {
 }
 
 # Judges one body. Prints nothing on success; returns 1 on a broken property.
+#
+# ★ЧТО ЗДЕСЬ ИСПРАВЛЕНО ПОСЛЕ ВТОРОЙ ИТЕРАЦИИ CODEX (WARN 4)
+#   Первая версия искала три ТОКЕНА где угодно в теле — включая комментарии и
+#   мёртвый код. Она принимала функцию, в которой взвешенный выбор посчитан в
+#   неиспользуемую переменную, а `result.type` присвоен из `engine() % size()`
+#   или `shuffle`. То есть гейт проверял ПРИСУТСТВИЕ вызовов, а не то, откуда
+#   берётся результат. Теперь:
+#     * комментарии срезаются ДО суждения (токен в комментарии больше не считается);
+#     * тело склеивается в одну строку и режется на ОПЕРАТОРЫ по `;`;
+#     * каждое присваивание `result.type = …` обязано содержать PickWeighted, и
+#       хотя бы одно такое присваивание обязано быть.
 judge_body() {
   local body="$1" where="$2" rc=0
   [ -n "$body" ] && [ "$(printf '%s' "$body" | wc -l)" -ge 5 ] \
     || { echo "  $where: тело функции не извлечено" >&2; return 2; }
 
-  printf '%s\n' "$body" | grep -q 'CoatTierToOddsIndex' \
+  # Срезаем строчные комментарии, склеиваем в одну строку.
+  local code
+  code="$(printf '%s\n' "$body" | sed 's|//.*$||' | tr '\n' ' ')"
+
+  printf '%s\n' "$code" | grep -q 'CoatTierToOddsIndex' \
     || { echo "  $where: нет CoatTierToOddsIndex — масть не участвует в броске" >&2; rc=1; }
-  printf '%s\n' "$body" | grep -q 'BuildPotentialTypeChoices' \
+  printf '%s\n' "$code" | grep -q 'BuildPotentialTypeChoices' \
     || { echo "  $where: нет BuildPotentialTypeChoices — кандидаты не взвешены" >&2; rc=1; }
-  printf '%s\n' "$body" | grep -q 'PickWeighted' \
-    || { echo "  $where: нет PickWeighted — выбор не по весам" >&2; rc=1; }
-  if printf '%s\n' "$body" | grep -qE 'uniform_int_distribution|uniform_real_distribution|\brand\(\)'; then
+  if printf '%s\n' "$code" | grep -qE 'uniform_int_distribution|uniform_real_distribution|\brand\(\)|std::shuffle|std::sample'; then
     echo "  $where: равномерный бросок вернулся в выбор типа способности" >&2
+    rc=1
+  fi
+
+  # ★Главный предикат: ОТКУДА берётся result.type.
+  local assigns weighted
+  assigns="$(printf '%s\n' "$code" | tr ';' '\n' | grep -E 'result\.type[[:space:]]*=[^=]' || true)"
+  if [ -z "$assigns" ]; then
+    echo "  $where: не нашёл ни одного присваивания result.type" >&2
+    return 1
+  fi
+  weighted="$(printf '%s\n' "$assigns" | grep -cE 'PickWeighted')"
+  if [ "$weighted" -ne "$(printf '%s\n' "$assigns" | grep -c .)" ]; then
+    echo "  $where: result.type присваивается не из PickWeighted" >&2
     rc=1
   fi
   return $rc
@@ -101,12 +127,33 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
 }
 FIXTURE
 
+cat > "$FIX/sneaky.cpp" <<'FIXTURE'
+Genetics::PotentialResult Genetics::CalculateFoalPotential(
+  const data::Uid mareUid)
+{
+  PotentialResult result{};
+  const auto tierIndex = registry::CoatTierToOddsIndex(tier);
+  const auto choices = registry::BuildPotentialTypeChoices(registry, *tierIndex);
+  const auto ignored = PickWeighted(
+    server::util::GetRandomEngine(), choices.values, choices.weights, uint32_t{0});
+  result.type = static_cast<uint8_t>(
+    choices.values[server::util::GetRandomEngine()() % choices.values.size()]);
+  return result;
+}
+FIXTURE
+
 judge_body "$(extract_body "$FIX/good.cpp")" "fixture-good" >/dev/null 2>&1 \
   || die "самопроверка: гейт отверг ПРАВИЛЬНУЮ форму — его вердикт ничего не значит"
 if judge_body "$(extract_body "$FIX/uniform.cpp")" "fixture-uniform" >/dev/null 2>&1; then
   die "самопроверка: гейт ПРИНЯЛ равномерный бросок — он не умеет провалиться"
 fi
-echo "самопроверка гейта: правильная форма принята, равномерная отвергнута ✓"
+# ★Третья фикстура — ровно обход, который нашёл Codex во второй итерации: все три
+# токена на месте, взвешенный выбор посчитан «в никуда», а result.type взят по
+# модулю от движка. Гейт обязан её отвергнуть.
+if judge_body "$(extract_body "$FIX/sneaky.cpp")" "fixture-sneaky" >/dev/null 2>&1; then
+  die "самопроверка: гейт ПРИНЯЛ форму, где result.type идёт мимо PickWeighted"
+fi
+echo "самопроверка гейта: правильная форма принята; равномерная и обходная отвергнуты ✓"
 
 # ---- 1. the repository ----------------------------------------------------------
 [ -f "$TARGET" ] || die "нет файла $TARGET"

@@ -17,6 +17,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  **/
 
+#include "libserver/registry/BreedingOdds.hpp"
 #include "libserver/registry/HorseRegistry.hpp"
 #include "libserver/util/QuietLog.hpp"
 
@@ -149,7 +150,6 @@ void HorseRegistry::ValidateTables() const
   if (_emblemRatios.empty())
     refuse("no emblem ratios");
 
-  int32_t ratioSum = 0;
   bool anyPositiveRatio = false;
   for (const auto& [odds, ratio] : _emblemRatios)
   {
@@ -157,8 +157,15 @@ void HorseRegistry::ValidateTables() const
       refuse("emblem ratio for tier " + std::to_string(odds) + " is negative");
     if (ratio.ratio == 0)
       continue;
+
+    // ★fix-3 (Codex iteration 2, BLOCK 2). Tier 0 is the RESERVED sentinel that
+    // BreedingOdds uses for "this foal gets no emblem". A configured tier 0 with
+    // a positive ratio would be rolled and then read as the sentinel, so real
+    // emblems would silently turn into no emblem. The name is reserved; refuse it.
+    if (odds == kNoEmblemTier)
+      refuse("emblem tier 0 is the reserved \"no emblem\" sentinel and cannot carry a ratio");
+
     anyPositiveRatio = true;
-    ratioSum += ratio.ratio;
 
     // A tier that CAN be rolled must have emblems to hand out. Without this the
     // roll picked a tier and then returned the invented emblem id 1.
@@ -169,8 +176,13 @@ void HorseRegistry::ValidateTables() const
   }
   if (not anyPositiveRatio)
     refuse("every emblem ratio is zero");
-  if (ratioSum > 100)
-    refuse("emblem ratios sum to " + std::to_string(ratioSum) + ", above 100");
+
+  // ★fix-3 (Codex iteration 2, WARN 3). A sum ABOVE 100 is deliberately NOT
+  // refused, and no sum is accumulated here at all. The documented contract of
+  // BuildEmblemTierChoices is that ratios are WEIGHTS and that a sum of 100 or
+  // more simply means "no no-emblem share"; refusing it contradicted the helper's
+  // own header, and an accumulator that exists only for a rule we do not want is
+  // just an int32 overflow waiting to happen (Codex iteration 2, BLOCK 1).
 }
 
 void HorseRegistry::LoadTables(const std::filesystem::path& configPath)

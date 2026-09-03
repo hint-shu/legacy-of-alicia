@@ -38,7 +38,9 @@ std::optional<std::size_t> CoatTierToOddsIndex(const Coat::Tier tier)
 WeightedChoices BuildEmblemTierChoices(const std::vector<EmblemRatio>& ratios)
 {
   WeightedChoices choices;
-  int32_t totalRatio = 0;
+  // ★fix-3 (Codex iteration 2, BLOCK 1). int64_t: several large legal int32_t
+  // ratios overflow a 32-bit accumulator, and signed overflow is UB.
+  int64_t totalRatio = 0;
   for (const auto& ratio : ratios)
   {
     if (ratio.ratio <= 0)
@@ -53,7 +55,7 @@ WeightedChoices BuildEmblemTierChoices(const std::vector<EmblemRatio>& ratios)
   if (totalRatio > 0 && totalRatio < 100)
   {
     choices.values.push_back(kNoEmblemTier);
-    choices.weights.push_back(100 - totalRatio);
+    choices.weights.push_back(static_cast<int32_t>(100 - totalRatio));
   }
 
   return choices;

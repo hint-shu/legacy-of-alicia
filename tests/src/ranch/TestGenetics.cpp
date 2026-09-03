@@ -139,6 +139,18 @@ void TestNoEmblemShareComesFromTheData()
 
   // An empty table must not invent a "no emblem" branch out of nothing.
   CHECK(BuildEmblemTierChoices({}).empty());
+
+  // ★fix-3 (Codex iteration 2, BLOCK 1). Ratios arrive as int32_t and used to be
+  // summed into an int32_t: three large legal values overflowed a signed 32-bit
+  // accumulator, which is UB, and the result decided whether a "no emblem"
+  // candidate was added at all. Summed in int64_t now -- these three sum to
+  // 3 * 2e9 > INT32_MAX and must simply mean "no no-emblem share".
+  const std::vector<EmblemRatio> huge = {
+    {1, 2000000000}, {2, 2000000000}, {3, 2000000000}};
+  const auto hugeChoices = BuildEmblemTierChoices(huge);
+  CHECK(hugeChoices.values.size() == 3);
+  for (const uint32_t tier : hugeChoices.values)
+    CHECK(tier != kNoEmblemTier);
 }
 
 //! Live check of the shipped potential.yaml through the same call Genetics makes.

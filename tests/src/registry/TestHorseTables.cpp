@@ -456,7 +456,9 @@ void TestEmblemConfigIsValidatedAtLoad()
     std::filesystem::remove_all(broken);
   }
 
-  // (c) ratios above 100 -> the "no emblem" share is not a number any more.
+  // (c) ★fix-3 (Codex iteration 2, BLOCK 2): tier 0 is the reserved "no emblem"
+  // sentinel. A ratio row on tier 0 would be rolled and then read as "no emblem",
+  // so real emblems would silently disappear. It must be refused at load.
   {
     const auto broken = MakeBrokenConfig(
       "emblems.yaml",
@@ -464,7 +466,32 @@ void TestEmblemConfigIsValidatedAtLoad()
       {
         for (auto& line : lines)
         {
-          if (line.find("    ratio: 77") != std::string::npos)
+          if (line == "  - odds: 1")
+          {
+            line = "  - odds: 0";
+            return true;
+          }
+        }
+        return false;
+      },
+      "emblem_sentinel");
+    HorseRegistry registry;
+    CHECK(ReadConfigThrows(registry, broken));
+    std::filesystem::remove_all(broken);
+  }
+
+  // (d) ★fix-3 (Codex iteration 2, WARN 3): ratios are WEIGHTS, and a sum of 100
+  // or more is legal by the documented contract of BuildEmblemTierChoices -- it
+  // simply means there is no "no emblem" share. The loader must NOT refuse it,
+  // otherwise the validation and the helper disagree about what a legal file is.
+  {
+    const auto legal = MakeBrokenConfig(
+      "emblems.yaml",
+      [](std::vector<std::string>& lines)
+      {
+        for (auto& line : lines)
+        {
+          if (line == "    ratio: 77")
           {
             line = "    ratio: 177";
             return true;
@@ -474,8 +501,8 @@ void TestEmblemConfigIsValidatedAtLoad()
       },
       "emblem_over100");
     HorseRegistry registry;
-    CHECK(ReadConfigThrows(registry, broken));
-    std::filesystem::remove_all(broken);
+    CHECK(not ReadConfigThrows(registry, legal));
+    std::filesystem::remove_all(legal);
   }
 
   // And the SHIPPED table still loads, so "always throws" is not a pass.
