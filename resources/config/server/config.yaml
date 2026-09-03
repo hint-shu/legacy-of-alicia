@@ -96,6 +96,14 @@ server:
       # The port the server listens on.
       # Additionally configurable through environment variable RANCH_SERVER_PORT.
       port: 10031
+    # LOA (R70-fix-7): how long a race-earned achievement popup is held for a
+    # character who is not on the ranch right now. The real client closes its
+    # ranch connection for the duration of a race, so the popup earned at the
+    # finish line has nowhere to go until the player is back on the ranch.
+    # Progress itself is persisted regardless and shows up in the 0xe6 list.
+    # Additionally configurable through environment variable
+    # RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS.
+    achievement_notify_hold_seconds: 900
   # Configuration section of the race server.
   race:
     # Whether the race server is enabled.

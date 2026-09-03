@@ -25,6 +25,7 @@
 #include <charconv>
 #include <format>
 #include <fstream>
+#include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
 #include <spdlog/spdlog.h>
@@ -117,6 +118,33 @@ void Config::LoadFromEnvironment()
     std::format("RANCH_SERVER_PORT"),
     ranch.listen.address,
     ranch.listen.port);
+
+  // LOA (R70-fix-7, backlog #58): срок удержания попапов достижений заезда.
+  // ★ПЕРЕМЕННАЯ СРЕДЫ, А НЕ ТОЛЬКО КЛЮЧ YAML, И ЭТО НЕ УДОБСТВО. Конфиг живёт
+  // ВНУТРИ образа и стендами не монтируется намеренно (каталог достижений
+  // обязан ехать тем же каноном, что и бинарь). Значит единственный способ дать
+  // стенду короткий срок, не подменяя образ, — среда. Прод переменную не
+  // ставит и остаётся на 900 с.
+  // ★ЗНАЧЕНИЕ, КОТОРОЕ НЕ РАЗОБРАЛОСЬ, — ОТКАЗ, А НЕ УМОЛЧАНИЕ: тихий откат к
+  // 900 означал бы, что стенд поставил 20 с, получил 900 и объявил «протухания
+  // нет» — ложно-зелёный ровно там, где эта настройка и заведена.
+  {
+    const auto holdValue = getEnvValue("RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS");
+    if (not holdValue.empty())
+    {
+      uint32_t holdSeconds = 0;
+      const auto result = std::from_chars(
+        holdValue.c_str(),
+        holdValue.c_str() + holdValue.length(),
+        holdSeconds);
+      if (result.ec != std::errc{} or holdSeconds == 0)
+      {
+        throw std::runtime_error(
+          "RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS must be a positive number of seconds");
+      }
+      ranch.achievementNotifyHoldSeconds = holdSeconds;
+    }
+  }
 
   // Race address and port.
   getAddressAndPortVariables(
