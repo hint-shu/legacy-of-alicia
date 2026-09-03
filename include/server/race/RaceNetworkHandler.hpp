@@ -205,6 +205,7 @@ private:
   //! зависит от данных `magic.yaml` — конфиг его сдвинуть не может.
   static constexpr size_t MaxMagicTargetListSize = 8;
 
+
   //! LOA-fix (R71-25, находка ревью 4 #3): СКОЛЬКО БАЙТ НЕРАЗОБРАННОЙ НАГРУЗКИ
   //! ПОПАДАЕТ В ЛОГ.
   //!

@@ -117,6 +117,41 @@ void TestUnknownTypesAreNotAttacks()
     "максимум домена неизвестен");
 }
 
+//! LOA-fix (R71-28, находка ревью 5 #2, BLOCK): ФОРМА СПИСКА ЛЕДЯНОЙ СТЕНЫ.
+//!
+//! ★ЭТО ПРОВЕРКА НА ДЕФЕКТ, А НЕ НА ФОРМУ. Дефект был ровно один: НУЛЕВОЙ список
+//! проходил как законный каст — резервировал ноль экземпляров, не тратил бюджет,
+//! но рассылался комнате и ставил четырёхсекундный джоб в планировщик.
+//!
+//! ★КАК ЭТА ПРОВЕРКА ПРОВАЛИТСЯ: замени предикат на `segmentCount <= 3` (или на
+//! «не ноль») — и первая же строка ниже покраснеет.
+void TestIceWallSegmentShape()
+{
+  Check(
+    IsKnownIceWallSegmentCount(1),
+    "обычная стена ставит одну сосульку — форма обязана приниматься");
+  Check(
+    IsKnownIceWallSegmentCount(3),
+    "критическая стена ставит три сосульки — форма обязана приниматься");
+
+  Check(
+    not IsKnownIceWallSegmentCount(0),
+    "★НУЛЕВОЙ список обязан быть отвергнут: он ничего не резервирует, но рассылается "
+    "и ставит джоб");
+  Check(
+    not IsKnownIceWallSegmentCount(2),
+    "два сегмента протоколу неизвестны");
+  Check(
+    not IsKnownIceWallSegmentCount(4),
+    "четыре сегмента протоколу неизвестны");
+  Check(
+    not IsKnownIceWallSegmentCount(8),
+    "восемь сегментов — прежний потолок списка, а не форма стены");
+  Check(
+    not IsKnownIceWallSegmentCount(255),
+    "максимум, представимый uint8_t на проводе, обязан быть отвергнут");
+}
+
 } // namespace
 
 int main()
@@ -125,6 +160,7 @@ int main()
   TestIceWallFamily();
   TestAttackFamilies();
   TestUnknownTypesAreNotAttacks();
+  TestIceWallSegmentShape();
 
   if (failures != 0)
   {

@@ -5351,6 +5351,97 @@ void RaceNetworkHandler::HandleUseMagicItem(
     return;
   }
 
+  // LOA-fix (R71-28, находка ревью 5 #2, BLOCK): ФОРМА СПИСКА СТЕНЫ ПРОВЕРЯЕТСЯ ДО
+  // ПЕРВОГО НЕОБРАТИМОГО ШАГА.
+  //
+  // ★ЧТО БЫЛО ОТКРЫТО. У ледяной стены `targetList` — это НЕ цели, а число сосулек,
+  // и размер его читается `uint8_t` (`RaceMessageDefinitions.cpp:1537-1541`), то есть
+  // НОЛЬ протоколом принимается. Каст с нулевым списком резервировал НОЛЬ экземпляров:
+  // `CanIssueEffectInstances(oid, 0)` отвечал «да», списание списывало ноль, записей
+  // не появлялось — а сервер всё равно рассылал каст всей комнате и ставил в планировщик
+  // четырёхсекундный джоб (:5179). Бюджет 512 при этом НЕ ТРАТИЛСЯ ВООБЩЕ, значит
+  // модифицированный клиент (набрать калибр -> получить стену -> кастовать пустым
+  // списком) заводил серверу неограниченную работу и неограниченный список джобов,
+  // не платя ничем. То есть потолок выдачи, ради которого раунд и городил бюджет,
+  // обходился одним нулём ([[gate-by-form-gives-false-completeness]]: пять чисел
+  // сошлись, а один перебор поехал мимо замка).
+  //
+  // ★ЗАПРЕЩАЕТСЯ НЕ «НОЛЬ», А ВСЁ, ЧТО НЕ ФОРМА ПРОТОКОЛА. Форма известна и записана
+  // в самом определении сообщения (`RaceMessageDefinitions.hpp:1942-1944`): обычная
+  // стена ставит ОДНУ сосульку (список `[2]`), критическая — ТРИ (`[1, 2, 3]`).
+  // Других размеров у честного клиента не бывает. Проверять «не ноль» значило бы
+  // чинить симптом: 2, 5 и 8 сосулек — такой же выдуманный кадр, только дороже
+  // ([[sweep-must-key-on-the-defect]]).
+  //
+  // ★ЖЁСТКОЙ ПРИВЯЗКИ «ТИП 10 -> 1, ТИП 11 -> 3» ЗДЕСЬ НЕТ СОЗНАТЕЛЬНО: захваты r41 и
+  // r53 подтверждают ДВА размера у семейства стены, но не подтверждают, что сервер
+  // видит крит-подмену раньше клиента во ВСЕХ случаях (крит выдаёт и `RandomMagicItem`).
+  // Отвергать честный кадр дороже, чем принять ровно два размера вместо одного
+  // ([[dont-trade-success-path-for-failure-path]]).
+  //
+  // ★СТОИТ ЗДЕСЬ, А НЕ НИЖЕ: до списания крит-бафа, до выдачи номеров, до рассылки и
+  // до постановки джоба. Отказ обязан не оставить после себя ничего.
+  if (isIceWall && not race::IsKnownIceWallSegmentCount(command.targetList.size()))
+  {
+    uint64_t suppressed = 0;
+    if (_iceWallShapeThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Racer {} cast ice wall {} with {} segments; the protocol has only {} or {} "
+        "(suppressed {})",
+        racer.oid,
+        magicSlotInfo.type,
+        command.targetList.size(),
+        race::IceWallSegmentsNormal,
+        race::IceWallSegmentsCritical,
+        suppressed);
+    return;
+  }
+
+  // LOA-fix (R71-29, находка ревью 5 #4, WARN): ЦЕЛЬ НЕ-СТЕННОГО КАСТА — УЧАСТНИК
+  // ЭТОГО ЗАЕЗДА, А НЕ ЛЮБОЕ ЧИСЛО.
+  //
+  // Список целей проверялся только по ДЛИНЕ, после чего уезжал в реестр как УЛИКА
+  // (`authorizedTargets`) и рассылался комнате дословно (`AcCmdCRUseMagicItemNotify`).
+  // То есть инвариант раунда «цели — гонщики этой комнаты» держался на честном слове:
+  // сервер записывал в собственную улику числа, о которых не знал ничего. Гард отчёта
+  // ниже по течению не давал ПРИМЕНИТЬ эффект к постороннему, но это ограничивает
+  // последствие, а не закрывает дыру — улика обязана БЫТЬ уликой
+  // ([[a-gate-must-prove-itself-first]]).
+  //
+  // ★УЧАСТНИК — ЭТО ДВА СПИСКА, А НЕ ОДИН. Живые гонщики лежат в трекере, семь ботов
+  // соло-заезда — в `RaceInstance::_aiRacers`; навести магию на бота законно. Спрашивать
+  // один трекер значило бы отвергать честный каст по боту.
+  //
+  // ★У СТЕНЫ ЭТОТ ВОПРОС НЕ ЗАДАЁТСЯ: там список — номера сосулек, а не oid'ы.
+  if (not isIceWall)
+  {
+    const auto& rosterRacers = raceInstance.GetTracker().GetRacers();
+    for (const auto targetOid : command.targetList)
+    {
+      const bool isParticipant = raceInstance.IsAiRacerOid(targetOid)
+        || std::ranges::any_of(
+          rosterRacers,
+          [targetOid](const auto& entry)
+          {
+            return entry.second.oid == targetOid;
+          });
+
+      if (isParticipant)
+        continue;
+
+      uint64_t suppressed = 0;
+      if (_magicTargetRosterThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Racer {} named {} as a target of magic {}, but it is not a participant of "
+          "this race (suppressed {})",
+          racer.oid,
+          targetOid,
+          magicSlotInfo.type,
+          suppressed);
+      return;
+    }
+  }
+
   // LOA-fix (R71-21, находка ревью 2 #3): МЕСТО ПОД УЛИКУ СПРАШИВАЕТСЯ ДО КАСТА.
   //
   // Реестр выданных экземпляров — единственное, чем сервер потом отличит честный

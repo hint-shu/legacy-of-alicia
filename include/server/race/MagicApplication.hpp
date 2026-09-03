@@ -117,6 +117,29 @@ enum class MagicApplication : uint8_t
   }
 }
 
+//! LOA-fix (R71-28, находка ревью 5 #2, BLOCK): ЕДИНСТВЕННЫЕ ДВЕ ФОРМЫ СПИСКА
+//! ЛЕДЯНОЙ СТЕНЫ.
+//!
+//! У стены `AcCmdCRUseMagicItem::targetList` — это сосульки, а не гонщики, и размеров
+//! у него ровно два: обычная стена ставит ОДНУ (список `[2]`), критическая — ТРИ
+//! (`[1, 2, 3]`); так это записано в определении сообщения
+//! (`RaceMessageDefinitions.hpp:1942-1944`) и так же выглядят захваты r41/r53.
+//! Размер читается `uint8_t` (`RaceMessageDefinitions.cpp:1537-1541`), то есть протокол
+//! принимает и НОЛЬ, и 255 — обе величины у честного клиента невозможны.
+//!
+//! ★ЖИВЁТ ЗДЕСЬ, А НЕ В ХЕНДЛЕРЕ, чтобы форму можно было проверить юнит-тестом:
+//! проверка, которую нельзя прогнать отдельно, проверяется только глазами
+//! ([[a-gate-must-prove-itself-first]]).
+inline constexpr size_t IceWallSegmentsNormal = 1;
+inline constexpr size_t IceWallSegmentsCritical = 3;
+
+//! @returns `true`, если `segmentCount` — законная форма списка ледяной стены.
+[[nodiscard]] constexpr bool IsKnownIceWallSegmentCount(const size_t segmentCount) noexcept
+{
+  return segmentCount == IceWallSegmentsNormal
+    || segmentCount == IceWallSegmentsCritical;
+}
+
 } // namespace server::race
 
 #endif // SERVER_RACE_MAGIC_APPLICATION_HPP
