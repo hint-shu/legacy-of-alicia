@@ -16,7 +16,7 @@ Plain-language summary of the gameplay and reliability work we built on top of t
 
 - **Story quests and quest arcs** — playable questlines with proper start/finish, rewards, and multi-step story arcs.
 - **Daily quests** — daily tasks that reset each day and hand out their rewards.
-- **Achievement system** — achievements that track your progress as you play and award cosmetic rewards, built on a clean event system so new achievements are easy to add.
+- **Achievement system** — achievements that track your progress as you play and award cosmetic rewards, built on a clean event system so new achievements are easy to add. Racing has its own set of 17 more achievements — finishing, winning, mastery over many races, riding inside a time window, retiring, and revenge on a rival. The award popup is held until you are back on your ranch, so it never interrupts a race or the results screen, and game time runs on Moscow time.
 - **Horse racing that actually works** — fixes to race start, the countdown, in-race item pickups, and matchmaking so races run correctly for multiple players.
 - **Horse care skills** — the grooming/feeding care activities and their progression.
 - **Breeding and horse market fixes** — breeding, the stallion market, and horse handling behave correctly.
