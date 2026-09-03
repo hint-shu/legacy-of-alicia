@@ -48,6 +48,25 @@ target_sources(race_test_p2did_pool PRIVATE
 target_link_libraries(race_test_p2did_pool
         PRIVATE project-properties alicia-libserver)
 
+# R77. Both need the shipped horse tables, so they get the config dir by path.
+# The tables ARE the change in this round: a test built against a fixture copy
+# would go green while the shipped YAML rotted.
+add_executable(registry_test_horse_tables)
+target_sources(registry_test_horse_tables PRIVATE
+        src/registry/TestHorseTables.cpp)
+target_link_libraries(registry_test_horse_tables
+        PRIVATE project-properties alicia-libserver)
+target_compile_definitions(registry_test_horse_tables
+        PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
+
+add_executable(ranch_test_genetics)
+target_sources(ranch_test_genetics PRIVATE
+        src/ranch/TestGenetics.cpp)
+target_link_libraries(ranch_test_genetics
+        PRIVATE project-properties alicia-libserver)
+target_compile_definitions(ranch_test_genetics
+        PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -56,6 +75,8 @@ add_test(NAME UtilTestAliciaShopTime COMMAND util_test_alicia_shop_time)
 add_test(NAME UtilTestProfiler COMMAND util_test_profiler)
 add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
 add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
+add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
+add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
