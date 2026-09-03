@@ -195,8 +195,8 @@ private:
   //! RaceMessageDefinitions.hpp:1942-1944).
   //!
   //! ★8 — это ТОЧНАЯ вместимость, а не запас с потолка: комната клампится восемью
-  //! (`RaceNetworkHandler.cpp:1572`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
-  //! ровно восемь участников в трекере у соло-заезда (1 живой + 7 ботов, :2395-2400
+  //! (`RaceNetworkHandler.cpp:1580`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
+  //! ровно восемь участников в трекере у соло-заезда (1 живой + 7 ботов, :2403-2406
   //! + `SpawnAiRacers`). Поэтому сравнение строгое (`>`), а не `>=`. Число НЕ
   //! зависит от данных `magic.yaml` — конфиг его сдвинуть не может.
   static constexpr size_t MaxMagicTargetListSize = 8;
