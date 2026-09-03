@@ -2098,6 +2098,30 @@ void server::FileDataSource::ForgetCharacterName(const data::Uid uid)
   _characterUidToName.erase(previous);
 }
 
+server::FileDataSource::NameIndexAnswer server::FileDataSource::ReadNameIndexAnswer(
+  std::shared_mutex& mutex,
+  const std::unordered_map<std::string, std::vector<data::Uid>>& index,
+  const std::atomic_bool& complete,
+  const std::string& key)
+{
+  // ★ОДИН ЗАМОК НА ОБА ФАКТА. Полнота — атомарная переменная и читаться могла бы
+  // где угодно; она читается ЗДЕСЬ намеренно, потому что важна не полнота сама
+  // по себе, а полнота ТОГО СОДЕРЖИМОГО, которое мы только что видели. Читать
+  // её вторым действием значило бы отвечать по содержимому одного поколения
+  // индекса и по полноте другого.
+  const std::shared_lock indexLock(mutex);
+  NameIndexAnswer answer;
+  answer.complete = complete.load(std::memory_order::relaxed);
+  const auto found = index.find(key);
+  if (found != index.end() && not found->second.empty())
+  {
+    // Список отсортирован по возрастанию — имя разрешает МЕНЬШИЙ uid, то есть
+    // старшая запись, и это правило одно и то же на старте и в рантайме.
+    answer.uid = found->second.front();
+  }
+  return answer;
+}
+
 server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::string_view& name)
 {
   // ★СТРУКТУРНЫЙ ГЕЙТ ДО ВСЕГО — до аллокации ключа, до хеша, до диска. Провод
@@ -2124,13 +2148,9 @@ server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::
   // (RaceNetworkHandler), добавление друга и письмо (MessengerDirector). Один
   // пакет = O(все персонажи) обращений к диску.
   const auto key = server::util::AsciiLowerKey(name);
-  const std::shared_lock indexLock(_characterNameIndexMutex);
-  const auto found = _characterNameToUid.find(key);
-  if (found == _characterNameToUid.end() || found->second.empty())
-    return data::InvalidUid;
-  // Список отсортирован по возрастанию — имя разрешает МЕНЬШИЙ uid, то есть
-  // старшая запись, и это правило одно и то же на старте и в рантайме.
-  return found->second.front();
+  return ReadNameIndexAnswer(
+    _characterNameIndexMutex, _characterNameToUid,
+    _characterNameIndexComplete, key).uid;
 }
 
 bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
@@ -2156,23 +2176,35 @@ bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
     return false;
   }
 
-  // Имя, которое индекс РАЗРЕШАЕТ, занято — тут спорить не о чем.
-  if (RetrieveCharacterUidByName(name) != data::InvalidUid)
-    return false;
+  // ★ОТВЕТ СНИМАЕТСЯ ОДНИМ СНИМКОМ (правка ревью, итерация 9). Прежде здесь
+  // стояли ДВА чтения: `RetrieveCharacterUidByName` под своим общим замком и
+  // отдельное чтение флага полноты после него. Между ними умещалась чужая
+  // перестройка целиком, и промах по СТАРОМУ неполному индексу читался вместе с
+  // НОВОЙ полнотой как «имя свободно» — притом что имя в новом индексе уже
+  // лежало.
+  const auto key = server::util::AsciiLowerKey(name);
+  auto answer = ReadNameIndexAnswer(
+    _characterNameIndexMutex, _characterNameToUid,
+    _characterNameIndexComplete, key);
 
-  // ★ПРОМАХ ПО НЕПОЛНОМУ ИНДЕКСУ — НЕ «СВОБОДНО» (правка ревью, итерация 7).
-  // Перестройка молча пропускала нечитаемый или битый файл персонажа, и его имя
-  // до перезапуска числилось свободным: второй игрок создавал персонажа с тем
-  // же именем. Сначала одна попытка починиться (не чаще раза в две секунды),
-  // и только потом ответ; пока индекс неполон, ответ — «занято».
-  if (_characterNameIndexComplete.load(std::memory_order::relaxed))
+  // Имя, которое индекс РАЗРЕШАЕТ, занято — тут спорить не о чем.
+  if (answer.uid != data::InvalidUid)
+    return false;
+  if (answer.complete)
     return true;
 
+  // ★ПРОМАХ ПО НЕПОЛНОМУ ИНДЕКСУ — НЕ «СВОБОДНО» (правка ревью, итерация 7).
+  // Сначала одна попытка починиться, и только потом ответ; ПОСЛЕ починки снимок
+  // берётся ЗАНОВО и целиком — иначе мы отвечали бы по полноте нового индекса и
+  // содержимому старого, то есть ровно тем расхождением, ради которого снимок и
+  // заведён.
   ReconcileCharacterNameIndexIfBroken();
-  if (not _characterNameIndexComplete.load(std::memory_order::relaxed))
+  answer = ReadNameIndexAnswer(
+    _characterNameIndexMutex, _characterNameToUid,
+    _characterNameIndexComplete, key);
+  if (answer.uid != data::InvalidUid)
     return false;
-
-  return RetrieveCharacterUidByName(name) == data::InvalidUid;
+  return answer.complete;
 }
 
 void server::FileDataSource::CreateHorse(data::Horse& horse)
@@ -2831,11 +2863,16 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
   // нижнем ASCII-регистре, ровно то, что делал прежний `equalsIgnoreCase`.
   const auto key = server::util::AsciiLowerKey(name);
 
-  {
-    const std::shared_lock indexLock(_guildNameIndexMutex);
-    if (_guildNameIndexComplete)
-      return not _guildNameToUid.contains(key);
-  }
+  // ★ТОТ ЖЕ ОДИН СНИМОК, ЧТО У ПЕРСОНАЖЕЙ (правка ревью, итерация 9). Здесь
+  // раздельного чтения не было и до правки, но помощник один на все три места
+  // намеренно: пока правило записано в трёх телах, четвёртое место, написанное
+  // по образцу соседей, унаследует ту форму, которую увидит.
+  auto answer = ReadNameIndexAnswer(
+    _guildNameIndexMutex, _guildNameToUid, _guildNameIndexComplete, key);
+  if (answer.uid != data::InvalidUid)
+    return false;
+  if (answer.complete)
+    return true;
 
   // ★ИНДЕКС, КОТОРЫЙ ВИДЕЛ НЕ ВСЁ, НЕ ОТВЕЧАЕТ «СВОБОДНО» (правка ревью,
   // итерация 7). Перестройка МОЛЧА пропускала нечитаемый файл, битый JSON и имя
@@ -2846,11 +2883,11 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
   // индекс всё ещё неполон — «занято», то есть отказ в создании, а не выдача
   // чужого имени.
   ReconcileGuildNameIndexIfBroken();
-
-  const std::shared_lock indexLock(_guildNameIndexMutex);
-  if (not _guildNameIndexComplete)
+  answer = ReadNameIndexAnswer(
+    _guildNameIndexMutex, _guildNameToUid, _guildNameIndexComplete, key);
+  if (answer.uid != data::InvalidUid)
     return false;
-  return not _guildNameToUid.contains(key);
+  return answer.complete;
 }
 
 void server::FileDataSource::MarkGuildNameIndexBroken(

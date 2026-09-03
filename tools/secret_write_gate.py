@@ -122,6 +122,97 @@ MACRO_PATTERN = re.compile(
 PASTE_PATTERN = re.compile(r"##")
 
 
+#! ═══════════════════════════════════════════════════════════════════════════
+#! ФОРМЫ, КОТОРЫЕ НИ ОДИН ГЕЙТ ЭТОГО РАУНДА ЧИТАТЬ НЕ УМЕЕТ — ЖЁСТКИЙ ОСТАНОВ
+#! (правка ревью, итерация 9, находки 7/8/9; политика взята у гардов R72 —
+#!  `tools/check_lobby_auth_gate.sh`, проверка 0c, «сделали гарды раунда
+#!  отказывающимися от того, чего не читают»).
+#
+#  ★МОДЕЛЬ УГРОЗЫ, СКАЗАННАЯ ВСЛУХ. Эти гейты защищают от ЧЕСТНОЙ РЕГРЕССИИ
+#  кого-то из нас, а не от коммитера, который прячет вызов от текстового
+#  сканера: репозиторий наш и диффы мы читаем. Все три гейта читают НАПИСАНИЕ
+#  исходника, а препроцессор и псевдоним умеют менять написание, не меняя
+#  смысла. Ревью показало три такие формы, и все три давали ноль нарушителей:
+#
+#    #define MAKE(a, b) a##b
+#    MAKE(WriteFileAtom, ically)(p, d, "x", MAKE(FileSensi, tivity)::Public);
+#        — ни одного охраняемого имени в тексте нет вовсе (находка 7)
+#
+#    namespace s = std;
+#    s::ifstream file(path);          — чтение ПО ПУТИ без слова `filesystem`
+#    s::regex rg(name);               — регулярка без слова `std::regex`
+#        — ключ гейта это квалификатор, а после псевдонима его нет (8 и 9)
+#
+#    #define HDR <regex>
+#    #include HDR                     — включение, которого не видно (8 и 9)
+#
+#  ★ПОЧЕМУ ОТКАЗ, А НЕ РАЗБОР. Разобрать значит написать препроцессор, а затем
+#  таблицу псевдонимов по всей единице трансляции, включая псевдоним псевдонима
+#  и псевдоним из заголовка, — то есть второй компилятор внутри build-гейта.
+#  Честный ответ на форму, которую гейт прочитать не может, — не «разверну» и не
+#  «наверное, чисто», а ОТКАЗАТЬСЯ ЗАВЕРЯТЬ: код 2, файл и строка названы. Гейт,
+#  который не прочитал дерево, обязан сказать это вслух, а не сказать «чисто».
+#
+#  ★ЦЕНА СЕГОДНЯ — НОЛЬ: в продакшн-дереве ни одной из этих форм нет (проверено
+#  на каждом прогоне). Кому форма действительно понадобится — сперва учит гейт
+#  её читать.
+#
+#  Склейка строк — единственное поддерживаемое исключение: она СКЛЕИВАЕТСЯ до
+#  всякого счёта, с сохранением истинных номеров строк.
+
+#! `namespace s = std;` и `namespace fs = std::filesystem;` — обе формы. Суффикс
+#  `::...` не важен: важно, что дальше по файлу `std` пишется другой буквой.
+STD_ALIAS_PATTERN = re.compile(r"\bnamespace\s+\w+\s*=\s*(?:::\s*)?std\b")
+#! Включение, поддающееся чтению, называет свой заголовок ЛИТЕРАЛЬНО. Литералы к
+#  этому моменту обнулены по содержимому, но КАВЫЧКИ сохранены, а `<...>`
+#  литералом не является и доходит целиком.
+INCLUDE_DIRECTIVE_PATTERN = re.compile(r"^[ \t]*#[ \t]*include\b")
+INCLUDE_READABLE_PATTERN = re.compile(
+    r"^[ \t]*#[ \t]*include[ \t]*(?:\"[^\"]*\"|<[^>]*>)[ \t]*$")
+
+
+def unsupported_preprocessing(text: str, origin: str) -> list[tuple[str, str]]:
+    """Все непрочитываемые препроцессорные/псевдонимные формы одного файла.
+
+    Возвращает список `("<файл>:<строка>", "<причина>: <текст строки>")` в том
+    же виде, в каком гарды R72 печатают свои остановы. Пусто — файл читается.
+
+    Читается текст ПОСЛЕ склейки строк, вычистки комментариев и обнуления
+    содержимого литералов: закомментированный `##` и строка `"namespace s = std"`
+    в логе — это проза, а не программа, и останавливать на них дерево значило бы
+    завести ложно-красный гейт, а такой отключают ровно так же, как ложно-зелёный.
+    """
+    spliced, source_line = splice_line_continuations(text)
+    scan = normalize_alternative_tokens(
+        blank_literal_contents(strip_comments(spliced)))
+    raw_lines = spliced.split("\n")
+
+    def where(offset: int) -> str:
+        line = source_line[offset] if offset < len(source_line) else 0
+        return f"{origin}:{line}"
+
+    def source_text(offset: int) -> str:
+        index = source_line[offset] - 1 if offset < len(source_line) else -1
+        return raw_lines[index].strip() if 0 <= index < len(raw_lines) else ""
+
+    found: list[tuple[str, str]] = []
+    for paste in PASTE_PATTERN.finditer(scan):
+        found.append((where(paste.start()),
+                      f"макрос-склейка: {source_text(paste.start())}"))
+    for alias in STD_ALIAS_PATTERN.finditer(scan):
+        found.append((where(alias.start()),
+                      f"псевдоним-std: {source_text(alias.start())}"))
+
+    offset = 0
+    for line in scan.split("\n"):
+        if INCLUDE_DIRECTIVE_PATTERN.match(line) and not (
+                INCLUDE_READABLE_PATTERN.match(line)):
+            found.append((where(offset),
+                          f"включение-через-макрос: {source_text(offset)}"))
+        offset += len(line) + 1
+    return sorted(found)
+
+
 def splice_line_continuations(text: str) -> tuple[str, list[int]]:
     """Выполняет ФАЗУ 2 трансляции: снимает `\\` перед переводом строки.
 
