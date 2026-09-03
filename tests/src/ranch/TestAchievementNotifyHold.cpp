@@ -57,6 +57,14 @@ AchievementNotifyHold::Notify MakeNotify(const uint16_t tid)
   return notify;
 }
 
+//! Кадр ВЗЯТОГО ТИРА — то, ради чего очередь и существует.
+AchievementNotifyHold::Notify MakeCompletedNotify(const uint16_t tid)
+{
+  auto notify = MakeNotify(tid);
+  notify.objectiveProgress.isCompleted = true;
+  return notify;
+}
+
 //! ★ГЕЙТ ОБЯЗАН СПЕРВА ДОКАЗАТЬ СЕБЯ: если `Check` не умеет считать провал,
 //! все остальные проверки зелены по построению.
 void TestCheckerCanFail()
@@ -183,6 +191,75 @@ void TestCharactersAreIndependent()
   Check(hold.Take(9).at(0).achievementTid == 10018, "и остаться ИМЕННО его записями");
 }
 
+//! LOA (R70-fix-8, находка Codex 6 WARN-3): ★ПОТОЛОК ВЫТЕСНЯЕТ ПРОГРЕСС, А НЕ
+//! НАГРАДУ. Кладём завершение ПЕРВЫМ (значит, оно самое старое), заполняем
+//! остаток прогрессными кадрами и переполняем. Слепое «выбрось самое старое»
+//! отдало бы именно завершение — и игрок не увидел бы взятый тир.
+void TestCapEvictsProgressBeforeCompletion()
+{
+  AchievementNotifyHold hold(std::chrono::minutes(15));
+  const auto t0 = Clock::time_point{} + std::chrono::hours(1);
+
+  Check(
+    hold.Push(7, MakeCompletedNotify(10003), t0) == 0,
+    "первый Push не должен вытеснять");
+  for (std::size_t index = 1; index < AchievementNotifyHold::CharacterCap; ++index)
+    hold.Push(7, MakeNotify(static_cast<uint16_t>(20000 + index)), t0);
+  Check(
+    hold.HeldCount() == AchievementNotifyHold::CharacterCap,
+    "очередь обязана быть заполнена ровно под потолок");
+
+  Check(
+    hold.Push(7, MakeNotify(30000), t0) == 1,
+    "запись сверх потолка обязана вытеснить ровно одну");
+
+  const auto taken = hold.Take(7);
+  Check(
+    taken.size() == AchievementNotifyHold::CharacterCap,
+    "после вытеснения обязано остаться ровно столько, сколько потолок");
+  bool completionSurvived = false;
+  for (const auto& notify : taken)
+  {
+    if (notify.objectiveProgress.isCompleted and notify.achievementTid == 10003)
+      completionSurvived = true;
+  }
+  Check(
+    completionSurvived,
+    "вытеснение обязано было выбросить ПРОГРЕССНЫЙ кадр, а не взятый тир");
+  Check(
+    taken.front().achievementTid == 10003,
+    "уцелевшее завершение обязано остаться первым в порядке выдачи");
+  Check(
+    taken.at(1).achievementTid == 20002,
+    "выброшен обязан быть САМЫЙ СТАРЫЙ прогрессный кадр (20001), а не любой");
+}
+
+//! ★ЕСЛИ ПРОГРЕССНЫХ КАДРОВ НЕТ ВОВСЕ — потолок обязан держаться всё равно,
+//! выбрасывая самое старое завершение. Иначе «беречь награды» превращается в
+//! неограниченный рост от одного игрока, то есть в отсутствие потолка.
+void TestCapEvictsOldestCompletionWhenAllCompleted()
+{
+  AchievementNotifyHold hold(std::chrono::minutes(15));
+  const auto t0 = Clock::time_point{} + std::chrono::hours(1);
+
+  for (std::size_t index = 0; index < AchievementNotifyHold::CharacterCap; ++index)
+    hold.Push(7, MakeCompletedNotify(static_cast<uint16_t>(20000 + index)), t0);
+  Check(
+    hold.Push(7, MakeCompletedNotify(30000), t0) == 1,
+    "потолок обязан сработать и на одних завершениях");
+  Check(
+    hold.HeldCount() == AchievementNotifyHold::CharacterCap,
+    "после вытеснения удержано обязано быть ровно по потолок");
+
+  const auto taken = hold.Take(7);
+  Check(
+    taken.front().achievementTid == 20001,
+    "выброшено обязано быть САМОЕ СТАРОЕ завершение (20000)");
+  Check(
+    taken.back().achievementTid == 30000,
+    "новое завершение обязано лежать в хвосте");
+}
+
 } // namespace
 
 int main()
@@ -192,6 +269,8 @@ int main()
   TestHeldUntilTakenWhileNotExpired();
   TestExpiryDropsOnlyOldEntries();
   TestCapDropsOldest();
+  TestCapEvictsProgressBeforeCompletion();
+  TestCapEvictsOldestCompletionWhenAllCompleted();
   TestCapIsPerCharacter();
   TestCharactersAreIndependent();
 

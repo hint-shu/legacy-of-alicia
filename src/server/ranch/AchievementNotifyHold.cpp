@@ -19,6 +19,8 @@
 
 #include "server/ranch/AchievementNotifyHold.hpp"
 
+#include <algorithm>
+
 namespace server
 {
 
@@ -35,7 +37,20 @@ std::size_t AchievementNotifyHold::Push(
   std::size_t dropped = 0;
   while (queue.size() > CharacterCap)
   {
-    queue.pop_front();
+    // LOA-fix (R70-fix-8, backlog #58, находка Codex 6 WARN-3):
+    // ★ВЫТЕСНЯЕМ САМЫЙ СТАРЫЙ ПРОГРЕССНЫЙ КАДР, А НЕ ПРОСТО САМЫЙ СТАРЫЙ.
+    // Кадры в очереди НЕРАВНОЦЕННЫ: `isCompleted = true` — это взятый тир,
+    // единственный экран, который игрок и считает наградой; `isCompleted =
+    // false` — это «счётчик подрос», и его же значение придёт со следующим
+    // кадром того же достижения. Слепое `pop_front` при переполнении меняло
+    // взятую бронзу на «+1 к счётчику», то есть теряло РОВНО ТО, ради чего
+    // очередь существует.
+    // ★ЕСЛИ ПРОГРЕССНЫХ НЕТ ВОВСЕ — вытесняем самое старое завершение: потолок
+    // обязан держаться при любом составе, иначе это не потолок.
+    const auto victim = std::ranges::find_if(
+      queue,
+      [](const Entry& entry) { return not entry.notify.objectiveProgress.isCompleted; });
+    queue.erase(victim != queue.end() ? victim : queue.begin());
     ++dropped;
   }
   return dropped;
