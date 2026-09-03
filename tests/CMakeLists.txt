@@ -107,6 +107,13 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py --selftest)
     add_test(NAME ToolDnaVsStockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py)
+    # R77-fix-2 (Codex finding 6). The breeding potential roll lives in the
+    # alicia-server EXECUTABLE and cannot be linked into a test binary, so neg-d
+    # -- the negative that puts the uniform roll back -- was provable only by the
+    # stand and the ladder, i.e. only for one SHA. This source gate states the
+    # property durably; it proves itself on two fixtures before judging the tree.
+    add_test(NAME ToolPotentialRollGate
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_potential_roll.sh)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()
