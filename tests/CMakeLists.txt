@@ -92,6 +92,18 @@ target_include_directories(ranch_test_achievement_notify_hold
 target_link_libraries(ranch_test_achievement_notify_hold
         PRIVATE project-properties alicia-libserver)
 
+# LOA (R70-fix-8, backlog #58, находка Codex 6 BLOCK-2): строгий разбор
+# значений строгих ключей конфига. ★Заголовочный, поэтому линковать нечего,
+# кроме include-пути: правило разбора вынесено из Config.cpp ИМЕННО ради того,
+# чтобы его можно было проверить без поднятия сервера.
+add_executable(server_test_config_strict)
+target_sources(server_test_config_strict PRIVATE
+        src/server/TestConfigStrict.cpp)
+target_include_directories(server_test_config_strict
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(server_test_config_strict
+        PRIVATE project-properties)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -104,6 +116,7 @@ add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
 add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
 add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
+add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
