@@ -104,6 +104,15 @@ target_include_directories(server_test_config_strict
 target_link_libraries(server_test_config_strict
         PRIVATE project-properties)
 
+# R75. Пер-курсовые рекорды — новые поля ЗАПИСИ на диске, и круг
+# «записали -> прочитали» на стенде не проверяется: стенд пишет и читает одним
+# сервером, где потеря при сохранении и потеря при чтении сокращаются.
+add_executable(data_test_course_records)
+target_sources(data_test_course_records PRIVATE
+        src/data/TestCourseRecords.cpp)
+target_link_libraries(data_test_course_records
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -117,6 +126,7 @@ add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
 add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
 add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
+add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
