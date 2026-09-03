@@ -83,6 +83,19 @@ uint32_t CurrentGameDayIndex()
       Clock::now() - std::chrono::hours{6}).time_since_epoch().count());
 }
 
+//! Смещение игрового часового пояса относительно UTC (Europe/Moscow, +03:00).
+//! Негативный образ negF ставит здесь ноль — и часовые окна становятся UTC'шными.
+constexpr std::chrono::hours GameTimeZoneOffset{3};
+
+uint32_t CurrentGameLocalHour()
+{
+  const auto local = Clock::now() + GameTimeZoneOffset;
+  return static_cast<uint32_t>(
+    std::chrono::hh_mm_ss{
+      local - std::chrono::floor<std::chrono::days>(local)}
+      .hours().count());
+}
+
 uint32_t DurationToAliciaTime(const Clock::duration& duration)
 {
   // The extracted date time from the duration.

@@ -20,6 +20,7 @@
 #include "Version.hpp"
 #include "libserver/util/QuietLog.hpp"
 #include "server/ServerInstance.hpp"
+#include "server/ConfigStrict.hpp"
 #include <libserver/util/Util.hpp>
 
 #include <spdlog/sinks/daily_file_sink.h>
@@ -183,7 +184,22 @@ int main(int argc, char** argv)
     server::util::QuietLogInfo("Base directory is the working directory");
 
   server::ServerInstance serverInstance(baseDirectory);
-  serverInstance.Initialize();
+  // LOA (R70-fix-8, backlog #58, находка Codex 6 BLOCK-2): ★ОТКАЗ СТАРТА НА
+  // СТРОГОМ КЛЮЧЕ — С ВНЯТНОЙ СТРОКОЙ, А НЕ `std::terminate`.
+  // Без этого перехвата исключение из `LoadFromFile`/`LoadFromEnvironment`
+  // уходило бы мимо `main` и процесс падал бы аварийно — отказ настоящий, но
+  // причина в логе не названа, и оператор чинил бы «сервер крашится на старте»
+  // вместо «в конфиге опечатка вот в этом ключе».
+  try
+  {
+    serverInstance.Initialize();
+  }
+  catch (const server::ConfigError& x)
+  {
+    server::util::QuietLogError("Refusing to start: {}", x.what());
+    spdlog::default_logger()->flush();
+    return 1;
+  }
 
   server::util::QuietLogInfo(
     "Server started up in {}ms",

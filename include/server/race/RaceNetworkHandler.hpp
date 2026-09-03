@@ -111,6 +111,54 @@ public:
       });
   }
 
+  //! Отправляет команду ОДНОМУ клиенту по УЖЕ ИЗВЕСТНОМУ `ClientId`.
+  //!
+  //! ★СМЫСЛ МЕТОДА — В ТОМ, ЧЕГО В НЁМ НЕТ: обращения к `_clients`.
+  //! `RaceInstance::Stop()` исполняется на потоке ГОНОЧНОГО ДИРЕКТОРА
+  //! (`ServerInstance::_raceDirectorThread` → `RaceNetworkHandler::Tick` →
+  //! `RaceInstance::Tick` → `TickFinishing` → `Stop`), а `_clients` мутирует
+  //! СЕТЕВОЙ поток команд (`CommandServer::BeginHost` заводит собственный
+  //! `_serverThread`, с него приходят `HandleClientConnected`/
+  //! `HandleClientDisconnected` и все `Handle*`). Значит любой поиск по
+  //! `_clients` из `Stop()` — гонка на `unordered_map` с параллельными
+  //! `try_emplace`/`erase`, то есть UB, а не «редкая неточность». Первая
+  //! редакция достижений R70 звала оттуда `GetClientIdByCharacterUid`, копируя
+  //! форму `SendDailyQuestNotificationToCharacter`; ревью (итерация 2) поймало
+  //! это как BLOCK, и утверждение «оба на одном потоке» оказалось ложным.
+  //! ★ЧЕМ ЗАМЕНЕНО: `ClientId` берётся ИЗ КОМНАТЫ — `RoomSystem::GetRoom`
+  //! держит per-room `std::mutex` на всё время колбэка, и ровно этим путём
+  //! `Broadcast`/`BroadcastExceptCharacterUid` уже ходят с этого же потока на
+  //! каждом пакете заезда. То есть это не новый механизм, а тот, что уже
+  //! доказан в проде.
+  //! ★УСТАРЕВШИЙ `ClientId` БЕЗОПАСЕН: `CommandServer::SendCommand` идёт в
+  //! `Server::GetClient`, а тот ищет под разделяемым замком и БРОСАЕТ на
+  //! неизвестном клиенте — здесь этот бросок глушится, потому что «игрок уже
+  //! вышел» не должно стоить остальным ни заезда, ни достижений. Прогресс к
+  //! этому моменту уже записан в БД, теряется только уведомление.
+  template <WritableStruct C>
+  void SendToClient(
+    const ClientId clientId,
+    const C& command) noexcept
+  {
+    try
+    {
+      _commandServer.QueueCommand<C>(
+        clientId,
+        [command]()
+        {
+          return command;
+        });
+    }
+    catch (const std::exception&)
+    {
+      // Клиента уже нет — уведомление теряется, состояние нет.
+    }
+    catch (...)
+    {
+      // То же самое для не-std броска.
+    }
+  }
+
   template <WritableStruct C>
   void BroadcastExceptCharacterUid(
     const RaceInstance& raceInstance,

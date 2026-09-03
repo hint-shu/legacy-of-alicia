@@ -18,6 +18,7 @@
  **/
 
 #include "server/Config.hpp"
+#include "server/ConfigStrict.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include <libserver/util/Util.hpp>
@@ -25,6 +26,7 @@
 #include <charconv>
 #include <format>
 #include <fstream>
+#include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
 #include <spdlog/spdlog.h>
@@ -117,6 +119,31 @@ void Config::LoadFromEnvironment()
     std::format("RANCH_SERVER_PORT"),
     ranch.listen.address,
     ranch.listen.port);
+
+  // LOA (R70-fix-7, backlog #58): срок удержания попапов достижений заезда.
+  // ★ПЕРЕМЕННАЯ СРЕДЫ, А НЕ ТОЛЬКО КЛЮЧ YAML, И ЭТО НЕ УДОБСТВО. Конфиг живёт
+  // ВНУТРИ образа и стендами не монтируется намеренно (каталог достижений
+  // обязан ехать тем же каноном, что и бинарь). Значит единственный способ дать
+  // стенду короткий срок, не подменяя образ, — среда. Прод переменную не
+  // ставит и остаётся на 900 с.
+  // ★ЗНАЧЕНИЕ, КОТОРОЕ НЕ РАЗОБРАЛОСЬ, — ОТКАЗ, А НЕ УМОЛЧАНИЕ: тихий откат к
+  // 900 означал бы, что стенд поставил 20 с, получил 900 и объявил «протухания
+  // нет» — ложно-зелёный ровно там, где эта настройка и заведена.
+  // ★ЧИТАЕМ getenv НАПРЯМУЮ, А НЕ ЧЕРЕЗ `getEnvValue` (R70-fix-8, находка
+  // Codex 6 BLOCK-2). `getEnvValue` возвращает пустую строку И на отсутствующей
+  // переменной, И на явно пустой (`FOO=`) — то есть СКЛЕИВАЕТ «не задано» с
+  // «задано мусором». Именно на этой склейке опечатка становилась умолчанием.
+  // Разбор — общий с YAML-веткой (`ParseStrictPositiveSeconds`), чтобы правила
+  // строгости не разъехались между двумя источниками.
+  {
+    const char* const holdValue = getenv("RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS");
+    if (holdValue != nullptr)
+    {
+      ranch.achievementNotifyHoldSeconds = ParseStrictPositiveSeconds(
+        "RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS",
+        holdValue);
+    }
+  }
 
   // Race address and port.
   getAddressAndPortVariables(
@@ -245,6 +272,38 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
       const auto ranchYaml = serverYaml["ranch"];
       ranch.enabled = ranchYaml["enabled"].as<bool>();
       ranch.listen = parseListenSection(ranchYaml["listen"]);
+
+      // LOA (R70-fix-7, backlog #58): срок удержания попапа достижения заезда.
+      // ★КЛЮЧ НЕОБЯЗАТЕЛЕН, НО ЕСЛИ ОН ЕСТЬ — ОН ОБЯЗАН БЫТЬ ЧИТАЕМ. Старые
+      // конфиги без ключа обязаны работать (иначе правка ломает деплой), а
+      // конфиг С ключом, который не разбирается, — это тихая подмена срока на
+      // умолчание, то есть ровно тот ложно-зелёный, ради которого раунд и
+      // завёл настраиваемость: стенд поставил бы 20 с, получил бы 900 и
+      // объявил «протухания нет».
+      // ★РАЗБИРАЕМ СКАЛЯР САМИ, А НЕ `as<uint32_t>()` (R70-fix-8, находка
+      // Codex 6 BLOCK-2). Конверсия yaml-cpp снисходительна и, главное, её
+      // исключение — обычный `std::exception`, который секционный перехват
+      // ниже съедал бы вместе с остальными. Через `Scalar()` строка приходит
+      // как есть и проходит ТЕ ЖЕ правила, что и переменная среды.
+      if (const auto holdYaml = ranchYaml["achievement_notify_hold_seconds"];
+        holdYaml.IsDefined())
+      {
+        if (not holdYaml.IsScalar())
+          throw ConfigError(
+            "ranch.achievement_notify_hold_seconds", "value is not a scalar");
+        ranch.achievementNotifyHoldSeconds = ParseStrictPositiveSeconds(
+          "ranch.achievement_notify_hold_seconds",
+          holdYaml.Scalar());
+      }
+    }
+    // ★СТРОГИЕ КЛЮЧИ ПЕРЕБРАСЫВАЮТСЯ, А НЕ ЛОГИРУЮТСЯ. Перехват ниже — это
+    // осознанная снисходительность к секции целиком (сломанный `listen` не
+    // должен ронять сервер), но ключ, чьё ОБЕЩАНИЕ — «плохое значение = отказ
+    // старта», обязан пройти сквозь неё. Иначе обещание существует только в
+    // комментарии.
+    catch (const ConfigError&)
+    {
+      throw;
     }
     catch (const std::exception& e)
     {
@@ -331,6 +390,13 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
     {
       server::util::QuietLogError("Unhandled exception parsing the dat config: {}", e.what());
     }
+  }
+  // ★И ВНЕШНИЙ ПЕРЕХВАТ ТОЖЕ ПРОПУСКАЕТ СТРОГИЕ КЛЮЧИ. Их два, и починить
+  // только внутренний значило бы оставить дыру ровно того же класса одним
+  // уровнем выше — [[total-invariant-beats-list-of-sites]].
+  catch (const ConfigError&)
+  {
+    throw;
   }
   catch (const std::exception& e)
   {

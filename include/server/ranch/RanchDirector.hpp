@@ -21,14 +21,17 @@
 #define RANCHDIRECTOR_HPP
 
 #include "libserver/network/command/CommandDeferrer.hpp"
+#include "libserver/util/LogThrottle.hpp"
 #include "libserver/util/Scheduler.hpp"
 #include "server/Config.hpp"
+#include "server/ranch/AchievementNotifyHold.hpp"
 #include "server/ranch/BreedingMarket.hpp"
 #include "server/tracker/RanchTracker.hpp"
 
 #include "libserver/network/command/CommandServer.hpp"
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
+#include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 
 // LOA-fix (R34-9, round34, backlog #96): <atomic> — под
@@ -172,6 +175,44 @@ public:
   void BroadcastSetIntroductionNotify(
     uint32_t characterUid,
     const std::string& introduction);
+
+  //! LOA (R70, backlog #58): ★ПРОСИТ ДОСТАВИТЬ ЗНАЧКИ ЗАЕЗДА ПО РАНЧЕВОМУ
+  //! СОЕДИНЕНИЮ. НЕ отправляет здесь и НЕ трогает `_clients`.
+  //!
+  //! Зовут отсюда с потока ГОНОЧНОГО директора (`RaceInstance::Stop`), а
+  //! `_clients` принадлежит РАНЧ-СЕТЕВОМУ — приём тот же, что у
+  //! `BroadcastSetIntroductionNotify` (R72-fix-3) и `Disconnect` (R34-4):
+  //! кладём ЗНАЧЕНИЯ под ЛИСТОВЫМ локом и уходим, доставку делает
+  //! `DrainPendingAchievementNotifies` на ранч-сетевом тике (задержка ≤1 c).
+  //!
+  //! ★ПОЧЕМУ ВООБЩЕ РАНЧЕВОЕ СОЕДИНЕНИЕ, А НЕ ГОНОЧНОЕ (пара опкод/сокет).
+  //! `AcCmdRCAchievementUpdateNotify` (0xe4) до этого раунда отправлял ровно
+  //! один путь — `SendAchievementEvent` ранч-директора, в ранчевую очередь; это
+  //! ЕДИНСТВЕННАЯ пара «опкод — сокет», доказанная живым клиентом. Структура
+  //! лежит в `RaceMessageDefinitions.hpp`, но этот файл — свалка, а не
+  //! утверждение о канале. Первая редакция R70 слала 0xe4 по ГОНОЧНОМУ сокету;
+  //! что делает клиент с командой, которой его гоночный диспетчер не знает, не
+  //! измерено, а прецедент в проекте плохой — на неверно смаршрутизированном
+  //! `UpdateGameMoney` клиент рвал соединение. Значок не имеет права стоить
+  //! игроку результата заезда (R48-11), поэтому канал берётся доказанный.
+  //!
+  //! ★ОЧЕРЕДЬ КОПИТ, А НЕ СХЛОПЫВАЕТ (в отличие от очереди представлений):
+  //! каждый 0xe4 — отдельный значок/тир, потерять промежуточный значит потерять
+  //! попап.
+  //!
+  //! ★НОТИФИКАЦИЯ ПРИДЕРЖИВАЕТСЯ ДО ВОЗВРАЩЕНИЯ НА РАНЧО (R70-fix-7, решение
+  //! лида по находке fix-6). Настоящий клиент ЗАКРЫВАЕТ ранчевую ногу ровно
+  //! при входе в заезд (захват; то же делает сессия тестера), поэтому в момент
+  //! `RaceInstance::Stop()` ранчевого соединения у игрока НЕТ, и прежнее
+  //! правило «нет клиента — выбросить» теряло бы попап почти всегда. Теперь
+  //! записи лежат в `AchievementNotifyHold` (срок и потолок — там же) и
+  //! уходят на ближайшем ранч-тике ПОСЛЕ того, как персонаж снова окажется на
+  //! ранчо. Если контекст есть уже сейчас — уйдут немедленно, как и раньше.
+  //! @param characterUid UID персонажа-получателя.
+  //! @param notifies Готовые нотификации (значения, без ссылок и ClientId).
+  void QueueAchievementNotifies(
+    data::Uid characterUid,
+    std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies) noexcept;
 
   //!
   void BroadcastUpdateMountInfoNotify(
@@ -849,6 +890,25 @@ private:
   //! (дисциплина раундов 21/34).
   void DrainPendingIntroductionNotifies();
 
+  //! LOA (R70, backlog #58): СЛИВ ОЧЕРЕДИ ОТЛОЖЕННЫХ НОТИФИКАЦИЙ ДОСТИЖЕНИЙ.
+  //! Зовётся ТОЛЬКО из HandleNetworkTick, то есть строго на РАНЧ-СЕТЕВОМ
+  //! потоке — единственном, которому законно трогать `_clients` и
+  //! `_commandServer`.
+  //! ★Очередь снимается целиком, лок ОТПУСКАЕТСЯ, и только потом идут поиски и
+  //! отправки (дисциплина раундов 21/34/72).
+  //! ★Персонаж без ранчевого соединения НЕ ТЕРЯЕТ попап: его записи остаются в
+  //! удержании до следующего входа на ранчо (R70-fix-7). Выбрасываются они
+  //! только по сроку `AchievementNotifyHold::Ttl()` — и МОЛЧА в смысле
+  //! «без жалобы»: «игрок не вернулся» — штатное состояние, а не сбой; строка
+  //! в лог при этом пишется, потому что она несёт СЧЁТ (оракул стенда судит
+  //! «после протухания удержано ноль» числом, а не отсутствием строк).
+  //! ★ПОРЯДОК В ТИКЕ (R70-fix-8, находка Codex 6 BLOCK-1): вызов стоит ПОСЛЕ
+  //! `_enterRanchDeferrer.Tick()`, а отдаёт попап ТОЛЬКО соединению с
+  //! `visitingRancherUid != data::InvalidUid` — то есть тому, чей вход РЕАЛЬНО
+  //! завершён. `isAuthenticated` этого не доказывает: он ставится ещё до
+  //! отсрочки и переживает `LeaveRanch`.
+  void DrainPendingAchievementNotifies();
+
   //! LOA-fix (R72-fix-3, round72, находка Codex 2): САМА РАССЫЛКА нового
   //! представления — тело, которое до правки жило прямо в
   //! `BroadcastSetIntroductionNotify` и исполнялось на ЛОББИ-потоке.
@@ -1000,6 +1060,28 @@ private:
   //! map, а не vector: повторные правки одного персонажа схлопываются, что и
   //! даёт верхнюю границу памяти = числу персонажей онлайн.
   std::unordered_map<data::Uid, std::string> _pendingIntroductionNotifies;
+
+  //! LOA (R70, backlog #58): ★ЛИСТОВОЙ мьютекс очереди отложенных нотификаций
+  //! достижений. Правило то же, нарушение = deadlock: под ним НЕ берётся ни
+  //! один другой лок и НЕ делается ни одного вызова наружу.
+  std::mutex _pendingAchievementNotifiesMutex;
+
+  //! LOA (R70, backlog #58; удержание — R70-fix-7): придержанные нотификации
+  //! достижений — UID персонажа → его нотификации в порядке появления.
+  //! Пишется потоком ГОНОЧНОГО директора (`QueueAchievementNotifies`),
+  //! разбирается РАНЧ-СЕТЕВЫМ в HandleNetworkTick.
+  //! ★ТОЛЬКО ЗНАЧЕНИЯ: ни указателей, ни ссылок, ни ClientId.
+  //! ★Срок жизни берётся из конфига (`ranch.achievementNotifyHoldSeconds`,
+  //! по умолчанию 900 с = 15 минут). Причина знобки — не «настраиваемость ради
+  //! настраиваемости»: стенд обязан УВИДЕТЬ протухание, а ждать пятнадцать
+  //! минут в каждой клетке матрицы нельзя. Прод остаётся на 15 минутах.
+  AchievementNotifyHold _pendingAchievementNotifies{std::chrono::seconds(900)};
+
+  //! LOA (R70-fix-7): дроссель жалобы о вытеснении по потолку. Вытеснение —
+  //! это НЕ штатное состояние (значит, игрок набрал больше двух заездов
+  //! попаданий, ни разу не вернувшись на ранчо), но и не повод залить лог:
+  //! источник события — поведение игрока.
+  util::LogThrottle _achievementHoldOverflowThrottle{std::chrono::seconds(60)};
 
   //! A command deferrer for the `AcCmdCRMountFamilyTree` command.
   CommandDeferrer<protocol::AcCmdCRMountFamilyTree> _mountFamilyTreeDeferrer;

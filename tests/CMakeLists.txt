@@ -67,6 +67,43 @@ target_link_libraries(ranch_test_genetics
 target_compile_definitions(ranch_test_genetics
         PRIVATE LOA_CONFIG_GAME_DIR="${CMAKE_SOURCE_DIR}/resources/config/game")
 
+# LOA (R70, backlog #58): потолок доступных тиров + фильтр режима/состава.
+add_executable(registry_test_achievement_tiers)
+target_sources(registry_test_achievement_tiers PRIVATE
+        src/registry/TestAchievementTiers.cpp)
+target_link_libraries(registry_test_achievement_tiers
+        PRIVATE project-properties alicia-libserver)
+# Каталог достижений читается тестом ТОЛЬКО НА ЧТЕНИЕ — так проверка форм
+# состава перестаёт зависеть от литералов в исходнике и ловит дрейф данных.
+target_compile_definitions(registry_test_achievement_tiers
+        PRIVATE LOA_ACHIEVEMENTS_CATALOG="${CMAKE_SOURCE_DIR}/resources/config/game/achievements.yaml")
+
+# LOA (R70-fix-7, backlog #58): срок/потолок/порядок удержания попапов.
+# ★ИСХОДНИК КЛАССА ПОДКЛЮЧАЕТСЯ НАПРЯМУЮ: он живёт в цели `alicia-server`
+# (исполняемой), а не в библиотеке, и слинковать его иначе нечем. Класс не
+# зависит ни от директора, ни от сети — только от протокольной структуры и
+# `data::Uid`, поэтому пары файлов достаточно.
+add_executable(ranch_test_achievement_notify_hold)
+target_sources(ranch_test_achievement_notify_hold PRIVATE
+        src/ranch/TestAchievementNotifyHold.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/ranch/AchievementNotifyHold.cpp)
+target_include_directories(ranch_test_achievement_notify_hold
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(ranch_test_achievement_notify_hold
+        PRIVATE project-properties alicia-libserver)
+
+# LOA (R70-fix-8, backlog #58, находка Codex 6 BLOCK-2): строгий разбор
+# значений строгих ключей конфига. ★Заголовочный, поэтому линковать нечего,
+# кроме include-пути: правило разбора вынесено из Config.cpp ИМЕННО ради того,
+# чтобы его можно было проверить без поднятия сервера.
+add_executable(server_test_config_strict)
+target_sources(server_test_config_strict PRIVATE
+        src/server/TestConfigStrict.cpp)
+target_include_directories(server_test_config_strict
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(server_test_config_strict
+        PRIVATE project-properties)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -77,6 +114,9 @@ add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
 add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
 add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
 add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
+add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
+add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
+add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ

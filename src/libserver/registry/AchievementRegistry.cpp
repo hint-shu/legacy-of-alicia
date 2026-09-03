@@ -126,6 +126,44 @@ uint8_t AchievementInfo::GetReachedTierCount(const uint32_t progress) const
   return reached;
 }
 
+uint8_t AchievementInfo::GetAvailableTierCount() const
+{
+  uint8_t available = 0;
+  for (const auto threshold : thresholds)
+  {
+    // Ноль = тир не используется. Дальше идти незачем: непрерывность порогов
+    // проверяет ReadConfig (AreThresholdsContiguous), дыра роняет старт сервера.
+    if (threshold == 0)
+      break;
+    ++available;
+  }
+
+  if (available != 0)
+    return available;
+
+  // Порогов нет вовсе. Для Counter/MaxRecord/Total запись РАЗОВАЯ:
+  // GetReachedTierCount отдаёт ровно 1 на первом же ненулевом прогрессе
+  // (ветка «reached == 0 and thresholds[0] == 0 and progress > 0 and not
+  // lowerIsBetter»). Для AtMost та же ветка исключена явным
+  // `not lowerIsBetter`, и тиров не будет никогда — значит доступных тиров
+  // ноль, и такую запись двигать нечем.
+  return compareType == AchievementCompareType::AtMost
+    ? uint8_t{0}
+    : uint8_t{1};
+}
+
+bool AchievementInfo::CountsInMode(
+  const uint32_t eventModeBit,
+  const uint32_t playerCount) const
+{
+  // (1) режим: ноль = без ограничения, иначе пересечение масок.
+  if (gameModeFlag != 0 and (gameModeFlag & eventModeBit) == 0)
+    return false;
+
+  // (2) состав: numPlayer — МИНИМУМ (см. §2.2в спеки: выбор, не вывод).
+  return playerCount >= numPlayer;
+}
+
 void AchievementRegistry::ReadConfig(const std::filesystem::path& configPath)
 {
   const auto root = YAML::LoadFile(configPath.string());

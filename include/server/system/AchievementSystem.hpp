@@ -24,6 +24,7 @@
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -49,6 +50,28 @@ class ServerInstance;
 class AchievementSystem
 {
 public:
+  //! Обстоятельства ЗАЕЗДА, в котором произошло событие.
+  //!
+  //! ★ОТСУТСТВИЕ КОНТЕКСТА = «событие не гоночное»: фильтр режима и состава не
+  //! применяется вовсе, и поведение ДЕВЯТИ существующих ранчевых вызовов
+  //! `RanchDirector::SendAchievementEvent` (`RanchDirector.cpp:2892, 3449, 3735,
+  //! 3736, 3750, 3751, 4559, 6742, 6932`) не меняется ни на байт. Сам
+  //! `OnServerEvent` при этом зовётся из ОДНОГО места — `RanchDirector.cpp:11507`,
+  //! изнутри `SendAchievementEvent`; два множества не путать.
+  //! Это не удобство, а страховка от регрессии: ИЗМЕРЕНО — у всех 19 записей на
+  //! уже проведённых шинах `gameModeFlag == 0` и `numPlayer == 0`, поэтому
+  //! фильтр на них был бы тождественным; но «был бы» проверять нечем, а
+  //! «не применяется» проверяется предикатом `P_ranch_unchanged`.
+  struct EventContext
+  {
+    //! Чистый бит режима: 1 speed-solo, 2 speed-team, 4 magic-solo,
+    //! 8 magic-team; 0 — режим вне этой четвёрки (обучение и прочее).
+    uint32_t modeBit{};
+    //! Сколько ЛЮДЕЙ стартовало в заезде. Боты сюда НЕ входят: их нет в
+    //! трекере (`RaceInstance.hpp`, `_aiRacers`).
+    uint32_t playerCount{};
+  };
+
   explicit AchievementSystem(ServerInstance& serverInstance);
 
   //! Событие, измеренное сервером.
@@ -69,7 +92,10 @@ public:
     data::Uid characterUid,
     uint16_t event,
     uint32_t increment = 1,
-    std::span<const std::string_view> provenConditions = {});
+    std::span<const std::string_view> provenConditions = {},
+    //! @param context Обстоятельства заезда. `nullopt` = событие не гоночное,
+    //!        фильтр `CountsInMode` не применяется.
+    std::optional<EventContext> context = std::nullopt);
 
 private:
   ServerInstance& _serverInstance;
