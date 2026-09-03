@@ -266,11 +266,10 @@ private:
   std::atomic_bool _characterNameIndexComplete{false};
   std::atomic_bool _guildNameIndexComplete{false};
 
-  //! Момент последней ПОПЫТКИ пересобрать сломанный индекс. Ограничивает
-  //! частоту: пока данные на диске битые, обход стоит не чаще одного раза в
-  //! `kBrokenNameIndexRetryGap`, сколько бы пакетов ни пришло. Атомарные —
-  //! читаются и переставляются БЕЗ замка индекса (иначе попытка сама стала бы
-  //! очередью за замком, который перестройка держит).
+  //! Момент последней перестройки индекса с диска. Частоту он больше НЕ
+  //! ограничивает — это делает `kScheduledNameIndexRepairGap` планового
+  //! прохода; он остаётся отметкой «когда индекс последний раз читали с
+  //! диска». Атомарные: переставляются под замком перестройки, читаются без.
   std::atomic<std::chrono::steady_clock::time_point> _characterIndexLastRetry{};
   std::atomic<std::chrono::steady_clock::time_point> _guildIndexLastRetry{};
 
@@ -443,10 +442,11 @@ private:
     std::string_view what, std::string_view detail) noexcept;
   void MarkGuildNameIndexBroken(
     std::string_view what, std::string_view detail) noexcept;
-  //! Пересобрать индекс персонажей, если он объявлен НЕПОЛНЫМ, но не чаще, чем
-  //! раз в `kBrokenNameIndexRetryGap`. Возвращает `true`, если перестройка
-  //! состоялась. Так временно нечитаемый файл, ставший читаемым, чинит индекс
-  //! БЕЗ перезапуска — иначе «неполный» означало бы «сломано до утра».
+  //! Пересобрать индекс персонажей, если он объявлен НЕПОЛНЫМ. Возвращает
+  //! `true`, если перестройка состоялась. Так временно нечитаемый файл,
+  //! ставший читаемым, чинит индекс БЕЗ перезапуска — иначе «неполный»
+  //! означало бы «сломано до утра». ★Зовётся ТОЛЬКО из планового прохода
+  //! `TickNameIndexMaintenance`: частоту держит он, а не эта функция.
   bool ReconcileCharacterNameIndexIfBroken();
   //! То же для гильдий.
   bool ReconcileGuildNameIndexIfBroken();

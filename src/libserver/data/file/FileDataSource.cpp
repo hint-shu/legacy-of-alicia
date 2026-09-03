@@ -83,38 +83,15 @@ constexpr auto kUserIndexStaleAfter = std::chrono::seconds(60);
 //! старта, стоил бы отказа в создании ДО ПЕРЕЗАПУСКА, хотя на диске всё давно
 //! в порядке.
 //!
-//! ★ЗАЧЕМ ПОТОЛОК. Пока данные действительно битые, перестройка — это полный
-//! обход каталога, и без потолка её заказывал бы КАЖДЫЙ пакет создания. Две
-//! секунды дают самопочинку за время, неразличимое для человека, и при этом
-//! ограничивают стоимость одним обходом в две секунды на весь сервер.
-constexpr auto kBrokenNameIndexRetryGap = std::chrono::seconds(2);
-
-//! Занимает право на попытку перестройки: `true` не чаще раза в `gap`.
-//!
-//! ★ЧАСЫ ЧИТАЮТСЯ БЕЗ ЗАМКА ИНДЕКСА НАМЕРЕННО. Перестройка держит замок
-//! индекса эксклюзивно; спрашивать «а можно?» под тем же замком значило бы
-//! встать в очередь за той самой перестройкой, которую мы пытаемся не
-//! дублировать.
-bool ClaimNameIndexRetry(
-  std::atomic<std::chrono::steady_clock::time_point>& last,
-  const std::chrono::steady_clock::duration gap)
-{
-  const auto now = std::chrono::steady_clock::now();
-  auto previous = last.load(std::memory_order::relaxed);
-  while (true)
-  {
-    if (previous != std::chrono::steady_clock::time_point{}
-      && now - previous < gap)
-    {
-      return false;
-    }
-    if (last.compare_exchange_weak(
-        previous, now, std::memory_order::relaxed, std::memory_order::relaxed))
-    {
-      return true;
-    }
-  }
-}
+//! ★ПОТОЛКА ЧАСТОТЫ ЗДЕСЬ БОЛЬШЕ НЕТ, И ЭТО НЕ ОСЛАБЛЕНИЕ (правка ревью,
+//! итерация 9). Двухсекундный `ClaimNameIndexRetry` существовал ровно затем,
+//! чтобы КАЖДЫЙ пакет создания не заказывал полный обход каталога. Теперь
+//! ремонт вообще не достижим с пути запроса: его зовёт только плановый проход
+//! `TickNameIndexMaintenance`, у которого свой потолок —
+//! `kScheduledNameIndexRepairGap`, то есть шестьдесят секунд вместо двух.
+//! Оставить оба значило бы, что первый же тик после старта (а старт только что
+//! переставил отметку попытки) НЕ ЧИНИТ неполный индекс и ждёт следующей
+//! минуты — то есть «починиться сразу после старта» не выполнялось бы.
 
 //! РАЗБИРАЕТ uid ЗАПИСИ ИЗ ИМЕНИ ФАЙЛА (правка ревью, итерация 7).
 //!
@@ -3110,9 +3087,6 @@ bool server::FileDataSource::ReconcileGuildNameIndexIfBroken()
     if (_guildNameIndexComplete)
       return false;
   }
-  if (not ClaimNameIndexRetry(_guildIndexLastRetry, kBrokenNameIndexRetryGap))
-    return false;
-
   try
   {
     RebuildGuildNameIndex();
@@ -3138,9 +3112,6 @@ bool server::FileDataSource::ReconcileCharacterNameIndexIfBroken()
     if (_characterNameIndexComplete)
       return false;
   }
-  if (not ClaimNameIndexRetry(_characterIndexLastRetry, kBrokenNameIndexRetryGap))
-    return false;
-
   try
   {
     RebuildCharacterNameIndex();
