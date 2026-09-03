@@ -185,6 +185,13 @@ docker save alicia-server-ru:r<N>cand | ssh "$PROD_HOST" docker load
 echo "transfer rc=$?"          # with pipefail this is the FIRST failing stage
 ```
 
+> **Transfer gotcha (R70 deploy, 2026-09-03):** never use `ssh -n` on the receiving side of the
+> image pipe — `-n` redirects stdin from /dev/null, so `docker save TAG | ssh -n host docker load`
+> SIGPIPEs `docker save` (PIPESTATUS `141 1`, "unrecognized image format") and can fail silently.
+> Use plain `ssh host docker load` for the pipe, and treat the image-ID comparison on both ends —
+> not the pipeline exit code — as the gate that makes this step safe.
+
+
 Without `pipefail` the exit code you read is `docker load`'s, and a `docker save` that
 died halfway reads as success.
 
