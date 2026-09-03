@@ -198,6 +198,18 @@ class HorseRegistry
 public:
   HorseRegistry();
 
+  //! Reads every horse table from the config directory.
+  //!
+  //! ★R77-fix-2 (Codex finding 1). This call is ALL-OR-NOTHING. It parses into a
+  //! scratch registry and only then moves the result over the live tables, so a
+  //! failed hot reload (`/reload`, whose handler catches and keeps the server
+  //! running) leaves the PREVIOUS tables in place instead of an empty registry.
+  //! Before this, `ReadConfig` cleared each container and then parsed into it:
+  //! the round taught the potential loop to throw, and a throw halfway through
+  //! left `_potentialTypes` empty -- which `GiveHorseRandomPotential` indexed
+  //! with `size() - 1`, i.e. SIZE_MAX on an empty vector.
+  //! @throws std::exception on any malformed or inconsistent table; on a throw
+  //!         this registry is UNCHANGED.
   void ReadConfig(const std::filesystem::path& configPath);
 
   static void BuildDefaultHorse(
@@ -344,6 +356,18 @@ public:
   std::vector<uint32_t> GetEmblemsByOdds(uint32_t odds) const;
 
 private:
+  //! Parses every table from the config directory INTO THIS INSTANCE. May throw
+  //! at any point, leaving this instance half-filled -- which is why only
+  //! `ReadConfig`'s private scratch instance is ever exposed to that state.
+  void LoadTables(const std::filesystem::path& configPath);
+
+  //! ★R77-fix-2 (Codex findings 2 and 3). Refuses a parse whose tables are
+  //! internally inconsistent, BEFORE it can become the live registry. Everything
+  //! the breeding and admin rolls index must be non-empty and self-consistent
+  //! here, so no roll ever has to invent a fallback at runtime.
+  //! @throws std::runtime_error naming the offending table.
+  void ValidateTables() const;
+
   std::vector<std::vector<Color>> _colorGroups;
 
   std::unordered_map<data::Tid, Coat> _coats;
