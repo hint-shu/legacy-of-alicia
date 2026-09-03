@@ -18,6 +18,7 @@
  **/
 
 #include "server/ranch/Genetics.hpp"
+#include "libserver/registry/BreedingOdds.hpp"
 #include "libserver/util/QuietLog.hpp"
 #include "server/ServerInstance.hpp"
 
@@ -92,18 +93,15 @@ uint32_t Genetics::RollEmblem()
 {
   const auto& horseRegistry = _serverInstance.GetHorseRegistry();
 
-  // Pick a rarity tier weighted by its ratio (emblems.yaml -> emblemRatios).
-  std::vector<uint32_t> tiers;
-  std::vector<int32_t> ratios;
-  for (const auto& ratio : horseRegistry.GetEmblemRatios())
-  {
-    if (ratio.ratio > 0)
-    {
-      tiers.push_back(ratio.odds);
-      ratios.push_back(ratio.ratio);
-    }
-  }
-  const uint32_t tier = PickWeighted(server::util::GetRandomEngine(), tiers, ratios, uint32_t{1});
+  // Pick a rarity tier weighted by its ratio (emblems.yaml -> emblemRatios), plus
+  // the "no emblem" sentinel that makes up the shortfall to 100. Stock
+  // EmblemRatioInfo sums to 92, and the missing 8 is a real stock outcome that a
+  // normalising weighted pick used to swallow -- every foal got an emblem.
+  const auto choices = registry::BuildEmblemTierChoices(horseRegistry.GetEmblemRatios());
+  const uint32_t tier = PickWeighted(
+    server::util::GetRandomEngine(), choices.values, choices.weights, uint32_t{1});
+  if (tier == registry::kNoEmblemTier)
+    return 0;
 
   // Pick a uniform emblem within the chosen tier.
   const std::vector<uint32_t> emblems = horseRegistry.GetEmblemsByOdds(tier);
@@ -628,15 +626,30 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
     return result;
   }
 
-  // Pick a random potential type from the registry
+  // Pick the potential type weighted by the foal's coat star tier (stock
+  // MountPotentialInfo.OddsRare1..3). Chasing a rare coat used to mean nothing
+  // for the potential: the type was a uniform coin flip.
   const auto& potentialTypes = registry.GetPotentialTypes();
   if (potentialTypes.empty())
   {
     server::util::QuietLogWarn("Genetics: no potential types configured");
     return result;
   }
-  std::uniform_int_distribution<size_t> typeDist(0, potentialTypes.size() - 1);
-  result.type = static_cast<uint8_t>(potentialTypes[typeDist(server::util::GetRandomEngine())]);
+
+  const size_t tierIndex = registry::CoatTierToOddsIndex(registry.GetCoatInfo(foalSkinTid).tier);
+  const auto choices = registry::BuildPotentialTypeChoices(registry, tierIndex);
+  if (choices.empty())
+  {
+    // Deliberately NOT a silent fallback to the uniform roll: a config with no
+    // positive weight must be visible, otherwise the round's own check goes green
+    // on the very behaviour it was written to catch.
+    server::util::QuietLogWarn(
+      "Genetics: no potential type has a positive weight for coat tier index {}", tierIndex);
+    return result;
+  }
+
+  result.type = static_cast<uint8_t>(PickWeighted(
+    server::util::GetRandomEngine(), choices.values, choices.weights, uint32_t{0}));
   result.level = 1;
 
   return result;

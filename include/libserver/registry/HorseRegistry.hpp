@@ -60,6 +60,11 @@ struct PotentialInfo
 {
   uint32_t type{0};
   std::string name;
+  //! Weight of picking this potential type when the foal's coat has star tier 1/2/3
+  //! (stock MountPotentialInfo.OddsRare1..3). Index 0 -> tier 1, index 2 -> tier 3.
+  //! The SHAPE is stock; the NUMBERS are our design, see potential.yaml.
+  //! Parsed without a default: a missing key must throw, never silently read as 0.
+  std::array<int32_t, 3> oddsByCoatTier{};
 };
 
 struct MasteryParams

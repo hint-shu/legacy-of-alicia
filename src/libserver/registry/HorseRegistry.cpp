@@ -188,6 +188,14 @@ void HorseRegistry::ReadConfig(const std::filesystem::path& configPath)
     _potentials[type] = PotentialInfo{
       .type = type,
       .name = node["name"].as<std::string>(),
+      // Mandatory on purpose: no .as<int32_t>(0) and no "if (node[...])".
+      // A missing oddsRare key must throw here and stop the server, because the
+      // silent alternative is every weight reading 0, which puts the potential
+      // type roll back on a uniform coin flip that nothing would ever report.
+      .oddsByCoatTier = {
+        node["oddsRare1"].as<int32_t>(),
+        node["oddsRare2"].as<int32_t>(),
+        node["oddsRare3"].as<int32_t>()},
     };
     _potentialTypes.push_back(type);
   }
@@ -378,6 +386,11 @@ void HorseRegistry::BuildRandomHorse(
   appearance.bodyVolume = scale;
 }
 
+//! ROUND BOUNDARY (R77). This is the admin path (//horse potential, ChatSystem),
+//! and it stays a uniform roll ON PURPOSE. R77 made the BREEDING roll depend on
+//! the foal's coat star tier (Genetics::CalculateFoalPotential); this function has
+//! no coat context to key off, and it doubles as the round's non-growing control
+//! symbol. It is not an unfixed defect -- do not "harmonise" it without a coat.
 void HorseRegistry::GiveHorseRandomPotential(
   data::Horse::Potential& potential)
 {
