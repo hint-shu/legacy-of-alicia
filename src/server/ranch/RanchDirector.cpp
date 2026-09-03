@@ -811,6 +811,20 @@ RanchDirector::RanchDirector(ServerInstance& serverInstance)
 
 void RanchDirector::Initialize()
 {
+  // LOA (R70-fix-7, backlog #58): срок удержания попапов достижений берётся из
+  // конфига ЗДЕСЬ, а не в конструкторе директора: `ServerInstance::Initialize`
+  // читает YAML ПОСЛЕ построения всех директоров, поэтому в конструкторе поле
+  // ещё содержит умолчание. Тихо взять умолчание вместо настроенного значения
+  // — это ровно тот ложно-зелёный, из-за которого стенд объявил бы «протухания
+  // нет», поставив 20 с и получив 900.
+  const auto holdSeconds = std::chrono::seconds(
+    _serverInstance.GetSettings().ranch.achievementNotifyHoldSeconds);
+  _pendingAchievementNotifies.SetTtl(holdSeconds);
+  server::util::QuietLogDebug(
+    "Race achievement popups are held for {} s (cap {} per character)",
+    holdSeconds.count(),
+    AchievementNotifyHold::CharacterCap);
+
   _breedingMarket.Initialize();
 
   ScheduleFoalMaturityCheck();
@@ -1794,37 +1808,84 @@ void RanchDirector::QueueAchievementNotifies(
   if (notifies.empty())
     return;
 
+  std::size_t droppedByCap = 0;
   try
   {
+    const auto now = AchievementNotifyHold::Clock::now();
     std::lock_guard lock(_pendingAchievementNotifiesMutex);
-    auto& queued = _pendingAchievementNotifies[characterUid];
-    queued.insert(
-      queued.end(),
-      std::make_move_iterator(notifies.begin()),
-      std::make_move_iterator(notifies.end()));
+    for (const auto& notify : notifies)
+      droppedByCap += _pendingAchievementNotifies.Push(characterUid, notify, now);
   }
   catch (...)
   {
     // Очередь не приняла (bad_alloc) — теряется только попап, прогресс уже
     // записан и виден в списке достижений.
+    return;
+  }
+
+  // ★ЖАЛОБА — ВНЕ ЛОКА. Под листовым мьютексом не должно быть ни одного вызова
+  // наружу, а spdlog — это вызов наружу (форматирование, приёмники, свои
+  // замки). Дисциплина раундов 21/34/72.
+  if (droppedByCap == 0)
+    return;
+
+  uint64_t suppressed = 0;
+  uint64_t total = 0;
+  if (_achievementHoldOverflowThrottle.Allow(suppressed, total))
+  {
+    server::util::QuietLogWarn(
+      "Held race achievement popups overflowed for character {}: {} dropped "
+      "(cap {} per character); suppressed {} similar, {} total",
+      characterUid,
+      droppedByCap,
+      AchievementNotifyHold::CharacterCap,
+      suppressed,
+      total);
   }
 }
 
 void RanchDirector::DrainPendingAchievementNotifies()
 {
-  // LOA (R70, backlog #58): исполнение отложенных нотификаций достижений.
+  // LOA (R70, backlog #58; удержание — R70-fix-7): доставка придержанных
+  // нотификаций достижений.
   // ★ПОТОК: только РАНЧ-СЕТЕВОЙ (единственный вызов — из HandleNetworkTick).
-  std::unordered_map<data::Uid, std::vector<protocol::AcCmdRCAchievementUpdateNotify>>
-    pendingNotifies;
+  //
+  // ★ПОРЯДОК ШАГОВ ЗДЕСЬ — ЭТО И ЕСТЬ ПОЛИТИКА, ЧИТАТЬ ЦЕЛИКОМ:
+  //   1) под ЛИСТОВЫМ локом выбрасываем протухшее и снимаем СПИСОК персонажей
+  //      (обе операции — только с контейнером, ни одного вызова наружу);
+  //   2) лок ОТПУСКАЕТСЯ, и только потом идёт поиск клиента и отправка;
+  //   3) у персонажа без ранчевого клиента записи ОСТАЮТСЯ в удержании — это
+  //      и есть смысл fix-7: клиент закрывает ранчевую ногу на время заезда,
+  //      поэтому «нет клиента прямо сейчас» — это норма, а не потеря.
+  // Забирать всю карту `swap`'ом, как делает очередь представлений, здесь
+  // НЕЛЬЗЯ: то, что не доставлено, обязано остаться на месте, а возврат
+  // недоставленного обратно — это второй шанс разъехаться с тем, что за это
+  // время положил гоночный поток.
+  const auto now = AchievementNotifyHold::Clock::now();
+  std::size_t expired = 0;
+  std::size_t heldAfterExpiry = 0;
+  std::vector<data::Uid> characters;
   {
     std::lock_guard lock(_pendingAchievementNotifiesMutex);
-    if (_pendingAchievementNotifies.empty())
+    expired = _pendingAchievementNotifies.Expire(now);
+    heldAfterExpiry = _pendingAchievementNotifies.HeldCount();
+    if (heldAfterExpiry == 0 and expired == 0)
       return;
-
-    pendingNotifies.swap(_pendingAchievementNotifies);
+    characters = _pendingAchievementNotifies.Characters();
   }
 
-  for (const auto& [characterUid, notifies] : pendingNotifies)
+  // ★СТРОКА С ЧИСЛАМИ, А НЕ «что-то протухло»: оракул стенда судит «после
+  // срока удержано ноль» ПО ЧИСЛУ. Уровень info, потому что это не отказ:
+  // игрок просто не вернулся на ранчо в срок, прогресс у него записан.
+  if (expired > 0)
+  {
+    server::util::QuietLogInfo(
+      "Held race achievement popups expired: {} dropped, {} still held",
+      expired,
+      heldAfterExpiry);
+  }
+
+  for (const auto& characterUid : characters)
   {
     // ★ПЕРЕХВАТ НА КАЖДОМ ПЕРСОНАЖЕ, а не один на весь слив: очередь УЖЕ
     // снята, и осечка на одном съела бы попапы всех остальных.
@@ -1833,9 +1894,22 @@ void RanchDirector::DrainPendingAchievementNotifies()
       ClientId clientId = 0;
       const ClientContext* clientContext =
         TryGetClientContextByCharacterUid(characterUid, clientId);
-      // ★«ПЕРСОНАЖ НЕ НА РАНЧО» — ШТАТНОЕ СОСТОЯНИЕ, А НЕ ОТКАЗ (R72-2):
-      // после заезда игрок мог закрыть игру. Пропускаем МОЛЧА.
+      // ★«ПЕРСОНАЖ НЕ НА РАНЧО» — ШТАТНОЕ СОСТОЯНИЕ, А НЕ ОТКАЗ (R72-2).
+      // ПРИДЕРЖИВАЕМ и пробуем на следующем тике: во время заезда ранчевой
+      // ноги нет ни у одного игрока, и выбрасывать здесь значило бы выбросить
+      // ВСЕГДА.
       if (clientContext == nullptr)
+        continue;
+
+      // ★ЗАБИРАЕМ ТОЛЬКО ТОГДА, КОГДА ЕСТЬ КОМУ ОТДАТЬ. Снять записи раньше
+      // поиска — значит потерять их у персонажа, который отключился между
+      // снимком списка и поиском.
+      std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies;
+      {
+        std::lock_guard lock(_pendingAchievementNotifiesMutex);
+        notifies = _pendingAchievementNotifies.Take(characterUid);
+      }
+      if (notifies.empty())
         continue;
 
       for (const auto& notify : notifies)
@@ -1843,6 +1917,14 @@ void RanchDirector::DrainPendingAchievementNotifies()
         _commandServer.QueueCommand<protocol::AcCmdRCAchievementUpdateNotify>(
           clientId, [notify]() { return notify; });
       }
+
+      // ★СЧЁТ ДОСТАВЛЕННОГО — ТОЖЕ УЛИКА СТЕНДА (предикат «придержанное дошло
+      // на повторном входе»): без строки доставка видна только по проводу, а
+      // провод и лог — две независимые улики.
+      server::util::QuietLogInfo(
+        "Delivered {} held race achievement popups to character {}",
+        notifies.size(),
+        characterUid);
     }
     catch (const std::exception& x)
     {

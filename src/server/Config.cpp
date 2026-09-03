@@ -245,6 +245,22 @@ void Config::LoadFromFile(const std::filesystem::path& filePath)
       const auto ranchYaml = serverYaml["ranch"];
       ranch.enabled = ranchYaml["enabled"].as<bool>();
       ranch.listen = parseListenSection(ranchYaml["listen"]);
+
+      // LOA (R70-fix-7, backlog #58): срок удержания попапа достижения заезда.
+      // ★КЛЮЧ НЕОБЯЗАТЕЛЕН, НО ЕСЛИ ОН ЕСТЬ — ОН ОБЯЗАН БЫТЬ ЧИТАЕМ. Старые
+      // конфиги без ключа обязаны работать (иначе правка ломает деплой), а
+      // конфиг С ключом, который не разбирается, — это тихая подмена срока на
+      // умолчание, то есть ровно тот ложно-зелёный, ради которого раунд и
+      // завёл настраиваемость: стенд поставил бы 20 с, получил бы 900 и
+      // объявил «протухания нет».
+      if (const auto holdYaml = ranchYaml["achievement_notify_hold_seconds"])
+      {
+        const auto holdSeconds = holdYaml.as<uint32_t>();
+        if (holdSeconds == 0)
+          throw std::runtime_error(
+            "ranch.achievement_notify_hold_seconds must be at least 1 second");
+        ranch.achievementNotifyHoldSeconds = holdSeconds;
+      }
     }
     catch (const std::exception& e)
     {

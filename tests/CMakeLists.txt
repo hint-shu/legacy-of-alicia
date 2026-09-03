@@ -78,6 +78,20 @@ target_link_libraries(registry_test_achievement_tiers
 target_compile_definitions(registry_test_achievement_tiers
         PRIVATE LOA_ACHIEVEMENTS_CATALOG="${CMAKE_SOURCE_DIR}/resources/config/game/achievements.yaml")
 
+# LOA (R70-fix-7, backlog #58): срок/потолок/порядок удержания попапов.
+# ★ИСХОДНИК КЛАССА ПОДКЛЮЧАЕТСЯ НАПРЯМУЮ: он живёт в цели `alicia-server`
+# (исполняемой), а не в библиотеке, и слинковать его иначе нечем. Класс не
+# зависит ни от директора, ни от сети — только от протокольной структуры и
+# `data::Uid`, поэтому пары файлов достаточно.
+add_executable(ranch_test_achievement_notify_hold)
+target_sources(ranch_test_achievement_notify_hold PRIVATE
+        src/ranch/TestAchievementNotifyHold.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/ranch/AchievementNotifyHold.cpp)
+target_include_directories(ranch_test_achievement_notify_hold
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(ranch_test_achievement_notify_hold
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -89,6 +103,7 @@ add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
 add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
 add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
+add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
