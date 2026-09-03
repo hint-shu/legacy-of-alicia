@@ -625,7 +625,12 @@ def selftest():
          "  if (stem.size() > 1 && stem.front() == '0')\n    return std::nullopt;\n",
          ""),
         # ★КАНАРЕЙКИ ИТЕРАЦИИ 11: ровно те две формы, в которых дефект БЫЛ.
+        # ★ЯКОРЬ БЕРЁТСЯ С КОНТЕКСТОМ ПУТИ ЗАПРОСА: сама строка «взвести флаг»
+        # встречается семь раз (её ставят ещё и Mark*Broken, и Reconcile*), и
+        # канарейка по ней подменяла бы не то место — самопроверка это и
+        # поймала.
         ("пол-ремонта",
+         "  // не запускает проход раньше пола ни по чьей просьбе.\n"
          "  _nameIndexRepairPending.store(true, std::memory_order::relaxed);",
          "  _nameIndexMaintenanceLastRun.store(\n"
          "    std::chrono::steady_clock::time_point{}, std::memory_order::relaxed);"),
