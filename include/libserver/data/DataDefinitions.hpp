@@ -249,6 +249,12 @@ struct Settings
 };
 
 //! User
+//! LOA (R75, #14): предел числа пер-курсовых рекордов у персонажа. Провод пишет
+//! длину списка одним байтом (LobbyMessageDefinitions.cpp), поэтому 255 — не «с
+//! запасом», а физический потолок кадра. Боевых карт в courses.yaml 55, так что
+//! список длиннее означает порченый файл, а не игрока-рекордсмена.
+constexpr std::size_t MaxCourseRecords = 255;
+
 struct Character
 {
   //! An UID of the character.
@@ -461,6 +467,33 @@ struct Character
     std::string kind{};
   };
   dao::Field<std::vector<DamagedReference>> damagedReferences{};
+
+  //! LOA (R75, #14): РЕКОРД ПЕРСОНАЖА НА ОДНОЙ ТРАССЕ.
+  //! ★Структура ПЛОСКАЯ (обычные поля, а не dao::Field) — как AchievementEntry:
+  //! у dao::Field удалён копирующий конструктор, и вектор из них не собрался бы.
+  //! ★Поля дописаны В КОНЕЦ структуры: смещения существующих членов Character
+  //! не двигаются, поэтому код функций, которые раунд не правит (в том числе
+  //! контроль лесенки HandleRequestMountInfo), не меняет размер.
+  struct CourseRecord
+  {
+    //! `mapBlockId` трассы (courses.yaml -> mapBlockInfo.id; максимум 20009,
+    //! в uint16 помещается). Он же уходит клиенту как
+    //! AcCmdLCPersonalInfo::CourseInformation::Course::courseId.
+    uint16_t courseId{};
+    //! Лучшее ВАЛИДНОЕ время прохождения, мс. 0 = рекорда ещё нет.
+    uint32_t recordTime{};
+    //! Сколько раз трасса пройдена до финиша.
+    uint32_t timesRaced{};
+  };
+  //! Пер-курсовые рекорды. Порядок — порядок первого финиша, клиент сортирует сам.
+  dao::Field<std::vector<CourseRecord>> courseRecords{};
+
+  //! LOA (R75, #14): заезды, доведённые до финиша, по режимам. `totalGames`
+  //! ОТДЕЛЬНЫМ полем НЕ хранится — он сумма этих двух, и потому не умеет
+  //! разойтись со слагаемыми. Туториальные заезды (GameMode::Tutorial) сюда не
+  //! идут: окно клиента знает только «скоростные» и «магические».
+  dao::Field<uint32_t> totalSpeedGames{};
+  dao::Field<uint32_t> totalMagicGames{};
 };
 
 struct Horse

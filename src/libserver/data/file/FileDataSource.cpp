@@ -722,6 +722,60 @@ void server::FileDataSource::RetrieveCharacter(data::Uid uid, data::Character& c
       }
       character.achievementBooks = std::move(books);
     }
+
+    // LOA (R75, #14): пер-курсовые рекорды. Читаем ЗАЩИЩЁННО, как достижения:
+    // мусорная запись пропускается, а не роняет загрузку персонажа; дубли по
+    // courseId побеждает первая запись (двух рекордов на одну трассу не бывает);
+    // список режется тем же капом, что несёт провод.
+    // ★СТОИМ ВНУТРИ ЭТОГО БЛОКА НАМЕРЕННО: лямбда readBounded объявлена здесь и
+    // живёт до закрывающей скобки блока. Снаружи её нет.
+    if (json.contains("courseRecords") and json["courseRecords"].is_array())
+    {
+      std::vector<data::Character::CourseRecord> records;
+      // ★reserve на весь кап: рост вектора на ГОРЯЧЕМ пути RaceInstance::Stop()
+      // идёт внутри noexcept-тела пояса, и чем реже там случается реаллокация,
+      // тем уже окно теоретического bad_alloc (там он выловлен, но лучше в него
+      // не входить).
+      records.reserve(data::MaxCourseRecords);
+      for (const auto& entry : json["courseRecords"])
+      {
+        if (records.size() >= data::MaxCourseRecords)
+        {
+          server::util::QuietLogWarn(
+            "Character '{}' has more than {} course records, ignoring the rest",
+            uid, data::MaxCourseRecords);
+          break;
+        }
+        uint64_t courseId = 0;
+        if (not entry.is_object()
+          or not entry.contains("courseId")
+          or not readBounded(entry["courseId"],
+                std::numeric_limits<uint16_t>::max(), courseId)
+          or courseId == 0)
+          continue;
+        if (std::ranges::find(records, static_cast<uint16_t>(courseId),
+              &data::Character::CourseRecord::courseId) != records.end())
+          continue;
+
+        data::Character::CourseRecord record{
+          .courseId = static_cast<uint16_t>(courseId)};
+        uint64_t value = 0;
+        if (entry.contains("recordTime")
+          and readBounded(entry["recordTime"],
+                std::numeric_limits<uint32_t>::max(), value))
+          record.recordTime = static_cast<uint32_t>(value);
+        value = 0;
+        if (entry.contains("timesRaced")
+          and readBounded(entry["timesRaced"],
+                std::numeric_limits<uint32_t>::max(), value))
+          record.timesRaced = static_cast<uint32_t>(value);
+
+        records.push_back(record);
+      }
+      character.courseRecords = std::move(records);
+    }
+    character.totalSpeedGames = json.value("totalSpeedGames", uint32_t{});
+    character.totalMagicGames = json.value("totalMagicGames", uint32_t{});
   }
 
   character.settingsUid = json.value("settingsUid", data::Uid{});
@@ -900,6 +954,22 @@ void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character
     }
     json["achievementBooks"] = std::move(booksJson);
   }
+
+  // LOA (R75, #14): пер-курсовые рекорды и счётчики заездов. Пишем БЕЗУСЛОВНО —
+  // как achievements/careSkills: это часть каждой записи, а не карантин, который
+  // у здорового персонажа обязан отсутствовать.
+  {
+    auto courseRecordsJson = nlohmann::json::array();
+    for (const auto& entry : character.courseRecords())
+    {
+      courseRecordsJson.push_back({{"courseId", entry.courseId},
+        {"recordTime", entry.recordTime},
+        {"timesRaced", entry.timesRaced}});
+    }
+    json["courseRecords"] = std::move(courseRecordsJson);
+  }
+  json["totalSpeedGames"] = character.totalSpeedGames();
+  json["totalMagicGames"] = character.totalMagicGames();
 
   json["settingsUid"] = character.settingsUid();
 
