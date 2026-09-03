@@ -95,6 +95,17 @@ judge_body() {
     echo "  $where: result.type присваивается не из PickWeighted" >&2
     rc=1
   fi
+  # ★Третья итерация Codex: «взвешенный» вызов с ПЛОСКИМИ весами — это тот же
+  # равномерный бросок, только записанный через PickWeighted. Присваивание обязано
+  # брать И кандидатов, И ВЕСА, посчитанные BuildPotentialTypeChoices.
+  local withValues withWeights total
+  total="$(printf '%s\n' "$assigns" | grep -c .)"
+  withValues="$(printf '%s\n' "$assigns" | grep -cE 'choices\.values')"
+  withWeights="$(printf '%s\n' "$assigns" | grep -cE 'choices\.weights')"
+  if [ "$withValues" -ne "$total" ] || [ "$withWeights" -ne "$total" ]; then
+    echo "  $where: result.type не берёт choices.values И choices.weights — веса масти не участвуют" >&2
+    rc=1
+  fi
   return $rc
 }
 
@@ -142,6 +153,20 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
 }
 FIXTURE
 
+cat > "$FIX/flat.cpp" <<'FIXTURE'
+Genetics::PotentialResult Genetics::CalculateFoalPotential(
+  const data::Uid mareUid)
+{
+  PotentialResult result{};
+  const auto tierIndex = registry::CoatTierToOddsIndex(tier);
+  const auto choices = registry::BuildPotentialTypeChoices(registry, *tierIndex);
+  std::vector<int32_t> flat(choices.values.size(), 1);
+  result.type = static_cast<uint8_t>(PickWeighted(
+    server::util::GetRandomEngine(), choices.values, flat, uint32_t{0}));
+  return result;
+}
+FIXTURE
+
 judge_body "$(extract_body "$FIX/good.cpp")" "fixture-good" >/dev/null 2>&1 \
   || die "самопроверка: гейт отверг ПРАВИЛЬНУЮ форму — его вердикт ничего не значит"
 if judge_body "$(extract_body "$FIX/uniform.cpp")" "fixture-uniform" >/dev/null 2>&1; then
@@ -153,7 +178,12 @@ fi
 if judge_body "$(extract_body "$FIX/sneaky.cpp")" "fixture-sneaky" >/dev/null 2>&1; then
   die "самопроверка: гейт ПРИНЯЛ форму, где result.type идёт мимо PickWeighted"
 fi
-echo "самопроверка гейта: правильная форма принята; равномерная и обходная отвергнуты ✓"
+# ★Четвёртая фикстура (Codex, итерация 3): PickWeighted с ПЛОСКИМИ весами — все
+# токены на месте, присваивание идёт из PickWeighted, а веса масти не участвуют.
+if judge_body "$(extract_body "$FIX/flat.cpp")" "fixture-flat" >/dev/null 2>&1; then
+  die "самопроверка: гейт ПРИНЯЛ взвешенный бросок с плоскими весами"
+fi
+echo "самопроверка гейта: правильная форма принята; равномерная, обходная и плоская отвергнуты ✓"
 
 # ---- 1. the repository ----------------------------------------------------------
 [ -f "$TARGET" ] || die "нет файла $TARGET"
