@@ -24,6 +24,21 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_YAML = os.path.join(REPO, "resources", "config", "game", "horses", "appearance.yaml")
 DEFAULT_STOCK = os.path.join(REPO, "tools", "stock")
 
+# ★R77-fix-2 (Codex finding 5, WARN). The first version only compared the rows it
+# FOUND and accepted any scan of at least 80 entries. Codex deleted the whole
+# coat-20 entry and got "scanned 89 entries, 0 finding(s)", exit code 0 — the
+# oracle on which the round's entire M1/M2 evidence rests was blind to exactly
+# the failure mode of the round (a row going missing). The census is exact now,
+# per section, and a missing row is a FINDING, not a smaller number nobody reads.
+EXPECTED_COUNTS = {"coats": 20, "manes": 40, "tails": 30}
+# The tid of every entry is known too, so a row that is present but renumbered
+# (which keeps the count intact) is caught as well.
+EXPECTED_TIDS = {
+    "coats": set(range(1, 21)),
+    "manes": set(range(1, 41)),
+    "tails": set(range(1, 31)),
+}
+
 
 def read_tsv(path):
     """Return {ShapeID: {column: value}} for a stock DNA table."""
@@ -116,15 +131,82 @@ def check(yaml_path, stock_dir):
             compare(section, "minGrade", entry["minGrade"], float(row["LimitGrade"]), shape)
             compare(section, "tier", entry["tier"], float(row["Rare"]), shape)
 
+    # ★The census: exact per-section counts and exact tid sets. A deleted,
+    # duplicated or renumbered row is a finding here even when every row that
+    # remains matches stock perfectly.
+    for section, want in EXPECTED_COUNTS.items():
+        entries = sections.get(section, [])
+        if len(entries) != want:
+            findings.append(
+                "%s: section '%s' has %d entries, expected exactly %d"
+                % (name, section, len(entries), want))
+        tids = []
+        for entry in entries:
+            if "tid" not in entry:
+                findings.append("%s: an entry in '%s' has no tid" % (name, section))
+                continue
+            tids.append(int(entry["tid"][0]))
+        got = set(tids)
+        want_tids = EXPECTED_TIDS[section]
+        if len(tids) != len(got):
+            findings.append("%s: section '%s' has duplicate tids" % (name, section))
+        for missing in sorted(want_tids - got):
+            findings.append("%s: section '%s' is missing tid %d" % (name, section, missing))
+        for extra in sorted(got - want_tids):
+            findings.append("%s: section '%s' has unexpected tid %d" % (name, section, extra))
+
     scanned = sum(len(sections.get(s, [])) for s in ("coats", "manes", "tails"))
     return findings, scanned
+
+
+def run_on_lines(lines, stock_dir):
+    """Runs the oracle over an in-memory copy of appearance.yaml."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "appearance.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        return check(path, stock_dir)
+
+
+def selftest_deleted_row(stock_dir):
+    """★The scenario Codex ran and the oracle slept through: a whole coat entry
+    deleted. Every remaining row still matches stock, so the value comparison has
+    nothing to say — the census is what must speak."""
+    with open(DEFAULT_YAML, encoding="utf-8") as handle:
+        lines = handle.read().split("\n")
+
+    start = None
+    for index, line in enumerate(lines):
+        if line == "  - tid: 20":
+            start = index
+            break
+    if start is None:
+        print("selftest(deleted row): could not find the coat-20 entry")
+        return False
+
+    end = start + 1
+    while end < len(lines) and lines[end].startswith("    "):
+        end += 1
+    kept = lines[:start] + lines[end:]
+
+    findings, scanned = run_on_lines(kept, stock_dir)
+    ok = scanned == 89 and any("missing tid 20" in f for f in findings)
+    print("selftest(deleted row): deleted coat 20, oracle reported %d finding(s), "
+          "scanned %d entries" % (len(findings), scanned))
+    for finding in findings:
+        print("  " + finding)
+    print("selftest(deleted row): " + ("PASS" if ok else "FAIL"))
+    return ok
 
 
 def selftest(stock_dir):
     """A gate must prove itself before its verdict means anything.
 
     Corrupts exactly one value in a copy of the real file and requires the oracle
-    to report exactly one finding, on the right line.
+    to report exactly one finding, on the right line; then deletes a whole entry
+    and requires the census to report it.
     """
     import tempfile
 
@@ -152,6 +234,8 @@ def selftest(stock_dir):
     for finding in findings:
         print("  " + finding)
     print("selftest: " + ("PASS" if ok else "FAIL"))
+
+    ok = selftest_deleted_row(stock_dir) and ok
     return 0 if ok else 1
 
 
@@ -175,6 +259,8 @@ def main():
     # a scan that never happened.
     print("scanned %d entries (coats + manes + tails), %d finding(s), expected %d"
           % (scanned, len(findings), args.expect))
+    # The floor stays as a parse sanity check, but it is NOT the census any more:
+    # the census lives in check() and speaks through findings.
     if scanned < 80:
         print("STOP: scanned too few entries, the parse is incomplete")
         return 3
