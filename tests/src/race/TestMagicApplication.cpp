@@ -33,6 +33,8 @@
 //! ★`assert` НЕ ИСПОЛЬЗУЕТСЯ: боевой образ собирается с -DNDEBUG.
 #include "server/race/MagicApplication.hpp"
 
+#include <vector>
+
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
@@ -153,6 +155,36 @@ void TestIceWallSegmentShape()
     "максимум, представимый uint8_t на проводе, обязан быть отвергнут");
 }
 
+//! LOA-fix (R71-33, находка ревью 8 #4, WARN): ПУСТОЙ СПИСОК DARKFIRE ОБЯЗАН
+//! ОСТАТЬСЯ ПУСТЫМ.
+//!
+//! ★ТЕСТ НАПИСАН НА ДЕФЕКТ, А НЕ НА ФОРМУ. Прежняя редакция звала
+//! `targetList.resize(1)` — и на пустом списке это НЕ усечение, а РОСТ до `{0}`:
+//! oid, которого в проверенном списке не было, уезжал в улику `authorizedTargets`
+//! и в рассылку комнате. Верни `resize(1)` вместо `TruncateToSingleTarget` — и
+//! ПЕРВОЕ же утверждение ниже краснеет.
+void TestDarkFireTruncation()
+{
+  std::vector<uint16_t> empty{};
+  server::race::TruncateToSingleTarget(empty);
+  Check(
+    empty.empty(),
+    "★ПУСТОЙ список DarkFire обязан остаться пустым: `resize(1)` вырастил бы его в "
+    "{0} — цель, которой ростерная проверка не видела");
+
+  std::vector<uint16_t> single{7};
+  server::race::TruncateToSingleTarget(single);
+  Check(
+    single.size() == 1 && single[0] == 7,
+    "список из одной цели не меняется");
+
+  std::vector<uint16_t> many{7, 8, 9};
+  server::race::TruncateToSingleTarget(many);
+  Check(
+    many.size() == 1 && many[0] == 7,
+    "DarkFire применяется к ПЕРВОЙ цели, остальные отбрасываются");
+}
+
 } // namespace
 
 int main()
@@ -162,6 +194,7 @@ int main()
   TestAttackFamilies();
   TestUnknownTypesAreNotAttacks();
   TestIceWallSegmentShape();
+  TestDarkFireTruncation();
 
   if (failures != 0)
   {

@@ -5413,10 +5413,28 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // один трекер значило бы отвергать честный каст по боту.
   //
   // ★У СТЕНЫ ЭТОТ ВОПРОС НЕ ЗАДАЁТСЯ: там список — номера сосулек, а не oid'ы.
+  // LOA-fix (R71-33, находка ревью 8 #4, WARN): СПИСОК ПРИВОДИТСЯ К ОКОНЧАТЕЛЬНОМУ
+  // ВИДУ ДО ПРОВЕРКИ, А НЕ ПОСЛЕ.
+  //
+  // ★ЧТО БЫЛО ОТКРЫТО. Сужение DarkFire до одной цели (`targetList.resize(1)`) стояло
+  // НИЖЕ ростерной проверки. `resize` умеет не только резать, но и РАСТИТЬ: пустой
+  // список типа 14 превращался в `{0}` — значение, которого в проверенном списке не
+  // было. Этот ноль уезжал в улику `authorizedTargets` и рассылался комнате. То есть
+  // проверялся ОДИН список, а хранился и рассылался ДРУГОЙ
+  // ([[the-difference-may-be-what-is-missing]]: искали лишнюю цель, а дефектом было
+  // ОТСУТСТВИЕ цели).
+  //
+  // ★ЧИНИТСЯ ПОРЯДКОМ, А НЕ ЕЩЁ ОДНОЙ ПРОВЕРКОЙ: список приводится к окончательному
+  // виду здесь, и дальше ПРОВЕРЯЕТСЯ ИМЕННО ОН — то, что проверено, то и уезжает в
+  // улику и в рассылку. Пустой список пустым и остаётся: `resize` заменён на
+  // усечение, которое не умеет растить.
+  if (magicSlotInfo.type == 14)
+    race::TruncateToSingleTarget(targetList);
+
   if (not isIceWall)
   {
     const auto& rosterRacers = raceInstance.GetTracker().GetRacers();
-    for (const auto targetOid : command.targetList)
+    for (const auto targetOid : targetList)
     {
       const bool isParticipant = raceInstance.IsAiRacerOid(targetOid)
         || std::ranges::any_of(
@@ -5487,11 +5505,6 @@ void RaceNetworkHandler::HandleUseMagicItem(
   const uint16_t effectInstanceId = raceInstance.GetTracker().GetNextEffectInstanceIdAndIncrementBy(
     racer.oid,
     issuedInstanceCount);
-
-  // Darkfire should only affect one target
-  // Client sends all targets infront of them but we should only apply the effect to the targeted one (the arrow above their head)
-  if (magicSlotInfo.type == 14)
-    targetList.resize(1);
 
   // Dragon handling
   if (magicSlotInfo.basicType == 16)

@@ -141,6 +141,25 @@ inline constexpr size_t IceWallSegmentsCritical = 3;
     || segmentCount == IceWallSegmentsCritical;
 }
 
+//! LOA-fix (R71-33, находка ревью 8 #4, WARN): СУЖЕНИЕ СПИСКА DARKFIRE, КОТОРОЕ НЕ
+//! УМЕЕТ РАСТИТЬ.
+//!
+//! DarkFire (тип 14) применяется ровно к одной цели, а клиент присылает всех, кто
+//! перед ним. Прежняя редакция сужала список `targetList.resize(1)` — и на ПУСТОМ
+//! списке `resize` не сужал, а РАСТИЛ его до `{0}`: в улику и в рассылку уезжал oid,
+//! которого в проверенном списке не было. Здесь усечение и только усечение.
+//!
+//! ★ЖИВЁТ ЗДЕСЬ, А НЕ В ХЕНДЛЕРЕ, по той же причине, что и форма стены: чтобы
+//! свойство «пустой остаётся пустым» проверялось юнит-тестом, а не глазами.
+//!
+//! @returns список, усечённый до первой цели; пустой список остаётся пустым.
+template <typename TargetList>
+void TruncateToSingleTarget(TargetList& targetList) noexcept
+{
+  if (targetList.size() > 1)
+    targetList.resize(1);
+}
+
 } // namespace server::race
 
 #endif // SERVER_RACE_MAGIC_APPLICATION_HPP
