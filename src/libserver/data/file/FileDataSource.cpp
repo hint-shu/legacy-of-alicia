@@ -3193,6 +3193,11 @@ void server::FileDataSource::MarkGuildNameIndexBroken(
   // памяти), и требовать здесь замок значило бы уметь НЕ объявить индекс
   // сломанным ровно тогда, когда он сломан.
   _guildNameIndexComplete.store(false, std::memory_order::relaxed);
+  // ★СЛОМАННЫЙ ИНДЕКС САМ ПРОСИТ О РЕМОНТЕ (правка ревью, итерация 11).
+  // Повод здесь честнее всего: именно в этот момент индекс стал
+  // неполным. Пол частоты от этого не двигается — его держит
+  // `TickNameIndexMaintenanceAt`, и просьба его опустить не умеет.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
   try
   {
     server::util::QuietLogError(
@@ -3209,6 +3214,11 @@ void server::FileDataSource::MarkCharacterNameIndexBroken(
   const std::string_view what, const std::string_view detail) noexcept
 {
   _characterNameIndexComplete.store(false, std::memory_order::relaxed);
+  // ★СЛОМАННЫЙ ИНДЕКС САМ ПРОСИТ О РЕМОНТЕ (правка ревью, итерация 11).
+  // Повод здесь честнее всего: именно в этот момент индекс стал
+  // неполным. Пол частоты от этого не двигается — его держит
+  // `TickNameIndexMaintenanceAt`, и просьба его опустить не умеет.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
   try
   {
     server::util::QuietLogError(
@@ -3240,7 +3250,20 @@ bool server::FileDataSource::ReconcileGuildNameIndexIfBroken()
     server::util::QuietLogError(
       "Guild name index: the rebuild attempt failed ({}); every guild name "
       "keeps reading as taken", x.what());
+    // ★НЕУДАВШИЙСЯ РЕМОНТ ОСТАВЛЯЕТ ПРОСЬБУ ВЗВЕДЁННОЙ (правка ревью,
+    // итерация 11): индекс всё ещё неполон, и следующий плановый проход
+    // обязан попробовать снова — но не раньше пола.
+    _nameIndexRepairPending.store(true, std::memory_order::relaxed);
     return false;
+  }
+  {
+    // Перестройка могла опубликовать ВСЁ ЕЩЁ неполный индекс (файл на
+    // диске так и не читается). Тогда повод не исчерпан, и просьба
+    // взводится заново — иначе самопочинка ждала бы периодического
+    // осмотра, то есть переставала бы быть починкой «в течение минуты».
+    const std::shared_lock indexLock(_guildNameIndexMutex);
+    if (not _guildNameIndexComplete)
+      _nameIndexRepairPending.store(true, std::memory_order::relaxed);
   }
   return true;
 }
@@ -3261,7 +3284,20 @@ bool server::FileDataSource::ReconcileCharacterNameIndexIfBroken()
     server::util::QuietLogError(
       "Character name index: the rebuild attempt failed ({}); every character "
       "name keeps reading as taken", x.what());
+    // ★НЕУДАВШИЙСЯ РЕМОНТ ОСТАВЛЯЕТ ПРОСЬБУ ВЗВЕДЁННОЙ (правка ревью,
+    // итерация 11): индекс всё ещё неполон, и следующий плановый проход
+    // обязан попробовать снова — но не раньше пола.
+    _nameIndexRepairPending.store(true, std::memory_order::relaxed);
     return false;
+  }
+  {
+    // Перестройка могла опубликовать ВСЁ ЕЩЁ неполный индекс (файл на
+    // диске так и не читается). Тогда повод не исчерпан, и просьба
+    // взводится заново — иначе самопочинка ждала бы периодического
+    // осмотра, то есть переставала бы быть починкой «в течение минуты».
+    const std::shared_lock indexLock(_characterNameIndexMutex);
+    if (not _characterNameIndexComplete)
+      _nameIndexRepairPending.store(true, std::memory_order::relaxed);
   }
   return true;
 }

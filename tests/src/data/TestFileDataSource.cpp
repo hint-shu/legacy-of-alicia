@@ -518,9 +518,12 @@ void TestIncompleteIndexNeverAnswersFree()
 //! проходов.
 void TestRequestsCannotLowerTheRepairFloor()
 {
+  // ★ИНДЕКС ЗДЕСЬ ЗАВЕДОМО ЦЕЛ, И ЭТО СУЩЕСТВЕННО: сломанный индекс сам просит
+  // о ремонте на каждом полу (см. следующий тест), и тогда наблюдать «просьба
+  // клиента ничего не купила» было бы не на чем.
   const auto root = MakeSandbox("repair-floor");
   std::filesystem::create_directories(root / "characters");
-  WriteRaw(root / "characters" / "1.json", "{ this is not json");
+  WriteRaw(root / "characters" / "1.json", R"({"uid": 1, "name": "Alpha"})");
   WriteRaw(root / "characters" / "2.json", R"({"uid": 2, "name": "Beta"})");
 
   server::FileDataSource source;
@@ -530,8 +533,7 @@ void TestRequestsCannotLowerTheRepairFloor()
   CHECK(source.ScheduledNameIndexPassCount() == 0,
     "до первого тика проходов быть не может");
 
-  // Первый проход после старта идёт без ожидания — неполная стартовая сборка
-  // не имеет права ждать минуту.
+  // Первый проход после старта идёт без ожидания.
   source.TickNameIndexMaintenanceAt(base);
   CHECK(source.ScheduledNameIndexPassCount() == 1,
     "первый тик после старта обязан осмотреть индексы сразу");
@@ -564,6 +566,56 @@ void TestRequestsCannotLowerTheRepairFloor()
   source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(60 + 300));
   CHECK(source.ScheduledNameIndexPassCount() == 3,
     "периодический осмотр перестал случаться сам");
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★СЛОМАННЫЙ ИНДЕКС ЧИНИТСЯ САМ, БЕЗ ЕДИНОГО ЗАПРОСА, И ЧЕРЕЗ МИНУТУ, А НЕ
+//! ЧЕРЕЗ ПЯТЬ (ревью, итерация 11; поймано СТЕНДОМ).
+//!
+//! Первая редакция этой правки развела пол (60 с) и период (5 мин) — и тем
+//! самым отменила заявку раунда: без клиентского запроса неполный индекс ждал
+//! бы периода. Стенд это и показал («индекс починен БЕЗ ЕДИНОГО ПОИСКА» стало
+//! False). Повод обязан порождать сам ДЕФЕКТ: индекс, объявленный неполным,
+//! взводит просьбу, и неудавшийся ремонт взводит её снова.
+void TestBrokenIndexRepairsItselfAtTheFloorWithoutAnyRequest()
+{
+  const auto root = MakeSandbox("self-heal-floor");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "1.json", "{ this is not json");
+  WriteRaw(root / "characters" / "2.json", R"({"uid": 2, "name": "Beta"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  const auto base = std::chrono::steady_clock::now();
+  source.TickNameIndexMaintenanceAt(base);
+  CHECK(source.ScheduledNameIndexPassCount() == 1,
+    "первый проход не состоялся");
+  // Файл всё ещё бит: индекс остался неполным и НЕ отвечает «свободно».
+  CHECK(not source.IsCharacterNameUnique("Gamma"),
+    "неполный индекс ответил «имя свободно»");
+
+  // Файл ПОЧИНЕН на диске. Ни одного поиска, ни одной просьбы с провода.
+  WriteRaw(root / "characters" / "1.json", R"({"uid": 1, "name": "Alpha"})");
+
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(59));
+  CHECK(source.ScheduledNameIndexPassCount() == 1,
+    "проход случился раньше пола — пол не держится и для самопочинки");
+
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(60));
+  CHECK(source.ScheduledNameIndexPassCount() == 2,
+    "сломанный индекс не попросил о ремонте: самопочинка ждала бы периода");
+  CHECK(source.RetrieveCharacterUidByName("Alpha") == server::data::Uid{1},
+    "индекс не починился плановым проходом");
+  CHECK(source.IsCharacterNameUnique("Gamma"),
+    "индекс не объявлен полным после починки");
+
+  // А ПОЧИНЕННЫЙ индекс больше не просит: следующий пол проходит впустую.
+  source.TickNameIndexMaintenanceAt(base + std::chrono::seconds(120));
+  CHECK(source.ScheduledNameIndexPassCount() == 2,
+    "целый индекс продолжает просить о ремонте — просьба стала вечной");
 
   std::error_code error;
   std::filesystem::remove_all(root, error);
@@ -697,6 +749,7 @@ int main()
   TestNoncanonicalFileNameIsNotARecord();
   TestIncompleteIndexNeverAnswersFree();
   TestRequestsCannotLowerTheRepairFloor();
+  TestBrokenIndexRepairsItselfAtTheFloorWithoutAnyRequest();
   TestStaleScanCannotPublishOverAFailure();
   TestWidelyPaddedAliasIsStillReserved();
   if (g_failures > 0)
