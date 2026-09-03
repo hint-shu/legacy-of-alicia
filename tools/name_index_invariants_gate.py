@@ -35,6 +35,7 @@
 КОДЫ ВОЗВРАТА  0 чисто · 1 инвариант нарушен · 2 проверка НЕДЕЙСТВИТЕЛЬНА
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -333,6 +334,12 @@ def check_canonical_identity(bodies, violations):
                 "'%s' не берёт личность записи строгим разбором" % name))
 
 
+#! Голова строки, после которой идёт ОБЪЯВЛЯЕМОЕ имя: тип и только тип.
+#! `std::atomic_bool snapshot{_member.exchange(...)}` под неё не подходит —
+#! между типом и членом стоит чужой идентификатор.
+DECLARATOR_HEAD = re.compile(
+    r"^\s*(?:mutable\s+)?(?:inline\s+)?std::atomic(?:_[a-z]+|<[^<>]*>)?\s+$")
+
 READ_FORMS = (".load(",)
 WRITE_FORMS = (".store(", ".exchange(", ".fetch_add(", ".fetch_sub(",
                ".compare_exchange_weak(", ".compare_exchange_strong(")
@@ -371,15 +378,18 @@ def member_uses(text, member):
         start = at + len(member)
         line_start = text.rfind("\n", 0, at) + 1
         head = text[line_start:at]
-        # ★ОБЪЯВЛЕНИЕ ОТЛИЧАЕТСЯ ОТ СВЯЗЫВАНИЯ ССЫЛКОЙ (правка ревью,
-        # итерация 12). Прежнее «в строке есть std::atomic → это объявление»
-        # пропускало `std::atomic_bool& alias = _member;` — то есть ровно ту
-        # форму, ради которой перепись и заведена. Объявление члена — без `&`,
-        # без `*` и без присваивания.
-        if ("std::atomic" in head and "&" not in head and "*" not in head
-                and "=" not in head):
-            continue                      # объявление члена
         tail = squeeze(text[start:start + 40])
+        # ★ОБЪЯВЛЕНИЕМ СЧИТАЕТСЯ ТОЛЬКО ТО, ГДЕ ОБЪЯВЛЯЕМЫЙ — САМ ЧЛЕН (правка
+        # ревью, итерация 13, находка 1). Прежнее «в строке есть std::atomic и
+        # нет &,*,=» смотрело на СТРОКУ, а не на ДЕКЛАРАТОР, и пропускало
+        # `std::atomic_bool snapshot{_userIndexStampValid.exchange(true)};` —
+        # то есть настоящую ЗАПИСЬ, у которой слева стоит чужое объявление.
+        # Теперь объявлением признаётся только форма «тип <пробелы> ЧЛЕН», за
+        # которой сразу идёт инициализатор или точка с запятой.
+        if DECLARATOR_HEAD.match(head) and (
+                tail.startswith("{") or tail.startswith(";")
+                or tail.startswith("=")):
+            continue                      # объявление САМОГО члена
         if any(tail.startswith(form) for form in READ_FORMS):
             continue
         if any(tail.startswith(form) for form in WRITE_FORMS):
@@ -728,14 +738,25 @@ def selftest():
          "           < generation,",
          "      && _userIndexFailedGeneration.load(std::memory_order::relaxed)\n"
          "           >= generation,"),
-        # ★КАНАРЕЙКА-ПСЕВДОНИМ: член связан ссылкой и пишется через неё. Пока
-        # перепись читала только `имя.store(`, такая запись была ей невидима.
+        # ★КАНАРЕЙКА-ПСЕВДОНИМ: канонический store ОСТАЁТСЯ НА МЕСТЕ, рядом
+        # добавляется связывание ссылкой (правка ревью, итерация 13). Прежняя
+        # редакция store УБИРАЛА, и канарейка могла ловиться «числом писателей»
+        # или «предикатом» — то есть проверять не то, что заявлено.
         ("отметка-под-замком",
-         "  _userIndexStampValid.store(\n"
-         "    scanWasClean",
+         "void server::FileDataSource::MarkUserIndexFailure() noexcept\n{\n",
+         "void server::FileDataSource::MarkUserIndexFailure() noexcept\n{\n"
          "  std::atomic_bool& stampAlias = _userIndexStampValid;\n"
-         "  stampAlias.store(\n"
-         "    scanWasClean"),
+         "  (void)stampAlias;\n",
+         "используется формой, которую перепись не читает"),
+        # ★КАНАРЕЙКА-СНИМОК (находка Codex, итерация 12): ЗАПИСЬ, у которой
+        # слева стоит ЧУЖОЕ объявление того же типа. Именно эта форма
+        # проскакивала эвристику «в строке есть std::atomic».
+        ("отметка-под-замком",
+         "  StoreUserIndexStampValidLocked(false, std::size_t{0});\n",
+         "  StoreUserIndexStampValidLocked(false, std::size_t{0});\n"
+         "  std::atomic_bool snapshot{_userIndexStampValid.exchange(true)};\n"
+         "  (void)snapshot;\n",
+         "пишется вне"),
     ]
 
     failures = []
@@ -749,7 +770,13 @@ def selftest():
     else:
         print("  ✓ чистое дерево: 0 нарушений")
 
-    for reason, needle, replacement in canaries:
+    for canary in canaries:
+        reason, needle, replacement = canary[0], canary[1], canary[2]
+        # ★ЧЕТВЁРТЫЙ ЭЛЕМЕНТ — ОЖИДАЕМЫЙ ТЕКСТ НАХОДКИ (правка ревью,
+        # итерация 13). Совпадения по ИМЕНИ проверки мало: канарейка могла
+        # ловиться соседним утверждением той же проверки и «доказывать» не то,
+        # что заявлено ([[gate-by-form-gives-false-completeness]]).
+        expected = canary[3] if len(canary) > 3 else None
         if original.count(needle) != 1:
             failures.append("канарейка '%s': якорь не найден ровно один раз "
                             "(найдено %d)" % (reason, original.count(needle)))
@@ -761,12 +788,19 @@ def selftest():
         finally:
             open(source, "w", encoding="utf-8").write(original)
         reasons = {item[0] for item in found}
-        if reason in reasons:
-            print("  ✓ канарейка '%s' поймана" % reason)
-        else:
+        details = " | ".join(item[1] for item in found if item[0] == reason)
+        if reason not in reasons:
             print("  ✗ канарейка '%s' НЕ поймана (найдено: %s)"
                   % (reason, sorted(reasons) or "ничего"))
             failures.append("проверка '%s' не умеет покраснеть" % reason)
+        elif expected is not None and expected not in details:
+            print("  ✗ канарейка '%s' поймана НЕ ТЕМ утверждением "
+                  "(ждали '%s', нашли: %s)" % (reason, expected, details))
+            failures.append("канарейка '%s' ловится не своим утверждением"
+                            % reason)
+        else:
+            print("  ✓ канарейка '%s' поймана%s"
+                  % (reason, "" if expected is None else " (своим утверждением)"))
 
     # Отдельная канарейка на проводку планового прохода — она в другом файле.
     needle = "    _fileDataSource->TickNameIndexMaintenance();"
