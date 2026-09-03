@@ -570,7 +570,52 @@ void RaceInstance::Stop()
       // Поле «store in metres, displayed in kilometres» → метры.
       const uint32_t distanceMetres = static_cast<uint32_t>(
         racer.distanceMetres + 0.5);
-      if (topSpeedTenths == 0 && distanceMetres == 0)
+      // === LOA-fix (R75, #14 Ф2): ВЕЧНЫЕ РЕКОРДЫ ЛОШАДИ ====================
+      // ★ЕДИНСТВЕННЫЙ ПОТОЛОК ПРАВДОПОДОБИЯ СТОИТ ЗДЕСЬ, А НЕ В ХЕНДЛЕРАХ.
+      // Обе величины приходят из клиентских полей (member5 «в воздухе» и
+      // самообъявленная оплата рывка), обе уезжают в ВЕЧНЫЕ поля лошади, и
+      // проверка правдоподобия у них ОДНА ПО СМЫСЛУ. Ставим её в единственной
+      // точке, где пер-заездное становится вечным, — тогда «забыть применить
+      // потолок в одной из веток» невозможно, а негативная арка снимает его
+      // одним ханком у ОБЕИХ величин.
+      // ★ОТБРАСЫВАЕМ, А НЕ КЛАМПИМ. Кламп позволил бы модифицированному клиенту
+      // ПРИКОЛОТИТЬ вечный рекорд ровно к потолку; отброс означает, что
+      // неправдоподобная величина не даёт НИЧЕГО. Та же дисциплина, что у
+      // бюджета шага R24 (`if (step <= budget)` — отбросить, не обрезать).
+      const bool glidePlausible =
+        racer.longestGlideMetres <= tracker::MaxPlausibleGlideMetres;
+      const bool chainPlausible =
+        racer.boostComboMax <= tracker::MaxPlausibleBoostChain;
+      const float glideMetres = glidePlausible ? racer.longestGlideMetres : 0.0f;
+      // ★ЕДИНИЦЫ ЗДЕСЬ ДРУГИЕ, ЧЕМ У totalDistance, И ЭТО ЛОВУШКА.
+      // У totalDistance — «store in metres»; у longestGlideDistance — «whole
+      // number, divided by 10», ровно тот же комментарий, что у topSpeed, чьи
+      // десятые доказаны pcap'ом R24. Поэтому здесь ДЕСЯТЫЕ ДОЛИ МЕТРА.
+      const uint64_t glideTenthsRaw = static_cast<uint64_t>(
+        static_cast<double>(glideMetres) * 10.0 + 0.5);
+      const uint32_t glideTenths = glideTenthsRaw > 0xFFFFFFFFull
+        ? 0xFFFFFFFFu
+        : static_cast<uint32_t>(glideTenthsRaw);
+      // Wire-поле boostsInARow — uint16, и read-back режет его кастом. Клампим
+      // на ЗАПИСИ, иначе хранимое и показанное разойдутся. Потолок
+      // правдоподобия (50) и так ниже 65535 — кламп остаётся страховкой формы,
+      // а не логикой.
+      const uint32_t boostsInARow = chainPlausible
+        ? std::min<uint32_t>(racer.boostComboMax, 65535u)
+        : 0u;
+      if (not glidePlausible || not chainPlausible)
+        server::util::QuietLogWarn(
+          "Room {}: character {} reported an implausible per-race record "
+          "(glide {} m, boost chain {}); the implausible value is discarded",
+          this->GetRoomUid(),
+          characterUid,
+          racer.longestGlideMetres,
+          racer.boostComboMax);
+
+      // ★Гейт «нечего писать» обязан считать ВСЕ величины раунда: без glide и
+      // boosts гонщик с рывками, но без телеметрии, был бы молча пропущен.
+      if (topSpeedTenths == 0 && distanceMetres == 0
+        && glideTenths == 0 && boostsInARow == 0)
         continue;
 
       data::Uid mountUid = data::InvalidUid;
@@ -585,7 +630,8 @@ void RaceInstance::Stop()
 
       _raceNetworkHandler.GetServerInstance().GetDataDirector().GetHorse(
         mountUid).Mutable(
-        [topSpeedTenths, distanceMetres](data::Horse& horse)
+        [topSpeedTenths, distanceMetres, glideTenths, boostsInARow](
+          data::Horse& horse)
         {
           // Рекорд = максимум, пробег = сумма. ★Насыщающее сложение: totalDistance
           // это uint32, обычный += за 2^32 обернулся бы и превратил near-limit пробег
@@ -597,7 +643,122 @@ void RaceInstance::Stop()
           horse.mountInfo.totalDistance() = newTotalDistance > 0xFFFFFFFFull
             ? 0xFFFFFFFFu
             : static_cast<uint32_t>(newTotalDistance);
+
+          // ★ОБА ПОЛЯ — ВЕЧНЫЕ РЕКОРДЫ, ПОЭТОМУ ТОЛЬКО МАКСИМУМ И ТОЛЬКО ВВЕРХ.
+          // Безусловное присваивание стирало бы чужой рекорд КАЖДЫМ медленным
+          // заездом, а снять последствие можно только правкой файлов при
+          // остановленном сервере.
+          if (glideTenths > horse.mountInfo.longestGlideDistance())
+            horse.mountInfo.longestGlideDistance() = glideTenths;
+          if (boostsInARow > horse.mountInfo.boostsInARow())
+            horse.mountInfo.boostsInARow() = boostsInARow;
         });
+    }
+  }
+
+  // === LOA-fix (R75, #14): ПЕР-КУРСОВЫЕ РЕКОРДЫ ПЕРСОНАЖА ==================
+  // Окно «Мои данные -> Трассы» (AcCmdLCPersonalInfo type 7) отвечало пустотой:
+  // хендлер стоял на `// TODO: implement`, а хранить было НЕЧЕГО — у
+  // data::Character не было ни счётчика заездов, ни рекордов по трассам. Это и
+  // есть исходная формулировка #14 «число заездов не пишется» (провод был готов
+  // всегда).
+  //
+  // ★СЧИТАЕМ ПО `raceResult.scores`, А НЕ ПО `_tracker.GetRacers()`. Ботов в
+  // `scores` физически нет (R56/#61 развёл «показать» и «посчитать»: боты
+  // добавляются только в КОПИЮ broadcastResult), поэтому никакой будущий перебор
+  // их здесь не увидит — не потому, что помнит про них, а потому, что их там нет.
+  // Гейт — дословно тот же, что у Ф0/Ф1/S8: доехал (валидный courseTime) и
+  // время правдоподобное (MinPlausibleCourseTime).
+  //
+  // ★ЗАПИСЬ ЧЕРЕЗ `util::TryMutate`, А НЕ ПРЯМЫМ `Mutable`. Это НОВЫЙ доступ к
+  // записи на участке между начислениями и рассылкой табло: прямой `Mutable` на
+  // непрогруженной записи бросил бы, и вся комната осталась бы без результата
+  // заезда.
+  //
+  // ★ЧЕСТНО О ГРАНИЦЕ ПОЯСА. `static_assert` в RecordAccess.hpp проверяет
+  // `std::is_nothrow_invocable_v`, то есть НАЛИЧИЕ СПЕЦИФИКАТОРА `noexcept`, а
+  // НЕ отсутствие броска. Единственная операция тела, которая теоретически
+  // бросает, — рост вектора (`push_back` -> bad_alloc); невыловленный bad_alloc
+  // из noexcept-функции это std::terminate, то есть гибель всего процесса.
+  // Поэтому аллоцирующая операция стоит под СОБСТВЕННЫМ try/catch, и стоит она
+  // ПЕРВОЙ: при отказе тело выходит ДО единой мутации, и `NotApplied`/
+  // `credited == false` остаются честными.
+  {
+    const bool isSpeed = _parameters.gameMode == protocol::GameMode::Speed;
+    const bool isMagic = _parameters.gameMode == protocol::GameMode::Magic;
+    // Tutorial и Unk4 в статистику трасс НЕ идут: окно клиента считает ровно
+    // скоростные и магические заезды, третьего счётчика там нет.
+    const uint64_t rawCourseId = static_cast<uint64_t>(_mapBlockId);
+    if ((isSpeed || isMagic)
+      && rawCourseId != 0
+      && rawCourseId <= std::numeric_limits<uint16_t>::max())
+    {
+      // Та же величина, что S8 зовёт `finishedMapBlockId` — карта, на которой
+      // РЕАЛЬНО проехали, уже после PickRandomMapFromCourse.
+      const auto courseId = static_cast<uint16_t>(rawCourseId);
+
+      for (const auto& scoreInfo : raceResult.scores)
+      {
+        if (scoreInfo.courseTime == tracker::InvalidCourseTime
+          || scoreInfo.courseTime < tracker::MinPlausibleCourseTime)
+          continue;
+
+        const auto characterRecord =
+          _raceNetworkHandler.GetServerInstance().GetDataDirector().GetCharacter(
+            scoreInfo.uid);
+        bool credited = false;
+        const auto outcome = server::util::TryMutate(
+          characterRecord,
+          "credit the per-course race record",
+          [courseId, isSpeed, courseTime = scoreInfo.courseTime, &credited](
+            data::Character& character) noexcept
+          {
+            auto& records = character.courseRecords();
+            auto found = std::ranges::find(
+              records, courseId, &data::Character::CourseRecord::courseId);
+            if (found == records.end())
+            {
+              // Кап тот же, что несёт провод (счётчик списка пишется uint8), и
+              // он же — предел файла на чтении.
+              if (records.size() >= data::MaxCourseRecords)
+                return;
+              // ★ЕДИНСТВЕННАЯ АЛЛОЦИРУЮЩАЯ ОПЕРАЦИЯ ТЕЛА — под своим try/catch
+              // и ПЕРВОЙ, до любой мутации.
+              try
+              {
+                records.push_back(
+                  data::Character::CourseRecord{.courseId = courseId});
+              }
+              catch (...)
+              {
+                return;
+              }
+              found = std::prev(records.end());
+            }
+
+            // ★ТРЕТЬЕГО СЧЁТЧИКА НЕТ НАМЕРЕННО. `totalGames` выводится сложением
+            // двух и потому не умеет разойтись со слагаемыми.
+            auto& games = isSpeed
+              ? character.totalSpeedGames()
+              : character.totalMagicGames();
+            if (games < std::numeric_limits<uint32_t>::max())
+              games += 1;
+
+            if (found->timesRaced < std::numeric_limits<uint32_t>::max())
+              found->timesRaced += 1;
+            // Рекорд — МИНИМАЛЬНОЕ время. Ноль означает «рекорда ещё нет»,
+            // поэтому первый финиш всегда записывается.
+            if (found->recordTime == 0 || courseTime < found->recordTime)
+              found->recordTime = courseTime;
+            credited = true;
+          });
+
+        if (outcome == server::util::MutateOutcome::NotApplied || not credited)
+          server::util::QuietLogWarn(
+            "Room {}: the per-course record of character {} was not credited",
+            this->GetRoomUid(),
+            scoreInfo.uid);
+      }
     }
   }
 

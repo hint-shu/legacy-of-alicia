@@ -3048,7 +3048,33 @@ void LobbyNetworkHandler::HandleRequestPersonalInfo(
       }
       case protocol::AcCmdCLRequestPersonalInfo::Type::Courses:
       {
-        // TODO: implement
+        // LOA-fix (R75, #14): окно «Мои данные -> Трассы». Провод был готов
+        // всегда (LobbyMessageDefinitions) — не было ХРАНИЛИЩА. Теперь читаем
+        // прямо из записи персонажа.
+        // ★`totalGames` СЧИТАЕТСЯ, А НЕ ХРАНИТСЯ — отдельного поля нет
+        // намеренно, поэтому сумма не может разойтись со слагаемыми.
+        auto& courses = response.courseInformation;
+        courses.totalSpeedGames = character.totalSpeedGames();
+        courses.totalMagicGames = character.totalMagicGames();
+        const uint64_t total = static_cast<uint64_t>(courses.totalSpeedGames)
+          + static_cast<uint64_t>(courses.totalMagicGames);
+        courses.totalGames = total > 0xFFFFFFFFull
+          ? 0xFFFFFFFFu
+          : static_cast<uint32_t>(total);
+
+        for (const auto& record : character.courseRecords())
+        {
+          // Длина списка уходит на провод одним байтом — больше 255 записей
+          // кадр физически не унесёт (тот же кап стоит на чтении файла).
+          if (courses.courses.size() >= data::MaxCourseRecords)
+            break;
+          auto& entry = courses.courses.emplace_back();
+          entry.courseId = record.courseId;
+          entry.recordTime = record.recordTime;
+          entry.timesRaced = record.timesRaced;
+          // member4 (12 байт) остаётся нулями: назначение поля не разобрано,
+          // и врать в него нечем.
+        }
         break;
       }
       case protocol::AcCmdCLRequestPersonalInfo::Type::Eight:
