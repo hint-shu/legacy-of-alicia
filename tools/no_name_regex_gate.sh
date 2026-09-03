@@ -39,8 +39,27 @@
 #   canary is written in exactly those two forms. If normalisation is missing or
 #   broken, that canary misses and the gate stops instead of printing ЧИСТО.
 #
+#   ★A TOKEN OF THE PROGRAM, NOT A RUN OF LETTERS IN A STRING (review iteration
+#   9, finding 9). The shared normaliser deliberately KEEPS literal contents —
+#   the secret gate reads a file's class out of them — and this gate greps the
+#   same text, so an ordinary diagnostic `QuietLogError("std::regex failed")`
+#   was an offender. A false-red gate gets switched off exactly like a false-green
+#   one, so this detection now reads `--normalize-code`: the same translation
+#   phases PLUS blanked literal contents. `<regex>` is not a literal and survives.
+#
+#   ★AND THE FORMS THAT CANNOT BE READ AT ALL ARE A HARD STOP (review iteration
+#   9, finding 9; the policy is R72's, see tools/check_lobby_auth_gate.sh check
+#   0c). `namespace s = std;` + `s::regex rg(name);` is exactly the regression
+#   this gate refuses, and contains the string `std::regex` nowhere; so does a
+#   name assembled with `##`, and so does `#include HDR`. Resolving those means
+#   writing a preprocessor and an alias table — a second compiler inside a build
+#   gate. The honest answer is to refuse to certify: code 2, file and line named.
+#   The detector is shared with the two Python gates
+#   (`tools/secret_write_gate.py --unsupported`) so the three cannot drift apart.
+#
 # USAGE
 #   bash tools/no_name_regex_gate.sh
+#   bash tools/no_name_regex_gate.sh --selftest
 #   ROOT=/tmp/some/other/checkout bash tools/no_name_regex_gate.sh
 #
 # DEPENDENCIES
@@ -57,8 +76,81 @@
 #   0 clean · 1 offenders found (printed) · 2 not scannable / blind
 set -uo pipefail
 
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REGEX_MIN_FILES="${REGEX_MIN_FILES:-14}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# --selftest: ЧЕТЫРЕ ФИКСТУРЫ ЧЕРЕЗ НАСТОЯЩИЙ ВХОД (правка ревью, итерация 9).
+#
+# ★ЗАЧЕМ ЧЕРЕЗ ВХОД, А НЕ ЧЕРЕЗ ШАБЛОН. Канарейки ниже доказывают, что ШАБЛОН
+# умеет совпадать. Они ничего не говорят о том, что делает ВЕСЬ скрипт с
+# настоящим деревом: и ложный плюс на литерале, и слепота к псевдониму жили не в
+# шаблоне, а в том, какой текст до шаблона доходит. Поэтому здесь строится
+# настоящее дерево на диске и по нему запускается ЭТОТ ЖЕ скрипт.
+if [ "${1:-}" = "--selftest" ]; then
+  SELFTEST_TOOLS="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF_OK=0
+  selftest_case() {
+    # $1 имя · $2 ожидаемый код · $3 ожидаемая подстрока · $4 содержимое файла
+    SANDBOX="$(mktemp -d)"
+    mkdir -p "$SANDBOX/src/libserver/data" "$SANDBOX/include/libserver/data" \
+             "$SANDBOX/tools"
+    ln -s "$SELFTEST_TOOLS/secret_write_gate.py" "$SANDBOX/tools/secret_write_gate.py"
+    printf '%s\n' "$4" > "$SANDBOX/src/libserver/data/Probe.cpp"
+    OUT="$(ROOT="$SANDBOX" REGEX_MIN_FILES=1 bash "$SELF" 2>&1)"
+    RC=$?
+    rm -rf "$SANDBOX"
+    PROBLEM=""
+    [ "$RC" -eq "$2" ] || PROBLEM="код $RC, ожидался $2"
+    case "$OUT" in
+      *"$3"*) ;;
+      *) PROBLEM="$PROBLEM${PROBLEM:+; }в выводе нет «$3»" ;;
+    esac
+    if [ -z "$PROBLEM" ]; then
+      echo "  [ok] через вход: $1"
+    else
+      echo "  [ПРОВАЛ] через вход: $1 — $PROBLEM"
+      printf '%s\n' "$OUT" | sed 's/^/        /'
+      SELF_OK=1
+    fi
+  }
+
+  echo "=== no-name-regex gate: самопроверка ==="
+  selftest_case "склейка токенов собирает имя, которого в тексте нет" 2 \
+    "макрос-склейка" \
+    '#define JOIN(a, b) a##b
+void Lookup(const std::string& name) { std::JOIN(reg, ex) rg(name); }'
+  selftest_case "псевдоним самого \`std\` прячет регулярку" 2 \
+    "псевдоним-std" \
+    'namespace s = std;
+void Lookup(const s::string& name) { s::regex rg(name); }'
+  selftest_case "включение, названное макросом" 2 \
+    "включение-через-макрос" \
+    '#define HDR <regex>
+#include HDR'
+  selftest_case "\`std::regex\` ВНУТРИ ЛИТЕРАЛА — не программа, а проза" 0 \
+    "ЧИСТО" \
+    '#include <string>
+// std::regex здесь только в комментарии
+void Lookup(const std::string& name)
+{
+  QuietLogError("std::regex compilation failed for {}", name);
+  const char* note = R"(std::regex is banned in this layer)";
+  const char letter = '"'"'"'"'"';
+}'
+  selftest_case "настоящая регулярка по-прежнему ловится" 1 \
+    "ПРОВАЛ" \
+    '#include <regex>
+void Lookup(const std::string& name) { const std::regex rg(name); }'
+
+  if [ "$SELF_OK" -ne 0 ]; then
+    echo "=== ИТОГ САМОПРОВЕРКИ: ПРОВАЛ ✗ — гейт не доказал, что умеет падать ==="
+    exit 2
+  fi
+  echo "=== ИТОГ САМОПРОВЕРКИ: гейт умеет падать ✓ ==="
+  exit 0
+fi
 SCOPE="src/libserver/data include/libserver/data"
 # ★ПРОБЕЛЫ ДОПУСКАЮТСЯ ВЕЗДЕ, ГДЕ ИХ ДОПУСКАЕТ КОМПИЛЯТОР (правка ревью,
 # итерация 7). Текст сюда приходит НОРМАЛИЗОВАННЫМ (склейка строк + вычистка
@@ -134,7 +226,7 @@ if ! {
   echo "ОСТАНОВ: не удалось записать вторую канарейку '$CANARY2'."
   exit 2
 fi
-CANARY2_HITS="$(python3 "$NORMALIZER" --normalize "$CANARY2" | grep -cE "$PATTERN" || true)"
+CANARY2_HITS="$(python3 "$NORMALIZER" --normalize-code "$CANARY2" | grep -cE "$PATTERN" || true)"
 case "$CANARY2_HITS" in
   ''|*[!0-9]*)
     echo "ОСТАНОВ: нормализованная канарейка вернула не число ('$CANARY2_HITS')."
@@ -144,6 +236,41 @@ esac
 if [ "$CANARY2_HITS" -lt 2 ]; then
   echo "ОСТАНОВ: нормализованная канарейка дала $CANARY2_HITS совпадений из 2 —"
   echo "         нормализатор или шаблон сломаны, ноль нарушителей читать нельзя."
+  exit 2
+fi
+
+# Blindness guard #1c: ★И ОБРАТНАЯ КАНАРЕЙКА — ТЕКСТ В ЛИТЕРАЛЕ НЕ ЕСТЬ ПРОГРАММА
+# (правка ревью, итерация 9, находка 9). Общий нормализатор НАМЕРЕННО сохраняет
+# содержимое литералов: секретный гейт читает из них класс файла. Этот гейт
+# грепал тот же текст, и обычная диагностика `QuietLogError("std::regex ...")`
+# была НАРУШИТЕЛЕМ — ложно-красный гейт отключают ровно так же, как ложно-зелёный.
+# Поэтому детекция читает `--normalize-code` (те же фазы + обнулённое содержимое
+# литералов), а эта канарейка обязана дать НОЛЬ: если обнуление отвалится, гейт
+# остановится здесь, а не начнёт ругаться на честное дерево.
+CANARY3="$(mktemp 2>/dev/null)" || CANARY3=""
+if [ -z "$CANARY3" ] || [ ! -f "$CANARY3" ]; then
+  echo "ОСТАНОВ: не удалось создать третью канарейку (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$CANARY2" "$CANARY3"' EXIT
+if ! {
+  echo 'QuietLogError("std::regex compilation failed for {}", name);'
+  echo 'const char* note = R"(std::regex is banned in this layer)";'
+} > "$CANARY3"; then
+  echo "ОСТАНОВ: не удалось записать третью канарейку '$CANARY3'."
+  exit 2
+fi
+CANARY3_HITS="$(python3 "$NORMALIZER" --normalize-code "$CANARY3" | grep -cE "$PATTERN" || true)"
+case "$CANARY3_HITS" in
+  ''|*[!0-9]*)
+    echo "ОСТАНОВ: обратная канарейка вернула не число ('$CANARY3_HITS')."
+    exit 2
+    ;;
+esac
+if [ "$CANARY3_HITS" -ne 0 ]; then
+  echo "ОСТАНОВ: обратная канарейка дала $CANARY3_HITS совпадений вместо 0 — текст"
+  echo "         ВНУТРИ строкового литерала читается как программа, то есть гейт"
+  echo "         ложно-красный. Судить дерево им нельзя."
   exit 2
 fi
 
@@ -164,7 +291,7 @@ if [ -z "$SCAN_ERR" ] || [ ! -f "$SCAN_ERR" ]; then
   echo "ОСТАНОВ: не удалось создать файл для ошибок обхода (mktemp)."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$SCAN_ERR"' EXIT
+trap 'rm -f "$CANARY" "$CANARY2" "$CANARY3" "$SCAN_ERR"' EXIT
 
 FILE_LIST="$(cd "$ROOT" && find $SCOPE -type f 2>"$SCAN_ERR")"
 FIND_RC=$?
@@ -189,16 +316,31 @@ fi
 # отказ нормализатора на ЛЮБОМ файле — ОСТАНОВ, а не пропуск.
 SCANNED=0
 OFFENDERS=""
+UNREADABLE=""
 NORMALIZED="$(mktemp 2>/dev/null)" || NORMALIZED=""
 if [ -z "$NORMALIZED" ] || [ ! -f "$NORMALIZED" ]; then
   echo "ОСТАНОВ: не удалось создать файл для нормализованного текста (mktemp)."
   exit 2
 fi
-trap 'rm -f "$CANARY" "$CANARY2" "$SCAN_ERR" "$NORMALIZED"' EXIT
+trap 'rm -f "$CANARY" "$CANARY2" "$CANARY3" "$SCAN_ERR" "$NORMALIZED"' EXIT
 
 while IFS= read -r RELATIVE; do
   [ -n "$RELATIVE" ] || continue
-  if ! python3 "$NORMALIZER" --normalize "$ROOT/$RELATIVE" > "$NORMALIZED" 2>"$SCAN_ERR"; then
+  # ★СНАЧАЛА — ЧИТАЕТСЯ ЛИ ФАЙЛ ВООБЩЕ (правка ревью, итерация 9, находка 9).
+  # `namespace s = std;` + `s::regex rg(name);` — ровно та регрессия, ради которой
+  # гейт существует, и слова `std::regex` в ней нет. Детектор общий с двумя
+  # питоновскими гейтами, чтобы три останова не разъехались молча.
+  FORMS="$(python3 "$NORMALIZER" --unsupported "$ROOT/$RELATIVE" 2>"$SCAN_ERR")"
+  if [ $? -ne 0 ]; then
+    echo "ОСТАНОВ: проверка препроцессорных форм в '$RELATIVE' не удалась:"
+    sed 's/^/         /' "$SCAN_ERR"
+    exit 2
+  fi
+  if [ -n "$FORMS" ]; then
+    UNREADABLE="$UNREADABLE$FORMS
+"
+  fi
+  if ! python3 "$NORMALIZER" --normalize-code "$ROOT/$RELATIVE" > "$NORMALIZED" 2>"$SCAN_ERR"; then
     echo "ОСТАНОВ: нормализация '$RELATIVE' не удалась:"
     sed 's/^/         /' "$SCAN_ERR"
     echo "         непрочитанный файл делает «ноль нарушителей» бессмысленным."
@@ -216,6 +358,23 @@ EOF
 
 if [ "$SCANNED" -ne "$FOUND" ]; then
   echo "ОСТАНОВ: нормализовано $SCANNED файлов из $FOUND — часть дерева не просканирована."
+  exit 2
+fi
+
+# ★НЕПРОЧИТЫВАЕМАЯ ФОРМА — ОСТАНОВ, А НЕ СЛЕПОЕ ПЯТНО. Ни один счёт ниже не
+# имеет силы: имя, собранное из `##`, и `std`, переименованный псевдонимом, не
+# совпадут с шаблоном по построению, и «регулярок 0» будет означать «я не
+# смотрел». Код 2 и названная строка — политика гардов R72.
+if [ -n "$UNREADABLE" ]; then
+  UNREADABLE_COUNT="$(printf '%s\n' "$UNREADABLE" | grep -c . || true)"
+  echo "=== no-name-regex gate ==="
+  echo "дерево          : $ROOT"
+  echo "просканировано  : $SCANNED файлов"
+  echo "форм вне чтения : $UNREADABLE_COUNT (ожидалось 0)"
+  echo "ОСТАНОВ: дерево использует форму, которую этот гейт читать не умеет."
+  printf '%s\n' "$UNREADABLE" | grep . | sed 's/^/  ✗ /'
+  echo "         Пиши обычным образом либо расширяй гейт сознательно."
+  echo "=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ==="
   exit 2
 fi
 

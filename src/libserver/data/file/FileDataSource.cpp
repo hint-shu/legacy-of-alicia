@@ -130,7 +130,18 @@ bool ClaimNameIndexRetry(
 //! `std::stoul` принимает знак и игнорирует хвост.
 //!
 //! @return uid или `std::nullopt`, если имя файла не является записью.
-std::optional<server::data::Uid> ParseRecordUid(const std::string& stem)
+//! ЧИСЛО ИЗ ИМЕНИ ФАЙЛА — БЕЗ ТРЕБОВАНИЯ КАНОНИЧНОСТИ. Только для ПОЛА
+//! СЧЁТЧИКА uid.
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНАЯ, БОЛЕЕ СНИСХОДИТЕЛЬНАЯ ФУНКЦИЯ (правка ревью, итерация 9).
+//! Пол счётчика — это утверждение об ИМЕНАХ, которые каталог уже занял: если
+//! рядом лежит `007.json`, выдать следующему персонажу uid 7 нельзя, потому что
+//! `ProduceDataFilePath` напишет `7.json`, а `007.json` останется вторым живым
+//! файлом на ту же личность. Ужесточи мы РАЗБОР ПОЛА вместе с разбором
+//! личности — пол опустился бы ровно на тех именах, из-за которых он и заведён
+//! ([[dont-trade-success-path-for-failure-path]]). Поэтому: пол РЕЗЕРВИРУЕТ
+//! алиасы, индекс их НЕ ПРИЗНАЁТ.
+std::optional<server::data::Uid> ParseUidLikeStem(const std::string& stem)
 {
   if (stem.empty() || stem.size() > 10
     || not std::ranges::all_of(stem, [](const unsigned char symbol)
@@ -149,6 +160,33 @@ std::optional<server::data::Uid> ParseRecordUid(const std::string& stem)
     return std::nullopt;
 
   return static_cast<server::data::Uid>(parsed);
+}
+
+//! ЛИЧНОСТЬ ЗАПИСИ — ТОЛЬКО КАНОНИЧЕСКОЕ ДЕСЯТИЧНОЕ ИМЯ (правка ревью,
+//! итерация 9).
+//!
+//! ★ЧТО ЛОМАЛОСЬ, ПОКА `007.json` ЧИТАЛОСЬ КАК uid 7. Личность записи в индексе
+//! бралась из имени файла ИМЕННО ПОТОМУ, что этим именем запись адресуют
+//! `Store*` и `Delete*`. Но адресуют они РОВНО ОДНИМ написанием —
+//! `std::format("{}", uid)`, то есть `7.json`. Одинокий `007.json`
+//! индексировался под 7, а `DeleteGuild(7)` удалял НЕСУЩЕСТВУЮЩИЙ `7.json`,
+//! считал ENOENT успехом, забывал имя — и оставлял `007.json` живым, с именем,
+//! которое теперь числится свободным. При обоих написаниях сразу два разных
+//! физических файла схлопывались в одну личность обратной карты. То есть
+//! «личность = имя файла» держалась только пока написание одно; требование
+//! каноничности и делает её однозначной.
+//!
+//! ★НЕКАНОНИЧЕСКИЙ ФАЙЛ — НЕ УПРАВЛЯЕМАЯ ЗАПИСЬ, а посторонний файл в каталоге:
+//! он НЕ индексируется, НЕ делает индекс неполным и не подметается — ровно как
+//! `.bak-*` и `.tmp`. Названным он быть обязан (одна строка на перестройку),
+//! иначе «мы его не видим» стало бы «его нет».
+std::optional<server::data::Uid> ParseRecordUid(const std::string& stem)
+{
+  // Ведущий ноль — это ВТОРОЕ написание того же числа, и именно
+  // многозначность имени делала личность записи неоднозначной.
+  if (stem.size() > 1 && stem.front() == '0')
+    return std::nullopt;
+  return ParseUidLikeStem(stem);
 }
 
 //! УДАЛЯЕТ ЗАПИСЬ ИЛИ ГОВОРИТ ВСЛУХ, ЧТО НЕ УДАЛИЛ (правка ревью, итерация 7).
@@ -370,10 +408,14 @@ UidFloorScan HighestUidInDirectory(const std::filesystem::path& root)
     // UINT32_MAX — а следующий `++счётчик` завернул бы его в 0, то есть в
     // `InvalidUid`. Фикс, поставленный ПРОТИВ обнуления счётчиков, сам открыл
     // бы дорогу к обнулению. Найдено ревью (итерация 1).
-    // ★РАЗБОР ОДИН НА ВСЕХ (правка ревью, итерация 7): тот же `ParseRecordUid`
-    // читает личность записи и в перестройках индексов, иначе пол счётчика и
-    // индекс расходились бы в том, какой файл считать записью.
-    const auto parsed = ParseRecordUid(entryPath.stem().string());
+    // ★А ЗДЕСЬ РАЗБОР НАМЕРЕННО СНИСХОДИТЕЛЬНЕЕ, ЧЕМ У ИНДЕКСА (правка ревью,
+    // итерация 9). Индекс требует КАНОНИЧЕСКОГО написания, потому что личность
+    // записи обязана быть однозначной; пол счётчика требует обратного — он
+    // обязан считать занятым ЛЮБОЕ имя, которое может столкнуться с будущей
+    // записью, включая `007.json`. Ужесточи мы разбор и здесь — фикс,
+    // поставленный против схлопывания личностей, опустил бы пол и дал бы
+    // выдать занятый uid.
+    const auto parsed = ParseUidLikeStem(entryPath.stem().string());
     if (not parsed)
       continue;
 
@@ -1961,6 +2003,8 @@ void server::FileDataSource::RebuildCharacterNameIndex()
   //! отвечать «имя свободно» (правка ревью, итерация 7).
   std::size_t unresolved = 0;
   std::size_t duplicates = 0;
+  //! Файлы с числовым, но НЕканоническим именем (`007.json`): не записи.
+  std::size_t noncanonical = 0;
 
   const auto listing = server::util::ListRegularFiles(_characterDataPath);
   if (listing.incomplete)
@@ -2012,14 +2056,27 @@ void server::FileDataSource::RebuildCharacterNameIndex()
     // индекс, взявший uid из содержимого, вёл бы учёт про другую запись:
     // `7.json` с полем `uid: 8` делал `DeleteCharacter(7)` неспособным
     // освободить имя, а два файла с одним полем `uid` освобождали живое имя.
-    const auto parsedUid = ParseRecordUid(filePath.stem().string());
+    const auto stem = filePath.stem().string();
+    const auto parsedUid = ParseRecordUid(stem);
     if (not parsedUid)
     {
-      ++unresolved;
-      server::util::QuietLogWarn(
-        "Character file '{}' is not named after a record identifier; the index "
-        "refuses to guess whose name it carries",
-        server::util::LogPath(filePath));
+      // ★ФАЙЛ С НЕКАНОНИЧЕСКИМ ЧИСЛОВЫМ ИМЕНЕМ — НЕ УПРАВЛЯЕМАЯ ЗАПИСЬ, А
+      // ПОСТОРОННИЙ ФАЙЛ (правка ревью, итерация 9). `007.json` не создаётся и
+      // не адресуется ни одним путём записи (`std::format("{}", uid)` даёт
+      // ровно `7.json`), поэтому он не делает индекс НЕПОЛНЫМ — иначе чужой
+      // файл, положенный в каталог, отказывал бы в создании всех имён сразу.
+      // Считается и называется он ОДНОЙ строкой на перестройку, не строкой на
+      // файл.
+      if (ParseUidLikeStem(stem))
+        ++noncanonical;
+      else
+      {
+        ++unresolved;
+        server::util::QuietLogWarn(
+          "Character file '{}' is not named after a record identifier; the index "
+          "refuses to guess whose name it carries",
+          server::util::LogPath(filePath));
+      }
       continue;
     }
     const data::Uid existingUid = *parsedUid;
@@ -2092,6 +2149,15 @@ void server::FileDataSource::RebuildCharacterNameIndex()
   server::util::QuietLogInfo(
     "Character name index: {} names indexed, {} files unresolved, {} duplicates",
     _characterNameToUid.size(), unresolved, duplicates);
+
+  if (noncanonical > 0)
+  {
+    server::util::QuietLogWarn(
+      "Character name index: {} file(s) in '{}' are named with a noncanonical "
+      "record number (a leading zero); they are not records, are not indexed "
+      "and are not swept",
+      noncanonical, server::util::LogPath(_characterDataPath));
+  }
 
   if (unresolved != 0)
   {
@@ -3068,6 +3134,8 @@ void server::FileDataSource::RebuildGuildNameIndex()
   //! отвечать «имя свободно».
   std::size_t unresolved = 0;
   std::size_t duplicates = 0;
+  //! Файлы с числовым, но НЕканоническим именем (`007.json`): не записи.
+  std::size_t noncanonical = 0;
 
   const auto listing = server::util::ListRegularFiles(_guildDataPath);
   if (listing.incomplete)
@@ -3111,14 +3179,22 @@ void server::FileDataSource::RebuildGuildNameIndex()
     // индекс, взявший uid из содержимого, отвечал бы про ДРУГУЮ запись:
     // `7.json` с полем `uid: 8` делал `DeleteGuild(7)` неспособным освободить
     // имя, а два файла с одним полем `uid` освобождали живое имя.
-    const auto uid = ParseRecordUid(filePath.stem().string());
+    const auto stem = filePath.stem().string();
+    const auto uid = ParseRecordUid(stem);
     if (not uid)
     {
-      ++unresolved;
-      server::util::QuietLogWarn(
-        "Guild file '{}' is not named after a record identifier; the index "
-        "refuses to guess whose name it carries",
-        server::util::LogPath(filePath));
+      // Та же граница, что у персонажей: неканоническое числовое имя — не
+      // управляемая запись, а посторонний файл (правка ревью, итерация 9).
+      if (ParseUidLikeStem(stem))
+        ++noncanonical;
+      else
+      {
+        ++unresolved;
+        server::util::QuietLogWarn(
+          "Guild file '{}' is not named after a record identifier; the index "
+          "refuses to guess whose name it carries",
+          server::util::LogPath(filePath));
+      }
       continue;
     }
 
@@ -3185,6 +3261,15 @@ void server::FileDataSource::RebuildGuildNameIndex()
   server::util::QuietLogInfo(
     "Guild name index: {} names indexed, {} files unresolved, {} duplicates",
     _guildNameToUid.size(), unresolved, duplicates);
+
+  if (noncanonical > 0)
+  {
+    server::util::QuietLogWarn(
+      "Guild name index: {} file(s) in '{}' are named with a noncanonical "
+      "record number (a leading zero); they are not records, are not indexed "
+      "and are not swept",
+      noncanonical, server::util::LogPath(_guildDataPath));
+  }
 
   if (not _guildNameIndexComplete)
   {
