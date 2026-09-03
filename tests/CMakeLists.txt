@@ -42,6 +42,12 @@ target_sources(util_test_log_throttle PRIVATE
 target_link_libraries(util_test_log_throttle
         PRIVATE project-properties alicia-libserver)
 
+add_executable(util_test_keyed_log_throttle)
+target_sources(util_test_keyed_log_throttle PRIVATE
+        src/util/TestKeyedLogThrottle.cpp)
+target_link_libraries(util_test_keyed_log_throttle
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(util_test_name_guard)
 target_sources(util_test_name_guard PRIVATE
         src/util/TestNameGuard.cpp)
@@ -187,6 +193,7 @@ add_test(NAME UtilTestLocale COMMAND util_test_locale)
 add_test(NAME UtilTestAliciaShopTime COMMAND util_test_alicia_shop_time)
 add_test(NAME UtilTestProfiler COMMAND util_test_profiler)
 add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
+add_test(NAME UtilTestKeyedLogThrottle COMMAND util_test_keyed_log_throttle)
 add_test(NAME UtilTestNameGuard COMMAND util_test_name_guard)
 add_test(NAME UtilTestAtomicFile COMMAND util_test_atomic_file)
 add_test(NAME DataTestFileDataSource COMMAND data_test_file_data_source)

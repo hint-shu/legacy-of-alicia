@@ -22,8 +22,11 @@
 
 #include "libserver/util/Deferred.hpp"
 #include "libserver/util/Util.hpp"
+#include "libserver/util/KeyedLogThrottle.hpp"
 
 #include <ranges>
+#include <functional>
+#include <string_view>
 #include <stacktrace>
 
 #include <spdlog/spdlog.h>
@@ -519,11 +522,42 @@ size_t CommandServer::NetworkEventHandler::OnClientData(
       }
       catch (const std::exception& x)
       {
-        server::util::QuietLogError(
-          "Unhandled exception handling command '{}' (0x{:x}): {}",
-          protocol::GetCommandName(commandId),
-          magic.id,
-          x.what());
+        // LOA-fix (R71-31, находка ревью 8 #1, BLOCK): ТОЧКА РАЗВЕТВЛЕНИЯ, А НЕ СПИСОК МЕСТ.
+        //
+        // ★ЧТО БЫЛО ОТКРЫТО. Раунд задросселил жалобы ВНУТРИ восьми хендлеров, но
+        // КАЖДЫЙ из них начинается с бросающего `GetRaceInstance`. Клиенту достаточно
+        // остаться с недействительным uid комнаты (например, после `HandleLeaveRoom`)
+        // и слать любые заездовые пакеты: хендлер бросает ДО своих гардов, а вот этот
+        // внешний `catch` пишет по строке [error] НА КАЖДЫЙ ПАКЕТ. То есть заливка
+        // диска, ради которой раунд и городил дроссели, оставалась достижимой в
+        // обход их всех.
+        //
+        // ★ЧИНИТСЯ ЗДЕСЬ, ПОТОМУ ЧТО ЗДЕСЬ ОДНО МЕСТО НА ВСЕ ХЕНДЛЕРЫ. Любой бросок
+        // любого хендлера — существующего и будущего — становится жалобой ровно
+        // отсюда. Это ТОТАЛЬНЫЙ инвариант, а не ещё одна строка в списке мест
+        // ([[total-invariant-beats-list-of-sites]]): новый хендлер получает его
+        // даром, и «забыть задросселить» больше нечего.
+        //
+        // ★КЛЮЧ — ПАРА «КОМАНДА x ПРИЧИНА БРОСКА», а не одна команда: иначе брошенный
+        // `HandleUseMagicItem` глушил бы диагностику брошенного `HandleSpur`, и раунд
+        // снова судил бы гард по молчанию. Ёмкость дросселя фиксирована по построению
+        // (`KeyedLogThrottle`, 64 ведра), поэтому ключ из клиентских данных не даёт
+        // роста памяти.
+        static server::util::KeyedLogThrottle handlerExceptionThrottle;
+
+        const uint64_t reasonKey =
+          static_cast<uint64_t>(std::hash<std::string_view>{}(x.what()));
+        const uint64_t key =
+          static_cast<uint64_t>(commandId) * 0x9E3779B97F4A7C15ull ^ reasonKey;
+
+        uint64_t suppressed = 0;
+        if (handlerExceptionThrottle.Allow(key, suppressed))
+          server::util::QuietLogError(
+            "Unhandled exception handling command '{}' (0x{:x}): {} (suppressed {})",
+            protocol::GetCommandName(commandId),
+            magic.id,
+            x.what(),
+            suppressed);
       }
 
       // There shouldn't be any left-over data in the stream.
