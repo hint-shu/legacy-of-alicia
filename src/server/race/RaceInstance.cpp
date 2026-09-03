@@ -19,6 +19,7 @@
 
 #include "server/ServerInstance.hpp"
 #include "libserver/util/QuietLog.hpp"
+#include "libserver/util/RecordAccess.hpp"
 
 #include "server/race/RaceInstance.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
@@ -27,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -224,6 +227,11 @@ bool RaceInstance::Start(
   // такого исхода — джоб прошлого заезда всё ещё считается своим; это ровно
   // пред-существующее поведение «заезд кончился, а джоб ещё летит», и первый
   // же удавшийся `Start()` его отсекает.
+  // LOA-fix (R75, #14/#233): новый заезд — новые итоги. Стоит на том же пути,
+  // что ++_raceEpoch: после успешных PrepareGameMode/PrepareMap, то есть только
+  // там, где заезд ДЕЙСТВИТЕЛЬНО начался.
+  _resultsCredited = false;
+
   ++_raceEpoch;
 
   return true;
@@ -250,6 +258,18 @@ void RaceInstance::ArmLoadingDeadline()
 
 void RaceInstance::Stop()
 {
+  // LOA-fix (R75, #14/#233): см. `_resultsCredited` в заголовке. Ранний выход
+  // стоит ПЕРВЫМ действием функции — до единого чтения трекера, чтобы «не более
+  // одного раза» относилось ко ВСЕМУ телу, а не к тому куску, до которого дошли.
+  if (_resultsCredited)
+  {
+    server::util::QuietLogWarn(
+      "Room {}: the race results were already credited, skipping the repeated Stop()",
+      this->GetRoomUid());
+    return;
+  }
+  _resultsCredited = true;
+
   protocol::AcCmdRCRaceResultNotify raceResult{};
 
   using Team = tracker::RaceTracker::Racer::Team;
@@ -1933,8 +1953,64 @@ void RaceInstance::TickFinishing()
       this->GetRoomUid());
   }
 
-  Stop();
- _stage = Stage::Waiting;
+  // LOA-fix (R75, #14/#233): СТАДИЯ И КОМНАТА ОСВОБОЖДАЮТСЯ, ЧТО БЫ НИ СДЕЛАЛ
+  // Stop(). Раньше эти две строки шли линейно: бросок внутри Stop() улетал в
+  // catch в Tick(), комната оставалась в Finishing, и каждый следующий тик звал
+  // Stop() заново. Латч `_resultsCredited` делает повтор БЕЗВРЕДНЫМ; здесь мы
+  // делаем его НЕНУЖНЫМ — и заодно закрываем второй, более дорогой хвост того же
+  // дефекта: `room.SetRoomPlaying(false)` стоит в предпоследнем блоке Stop(),
+  // то есть сорвавшееся подведение итогов оставляло комнату «играющей»
+  // НАВСЕГДА — ни нового старта, ни входа.
+  try
+  {
+    Stop();
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Room {}: the race results failed to complete: {}",
+      this->GetRoomUid(),
+      x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Room {}: the race results failed to complete: {}",
+      this->GetRoomUid(),
+      "unknown exception");
+  }
+
+  // Присваивание бросить не может — поэтому стоит ПЕРВЫМ после Stop().
+  _stage = Stage::Waiting;
+
+  // Возврат комнаты — тот же способ, что на таймаут-ветке TickRacing.
+  // Идемпотентно: удавшийся Stop() уже сделал ровно это, повтор — no-op.
+  try
+  {
+    this->GetRoom(
+      [](Room& room)
+      {
+        room.SetRoomPlaying(false);
+        for (const auto& characterUid : room.GetPlayers() | std::views::keys)
+        {
+          room.GetPlayer(characterUid).SetReady(false);
+        }
+      });
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Room {}: failed to return the room to the waiting state: {}",
+      this->GetRoomUid(),
+      x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Room {}: failed to return the room to the waiting state: {}",
+      this->GetRoomUid(),
+      "unknown exception");
+  }
 }
 
 void RaceInstance::TickActiveRaceContent()
