@@ -255,15 +255,25 @@ void DetachNameKey(
     index.erase(entry);
 }
 
-//! Поднимает потолок длины имени, никогда его не опуская.
-void RaiseNameCeiling(std::atomic_size_t& ceiling, const std::size_t candidate)
+//! Монотонная верхняя отметка: поднимает значение и никогда не опускает.
+//!
+//! ★ОДНА ФУНКЦИЯ НА ДВА ПРИМЕНЕНИЯ (потолок длины имени и поколение обхода),
+//! потому что свойство одно: «значение умеет только расти». Написанное дважды,
+//! оно умеет разъехаться в CAS-цикле молча.
+void RaiseAtomicWatermark(std::atomic_size_t& watermark, const std::size_t candidate)
 {
-  std::size_t current = ceiling.load(std::memory_order::relaxed);
+  std::size_t current = watermark.load(std::memory_order::relaxed);
   while (candidate > current
-    && not ceiling.compare_exchange_weak(
+    && not watermark.compare_exchange_weak(
       current, candidate, std::memory_order::relaxed))
   {
   }
+}
+
+//! Поднимает потолок длины имени, никогда его не опуская.
+void RaiseNameCeiling(std::atomic_size_t& ceiling, const std::size_t candidate)
+{
+  RaiseAtomicWatermark(ceiling, candidate);
 }
 
 //! ЕДИНСТВЕННОЕ ЧТЕНИЕ ФАЙЛА ДАННЫХ В ЭТОМ КЛАССЕ (LOA-fix R73-6, ревью 4).
@@ -705,9 +715,14 @@ void server::FileDataSource::Terminate()
   // ровно дефект R57: HandleRaceUserPos дал 15 350 строк/час). Но гейт, о
   // котором нельзя узнать, работал ли он, — это не гейт; поэтому счётчик один
   // и печатается один раз.
+  // ★ДВЕ СТРОКИ, А НЕ ОДНА (правка ревью, итерация 9): один счётчик считал и
+  // отбитые ПОИСКИ, и отказанные СОЗДАНИЯ, а подпись говорила только про поиски.
   server::util::QuietLogInfo(
     "Name lookup guard: rejected {} out-of-class name lookups",
     _rejectedNameLookups.load(std::memory_order::relaxed));
+  server::util::QuietLogInfo(
+    "Name creation guard: refused {} out-of-class name creations",
+    _refusedNameCreations.load(std::memory_order::relaxed));
 }
 
 void server::FileDataSource::SaveMetadata()
@@ -1011,6 +1026,12 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
   // под замком» на «строим снаружи» стоила бы только что зарегистрированному
   // игроку ответа `//infraction list`. Поэтому такие имена собираются отдельно
   // и вливаются в набор при публикации.
+  // ★ПОКОЛЕНИЕ ЭТОГО ОБХОДА (правка ревью, итерация 9). Берётся ДО того, как
+  // обход что-либо увидит: неудача регистрации, случившаяся с этого момента,
+  // принадлежит нам и обязана запретить нам объявить отпечаток действительным.
+  const std::size_t generation =
+    _userIndexScanGeneration.fetch_add(1, std::memory_order::relaxed) + 1;
+
   {
     const std::unique_lock indexLock(_userNameIndexMutex);
     _userNamesAddedDuringScan.clear();
@@ -1171,9 +1192,15 @@ void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
     scanFlagGuard.armed = false;
 
     _userNameKeys = std::move(keys);
+    // ★И НИ ОДНОЙ НЕУДАЧИ РЕГИСТРАЦИИ, ПРИНАДЛЕЖАЩЕЙ ЭТОМУ ОБХОДУ ИЛИ БОЛЕЕ
+    // ПОЗДНЕМУ (правка ревью, итерация 9). Без этого условия обход, снявший
+    // список ДО неудачи, перезаписывал её `false` своим `true` — то есть
+    // отметка о пропавшем аккаунте стиралась тем, кто этого аккаунта не видел.
     _userIndexStampValid.store(
       not stampError && not listing.incomplete
-        && not hardening.incomplete && hardening.failed == 0,
+        && not hardening.incomplete && hardening.failed == 0
+        && _userIndexFailedGeneration.load(std::memory_order::relaxed)
+             < generation,
       std::memory_order::relaxed);
     _userIndexDirectoryStamp = stamp;
 
@@ -1250,6 +1277,14 @@ void server::FileDataSource::IndexUserName(const std::string& name)
     // отпечаток недействительным обязано быть возможно и тогда, когда взять
     // замок снова нечем.
     _userIndexStampValid.store(false, std::memory_order::relaxed);
+    // ★И ОТМЕТКА ПРИВЯЗЫВАЕТСЯ К ПОКОЛЕНИЮ, А НЕ ТОЛЬКО К БИТУ (правка ревью,
+    // итерация 9). Бит умеет быть перезаписан обходом, начавшимся раньше нас;
+    // поколение — нет: любой обход, чей номер не больше этого, опубликует
+    // `false`, а следующий обход (номер больше) читает каталог с диска уже
+    // ПОСЛЕ нашей записи файла и потому вправе объявить себя полным.
+    RaiseAtomicWatermark(
+      _userIndexFailedGeneration,
+      _userIndexScanGeneration.load(std::memory_order::relaxed));
     server::util::QuietLogError(
       "Account name index: '{}' could not be indexed ({}); the index is marked "
       "stale and will be rebuilt from disk on the next miss", name, x.what());
@@ -2321,7 +2356,7 @@ bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
   if (not server::util::IsStorableNameShaped(
     name, _characterNameCeiling.load(std::memory_order::relaxed)))
   {
-    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    _refusedNameCreations.fetch_add(1, std::memory_order::relaxed);
     return false;
   }
 
@@ -3000,7 +3035,7 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
   if (not server::util::IsStorableNameShaped(
     name, _guildNameCeiling.load(std::memory_order::relaxed)))
   {
-    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    _refusedNameCreations.fetch_add(1, std::memory_order::relaxed);
     return false;
   }
 
