@@ -186,6 +186,75 @@ void TestUnreadableRecordMakesEveryNameTaken()
   std::filesystem::remove_all(root, error);
 }
 
+//! ★ИМЯ ГИЛЬДИИ С ПРОВОДА ПРОХОДИТ СТРУКТУРНЫЙ ГЕЙТ, А НЕ ТОЛЬКО ИНДЕКС.
+//!
+//! Директива ведущего требовала провести создание гильдии через NameGuard И
+//! индекс; итерация 6 поставила только индекс, и правило «имя с провода не
+//! оплачивается работой хранилища» держалось вежливостью ЕДИНСТВЕННОГО
+//! вызывающего (`RanchDirector` зовёт `locale::IsNameValid` с потолком 18
+//! байт). Второй вызывающий, написанный по образцу соседей, унаследовал бы
+//! отсутствие гейта — а соседи (`RetrieveCharacterUidByName`,
+//! `IsUserNameUnique`) свой гейт имеют.
+//!
+//! ★НАПРАВЛЕНИЕ ОТКАЗА ЗДЕСЬ ПРОТИВОПОЛОЖНО ПОИСКУ: имя, которое физически не
+//! может лежать на диске, обязано читаться как ЗАНЯТОЕ (отказ в создании), а не
+//! как свободное — иначе гейт стал бы способом пройти проверку уникальности.
+void TestGuildNameGateRefusesUnstorableNames()
+{
+  const auto root = MakeSandbox("guild-name-gate");
+  server::FileDataSource source;
+  source.Initialize(root);
+  source.StoreGuild(3, MakeGuild(3, "Alpha"));
+
+  // Контроль направления СНАЧАЛА: гейт не имеет права быть «всегда занято».
+  assert(not source.IsGuildNameUnique("Alpha"));       // занято индексом
+  assert(source.IsGuildNameUnique("Bravo"));           // свободно
+
+  // Имя, которого не может быть на диске, — отказ, а не «свободно».
+  assert(not source.IsGuildNameUnique(std::string("Bad\x01Name")));
+  assert(not source.IsGuildNameUnique(std::string("Bad\x7fName")));
+  assert(not source.IsGuildNameUnique("../../etc/passwd"));
+  assert(not source.IsGuildNameUnique("back\\slash"));
+  assert(not source.IsGuildNameUnique(""));
+  assert(not source.IsGuildNameUnique(std::string(4096, 'x')));  // 8 КБ с провода
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★ПОТОЛОК ГЕЙТА БЕРЁТСЯ ИЗ ИНДЕКСА, А НЕ ИЗ КОНСТАНТЫ.
+//!
+//! Гейт, который строже индекса, который он охраняет, отнимает путь успеха:
+//! гильдия, названная ДО появления валидатора (сегодня `IsNameValid` держит 18
+//! байт, вчера не держал ничего), обязана остаться спрашиваемой. Тот же вывод
+//! уже сделан для персонажей (правка ревью, итерация 1) — здесь он проверяется
+//! для гильдий.
+void TestGuildNameCeilingComesFromTheIndex()
+{
+  const auto root = MakeSandbox("guild-name-ceiling");
+  std::filesystem::create_directories(root / "guilds");
+
+  // 100 байт — длиннее пола гейта (64), то есть без подъёма потолка это имя
+  // было бы неспрашиваемым, хотя оно ЛЕЖИТ на диске.
+  const std::string longName(100, 'q');
+  WriteRaw(root / "guilds" / "5.json",
+    std::string(R"({"uid": 5, "name": ")") + longName
+      + R"(", "owner": 1, "officers": [], "members": []})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  assert(not source.IsGuildNameUnique(longName));      // лежит -> занято
+  // Другое имя той же длины гейт пропускает (потолок поднят), и индекс
+  // отвечает правду: свободно.
+  assert(source.IsGuildNameUnique(std::string(100, 'z')));
+  // Но потолок конечен: 8 КБ с провода по-прежнему отбиваются.
+  assert(not source.IsGuildNameUnique(std::string(4096, 'z')));
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
 } // namespace
 
 int main()
@@ -193,5 +262,7 @@ int main()
   TestFailedDeleteIsNotSilentSuccess();
   TestIndexIdentityComesFromTheFileName();
   TestUnreadableRecordMakesEveryNameTaken();
+  TestGuildNameGateRefusesUnstorableNames();
+  TestGuildNameCeilingComesFromTheIndex();
   std::puts("TestFileDataSource: ok");
 }

@@ -332,8 +332,16 @@ private:
   //! разъехаться стало нечему.
   static constexpr std::size_t kCharacterNameCeilingFloor = 64;
   static constexpr std::size_t kLoginNameCeilingFloor = 48;
+  //! ★ПОЛ ИМЕНИ ГИЛЬДИИ — НЕ ВТОРОЙ ЛИТЕРАЛ, А ТОТ ЖЕ (правка ревью, итерация
+  //! 7). Гильдия и персонаж — оба «сохранённое имя» в смысле `NameGuard.hpp`,
+  //! и второй литерал 64 разошёлся бы с первым ровно так же, как в итерации 2
+  //! разошлись инициализатор и `static_assert`. Значение одно, поэтому
+  //! расходиться нечему, а существующий `static_assert` на
+  //! `kCharacterNameCeilingFloor` сверяет с гейтом их обоих.
+  static constexpr std::size_t kGuildNameCeilingFloor = kCharacterNameCeilingFloor;
   std::atomic_size_t _characterNameCeiling{kCharacterNameCeilingFloor};
   std::atomic_size_t _loginNameCeiling{kLoginNameCeilingFloor};
+  std::atomic_size_t _guildNameCeiling{kGuildNameCeilingFloor};
 
   //! Сколько обращений отбито структурным гейтом имени. Читается РОВНО ОДИН раз,
   //! на `Terminate` — счётчик существует затем, чтобы гейт был проверкой, чей

@@ -2777,6 +2777,35 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
   // же способом, что у персонажей и аккаунтов, — индексом, а не третьим частным
   // случаем: ответ теперь стоит один хеш, независимо от числа гильдий.
   //
+  // ★СТРУКТУРНЫЙ ГЕЙТ ДО ВСЕГО — до ключа, до хеша, до замка (правка ревью,
+  // итерация 7; директива ведущего требовала провести создание гильдии через
+  // NameGuard И индекс, а итерация 6 поставила только индекс).
+  //
+  // Провод отдаёт до ~8190 байт (`Stream.cpp` при потолке `MaxCommandDataSize`),
+  // а хранимое имя короче на два порядка. Сегодня перед этим вызовом стоит
+  // `locale::IsNameValid(command.name)` с потолком 18 байт — но это ОДИН
+  // вызывающий, и свойство «имя с провода не оплачивается работой хранилища»
+  // держится его вежливостью, а не построением. Второй вызывающий,
+  // написанный по образцу соседей (`RetrieveCharacterUidByName`,
+  // `IsUserNameUnique` — оба со своим гейтом), унаследовал бы отсутствие
+  // гейта. Правило живёт в хранилище, а не в перечне вызывающих.
+  //
+  // ★ПОТОЛОК ИЗ ИНДЕКСА, А НЕ КОНСТАНТА: гейт, который строже индекса, отнял
+  // бы у гильдии, названной до появления валидатора, возможность быть
+  // спрошенной. Пол — тот же `kMaxStoredNameBytes`, что у персонажей.
+  //
+  // ★ОТКАЗ ЧИТАЕТСЯ КАК «ЗАНЯТО», А НЕ КАК «СВОБОДНО», и направление здесь
+  // противоположно `IsUserNameUnique` НЕ по недосмотру: там ответ идёт в
+  // ПОИСК (staff-команда скажет «такого нет»), а здесь — в СОЗДАНИЕ. Имя,
+  // которое физически не может лежать на диске, обязано отказать в создании,
+  // иначе гейт превратился бы в способ пройти проверку уникальности.
+  if (not server::util::IsStorableNameShaped(
+    name, _guildNameCeiling.load(std::memory_order::relaxed)))
+  {
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    return false;
+  }
+
   // Сравнение по-прежнему ASCII-регистронезависимое: ключ индекса и есть имя в
   // нижнем ASCII-регистре, ровно то, что делал прежний `equalsIgnoreCase`.
   const auto key = server::util::AsciiLowerKey(name);
@@ -3002,6 +3031,10 @@ void server::FileDataSource::RebuildGuildNameIndex()
 
     const std::size_t collisions =
       AttachNameKey(_guildNameToUid, key, *uid);
+    // ★ПОТОЛОК ГЕЙТА МЕРЯЕТСЯ ТЕМ, ЧТО ЛЕЖИТ НА ДИСКЕ, а не сегодняшним
+    // валидатором: гильдия, названная до появления `IsNameValid`, обязана
+    // остаться спрашиваемой (тот же вывод, что у персонажей, — итерация 1).
+    RaiseNameCeiling(_guildNameCeiling, existingName.size());
     if (collisions > 1)
       ++duplicates;
     _guildUidToName[*uid] = std::move(key);
@@ -3052,6 +3085,7 @@ void server::FileDataSource::IndexGuildName(
   try
   {
     auto key = server::util::AsciiLowerKey(name);
+    RaiseNameCeiling(_guildNameCeiling, name.size());
     const std::unique_lock indexLock(_guildNameIndexMutex);
     const auto previous = _guildUidToName.find(uid);
     if (previous != _guildUidToName.end())
