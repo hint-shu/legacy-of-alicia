@@ -153,7 +153,7 @@ coats:
   - tid: 20
     name: 'Dapple Bay'
     faceType: 0
-    minGrade: 8
+    minGrade: 10
     tier: 3
     inheritanceRate: 5.0
     allowedColorGroups: 0
@@ -208,32 +208,32 @@ manes:
   - tid: 6
     color: 'Black'
     shape: 3
-    inheritanceRate: 20.0
-    minGrade: 6
+    inheritanceRate: 30.0
+    minGrade: 1
     tier: 1
   - tid: 7
     color: 'White'
     shape: 3
-    inheritanceRate: 20.0
-    minGrade: 6
+    inheritanceRate: 30.0
+    minGrade: 1
     tier: 1
   - tid: 8
     color: 'Brown'
     shape: 3
-    inheritanceRate: 20.0
-    minGrade: 6
+    inheritanceRate: 30.0
+    minGrade: 1
     tier: 1
   - tid: 9
     color: 'DarkBrown'
     shape: 3
-    inheritanceRate: 20.0
-    minGrade: 6
+    inheritanceRate: 30.0
+    minGrade: 1
     tier: 1
   - tid: 10
     color: 'Grey'
     shape: 3
-    inheritanceRate: 20.0
-    minGrade: 6
+    inheritanceRate: 30.0
+    minGrade: 1
     tier: 1
   # Shape 4 (Shaved)
   - tid: 11
@@ -332,62 +332,62 @@ manes:
   - tid: 26
     color: 'Black'
     shape: 7
-    inheritanceRate: 30.0
+    inheritanceRate: 15.0
     minGrade: 4
     tier: 2
   - tid: 27
     color: 'White'
     shape: 7
-    inheritanceRate: 30.0
+    inheritanceRate: 15.0
     minGrade: 4
     tier: 2
   - tid: 28
     color: 'Brown'
     shape: 7
-    inheritanceRate: 30.0
+    inheritanceRate: 15.0
     minGrade: 4
     tier: 2
   - tid: 29
     color: 'DarkBrown'
     shape: 7
-    inheritanceRate: 30.0
+    inheritanceRate: 15.0
     minGrade: 4
     tier: 2
   - tid: 30
     color: 'Grey'
     shape: 7
-    inheritanceRate: 30.0
+    inheritanceRate: 15.0
     minGrade: 4
     tier: 2
   # Shape 2 (Long)
   - tid: 31
     color: 'Black'
     shape: 2
-    inheritanceRate: 15.0
+    inheritanceRate: 20.0
     minGrade: 6
     tier: 2
   - tid: 32
     color: 'White'
     shape: 2
-    inheritanceRate: 15.0
+    inheritanceRate: 20.0
     minGrade: 6
     tier: 2
   - tid: 33
     color: 'Brown'
     shape: 2
-    inheritanceRate: 15.0
+    inheritanceRate: 20.0
     minGrade: 6
     tier: 2
   - tid: 34
     color: 'DarkBrown'
     shape: 2
-    inheritanceRate: 15.0
+    inheritanceRate: 20.0
     minGrade: 6
     tier: 2
   - tid: 35
     color: 'Grey'
     shape: 2
-    inheritanceRate: 15.0
+    inheritanceRate: 20.0
     minGrade: 6
     tier: 2
   # Shape 8 (Curly)
@@ -489,33 +489,33 @@ tails:
   - tid: 11
     color: 'Black'
     shape: 4
-    inheritanceRate: 20.0
+    inheritanceRate: 30.0
     minGrade: 1
-    tier: 2
+    tier: 1
   - tid: 12
     color: 'White'
     shape: 4
-    inheritanceRate: 20.0
+    inheritanceRate: 30.0
     minGrade: 1
-    tier: 2
+    tier: 1
   - tid: 13
     color: 'Brown'
     shape: 4
-    inheritanceRate: 20.0
+    inheritanceRate: 30.0
     minGrade: 1
-    tier: 2
+    tier: 1
   - tid: 14
     color: 'DarkBrown'
     shape: 4
-    inheritanceRate: 20.0
+    inheritanceRate: 30.0
     minGrade: 1
-    tier: 2
+    tier: 1
   - tid: 15
     color: 'Grey'
     shape: 4
-    inheritanceRate: 20.0
+    inheritanceRate: 30.0
     minGrade: 1
-    tier: 2
+    tier: 1
   # Shape 5 (Long Thin)
   - tid: 16
     color: 'Black'
@@ -582,30 +582,30 @@ tails:
   - tid: 26
     color: 'Black'
     shape: 3
-    inheritanceRate: 30.0
+    inheritanceRate: 20.0
     minGrade: 7
-    tier: 1
+    tier: 2
   - tid: 27
     color: 'White'
     shape: 3
-    inheritanceRate: 30.0
+    inheritanceRate: 20.0
     minGrade: 7
-    tier: 1
+    tier: 2
   - tid: 28
     color: 'Brown'
     shape: 3
-    inheritanceRate: 30.0
+    inheritanceRate: 20.0
     minGrade: 7
-    tier: 1
+    tier: 2
   - tid: 29
     color: 'DarkBrown'
     shape: 3
-    inheritanceRate: 30.0
+    inheritanceRate: 20.0
     minGrade: 7
-    tier: 1
+    tier: 2
   - tid: 30
     color: 'Grey'
     shape: 3
-    inheritanceRate: 30.0
+    inheritanceRate: 20.0
     minGrade: 7
-    tier: 1
+    tier: 2
