@@ -191,11 +191,13 @@ def selftest_deleted_row(stock_dir):
         end += 1
     kept = lines[:start] + lines[end:]
 
+    baseline, _ = run_on_lines(lines, stock_dir)
     findings, scanned = run_on_lines(kept, stock_dir)
-    ok = scanned == 89 and any("missing tid 20" in f for f in findings)
+    added = [f for f in findings if f not in baseline]
+    ok = scanned == 89 and any("missing tid 20" in f for f in added)
     print("selftest(deleted row): deleted coat 20, oracle reported %d finding(s), "
           "scanned %d entries" % (len(findings), scanned))
-    for finding in findings:
+    for finding in added:
         print("  " + finding)
     print("selftest(deleted row): " + ("PASS" if ok else "FAIL"))
     return ok
@@ -212,6 +214,7 @@ def selftest(stock_dir):
 
     with open(DEFAULT_YAML, encoding="utf-8") as handle:
         lines = handle.read().split("\n")
+    base_lines = list(lines)
 
     target = None
     for index, line in enumerate(lines):
@@ -227,11 +230,22 @@ def selftest(stock_dir):
             handle.write("\n".join(lines))
         findings, scanned = check(path, stock_dir)
 
+    # ★Measured AGAINST THE BASELINE of this tree, not against zero. On a branch
+    # where the data is deliberately wrong (the round's own data negatives) the
+    # tree already has findings, and a self-check written as "exactly one finding"
+    # would go red there -- a negative would then fail somebody else's predicate
+    # instead of its own. What the self-check must prove is that the corruption
+    # ADDS its finding on the right line, which is true on any tree.
+    baseline, _ = run_on_lines(base_lines, stock_dir)
     expected_line = target + 1
-    ok = len(findings) == 1 and (":%d:" % expected_line) in findings[0]
-    print("selftest: corrupted line %d, oracle reported %d finding(s), scanned %d entries"
-          % (expected_line, len(findings), scanned))
-    for finding in findings:
+    added = [f for f in findings if f not in baseline]
+    ok = (len(findings) == len(baseline) + 1
+          and len(added) == 1
+          and (":%d:" % expected_line) in added[0])
+    print("selftest: corrupted line %d, oracle reported %d finding(s) against a "
+          "baseline of %d, scanned %d entries"
+          % (expected_line, len(findings), len(baseline), scanned))
+    for finding in added:
         print("  " + finding)
     print("selftest: " + ("PASS" if ok else "FAIL"))
 
