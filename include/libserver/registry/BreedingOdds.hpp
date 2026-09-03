@@ -23,6 +23,7 @@
 #include "libserver/registry/HorseRegistry.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace server::registry
@@ -44,9 +45,17 @@ struct WeightedChoices
 };
 
 //! Maps a coat star tier onto the OddsRare column index of PotentialInfo.
-//! Exhaustive switch with no default on purpose: adding a tier must break the
-//! build here rather than silently map to column 0.
-[[nodiscard]] std::size_t CoatTierToOddsIndex(Coat::Tier tier);
+//!
+//! ★R77-fix-2 (Codex finding 2). The first version returned `0` for anything the
+//! exhaustive switch did not name -- a SILENT DEFAULT that mapped an unknown tier
+//! onto the common-coat column, and it was reachable because the YAML parser cast
+//! any integer straight into the enum. Two changes close it: the parser now
+//! refuses a tier outside 1..3 (`HorseRegistry::ReadConfig`), and this function
+//! no longer answers at all for a value it does not know.
+//! @returns The column index, or `std::nullopt` for a value outside the enum --
+//!          whose only correct handling is to REFUSE the roll, never to roll on
+//!          an arbitrary column.
+[[nodiscard]] std::optional<std::size_t> CoatTierToOddsIndex(Coat::Tier tier);
 
 //! Builds the emblem-tier choices for one roll, from emblems.yaml -> emblemRatios.
 //! When the configured ratios sum to less than 100 the shortfall is added as an

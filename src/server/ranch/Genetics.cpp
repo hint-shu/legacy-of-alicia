@@ -98,6 +98,20 @@ uint32_t Genetics::RollEmblem()
   // EmblemRatioInfo sums to 92, and the missing 8 is a real stock outcome that a
   // normalising weighted pick used to swallow -- every foal got an emblem.
   const auto choices = registry::BuildEmblemTierChoices(horseRegistry.GetEmblemRatios());
+
+  // ★R77-fix-2 (Codex finding 3). An empty candidate list used to fall through
+  // PickWeighted's default and come back as tier 1 -- i.e. bad configuration was
+  // laundered into "always an emblem", the very behaviour M14 removed. The tables
+  // are validated at load (HorseRegistry::ValidateTables), so this state is
+  // unreachable through ReadConfig; if it happens anyway it is reported and the
+  // foal gets NO emblem. Never a fallback that invents an outcome.
+  if (choices.empty())
+  {
+    server::util::QuietLogError(
+      "Genetics: no emblem tier is configured, foal gets no emblem");
+    return 0;
+  }
+
   const uint32_t tier = PickWeighted(
     server::util::GetRandomEngine(), choices.values, choices.weights, uint32_t{1});
   if (tier == registry::kNoEmblemTier)
@@ -106,7 +120,12 @@ uint32_t Genetics::RollEmblem()
   // Pick a uniform emblem within the chosen tier.
   const std::vector<uint32_t> emblems = horseRegistry.GetEmblemsByOdds(tier);
   if (emblems.empty())
-    return 1;
+  {
+    // ★Was `return 1` -- an emblem id invented out of nothing. Same rule as above.
+    server::util::QuietLogError(
+      "Genetics: emblem tier {} has no emblems, foal gets no emblem", tier);
+    return 0;
+  }
   return emblems[std::uniform_int_distribution<size_t>(0, emblems.size() - 1)(server::util::GetRandomEngine())];
 }
 
@@ -636,15 +655,28 @@ Genetics::PotentialResult Genetics::CalculateFoalPotential(
     return result;
   }
 
-  const size_t tierIndex = registry::CoatTierToOddsIndex(registry.GetCoatInfo(foalSkinTid).tier);
-  const auto choices = registry::BuildPotentialTypeChoices(registry, tierIndex);
+  // ★R77-fix-2 (Codex finding 2). No silent column-0 default: an unknown star
+  // tier refuses the roll and says which value it was, instead of quietly
+  // handing the foal a common coat's odds.
+  const auto tier = registry.GetCoatInfo(foalSkinTid).tier;
+  const auto tierIndex = registry::CoatTierToOddsIndex(tier);
+  if (not tierIndex.has_value())
+  {
+    server::util::QuietLogError(
+      "Genetics: coat {} has star tier {}, outside 1..3 -- foal gets no potential",
+      foalSkinTid,
+      static_cast<int32_t>(tier));
+    return result;
+  }
+
+  const auto choices = registry::BuildPotentialTypeChoices(registry, *tierIndex);
   if (choices.empty())
   {
     // Deliberately NOT a silent fallback to the uniform roll: a config with no
     // positive weight must be visible, otherwise the round's own check goes green
     // on the very behaviour it was written to catch.
     server::util::QuietLogWarn(
-      "Genetics: no potential type has a positive weight for coat tier index {}", tierIndex);
+      "Genetics: no potential type has a positive weight for coat tier index {}", *tierIndex);
     return result;
   }
 

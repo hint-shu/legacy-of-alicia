@@ -22,7 +22,7 @@
 namespace server::registry
 {
 
-std::size_t CoatTierToOddsIndex(const Coat::Tier tier)
+std::optional<std::size_t> CoatTierToOddsIndex(const Coat::Tier tier)
 {
   switch (tier)
   {
@@ -30,7 +30,9 @@ std::size_t CoatTierToOddsIndex(const Coat::Tier tier)
     case Coat::Tier::Uncommon: return 1;
     case Coat::Tier::Rare:     return 2;
   }
-  return 0;
+  // ★NOT `return 0`. A value outside the enum is a bug, not a common coat; the
+  // caller must refuse the roll and say so. See the header for the full story.
+  return std::nullopt;
 }
 
 WeightedChoices BuildEmblemTierChoices(const std::vector<EmblemRatio>& ratios)
