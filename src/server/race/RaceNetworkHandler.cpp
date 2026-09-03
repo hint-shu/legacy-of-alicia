@@ -4078,6 +4078,18 @@ void RaceNetworkHandler::HandleHurdleClearResult(
       //   * в воздухе        -> помечаем ТЕКУЩИЙ отрезок;
       //   * только что сел   -> засчитываем ТОЛЬКО ЧТО закончившийся;
       //   * на земле давно   -> отметка ждёт взлёта (допуск проверит его).
+      //
+      // ★ОДНА ОТМЕТКА ПОМЕЧАЕТ РОВНО ОДИН ОТРЕЗОК (R75 ит.2, Codex #5).
+      // ЧТО БЫЛО НЕ ТАК: `glideMarkTimePoint = now` стояло БЕЗУСЛОВНО, в том
+      // числе на двух ветках, где отметка уже ИЗРАСХОДОВАНА — помечен текущий
+      // полёт или засчитан только что закончившийся. Отметка оставалась
+      // «свежей» ещё GlideMarkTolerance (500 мс), а каденция позиции 3.83 Гц
+      // (0.26 с) вполне позволяет за это время сесть и снова взлететь. Тогда
+      // взлёт СЛЕДУЮЩЕГО, ОБЫЧНОГО барьера видел ту же отметку и помечался
+      // планированием — путь обычного прыжка уезжал в ВЕЧНЫЙ рекорд лошади.
+      // ТЕПЕРЬ отметка ЛИБО израсходована здесь (гасим её), ЛИБО остаётся
+      // ждать взлёта; взлёт, воспользовавшись ею, гасит её сам. Ждать нового
+      // отрезка может только НЕизрасходованная отметка.
       if (command.hurdleClearType
             == protocol::AcCmdCRHurdleClearResult::HurdleClearType::DoubleJumpOrGlide)
       {
@@ -4087,6 +4099,8 @@ void RaceNetworkHandler::HandleHurdleClearResult(
           if (racer.previousAirborne)
           {
             racer.currentStretchIsGlide = true;
+            // Израсходована: пометила ТЕКУЩИЙ отрезок.
+            racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
           }
           else if (racer.lastLandingTimePoint
                      != std::chrono::steady_clock::time_point::max()
@@ -4096,8 +4110,15 @@ void RaceNetworkHandler::HandleHurdleClearResult(
               std::max(racer.longestGlideMetres, racer.lastStretchMetres);
             // Один отрезок не может быть засчитан дважды.
             racer.lastStretchMetres = 0.0f;
+            // Израсходована: засчитала ПРЕДЫДУЩИЙ отрезок.
+            racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
           }
-          racer.glideMarkTimePoint = now;
+          else
+          {
+            // Не израсходована — ждёт взлёта, который случится в пределах
+            // допуска. Это единственная ветка, оставляющая отметку живой.
+            racer.glideMarkTimePoint = now;
+          }
         }
       }
 
@@ -4330,6 +4351,12 @@ void RaceNetworkHandler::HandleRaceUserPos(
           racer.currentStretchIsGlide =
             racer.glideMarkTimePoint != std::chrono::steady_clock::time_point::max()
             && (now - racer.glideMarkTimePoint) <= tracker::GlideMarkTolerance;
+          // ★ОТМЕТКА ОДНОРАЗОВАЯ (R75 ит.2, Codex #5). Гасим её ВСЕГДА, а не
+          // только когда она сработала: просроченная отметка тоже не должна
+          // дожить до следующего взлёта, а сработавшая — тем более. Иначе
+          // обычный барьер, взлетевший вторым внутри допуска, унаследовал бы
+          // чужую пометку и его путь ушёл бы в ВЕЧНЫЙ рекорд лошади.
+          racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
         }
         else
         {
