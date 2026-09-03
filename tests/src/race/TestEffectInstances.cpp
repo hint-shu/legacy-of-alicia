@@ -37,6 +37,7 @@
 
 #include "server/tracker/RaceTracker.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -368,6 +369,103 @@ void TestIssuanceBudgetResetsPerRace()
     "следующий заезд обязан начинаться с полным бюджетом");
 }
 
+//! LOA-fix (R71-26): выбирает ровно `count` номеров бюджета кастера маленькими
+//! пакетами и сразу снимает записи. Пакетами — потому что потолок ЖИВЫХ записей
+//! (256) меньше бюджета выдачи (512), и один огромный `CanIssue` отказал бы по
+//! месту, а не по бюджету; речь же здесь именно о бюджете.
+void DrainIssuanceBudget(RaceTracker& tracker, const Oid caster, const uint32_t count)
+{
+  uint32_t drained = 0;
+  while (drained < count)
+  {
+    const auto block = static_cast<uint16_t>(std::min<uint32_t>(8, count - drained));
+    Check(
+      tracker.CanIssueEffectInstances(caster, block),
+      "выборка бюджета внутри потолка обязана разрешаться");
+    const uint16_t first = tracker.GetNextEffectInstanceIdAndIncrementBy(caster, block);
+    tracker.AddEffectInstances(first, block, 10, caster, false, {});
+    tracker.RemoveEffectInstances(first, block);
+    drained += block;
+  }
+}
+
+//! LOA-fix (R71-26, находка ревью 6): ПОГРАНИЧНЫЙ КАСТ ДОЛЖЕН ПРОЙТИ ЦЕЛИКОМ.
+//!
+//! Бюджет выдачи спрашивается и списывается РОВНО ОДИН РАЗ на пакет, до выдачи
+//! номеров. Раньше `AddEffectInstances` переспрашивал его уже ПОСЛЕ списания — и на
+//! касте, доводящем кастера ровно до потолка, записи не создавались вовсе: номер
+//! выдан, каст разослан, а честный отчёт по нему потом получал отказ.
+//!
+//! ★КАК ЭТА ПРОВЕРКА ПРОВАЛИТСЯ: верни в `AddEffectInstances` полный
+//! `CanIssueEffectInstances(casterOid, 1)` (или спиши бюджет до проверки в
+//! обработчике) — и `FindEffectInstance` на пограничном касте вернёт `nullptr`.
+void TestBoundaryCastIsWrittenInFull()
+{
+  RaceTracker tracker;
+  constexpr Oid Caster = 1;
+  constexpr uint32_t MaxIssuance = RaceTracker::MaxEffectInstanceIssuancePerRacer;
+
+  // Выбираем бюджет до «остался ровно один номер». Записи снимаем, чтобы потолок
+  // ЖИВЫХ записей не мешал: проверяем именно бюджет выдачи, а не место под улику.
+  DrainIssuanceBudget(tracker, Caster, MaxIssuance - 1);
+
+  // Честный ПОГРАНИЧНЫЙ каст: он доводит суммарную выдачу ровно до потолка и обязан
+  // пройти целиком — и по разрешению, и по записи.
+  Check(
+    tracker.CanIssueEffectInstances(Caster, 1),
+    "последний номер бюджета обязан быть разрешён");
+  const uint16_t boundaryId = tracker.GetNextEffectInstanceIdAndIncrementBy(Caster, 1);
+  tracker.AddEffectInstances(boundaryId, 1, 10, Caster, false, {});
+  Check(
+    tracker.FindEffectInstance(boundaryId) != nullptr,
+    "★пограничный каст обязан ОСТАВИТЬ ЗАПИСЬ, а не только выдать номер");
+  Check(
+    tracker.HasIssuedEffectInstanceId(boundaryId),
+    "пограничный номер обязан считаться выданным");
+
+  // Следующий каст — уже сверх бюджета: отказ приходит ДО выдачи номера.
+  Check(
+    not tracker.CanIssueEffectInstances(Caster, 1),
+    "каст сверх бюджета обязан получить отказ");
+}
+
+//! LOA-fix (R71-26, находка ревью 6): ПАКЕТ БОЛЬШЕ ОСТАТКА ОТВЕРГАЕТСЯ ЦЕЛИКОМ И
+//! НИЧЕГО НЕ СПИСЫВАЕТ.
+//!
+//! ★КАК ПРОВАЛИТСЯ: спиши бюджет до/без проверки — и остаток после отказанного
+//! пакета перестанет быть прежним, то есть честный каст на оставшееся место получит
+//! отказ, которого он не заслужил.
+void TestOversizedPacketChargesNothing()
+{
+  RaceTracker tracker;
+  constexpr Oid Caster = 1;
+  constexpr uint32_t MaxIssuance = RaceTracker::MaxEffectInstanceIssuancePerRacer;
+
+  DrainIssuanceBudget(tracker, Caster, MaxIssuance - 4);
+
+  // Осталось ровно 4 номера. Пакет на 8 (ледяная стена во всю ширину) обязан быть
+  // отвергнут ЦЕЛИКОМ — и не занять при этом ни одного номера.
+  Check(
+    not tracker.CanIssueEffectInstances(Caster, 8),
+    "пакет больше остатка обязан быть отвергнут целиком");
+
+  // Остаток не тронут: честные 4 номера обязаны пройти и оставить записи.
+  Check(
+    tracker.CanIssueEffectInstances(Caster, 4),
+    "отказанный пакет не имеет права списать ни одного номера");
+  const uint16_t tailId = tracker.GetNextEffectInstanceIdAndIncrementBy(Caster, 4);
+  tracker.AddEffectInstances(tailId, 4, 10, Caster, false, {});
+  for (uint16_t i = 0; i < 4; ++i)
+  {
+    Check(
+      tracker.FindEffectInstance(static_cast<uint16_t>(tailId + i)) != nullptr,
+      "★каждый номер пакета, выбирающего остаток, обязан оставить запись");
+  }
+  Check(
+    not tracker.CanIssueEffectInstances(Caster, 1),
+    "после выбранного остатка бюджет обязан кончиться");
+}
+
 } // namespace
 
 int main()
@@ -381,6 +479,8 @@ int main()
   TestServerAppliedInstancesAreMarked();
   TestClearMakesInstancesPerRace();
   TestIssuanceBudgetResetsPerRace();
+  TestBoundaryCastIsWrittenInFull();
+  TestOversizedPacketChargesNothing();
 
   if (failures != 0)
   {

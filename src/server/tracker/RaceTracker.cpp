@@ -331,6 +331,22 @@ bool RaceTracker::CanIssueEffectInstances(
   return ownedCount + count <= MaxEffectInstancesPerRacer;
 }
 
+bool RaceTracker::HasRoomForOneLiveEffectInstance(const Oid casterOid) const
+{
+  // LOA-fix (R71-26, находка ревью 6): ВОПРОС ТОЛЬКО ПРО МЕСТО, НЕ ПРО БЮДЖЕТ.
+  // Бюджет выдачи уже списан за весь пакет, поэтому спрашивать его ещё раз значит
+  // отказать честному пограничному касту. Место под живую запись от списания не
+  // зависит: его можно переспросить сколько угодно раз, ответ не поедет.
+  size_t ownedCount = 0;
+  for (const auto& instance : _effectInstances)
+  {
+    if (instance.casterOid == casterOid)
+      ++ownedCount;
+  }
+
+  return ownedCount + 1 <= MaxEffectInstancesPerRacer;
+}
+
 void RaceTracker::AddEffectInstances(
   const uint16_t firstInstanceId,
   const uint16_t count,
@@ -360,7 +376,16 @@ void RaceTracker::AddEffectInstances(
     // улику о ЖИВОЙ стене, и честный слом этой стены после переполнения получал
     // отказ. Место спрашивают ЗАРАНЕЕ (`CanIssueEffectInstances`); если правило
     // всё-таки нарушено, новая запись не делается, но ничего живого не гибнет.
-    if (not CanIssueEffectInstances(casterOid, 1))
+    //
+    // LOA-fix (R71-26, находка ревью 6): ЗДЕСЬ СПРАШИВАЕТСЯ ТОЛЬКО МЕСТО.
+    // Стоял полный `CanIssueEffectInstances(casterOid, 1)` — то есть БЮДЖЕТ ВЫДАЧИ
+    // переспрашивался уже ПОСЛЕ того, как этот же пакет с бюджета списан. На касте,
+    // доводящем кастера ровно до потолка, `alreadyIssued` уже равнялся потолку, и
+    // повторный вопрос «влезет ли ещё один» отвечал «нет»: номер выдан, баф списан,
+    // каст разослан — а записей нет, и честный отчёт по ним получал отказ. Бюджет
+    // теперь считается ровно один раз на пакет, до выдачи номеров; здесь остаётся
+    // фейл-клоуз, который от списания не зависит.
+    if (not HasRoomForOneLiveEffectInstance(casterOid))
       return;
 
     _effectInstances.push_back(
