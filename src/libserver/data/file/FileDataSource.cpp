@@ -2135,6 +2135,27 @@ server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::
 
 bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
 {
+  // ★ТОТ ЖЕ ОТВЕТ, ЧТО У ГИЛЬДИЙ, И ПО ТОЙ ЖЕ ПРИЧИНЕ (правка ревью, итерация
+  // 7). Структурный гейт у персонажей есть, но он стоит в ПОИСКЕ
+  // (`RetrieveCharacterUidByName`), а поиск отвечает «не нашёл» — и здесь это
+  // превращалось в «имя свободно». Персонаж, созданный с именем, которое
+  // физически не может лежать на диске (управляющий байт, разделитель пути,
+  // длиннее потолка индекса), был бы НАВСЕГДА НЕАДРЕСУЕМ: подарок, приглашение
+  // в заезд, друг и письмо ходят через тот же поиск, который это имя отбивает.
+  //
+  // Создание обязано отказать, а не выдать «свободно», — ровно как у гильдий.
+  // Направление отличается от поиска намеренно: поиск отвечает «такого нет»,
+  // создание — «так назвать нельзя». Сегодня оба вызывающих
+  // (`LobbyNetworkHandler`, `RanchDirector`) зовут `locale::IsNameValid` с
+  // потолком 18 байт до этого места, то есть свойство держалось их
+  // вежливостью; правило переезжает в хранилище, где ему и место.
+  if (not server::util::IsStorableNameShaped(
+    name, _characterNameCeiling.load(std::memory_order::relaxed)))
+  {
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    return false;
+  }
+
   // Имя, которое индекс РАЗРЕШАЕТ, занято — тут спорить не о чем.
   if (RetrieveCharacterUidByName(name) != data::InvalidUid)
     return false;

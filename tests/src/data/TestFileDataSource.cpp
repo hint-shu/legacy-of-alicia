@@ -255,6 +255,37 @@ void TestGuildNameCeilingComesFromTheIndex()
   std::filesystem::remove_all(root, error);
 }
 
+//! ★И ТО ЖЕ ПРАВИЛО ДЛЯ ПЕРСОНАЖА — ОДИН КЛАСС, ОДНО ПРАВИЛО.
+//!
+//! Гейт у персонажей стоял в ПОИСКЕ, а поиск отвечает «не нашёл»; проверка
+//! уникальности читала этот ответ как «свободно». Персонаж, созданный с именем,
+//! которого не может быть на диске, оказался бы навсегда неадресуем — подарок,
+//! приглашение в заезд, друг и письмо ходят через тот же поиск, который это имя
+//! отбивает. Чинить второе место списком было бы возвратом к «перечню сайтов»:
+//! правило одно и живёт в хранилище.
+void TestCharacterNameGateRefusesUnstorableNames()
+{
+  const auto root = MakeSandbox("character-name-gate");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "4.json", R"({"uid": 4, "name": "Echo"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  // Контроль направления: гейт не имеет права быть «всегда занято».
+  assert(not source.IsCharacterNameUnique("Echo"));    // занято индексом
+  assert(source.IsCharacterNameUnique("Foxtrot"));     // свободно
+
+  // Имя, которого не может быть на диске, — отказ в создании, а не «свободно».
+  assert(not source.IsCharacterNameUnique(std::string("Bad\x01Name")));
+  assert(not source.IsCharacterNameUnique("../../etc/passwd"));
+  assert(not source.IsCharacterNameUnique(""));
+  assert(not source.IsCharacterNameUnique(std::string(4096, 'x')));
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
 } // namespace
 
 int main()
@@ -264,5 +295,6 @@ int main()
   TestUnreadableRecordMakesEveryNameTaken();
   TestGuildNameGateRefusesUnstorableNames();
   TestGuildNameCeilingComesFromTheIndex();
+  TestCharacterNameGateRefusesUnstorableNames();
   std::puts("TestFileDataSource: ok");
 }
