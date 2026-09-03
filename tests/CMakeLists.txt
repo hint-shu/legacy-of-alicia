@@ -99,6 +99,14 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_field_init.py --selftest)
     add_test(NAME ToolFieldInitGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_field_init.py)
+    # R77. Same reasoning as the two gates above: an oracle nobody runs is not an
+    # oracle. The expected finding count is a property of the BRANCH -- 0 on the
+    # candidate, non-zero on the data negatives -- so the round builder passes
+    # --expect, while here it guards the tree that ships.
+    add_test(NAME ToolDnaVsStockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py --selftest)
+    add_test(NAME ToolDnaVsStockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_dna_vs_stock.py)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

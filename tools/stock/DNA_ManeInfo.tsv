@@ -1,0 +1,9 @@
+ShapeID	Name	FileName	InheritanceRate	LimitGrade	ChildGrade0	CalibRatio0	ChildGrade1	CalibRatio1	ChildGrade2	CalibRatio2	ChildGrade3	CalibRatio3	ChildGrade4	CalibRatio4	Rare	PCBangExcept
+1	средне-короткая	h000_hma000_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0
+2	средняя	h000_hma001_thumbnail.png	20.000000	6	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	2	0
+3	стриженая	h000_hma003_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0
+4	короткая	h000_hma004_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	1
+5	очень короткая	h000_hma005_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	0
+6	ёжиком	h000_hma006_thumbnail.png	30.000000	1	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	1	1
+7	длинная	h000_hma007_thumbnail.png	15.000000	4	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	2	0
+8	длинная волнистая	h000_hma002_thumbnail.png	5.000000	7	0	0.000000	0	0.000000	0	0.000000	0	0.000000	0	0.000000	2	0
