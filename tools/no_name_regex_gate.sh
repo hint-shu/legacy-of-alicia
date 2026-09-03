@@ -29,9 +29,23 @@
 #   writes itself. If the pattern or grep were broken, "0 offenders" would be a
 #   false green — so a canary that does not match is ОСТАНОВ, not a pass.
 #
+#   ★A SECOND CANARY, IN THE FORMS THE OLD GATE COULD NOT SEE (review iteration
+#   7). The gate used to grep the RAW text, so `#include /**/ <regex>` and
+#   `std/**/::/**/regex rg(name)` — both perfectly ordinary C++ once comments
+#   are removed — produced zero hits: the class-closing gate would have accepted
+#   the regression it exists to refuse. The tree is now scanned AFTER the same
+#   translation phases the two Python gates apply (line splicing, comment
+#   removal, digraphs — `tools/secret_write_gate.py --normalize`), and the second
+#   canary is written in exactly those two forms. If normalisation is missing or
+#   broken, that canary misses and the gate stops instead of printing ЧИСТО.
+#
 # USAGE
 #   bash tools/no_name_regex_gate.sh
 #   ROOT=/tmp/some/other/checkout bash tools/no_name_regex_gate.sh
+#
+# DEPENDENCIES
+#   python3 and tools/secret_write_gate.py (the shared normaliser). Their absence
+#   is ОСТАНОВ, never a silent raw-text scan.
 #
 # ENV
 #   ROOT               default: the repository this script lives in
@@ -46,7 +60,14 @@ set -uo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REGEX_MIN_FILES="${REGEX_MIN_FILES:-14}"
 SCOPE="src/libserver/data include/libserver/data"
-PATTERN='std::regex|std::basic_regex|#[[:space:]]*include[[:space:]]*<regex>'
+# ★ПРОБЕЛЫ ДОПУСКАЮТСЯ ВЕЗДЕ, ГДЕ ИХ ДОПУСКАЕТ КОМПИЛЯТОР (правка ревью,
+# итерация 7). Текст сюда приходит НОРМАЛИЗОВАННЫМ (склейка строк + вычистка
+# комментариев + диграфы, `tools/secret_write_gate.py --normalize`), а
+# комментарий между токенами оставляет после себя пробелы: `std/**/::/**/regex`
+# становится `std    ::    regex`. Прежний шаблон, писанный без пробелов, на
+# такой — совершенно законной — записи давал НОЛЬ совпадений.
+PATTERN='std[[:space:]]*::[[:space:]]*(basic_)?regex|#[[:space:]]*include[[:space:]]*<[[:space:]]*regex[[:space:]]*>'
+NORMALIZER="$ROOT/tools/secret_write_gate.py"
 
 for d in $SCOPE; do
   [ -d "$ROOT/$d" ] || { echo "ОСТАНОВ: нет каталога $ROOT/$d — считать нечего"; exit 2; }
@@ -86,6 +107,46 @@ if [ "$CANARY_HITS" -lt 3 ]; then
   exit 2
 fi
 
+# Blindness guard #1b: THE NORMALIZER MUST BE THERE AND MUST WORK (правка ревью,
+# итерация 7). Ищем мы теперь не по сырому тексту, а по нормализованному; если
+# нормализатор отсутствует или падает, «ноль нарушителей» означает «мы ничего не
+# прочитали». Канарейка написана в тех самых формах, на которых прежний гейт
+# давал ноль: комментарий между токенами.
+command -v python3 >/dev/null 2>&1 || {
+  echo "ОСТАНОВ: нет python3 — нормализовать текст нечем, а грепать сырой текст"
+  echo "         значит снова не видеть \`std/**/::/**/regex\`."
+  exit 2
+}
+[ -f "$NORMALIZER" ] || {
+  echo "ОСТАНОВ: нет '$NORMALIZER' — нормализовать текст нечем."
+  exit 2
+}
+CANARY2="$(mktemp 2>/dev/null)" || CANARY2=""
+if [ -z "$CANARY2" ] || [ ! -f "$CANARY2" ]; then
+  echo "ОСТАНОВ: не удалось создать вторую канарейку (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$CANARY2"' EXIT
+if ! {
+  echo '#include /**/ <regex>'
+  echo 'std/**/::/**/regex rg(name);'
+} > "$CANARY2"; then
+  echo "ОСТАНОВ: не удалось записать вторую канарейку '$CANARY2'."
+  exit 2
+fi
+CANARY2_HITS="$(python3 "$NORMALIZER" --normalize "$CANARY2" | grep -cE "$PATTERN" || true)"
+case "$CANARY2_HITS" in
+  ''|*[!0-9]*)
+    echo "ОСТАНОВ: нормализованная канарейка вернула не число ('$CANARY2_HITS')."
+    exit 2
+    ;;
+esac
+if [ "$CANARY2_HITS" -lt 2 ]; then
+  echo "ОСТАНОВ: нормализованная канарейка дала $CANARY2_HITS совпадений из 2 —"
+  echo "         нормализатор или шаблон сломаны, ноль нарушителей читать нельзя."
+  exit 2
+fi
+
 # Blindness guard #2: how many files exist vs how many grep actually opened.
 #
 # ★ОШИБКИ ОБХОДА ЛОВЯТСЯ, А НЕ ГЛУШАТСЯ (правка ревью, итерация 2). Прежняя
@@ -115,33 +176,49 @@ if [ "$FIND_RC" -ne 0 ] || [ -s "$SCAN_ERR" ]; then
 fi
 FOUND="$(printf '%s\n' "$FILE_LIST" | grep -c . || true)"
 
-SCAN_LIST="$(cd "$ROOT" && grep -rac --binary-files=text '' $SCOPE 2>"$SCAN_ERR")"
-SCAN_RC=$?
-if [ "$SCAN_RC" -gt 1 ] || [ -s "$SCAN_ERR" ]; then
-  echo "ОСТАНОВ: подсчёт открытых файлов (grep) завершился с кодом $SCAN_RC и сообщениями:"
-  sed 's/^/         /' "$SCAN_ERR"
-  echo "         часть дерева не прочитана — «ноль нарушителей» читать нельзя."
-  exit 2
-fi
-SCANNED="$(printf '%s\n' "$SCAN_LIST" | grep -c . || true)"
-
 if [ "$FOUND" -lt "$REGEX_MIN_FILES" ]; then
   echo "ОСТАНОВ: под «$SCOPE» найдено $FOUND файлов, ожидалось не меньше $REGEX_MIN_FILES"
   echo "         ноль нарушителей на неполном дереве — это не «чисто», это слепота."
   exit 2
 fi
+
+# ★СКАНИРУЕТСЯ НОРМАЛИЗОВАННЫЙ ТЕКСТ, ФАЙЛ ЗА ФАЙЛОМ (правка ревью, итерация 7).
+# `grep -r` по сырому дереву не видел ни `#include /**/ <regex>`, ни
+# `std/**/::/**/regex` — обе формы компилируются и обе давали ноль. Каждый файл
+# прогоняется через те же фазы трансляции, что видят два питоновских гейта;
+# отказ нормализатора на ЛЮБОМ файле — ОСТАНОВ, а не пропуск.
+SCANNED=0
+OFFENDERS=""
+NORMALIZED="$(mktemp 2>/dev/null)" || NORMALIZED=""
+if [ -z "$NORMALIZED" ] || [ ! -f "$NORMALIZED" ]; then
+  echo "ОСТАНОВ: не удалось создать файл для нормализованного текста (mktemp)."
+  exit 2
+fi
+trap 'rm -f "$CANARY" "$CANARY2" "$SCAN_ERR" "$NORMALIZED"' EXIT
+
+while IFS= read -r RELATIVE; do
+  [ -n "$RELATIVE" ] || continue
+  if ! python3 "$NORMALIZER" --normalize "$ROOT/$RELATIVE" > "$NORMALIZED" 2>"$SCAN_ERR"; then
+    echo "ОСТАНОВ: нормализация '$RELATIVE' не удалась:"
+    sed 's/^/         /' "$SCAN_ERR"
+    echo "         непрочитанный файл делает «ноль нарушителей» бессмысленным."
+    exit 2
+  fi
+  SCANNED=$((SCANNED + 1))
+  HITS="$(grep -nE "$PATTERN" "$NORMALIZED" || true)"
+  if [ -n "$HITS" ]; then
+    OFFENDERS="$OFFENDERS$(printf '%s\n' "$HITS" | sed "s|^|$RELATIVE:|")
+"
+  fi
+done <<EOF
+$FILE_LIST
+EOF
+
 if [ "$SCANNED" -ne "$FOUND" ]; then
-  echo "ОСТАНОВ: grep открыл $SCANNED файлов из $FOUND — часть дерева не просканирована."
+  echo "ОСТАНОВ: нормализовано $SCANNED файлов из $FOUND — часть дерева не просканирована."
   exit 2
 fi
 
-OFFENDERS="$(cd "$ROOT" && grep -rnE --binary-files=text "$PATTERN" $SCOPE 2>"$SCAN_ERR")"
-GREP_RC=$?
-if [ "$GREP_RC" -gt 1 ] || [ -s "$SCAN_ERR" ]; then
-  echo "ОСТАНОВ: сканирование (grep) завершилось с кодом $GREP_RC и сообщениями:"
-  sed 's/^/         /' "$SCAN_ERR"
-  exit 2
-fi
 if [ -z "$OFFENDERS" ]; then
   COUNT=0
 else

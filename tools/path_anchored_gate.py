@@ -79,8 +79,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 #  разъехаться молча, и тогда один гейт видит форму, которой другой не видит.
 from secret_write_gate import (  # noqa: E402
     blank_literal_contents,
+    normalize_alternative_tokens,
     splice_line_continuations,
     strip_comments,
+    unreadable_literals,
 )
 
 SCOPES = ("src/libserver/data", "include/libserver/data")
@@ -103,6 +105,32 @@ FORBIDDEN = {
     "fstream": "server::util::ReadManagedFile / WriteFileAtomically",
 }
 
+#! ПСЕВДОНИМ ПРОСТРАНСТВА ИМЁН — НАРУШЕНИЕ САМ ПО СЕБЕ (правка ревью, итерация 7).
+#
+#  ★ЗАЧЕМ. `namespace fs = std::filesystem;` + `fs::remove(path);` — обычнейший
+#  способ написать ровно то, что гейт запрещает, и он давал НОЛЬ нарушений:
+#  ключ гейта — квалификатор `std`/`filesystem` перед именем, а после псевдонима
+#  ни того, ни другого в тексте нет. То есть заявленное «правило всего слоя»
+#  было правилом одного НАПИСАНИЯ.
+#
+#  ★ПОЧЕМУ ЗАПРЕТ, А НЕ РАЗРЕШЕНИЕ ПСЕВДОНИМА. Разрешать значит вести таблицу
+#  псевдонимов по всей единице трансляции, включая псевдоним псевдонима и
+#  псевдоним, объявленный в заголовке, — то есть писать второй компилятор.
+#  Запретить дешевле и честнее: в этих двух каталогах сегодня НОЛЬ псевдонимов
+#  файловой системы (проверено), помощники зовутся полным именем, и тот, кому
+#  псевдоним понадобится, обязан сперва научить гейт его читать.
+#
+#  То же и для `using namespace std::filesystem;` и `using std::filesystem::X;`:
+#  после них имя пишется голым, и ключ по квалификатору не срабатывает.
+ALIAS_PATTERNS = (
+  (re.compile(r"\bnamespace\s+\w+\s*=\s*(?:::)?(?:std\s*::\s*)?filesystem\b"),
+   "псевдоним пространства имён файловой системы"),
+  (re.compile(r"\busing\s+namespace\s+(?:::)?(?:std\s*::\s*)?filesystem\b"),
+   "`using namespace` файловой системы"),
+  (re.compile(r"\busing\s+(?:::)?(?:std\s*::\s*)?filesystem\s*::\s*\w+"),
+   "`using`-объявление имени файловой системы"),
+)
+
 #! `std::filesystem::remove`, `filesystem::remove`, `std::remove` — все формы
 #  квалификации одного имени. Ключ — САМО ИМЯ с квалификатором `std`/
 #  `filesystem` перед ним; голое `remove(` (например `bucket.erase`-подобные
@@ -117,9 +145,30 @@ def analyse(text: str, origin: str) -> list[tuple[str, str]]:
     """Нарушения одной единицы трансляции."""
     spliced, source_line = splice_line_continuations(text)
     code = strip_comments(spliced)
-    scan = blank_literal_contents(code)
+    # ★ТЕ ЖЕ ФАЗЫ, ЧТО У СЕКРЕТНОГО ГЕЙТА, ВКЛЮЧАЯ СЫРЫЕ ЛИТЕРАЛЫ И ДИГРАФЫ
+    # (правка ревью, итерация 7): один лексер на оба гейта, потому что две копии
+    # одной фазы умеют разъехаться молча.
+    scan = normalize_alternative_tokens(blank_literal_contents(code))
 
     violations: list[tuple[str, str]] = []
+
+    def where(offset: int) -> str:
+        line = source_line[offset] if offset < len(source_line) else 0
+        return f"{origin}:{line}"
+
+    for offset in unreadable_literals(spliced):
+        violations.append(
+            (where(offset),
+             "незакрытый сырой строковый литерал — дальше файл не читается, "
+             "и «ноль нарушений» здесь ничего не значит"))
+
+    for pattern, what in ALIAS_PATTERNS:
+        for alias in pattern.finditer(scan):
+            violations.append(
+                (where(alias.start()),
+                 f"{what} — после него запрещённое имя пишется без "
+                 f"квалификатора, и правило слоя перестаёт быть правилом"))
+
     for match in PATTERN.finditer(scan):
         # Только КВАЛИФИЦИРОВАННОЕ обращение: `std::` или `filesystem::` перед
         # именем — квалификатор входит в САМО совпадение. Иначе поле структуры с
@@ -176,6 +225,19 @@ SELFTEST_FIXTURES = [
      "  command.rename = true;\n  guild.rename();\n"),
     ("имя, разрезанное переводом строки, всё равно имя", 1,
      "  std::filesystem::rem\\\nove(dataFilePath);\n"),
+    # ★ФИКСТУРЫ ИТЕРАЦИИ 7: формы, на которых проба ревью получила ноль.
+    ("псевдоним пространства имён прячет запрещённое имя", 1,
+     "  namespace fs = std::filesystem;\n  fs::remove(path);\n"),
+    ("`using namespace` файловой системы — то же самое", 1,
+     "  using namespace std::filesystem;\n  remove(path);\n"),
+    # Два нарушения намеренно: и само `using`-объявление, и квалифицированное
+    # имя внутри него. Гейт называет обе причины, а не выбирает одну.
+    ("`using`-объявление имени — то же самое", 2,
+     "  using std::filesystem::remove;\n  remove(path);\n"),
+    ("сырой литерал с кавычкой и слэшами не сбивает лексер", 1,
+     '  const char* s = R"(a \" // b)";\n  std::filesystem::remove(p);\n'),
+    ("незакрытый сырой литерал — не «чисто»", 1,
+     '  const char* s = R"delim(never closed;\n'),
     ("разрешённые помощники — чисто", 0,
      "  server::util::RemoveManagedFile(dataFilePath);\n"
      "  server::util::CreateManagedDirectories(root);\n"

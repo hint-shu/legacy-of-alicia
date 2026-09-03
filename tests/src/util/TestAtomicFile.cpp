@@ -774,11 +774,18 @@ void TestOversizedRecordIsRefusedWithoutReading(
   assert(read.status == server::util::ManagedReadStatus::Refused);
   assert(read.content.empty());
 
-  // А запись ровно по потолку читается: граница отсекает лишнее, а не живое.
+  // ★ЗАПИСЬ РОВНО ПО ПОТОЛКУ ЧИТАЕТСЯ, И ЭТО ПРОВЕРЯЕТСЯ НА САМОЙ ГРАНИЦЕ
+  // (правка ревью, итерация 7). Прежний контроль писал крошечный файл, то есть
+  // читатель с ошибочным `>=` прошёл бы его так же успешно — контроль ничего не
+  // различал. Файл разрежённый: на диске занимает почти ничего.
   const auto atCeiling = directory / "AtCeiling.json";
   SeedFile(atCeiling, 0600);
+  assert(::truncate(
+    atCeiling.c_str(),
+    static_cast<off_t>(server::util::kMaxManagedRecordBytes)) == 0);
   const auto ok = server::util::ReadManagedFile(atCeiling, FileSensitivity::Public);
   assert(ok.status == server::util::ManagedReadStatus::Ok);
+  assert(ok.content.size() == server::util::kMaxManagedRecordBytes);
 
   std::error_code cleanup;
   std::filesystem::remove_all(directory, cleanup);
@@ -917,6 +924,16 @@ void TestManagedCreateAndRemoveRefuseSymlinkedDirectories(
   // Отсутствующая запись — успех, а не отказ (прежний `remove` вёл себя так же).
   assert(server::util::RemoveManagedFile(mine));
 
+  // ★НАСТОЯЩАЯ НЕУДАЧА УДАЛЕНИЯ ВОЗВРАЩАЕТ `false`, А НЕ «УСПЕХ» (правка ревью,
+  // итерация 7). Именно этот вердикт вызывающие обязаны читать: удаление,
+  // которое не состоялось, оставляет запись жить после того, как сервер счёл её
+  // снятой. Каталог на месте записи даёт `EISDIR` у `unlinkat` независимо от
+  // прав — то есть утверждение верно и под root-армом.
+  const auto stubborn = root / "real" / "items" / "18.json";
+  std::filesystem::create_directories(stubborn);
+  assert(not server::util::RemoveManagedFile(stubborn));
+  assert(std::filesystem::exists(stubborn));
+
   std::error_code cleanup;
   std::filesystem::remove_all(root, cleanup);
   std::filesystem::remove_all(foreign, cleanup);
@@ -955,7 +972,29 @@ void TestSweepStaysInsideTheDataTree(const std::filesystem::path& sandbox)
   // …а чужое дерево уборка не увидела вовсе.
   assert(std::filesystem::exists(theirs));
 
+  // ★А ВОТ ЭТО И ЕСТЬ РАЗЛИЧАЮЩЕЕ УТВЕРЖДЕНИЕ (правка ревью, итерация 7).
+  // Проверка выше проходила и на ПРЕЖНЕЙ, путевой уборке: `recursive_directory_
+  // iterator` в ДОЧЕРНЮЮ ссылку не заходит, поэтому чужой файл выживал и без
+  // единой правки — тест наблюдал не то свойство, которое объявлял. Ссылка на
+  // месте САМОГО КОРНЯ обхода различает редакции: путевой итератор корень
+  // разрешает и удаляет чужой `.tmp` за деревом, а уборка от дескриптора
+  // открывает корень с `O_NOFOLLOW` и отказывается работать вовсе.
+  const auto rootLink = sandbox / "sweep-root-link";
+  std::filesystem::remove(rootLink, linkError);
+  std::filesystem::create_directory_symlink(foreign, rootLink, linkError);
+  assert(not linkError);
+
+  server::util::SweepStaleTemporaries(rootLink);
+  assert(std::filesystem::exists(theirs));
+
+  // Контроль направления: тот же мусор в НАСТОЯЩЕМ корне убирается.
+  const auto mineAgain = root / "characters" / "8.json.tmp";
+  SeedFile(mineAgain, 0644);
+  server::util::SweepStaleTemporaries(root);
+  assert(not std::filesystem::exists(mineAgain));
+
   std::error_code cleanup;
+  std::filesystem::remove(rootLink, cleanup);
   std::filesystem::remove_all(root, cleanup);
   std::filesystem::remove_all(foreign, cleanup);
 }
@@ -991,11 +1030,27 @@ void TestUnexaminedListedPathsAreNotPublishable(
   std::filesystem::remove(vanishing, removal);
   assert(not removal);
 
+  // ★КАТАЛОГ УВОДИТСЯ В СТОРОНУ, А НА ЕГО ИМЯ СТАВИТСЯ ДРУГОЙ (правка ревью,
+  // итерация 7). Прежний тест доказывал лишь то, что дескриптор ОТКРЫТ:
+  // редакция, которая разрешает путь заново, проходила его так же. Здесь между
+  // фазами по ИМЕНИ каталога лежит уже другой инод — и сужение обязано
+  // работать по тому, который перечислял обход, а до подменыша не дотянуться.
+  const auto movedAside = sandbox / "unexamined-moved";
+  std::error_code renameError;
+  std::filesystem::rename(directory, movedAside, renameError);
+  assert(not renameError);
+  std::filesystem::create_directories(directory);
+  const auto impostor = directory / "Impostor.json";
+  SeedFile(impostor, 0644);
+
   const auto hardening = server::util::HardenSecretFiles(listing);
 
-  // Оставшийся файл сужен и публикуем…
-  assert(ModeOf(staying) == 0600);
+  // Оставшийся файл сужен и публикуем — по дескриптору обхода, то есть уже в
+  // уведённом каталоге…
+  assert(ModeOf(movedAside / "Stays.json") == 0600);
   assert(hardening.narrowed == 1);
+  // …подменыш под тем же ИМЕНЕМ каталога не тронут вовсе…
+  assert(ModeOf(impostor) == 0644);
   // …а исчезнувший НАЗВАН непубликуемым, а не пропущен молча.
   assert(hardening.unsecured.size() == 1);
   assert(hardening.unsecured.front() == vanishing);
@@ -1004,6 +1059,7 @@ void TestUnexaminedListedPathsAreNotPublishable(
 
   std::error_code cleanup;
   std::filesystem::remove_all(directory, cleanup);
+  std::filesystem::remove_all(movedAside, cleanup);
 }
 
 //! ★ССЫЛКА НА МЕСТЕ САМОГО КАТАЛОГА ТОЖЕ ОТВЕРГАЕТСЯ.

@@ -54,6 +54,12 @@ target_sources(util_test_atomic_file PRIVATE
 target_link_libraries(util_test_atomic_file
         PRIVATE project-properties alicia-libserver)
 
+add_executable(data_test_file_data_source)
+target_sources(data_test_file_data_source PRIVATE
+        src/data/TestFileDataSource.cpp)
+target_link_libraries(data_test_file_data_source
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(race_test_p2did_pool)
 target_sources(race_test_p2did_pool PRIVATE
         src/race/TestP2dIdPool.cpp)
@@ -134,6 +140,7 @@ add_test(NAME UtilTestProfiler COMMAND util_test_profiler)
 add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
 add_test(NAME UtilTestNameGuard COMMAND util_test_name_guard)
 add_test(NAME UtilTestAtomicFile COMMAND util_test_atomic_file)
+add_test(NAME DataTestFileDataSource COMMAND data_test_file_data_source)
 add_test(NAME RaceTestP2dIdPool COMMAND race_test_p2did_pool)
 add_test(NAME RegistryTestHorseTables COMMAND registry_test_horse_tables)
 add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)

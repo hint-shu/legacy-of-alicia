@@ -155,6 +155,93 @@ def splice_line_continuations(text: str) -> tuple[str, list[int]]:
     return "".join(out), lines
 
 
+#! НАЧАЛО СЫРОГО ЛИТЕРАЛА (`R"delim(` с любым допустимым префиксом).
+#
+#  ★ЗАЧЕМ (правка ревью, итерация 7). Сырой литерал — это форма, в которой `"`
+#  и `//` НЕ являются ни кавычкой, ни комментарием. Рукописный лексер, не
+#  знающий о ней, на первом же таком литерале ТЕРЯЕТ СИНХРОНИЗАЦИЮ: дальше он
+#  читает код как строку, а строку как код, и любой плохой вызов ПОСЛЕ него
+#  становится невидимым — при этом пол числа вызовов держится существующими
+#  вызовами ДО него, то есть гейт остаётся зелёным. Проба ревью это показала.
+RAW_STRING_START = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n]{0,16})\(')
+
+
+def raw_string_span(text: str, index: int) -> tuple[int, int] | None:
+    """Если по смещению `index` начинается сырой литерал — вернуть (начало
+    содержимого, конец литерала). `конец == -1` означает НЕЗАКРЫТЫЙ литерал:
+    такой файл гейт прочитать не может и обязан сказать это вслух."""
+    if index > 0 and (text[index - 1].isalnum() or text[index - 1] == "_"):
+        return None
+    match = RAW_STRING_START.match(text, index)
+    if match is None:
+        return None
+    terminator = ")" + match.group(1) + '"'
+    end = text.find(terminator, match.end())
+    if end < 0:
+        return match.end(), -1
+    return match.end(), end + len(terminator)
+
+
+def unreadable_literals(text: str) -> list[int]:
+    """Смещения НЕЗАКРЫТЫХ сырых литералов. Пусто — файл читаем."""
+    problems: list[int] = []
+    index = 0
+    size = len(text)
+    while index < size:
+        symbol = text[index]
+        pair = text[index : index + 2]
+        if pair == "//":
+            end = text.find("\n", index)
+            index = size if end < 0 else end
+            continue
+        if pair == "/*":
+            end = text.find("*/", index + 2)
+            index = size if end < 0 else end + 2
+            continue
+        if symbol in "RuUL":
+            span = raw_string_span(text, index)
+            if span is not None:
+                if span[1] < 0:
+                    problems.append(index)
+                    break
+                index = span[1]
+                continue
+        if symbol in "\"'":
+            quote = symbol
+            index += 1
+            while index < size:
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return problems
+
+
+#! АЛЬТЕРНАТИВНЫЕ ТОКЕНЫ ПРЕПРОЦЕССОРА (диграфы). `%:` — это `#`, `%:%:` — это
+#  `##`, и обе формы компилируются ровно как их привычные написания.
+#
+#  ★ЗАЧЕМ (правка ревью, итерация 7). `%:define Secret Public` — законный C++,
+#  делающий `Secret` синонимом `Public`; гейт, ищущий `#define`, его не видел,
+#  и вызов, НАПИСАННЫЙ как Secret, компилировался как Public при зелёном гейте.
+#
+#  ★ДЛИНА СОХРАНЯЕТСЯ (`%:` -> `# `), потому что смещения этого текста делятся с
+#  текстом аргументов: сдвиг на один байт сделал бы отчёт указывающим не туда, а
+#  разбор аргументов — читающим не то.
+#
+#  ★СКОБОЧНЫЕ ДИГРАФЫ (`<%`, `%>`, `<:`, `:>`) НАМЕРЕННО НЕ НОРМАЛИЗУЮТСЯ. Они
+#  не могут изменить ни ИМЯ вызываемого, ни ПЕРЕДАВАЕМЫЙ перечислитель, а у `<:`
+#  есть исключение лексера (`<::` не диграф), которое наивная замена прочитала бы
+#  неверно — то есть завела бы ложно-красный там, где сегодня чисто.
+def normalize_alternative_tokens(scan: str) -> str:
+    """Приводит диграфы препроцессора к привычному написанию, сохраняя длину."""
+    return scan.replace("%:%:", "##  ").replace("%:", "# ")
+
+
 def strip_comments(text: str) -> str:
     """Заменяет содержимое комментариев пробелами, сохраняя длину и переводы строк.
 
@@ -185,6 +272,15 @@ def strip_comments(text: str) -> str:
                 for character in text[index:end]))
             index = end
             continue
+        # ★СЫРОЙ ЛИТЕРАЛ ПЕРЕПИСЫВАЕТСЯ ЦЕЛИКОМ И НЕ РАЗБИРАЕТСЯ: внутри него
+        # `//` — это два символа, а не комментарий (правка ревью, итерация 7).
+        if symbol in "RuUL":
+            span = raw_string_span(text, index)
+            if span is not None:
+                end = size if span[1] < 0 else span[1]
+                out.append(text[index:end])
+                index = end
+                continue
         if symbol in "\"'":
             quote = symbol
             out.append(symbol)
@@ -223,6 +319,17 @@ def blank_literal_contents(code: str) -> str:
     size = len(code)
     while index < size:
         symbol = code[index]
+        # ★СОДЕРЖИМОЕ СЫРОГО ЛИТЕРАЛА ОБНУЛЯЕТСЯ ТАК ЖЕ, КАК У ОБЫЧНОГО, но его
+        # границы читаются по своему правилу (правка ревью, итерация 7).
+        if symbol in "RuUL":
+            span = raw_string_span(code, index)
+            if span is not None:
+                end = size if span[1] < 0 else span[1]
+                out.append("".join(
+                    "\n" if character == "\n" else " "
+                    for character in code[index:end]))
+                index = end
+                continue
         if symbol in "\"'":
             quote = symbol
             out.append(symbol)
@@ -301,6 +408,11 @@ def decode_escapes(raw: str) -> str | None:
     return "".join(out)
 
 
+#! Метка «этот кусок пришёл из сырого литерала»: символ, который не может
+#  встретиться в исходнике (U+0000).
+RAW_MARKER = "\x00"
+
+
 def fold_string_literals(argument: str) -> str | None:
     """Склеивает соседние строковые литералы в один канонический литерал.
 
@@ -316,6 +428,21 @@ def fold_string_literals(argument: str) -> str | None:
         if symbol.isspace():
             index += 1
             continue
+        # ★СЫРОЙ ЛИТЕРАЛ — ЭТО ТОЖЕ ЯРЛЫК, И ЧИТАЕТСЯ ОН ДОСЛОВНО (правка ревью,
+        # итерация 7). Без этой ветки `R"(User file)"` объявлялся бы нечитаемым
+        # ярлыком, то есть гейт был бы ложно-КРАСНЫМ на законной записи.
+        if symbol in "RuUL":
+            span = raw_string_span(argument, index)
+            if span is not None:
+                if span[1] < 0:
+                    return None
+                # содержимое: от начала после `(` до закрывающей `)`
+                closing = argument.rfind(")", span[0], span[1])
+                if closing < 0:
+                    return None
+                pieces.append(RAW_MARKER + argument[span[0]:closing])
+                index = span[1]
+                continue
         if symbol != '"':
             return None
         index += 1
@@ -342,6 +469,12 @@ def fold_string_literals(argument: str) -> str | None:
     # потом значило бы прочитать `"User\x20" "file"` иначе, чем компилятор.
     decoded: list[str] = []
     for piece in pieces:
+        # В сыром литерале экранирования нет по определению: `\n` там — два
+        # символа. Раскрывать его как обычный означало бы прочитать ярлык иначе,
+        # чем его читает компилятор.
+        if piece.startswith(RAW_MARKER):
+            decoded.append(piece[len(RAW_MARKER):])
+            continue
         value = decode_escapes(piece)
         if value is None:
             return None
@@ -423,11 +556,22 @@ def analyse(text: str, origin: str) -> tuple[list[tuple[str, str]], int]:
         line = source_line[offset] if offset < len(source_line) else 0
         return f"{origin}:{line}"
 
+    # ★НЕЗАКРЫТЫЙ СЫРОЙ ЛИТЕРАЛ — ЭТО «НЕ МОГУ ПРОЧИТАТЬ», А НЕ «ЧИСТО» (правка
+    # ревью, итерация 7). Дальше по файлу лексер всё равно разъедется, и любой
+    # плохой вызов после него стал бы невидимым.
+    for offset in unreadable_literals(spliced):
+        violations.append(
+            (where(offset),
+             "незакрытый сырой строковый литерал — дальше файл не читается, "
+             "и «ноль нарушений» здесь ничего не значит"))
+
     code = strip_comments(spliced)
     # ★ИДЕНТИФИКАТОР ИЩЕТСЯ В ТЕКСТЕ БЕЗ СОДЕРЖИМОГО ЛИТЕРАЛОВ, А АРГУМЕНТЫ
     # РАЗБИРАЮТСЯ ПО ИСХОДНОМУ (правка ревью, итерация 5). Длина сохранена, то
     # есть смещения у обоих видов одни и те же.
-    scan = blank_literal_contents(code)
+    # ★И ДИГРАФЫ ПРИВОДЯТСЯ К ПРИВЫЧНОМУ НАПИСАНИЮ (правка ревью, итерация 7):
+    # `%:define Secret Public` — это `#define`, и читаться он обязан так же.
+    scan = normalize_alternative_tokens(blank_literal_contents(code))
 
     # ★ПЕРЕОПРЕДЕЛЕНИЕ ОХРАНЯЕМОГО ИМЕНИ — НАРУШЕНИЕ САМО ПО СЕБЕ. Гейт не
     # препроцессор и не может сказать, во что превратится `Secret` после
@@ -640,6 +784,35 @@ SELFTEST_FIXTURES = [
   server::util::WriteFileAtomically(
     p, q, "User file", server::util::FileSensitivity::Secret);
 '''),
+    # ★ТРИ ФИКСТУРЫ ИТЕРАЦИИ 7 — обе формы, на которых прямая проба ревью снова
+    # получила «ноль нарушений» от компилирующегося как `Public` кода, плюс
+    # контроль ложно-красного на законной записи с сырым литералом.
+    ("a digraph #define is a #define", 1, '''
+%:define Secret Public
+  server::util::WriteFileAtomically(
+    p, q, "User file", server::util::FileSensitivity::Secret);
+'''),
+    ("a raw string carrying a quote and a comment does not desynchronise", 1, '''
+  const char* sql = R"(SELECT "x" -- // not a comment)";
+  server::util::WriteFileAtomically(
+    p, q, "User file", server::util::FileSensitivity::Public);
+'''),
+    ("a raw-string label is read the way the compiler reads it", 1, '''
+  server::util::WriteFileAtomically(
+    p, q, R"(User file)", server::util::FileSensitivity::Public);
+'''),
+    ("a legitimate raw-string label as Secret is clean", 0, '''
+  server::util::WriteFileAtomically(
+    p, q, R"(User file)", server::util::FileSensitivity::Secret);
+'''),
+    ("an unterminated raw string is unreadable, not clean", 1, '''
+  const char* broken = R"delim(never closed;
+  server::util::WriteFileAtomically(
+    p, q, "Horse file", server::util::FileSensitivity::Public);
+'''),
+    ("a digraph paste is a paste", 1, '''
+#define CLASS(x) server::util::FileSensitivity::Sec %:%: ret
+'''),
     ("the declaration itself is not a call", 0, '''
 inline void WriteFileAtomically(
   const std::filesystem::path& path,
@@ -670,9 +843,37 @@ def selftest() -> int:
     return 0
 
 
+def normalize_file(path: Path) -> str:
+    """Текст файла ПОСЛЕ первых фаз трансляции: склейка строк, вычистка
+    комментариев, диграфы. Содержимое литералов СОХРАНЕНО.
+
+    ★ЗАЧЕМ ОТДЕЛЬНЫЙ ВЫХОД (правка ревью, итерация 7). `no_name_regex_gate.sh`
+    искал запрещённое написание ГРЕПОМ по сырому тексту, и `#include /**/ <regex>`
+    или `std/**/::/**/regex` — законный C++ после вычистки комментариев — давали
+    ноль совпадений. Три гейта обязаны видеть ОДИН И ТОТ ЖЕ текст, иначе «класс
+    закрыт» держится ровно до первого автора, который напишет иначе."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    spliced, _ = splice_line_continuations(text)
+    return normalize_alternative_tokens(strip_comments(spliced))
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
+
+    # ★РЕЖИМ «ПОКАЖИ НОРМАЛИЗОВАННЫЙ ТЕКСТ» — общий вход для остальных гейтов.
+    if "--normalize" in sys.argv:
+        index = sys.argv.index("--normalize")
+        if index + 1 >= len(sys.argv):
+            print("ОСТАНОВ: --normalize требует путь к файлу", file=sys.stderr)
+            return 2
+        target = Path(sys.argv[index + 1])
+        try:
+            sys.stdout.write(normalize_file(target))
+        except OSError as error:
+            print(f"ОСТАНОВ: {target}: {error}", file=sys.stderr)
+            return 2
+        return 0
 
     root = Path(os.environ.get("ROOT", Path(__file__).resolve().parent.parent))
     sources, walk_errors = collect_sources(root)
