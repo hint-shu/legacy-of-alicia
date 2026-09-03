@@ -155,6 +155,14 @@ public:
 private:
   //! An underlying data source of the data director.
   std::unique_ptr<DataSource> _primaryDataSource;
+  //! Тот же источник, но уже опознанный как файловый, — или `nullptr`.
+  //!
+  //! ★УКАЗАТЕЛЬ ЗАПОМИНАЕТСЯ ОДИН РАЗ, А НЕ ОПОЗНАЁТСЯ КАЖДЫЙ ТИК. `Tick`
+  //! крутится в цикле потока директора данных без паузы, и `dynamic_cast` в нём
+  //! был бы платой за факт, который не меняется от создания объекта до его
+  //! разрушения. Владение остаётся у `_primaryDataSource`; это наблюдающий
+  //! указатель на тот же объект.
+  FileDataSource* _fileDataSource{nullptr};
 
   Scheduler _scheduler;
 

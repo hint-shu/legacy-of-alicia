@@ -916,8 +916,94 @@ inline void WriteFileAtomically(
 ]
 
 
-def selftest() -> int:
+#! ═══════════════════════════════════════════════════════════════════════════
+#! ФИКСТУРЫ, КОТОРЫЕ ПРОГОНЯЮТСЯ ЧЕРЕЗ НАСТОЯЩИЙ ВХОД, А НЕ ЧЕРЕЗ `analyse`
+#! (правка ревью, итерация 9, находка 7).
+#
+#  ★ЗАЧЕМ ОТДЕЛЬНЫЙ ВИД САМОПРОВЕРКИ. Дыру нашли ровно там, где самопроверки не
+#  было: `analyse` про склейку токенов сообщала честно, а `main` до неё не
+#  доходил — он пропускал файл, не найдя целого охраняемого имени в сыром
+#  тексте. Самопроверка была зелёной, потому что проверяла ФУНКЦИЮ, а пропуск
+#  жил в ПУТИ СБОРА. Поэтому эти фикстуры — настоящее дерево на диске, и гейт
+#  запускается на нём отдельным процессом, ровно так, как его запускает сборка:
+#  всё, что стоит между файлом и вердиктом, участвует.
+#
+#  Каждая фикстура — (имя, ожидаемый код возврата, ожидаемая подстрока вывода,
+#  {относительный путь: содержимое}).
+TREE_FIXTURES = [
+    ("склейка токенов собирает охраняемое имя из кусков", 2, "макрос-склейка",
+     {"src/probe/Paste.cpp": (
+         "#define JOIN(a, b) a##b\n"
+         "void Store(const Path& p, const Text& d)\n"
+         "{\n"
+         "  server::util::JOIN(WriteFileAtom, ically)(\n"
+         "    p, d, \"User file\", server::util::JOIN(FileSensi, tivity)::Public);\n"
+         "}\n")}),
+    ("псевдоним самого `std`", 2, "псевдоним-std",
+     {"src/probe/Alias.cpp": (
+         "namespace s = std;\n"
+         "void Store(const s::string& d) {}\n")}),
+    ("включение, названное макросом", 2, "включение-через-макрос",
+     {"src/probe/MacroInclude.cpp": (
+         "#define HDR <string>\n"
+         "#include HDR\n")}),
+    ("обычный файл останов не вызывает", 0, "ЧИСТО",
+     {"src/probe/Clean.cpp": (
+         "#include <string>\n"
+         "// сборка имени через ## здесь только в прозе, а не в программе\n"
+         "const char* kNote = \"namespace s = std; a##b\";\n"
+         "void Store(const Text& d)\n"
+         "{\n"
+         "  server::util::WriteFileAtomically(\n"
+         "    p, d, \"User file\", server::util::FileSensitivity::Secret);\n"
+         "}\n")}),
+]
+
+
+def selftest_tree() -> bool:
+    """Гоняет `main` КАК ПРОЦЕСС по настоящим деревьям на диске."""
+    import shutil
+    import subprocess
+    import tempfile
+
     ok = True
+    for name, expected_code, expected_text, files in TREE_FIXTURES:
+        sandbox = Path(tempfile.mkdtemp(prefix="secret-gate-selftest-"))
+        try:
+            for relative, content in files.items():
+                target = sandbox / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            (sandbox / "include").mkdir(exist_ok=True)
+            environment = dict(os.environ)
+            environment["ROOT"] = str(sandbox)
+            # Пол числа вызовов здесь снят намеренно: фикстура проверяет ПУТЬ
+            # СБОРА, а не охват дерева, и пол дал бы код 2 по другой причине —
+            # то есть фикстура согласилась бы случайно.
+            environment["SECRET_MIN_CALLS"] = "0"
+            done = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve())],
+                capture_output=True, text=True, env=environment)
+            problems = []
+            if done.returncode != expected_code:
+                problems.append(f"код {done.returncode}, ожидался {expected_code}")
+            if expected_text not in done.stdout:
+                problems.append(f"в выводе нет «{expected_text}»")
+            verdict = "ok" if not problems else "ПРОВАЛ"
+            if problems:
+                ok = False
+            print(f"  [{verdict}] через main: {name}"
+                  + ("" if not problems else " — " + "; ".join(problems)))
+            if problems:
+                for line in done.stdout.splitlines():
+                    print(f"        {line}")
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    return ok
+
+
+def selftest() -> int:
+    ok = selftest_tree()
     for name, expected, fixture in SELFTEST_FIXTURES:
         violations, _ = analyse(fixture, f"<fixture {name}>")
         got = len(violations)
@@ -966,6 +1052,43 @@ def main() -> int:
             return 2
         return 0
 
+    # ★РЕЖИМ «ТЕКСТ БЕЗ СОДЕРЖИМОГО ЛИТЕРАЛОВ» (правка ревью, итерация 9,
+    # находка 9). `--normalize` НАМЕРЕННО сохраняет содержимое литералов: секретный
+    # гейт читает класс файла именно из них. Но детекция, ключом которой является
+    # ТОКЕН ПРОГРАММЫ, обязана смотреть текст без литералов, иначе обычная строка
+    # `"std::regex"` в сообщении об ошибке становится нарушителем — а ложно-красный
+    # гейт отключают ровно так же, как ложно-зелёный.
+    if "--normalize-code" in sys.argv:
+        index = sys.argv.index("--normalize-code")
+        if index + 1 >= len(sys.argv):
+            print("ОСТАНОВ: --normalize-code требует путь к файлу", file=sys.stderr)
+            return 2
+        target = Path(sys.argv[index + 1])
+        try:
+            sys.stdout.write(blank_literal_contents(normalize_file(target)))
+        except OSError as error:
+            print(f"ОСТАНОВ: {target}: {error}", file=sys.stderr)
+            return 2
+        return 0
+
+    # ★РЕЖИМ «ЧТО В ЭТОМ ФАЙЛЕ Я ПРОЧИТАТЬ НЕ МОГУ» — общий вход для остальных
+    # гейтов, чтобы останов на непрочитываемой форме был ОДИН на все три, а не
+    # три разъезжающиеся копии.
+    if "--unsupported" in sys.argv:
+        index = sys.argv.index("--unsupported")
+        if index + 1 >= len(sys.argv):
+            print("ОСТАНОВ: --unsupported требует путь к файлу", file=sys.stderr)
+            return 2
+        target = Path(sys.argv[index + 1])
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            print(f"ОСТАНОВ: {target}: {error}", file=sys.stderr)
+            return 2
+        for location, reason in unsupported_preprocessing(text, str(target)):
+            print(f"{location}: {reason}")
+        return 0
+
     root = Path(os.environ.get("ROOT", Path(__file__).resolve().parent.parent))
     sources, walk_errors = collect_sources(root)
     if walk_errors:
@@ -979,20 +1102,43 @@ def main() -> int:
         print(f"ОСТАНОВ: под {roots} не найдено ни одного исходника — считать нечего")
         return 2
 
+    # ★СНАЧАЛА — ЧИТАЕТСЯ ЛИ ДЕРЕВО ВООБЩЕ (правка ревью, итерация 9, находки
+    # 7/8/9). Ни один счёт ниже не имеет силы, если файл собирает охраняемое имя
+    # из `##` или переименовывает `std` псевдонимом: имени, которого в тексте
+    # нет, не найдёт ни один регекс, и «нарушений 0» будет означать «я не
+    # смотрел». Политика и код возврата — те же, что у гардов R72.
+    unreadable: list[tuple[str, str]] = []
+    texts: dict[Path, str] = {}
+    for path in sources:
+        relative = str(path.relative_to(root))
+        texts[path] = path.read_text(encoding="utf-8", errors="replace")
+        unreadable += unsupported_preprocessing(texts[path], relative)
+    if unreadable:
+        print("=== secret-write gate ===")
+        print(f"дерево          : {root}")
+        print(f"файлов прочитано: {len(sources)}")
+        print(f"форм вне чтения : {len(unreadable)} (ожидалось 0)")
+        print("ОСТАНОВ: дерево использует форму, которую этот гейт читать не умеет.")
+        for location, reason in unreadable:
+            print(f"  ✗ {location}: {reason}")
+        print("         Имя, собранное из `##`, и `std`, переименованный псевдонимом,")
+        print("         не совпадут ни с одним шаблоном ниже — «нарушений 0» означало бы")
+        print("         «я не смотрел». Пиши обычным образом либо расширяй гейт сознательно.")
+        print("=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ===")
+        return 2
+
     violations: list[tuple[str, str]] = []
     calls = 0
     for path in sources:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        # ★РАННИЙ ВЫХОД СЧИТАЕТ СКЛЕЕННЫЙ ТЕКСТ, А НЕ СЫРОЙ (правка ревью,
-        # итерация 6): `WriteFileAtom\<перевод строки>ically` в сыром тексте
-        # идентификатора НЕ содержит, и файл не читался бы вовсе. Охраняемые
-        # имена проверяются в том же тексте — переопределение обязано быть
-        # видно даже в файле без единого вызова.
-        spliced_text, _ = splice_line_continuations(text)
-        if IDENTIFIER not in spliced_text and not any(
-                name in spliced_text for name in GUARDED_NAMES[1:]):
-            continue
-        found, seen = analyse(text, str(path.relative_to(root)))
+        # ★РАННЕГО ВЫХОДА ЗДЕСЬ БОЛЬШЕ НЕТ (правка ревью, итерация 9, находка 7).
+        # Прежде файл пропускался, если в нём не встречалось ЦЕЛОЕ охраняемое имя
+        # ДО препроцессирования, — а макрос со склейкой строит `WriteFileAtomically`
+        # и `FileSensitivity` из кусков, ни один из которых целым именем не
+        # является. Файл не читался вовсе, и самопроверка этого не ловила, потому
+        # что звала `analyse` напрямую, минуя сам пропуск. Фильтр по написанию,
+        # стоящий ПЕРЕД разбором, — это второй, необъявленный разбор; такого здесь
+        # больше нет: каждый исходник области разбирается.
+        found, seen = analyse(texts[path], str(path.relative_to(root)))
         violations += found
         calls += seen
 

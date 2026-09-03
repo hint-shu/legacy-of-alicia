@@ -53,6 +53,16 @@ namespace
 //! «не чаще раза в пять секунд», сколько бы пакетов и потоков ни пришло.
 constexpr auto kUserIndexReconcileGap = std::chrono::seconds(5);
 
+//! Как часто ПЛАНОВЫЙ проход осматривает индексы имён.
+//!
+//! ★ВЕЛИЧИНА ВЫВЕДЕНА ИЗ СТОИМОСТИ, А НЕ ВЫБРАНА КРАСИВОЙ. Полная перестройка
+//! индекса персонажей на прод-шарде замерена стендом в 0.7-1.0 с; при неполном
+//! индексе (только тогда проход что-то делает) минута между попытками означает
+//! верхнюю границу нагрузки около 1-2 % одного ядра на потоке директора данных
+//! — и при этом «файл починили» становится «имя снова находится в течение
+//! минуты», а не «до следующего перезапуска».
+constexpr auto kScheduledNameIndexRepairGap = std::chrono::seconds(60);
+
 //! ПОЛ ЧАСТОТЫ: раз в минуту промах сверяется с диском ДАЖЕ при совпавшем
 //! отпечатке.
 //!
@@ -1888,6 +1898,56 @@ void server::FileDataSource::DeleteCharacter(data::Uid uid)
   ForgetCharacterName(uid);
 }
 
+void server::FileDataSource::RequestScheduledNameIndexRepair() noexcept
+{
+  // Сдвигаем срок ближайшего планового прохода в прошлое: следующий тик
+  // директора данных осмотрит индексы, не дожидаясь минуты. Ввода-вывода здесь
+  // нет и быть не должно — этот путь достижим именем с провода.
+  _nameIndexMaintenanceLastRun.store(
+    std::chrono::steady_clock::time_point{}, std::memory_order::relaxed);
+}
+
+void server::FileDataSource::TickNameIndexMaintenance() noexcept
+{
+  try
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const auto last =
+      _nameIndexMaintenanceLastRun.load(std::memory_order::relaxed);
+    // Эпоха означает «планового прохода ещё не было»: первый тик после старта
+    // осматривает индексы сразу — ровно тот случай, когда стартовая сборка
+    // вышла неполной и ждать минуту незачем.
+    if (last != std::chrono::steady_clock::time_point{}
+      && now - last < kScheduledNameIndexRepairGap)
+    {
+      return;
+    }
+    _nameIndexMaintenanceLastRun.store(now, std::memory_order::relaxed);
+
+    // Оба индекса, а не только тот, о который кто-то споткнулся: повод здесь
+    // общий и не знает, чьё имя спрашивали.
+    ReconcileCharacterNameIndexIfBroken();
+    ReconcileGuildNameIndexIfBroken();
+  }
+  catch (const std::exception& x)
+  {
+    // Плановый проход не имеет права уронить поток директора данных: индекс
+    // остаётся объявленным неполным, то есть ответ и без ремонта безопасен.
+    try
+    {
+      server::util::QuietLogError(
+        "Name index maintenance: the scheduled pass failed ({}); the indexes "
+        "keep reading every name as taken", x.what());
+    }
+    catch (...)
+    {
+    }
+  }
+  catch (...)
+  {
+  }
+}
+
 void server::FileDataSource::RebuildCharacterNameIndex()
 {
   const std::unique_lock indexLock(_characterNameIndexMutex);
@@ -2193,18 +2253,14 @@ bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
   if (answer.complete)
     return true;
 
-  // ★ПРОМАХ ПО НЕПОЛНОМУ ИНДЕКСУ — НЕ «СВОБОДНО» (правка ревью, итерация 7).
-  // Сначала одна попытка починиться, и только потом ответ; ПОСЛЕ починки снимок
-  // берётся ЗАНОВО и целиком — иначе мы отвечали бы по полноте нового индекса и
-  // содержимому старого, то есть ровно тем расхождением, ради которого снимок и
-  // заведён.
-  ReconcileCharacterNameIndexIfBroken();
-  answer = ReadNameIndexAnswer(
-    _characterNameIndexMutex, _characterNameToUid,
-    _characterNameIndexComplete, key);
-  if (answer.uid != data::InvalidUid)
-    return false;
-  return answer.complete;
+  // ★ПРОМАХ ПО НЕПОЛНОМУ ИНДЕКСУ — НЕ «СВОБОДНО» (правка ревью, итерация 7), И
+  // ПОЧИНКУ ЗДЕСЬ БОЛЬШЕ НЕ ПОКУПАЮТ (правка ревью, итерация 9). Раньше отсюда
+  // звалась `ReconcileCharacterNameIndexIfBroken`, то есть имя с провода могло
+  // заказать полный обход каталога персонажей. Теперь путь запроса лишь ПРОСИТ
+  // плановый проход случиться на ближайшем тике; ответ до тех пор — «занято»,
+  // то есть отказ в создании, а не выдача чужого имени.
+  RequestScheduledNameIndexRepair();
+  return false;
 }
 
 void server::FileDataSource::CreateHorse(data::Horse& horse)
@@ -2882,12 +2938,11 @@ bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
   // попытка починиться (не чаще раза в две секунды), и только потом ответ; если
   // индекс всё ещё неполон — «занято», то есть отказ в создании, а не выдача
   // чужого имени.
-  ReconcileGuildNameIndexIfBroken();
-  answer = ReadNameIndexAnswer(
-    _guildNameIndexMutex, _guildNameToUid, _guildNameIndexComplete, key);
-  if (answer.uid != data::InvalidUid)
-    return false;
-  return answer.complete;
+  // ★ТА ЖЕ ПРАВКА, ЧТО У ПЕРСОНАЖЕЙ (итерация 9): ремонт — повод плановый, а не
+  // купленный именем с провода. Проверка стоит ДО списания 3000 морковок, и
+  // покупать за ноль полный обход каталога гильдий здесь тем более нечего.
+  RequestScheduledNameIndexRepair();
+  return false;
 }
 
 void server::FileDataSource::MarkGuildNameIndexBroken(
