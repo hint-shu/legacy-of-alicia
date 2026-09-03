@@ -116,6 +116,19 @@ else
   say "  relay-authz gate: файла нет в этой ветке — ПРОПУЩЕН"
 fi
 
+# LOA-fix (R71-27, находка ревью 5 #1): гейт тотального правила дросселя — там же и
+# ПРОТИВ КЛОНА. Пропуск (в старых ветках файла нет) остаётся ГРОМКИМ.
+THROTTLE_GATE="$WORK/tools/check_race_rejection_throttle.sh"
+if [ -f "$THROTTLE_GATE" ]; then
+  ROOT="$WORK" bash "$THROTTLE_GATE" > "$WORK/.gate-throttle.log" 2>&1
+  TRC=$?
+  sed 's/^/    /' "$WORK/.gate-throttle.log"
+  [ "$TRC" -eq 0 ] || die "race-rejection-throttle gate вернул $TRC — сборка не начата"
+  say "  race-rejection-throttle gate: EXIT=0 ✓"
+else
+  say "  race-rejection-throttle gate: файла нет в этой ветке — ПРОПУЩЕН"
+fi
+
 # ---- 4. the base image must be pinned by digest ---------------------------------
 BASE_DIGEST="$(sed -nE 's/^FROM[[:space:]]+[^[:space:]@]+@(sha256:[0-9a-f]{64}).*/\1/p' \
                 "$WORK/Dockerfile" | head -1)"

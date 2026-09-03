@@ -513,6 +513,23 @@ private:
   //! общий гасил бы одну жалобу из-за другой, и раунд снова судил бы по молчанию.
   util::LogThrottle _magicTypeUnknownThrottle;
   util::LogThrottle _reportedMagicTypeThrottle;
+  //! LOA-fix (R71-27, находка ревью 5 #1): ТОТАЛЬНОЕ ПРАВИЛО ДЛЯ СЕМЕЙСТВА НАВОДКИ.
+  //!
+  //! Ни одна жалоба, которую умеет заказать клиентский пакет, не пишется сырой —
+  //! ни в `HandleStartMagicTarget`, ни в `HandleChangeMagicTarget`. Дроссели РАЗНЫЕ
+  //! по КЛАССУ отказа (чужой отправитель / несуществующая цель / нет дракона /
+  //! цель не участник заезда): общий дроссель гасил бы одну жалобу из-за другой, и
+  //! гард снова судился бы по молчанию. Проверяется сборочным гейтом
+  //! `tools/check_race_rejection_throttle.sh`.
+  util::LogThrottle _magicTargetOwnershipThrottle;
+  util::LogThrottle _magicTargetLookupThrottle;
+  util::LogThrottle _dragonHoldingThrottle;
+  util::LogThrottle _magicTargetRosterThrottle;
+  util::LogThrottle _iceWallShapeThrottle;
+  //! ★НАЙДЕНЫ ГЕЙТОМ, А НЕ РЕВЬЮ: три сырые жалобы вне семейства наводки
+  //! (подмена гонщика в двух хендлерах, неизвестный тип подобранного предмета).
+  util::LogThrottle _racerImpersonationThrottle;
+  util::LogThrottle _pickupItemTypeThrottle;
 };
 
 } // namespace server

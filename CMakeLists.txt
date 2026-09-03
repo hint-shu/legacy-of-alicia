@@ -166,8 +166,19 @@ if (BASH_PROGRAM)
             COMMENT "relay-authz gate: каждый тип relay-нагрузки классифицирован"
             VERBATIM)
     add_dependencies(alicia-server relay-authz-gate)
+
+    # LOA-fix (R71-27, находка ревью 5 #1): ГЕЙТ ТОТАЛЬНОГО ПРАВИЛА ДРОССЕЛЯ —
+    # тоже часть сборки. Ревью нашло пять сырых жалоб в семействе наводки; сам
+    # гейт нашёл ещё три вне его. Список мест закрывается один раз, правило —
+    # навсегда ([[total-invariant-beats-list-of-sites]]).
+    add_custom_target(race-rejection-throttle-gate ALL
+            COMMAND ${CMAKE_COMMAND} -E env "ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
+            ${BASH_PROGRAM} "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_race_rejection_throttle.sh"
+            COMMENT "race-rejection-throttle gate: клиентская жалоба не пишется сырой"
+            VERBATIM)
+    add_dependencies(alicia-server race-rejection-throttle-gate)
 else ()
-    message(WARNING "bash не найден: гейт relay-authz НЕ включён в сборку")
+    message(WARNING "bash не найден: гейты relay-authz и race-rejection-throttle НЕ включены в сборку")
 endif ()
 
 if (BUILD_TESTS)

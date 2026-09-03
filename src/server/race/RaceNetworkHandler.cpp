@@ -5091,7 +5091,16 @@ void RaceNetworkHandler::HandleRequestMagicItem(
     if (raceInstance.IsAiRacerOid(command.characterOid))
       return;
 
-    server::util::QuietLogWarn("Client tried to perform action on behalf of different racer");
+    // LOA-fix (R71-27, находка ревью 5 #1, СПЛОШНАЯ ЗАМЕНА): дроссель.
+    // ★Эти две строки ревью не называло — их нашёл гейт правила
+    // (`tools/check_race_rejection_throttle.sh`). Именно для этого гейт и написан:
+    // список мест устаревает, правило — нет ([[sweep-must-key-on-the-defect]]).
+    uint64_t suppressed = 0;
+    if (_racerImpersonationThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Client tried to perform action on behalf of different racer "
+        "in HandleRequestMagicItem (suppressed {})",
+        suppressed);
     return;
   }
 
@@ -5161,7 +5170,13 @@ void RaceNetworkHandler::HandleUseMagicItem(
     if (raceInstance.IsAiRacerOid(command.characterOid))
       return;
 
-    server::util::QuietLogWarn("Client tried to perform action on behalf of different racer");
+    // LOA-fix (R71-27, находка ревью 5 #1, СПЛОШНАЯ ЗАМЕНА): дроссель, см. выше.
+    uint64_t suppressed = 0;
+    if (_racerImpersonationThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Client tried to perform action on behalf of different racer "
+        "in HandleUseMagicItem (suppressed {})",
+        suppressed);
     return;
   }
 
@@ -5908,9 +5923,17 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
             racer.starPointValue = std::min(racer.starPointValue+10000, gameModeInfo.starPointsMax);
             break;
           default:
-            server::util::QuietLogWarn("Player {} picked up unknown item type {}",
-              clientId, deck.currentItem);
+          {
+            // LOA-fix (R71-27, находка ревью 5 #1, СПЛОШНАЯ ЗАМЕНА): дроссель.
+            // Тип предмета выбирает сервер, но ПАКЕТ подбора шлёт клиент, и на
+            // расстроенном конфиге деки эта строка писалась бы на каждый подбор.
+            uint64_t suppressed = 0;
+            if (_pickupItemTypeThrottle.Allow(suppressed))
+              server::util::QuietLogWarn(
+                "Player {} picked up unknown item type {} (suppressed {})",
+                clientId, deck.currentItem, suppressed);
             break;
+          }
         }
 
         // Only send this on good/perfect starts
@@ -6042,7 +6065,19 @@ void RaceNetworkHandler::HandleStartMagicTarget(
     if (raceInstance.IsAiRacerOid(command.casterOid))
       return;
 
-    server::util::QuietLogWarn("Character OID mismatch in HandleStartMagicTarget");
+    // LOA-fix (R71-27, находка ревью 5 #1): ТОТАЛЬНОЕ ПРАВИЛО СЕМЕЙСТВА НАВОДКИ.
+    //
+    // Эта жалоба заказывается ОДНИМ клиентским пакетом и пишется под
+    // `_raceInstancesMutex` — то есть флудер платит не своей строкой в логе, а
+    // задержкой КАЖДОЙ комнаты процесса. Ровно тот дефект, который R57 нашёл в
+    // другом месте (15 350 строк за час) и ради которого в раунде вообще появился
+    // дроссель; здесь он просто не был доведён до конца
+    // ([[total-invariant-beats-list-of-sites]] — правило, а не список мест).
+    uint64_t suppressed = 0;
+    if (_magicTargetOwnershipThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Character OID mismatch in HandleStartMagicTarget (suppressed {})",
+        suppressed);
     return;
   }
 
@@ -6060,7 +6095,15 @@ void RaceNetworkHandler::HandleStartMagicTarget(
     // игрок вправе навести магию на AI-соперника; у сервера просто нет для
     // него состояния, поэтому наводить нечего и жаловаться не на что.
     if (not raceInstance.IsAiRacerOid(command.targetOid))
-      server::util::QuietLogWarn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+    {
+      // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. выше.
+      uint64_t suppressed = 0;
+      if (_magicTargetLookupThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Target OID {} not found in HandleStartMagicTarget (suppressed {})",
+          command.targetOid,
+          suppressed);
+    }
 
     return;
   }
@@ -6136,13 +6179,27 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
     if (raceInstance.IsAiRacerOid(command.targetOid))
       return;
 
-    server::util::QuietLogWarn("Character OID mismatch in HandleChangeMagicTarget");
+    // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. `HandleStartMagicTarget`.
+    uint64_t suppressed = 0;
+    if (_magicTargetOwnershipThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Character OID mismatch in HandleChangeMagicTarget (suppressed {})",
+        suppressed);
     return;
   }
 
   if (!racer.pendingMagicTarget.has_value())
   {
-    server::util::QuietLogWarn("Caster does not have dragon in HandleChangeMagicTarget");
+    // LOA-fix (R71-27, находка ревью 5 #1): ★ИМЕННО ЭТУ СТРОКУ РЕВЬЮ НАЗВАЛО
+    // BLOCK'ом. Условие «у отправителя нет дракона» — состояние по умолчанию: его
+    // держит один гонщик из восьми и только несколько секунд, поэтому 2000 пакетов
+    // подряд дают 2000 строк под замком комнат. Флуд-негатив на этот путь стоит на
+    // стенде (`P-flood-nodragon`).
+    uint64_t suppressed = 0;
+    if (_dragonHoldingThrottle.Allow(suppressed))
+      server::util::QuietLogWarn(
+        "Caster does not have dragon in HandleChangeMagicTarget (suppressed {})",
+        suppressed);
     return;
   }
 
@@ -6191,7 +6248,15 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
     // жалобы апстрима здесь ошибочно называет чужую функцию и чужое поле;
     // трогать его не стали, чтобы правка осталась про один дефект).
     if (not raceInstance.IsAiRacerOid(command.targetOid2))
-      server::util::QuietLogWarn("Target OID {} not found in HandleStartMagicTarget", command.targetOid);
+    {
+      // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. выше.
+      uint64_t suppressed = 0;
+      if (_magicTargetLookupThrottle.Allow(suppressed))
+        server::util::QuietLogWarn(
+          "Target OID {} not found in HandleStartMagicTarget (suppressed {})",
+          command.targetOid,
+          suppressed);
+    }
 
     return;
   }
