@@ -164,6 +164,19 @@ if (NOT WIN32)
     # property durably; it proves itself on two fixtures before judging the tree.
     add_test(NAME ToolPotentialRollGate
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_potential_roll.sh)
+    # R75. Both are DELTA gates: they judge the lines this round ADDED, not the
+    # file's contents, because the properties ("no record access added inside
+    # Stop()", "the position handler acquired no logging") do not exist as
+    # properties of a file -- Stop() already holds twelve direct accesses the
+    # round keeps, and the position handler already holds one pre-existing debug
+    # line. Each proves it can fail on three fixtures before judging anything,
+    # and each stops with code 2 rather than reporting clean when it is blind.
+    # The self-tests run here; the delta run needs a BASE and lives in the round
+    # builder, since "what this branch added" is a property of the BRANCH.
+    add_test(NAME ToolR75RecordAccessSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_record_access_gate.sh --self-test)
+    add_test(NAME ToolR75UserPosLoggingSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_userpos_logging_gate.sh --self-test)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()
