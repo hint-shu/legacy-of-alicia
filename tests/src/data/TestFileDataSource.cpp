@@ -37,6 +37,7 @@
 
 #include <libserver/data/file/FileDataSource.hpp>
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -170,12 +171,24 @@ void TestUnreadableRecordMakesEveryNameTaken()
   assert(not source.IsCharacterNameUnique("NobodyHasThisNameEither"));
 
   // ★И ЭТО СОСТОЯНИЕ САМО ЧИНИТСЯ. Файл стал читаемым — ответ обязан вернуться
-  // к правде без перезапуска. Пауза длиннее предела частоты попыток (2 с).
+  // к правде без перезапуска.
+  //
+  // ★НО ЧИНИТ ЕГО ПЛАНОВЫЙ ПРОХОД, А НЕ ЗАПРОС (правка ревью, итерация 9).
+  // Раньше здесь стояла пауза в 2.2 с и повторный вопрос: починку покупал сам
+  // вопрос об имени, то есть имя с провода заказывало полный обход каталога.
+  // Хуже того, у ПОИСКА персонажа такого пути не было вовсе, и починенный файл
+  // оставался невидимым для подарка, друга и письма неограниченно долго.
+  // Теперь повод один и общий — `TickNameIndexMaintenance`, — и ждать нечего:
+  // первый проход после старта идёт без задержки.
   WriteRaw(root / "guilds" / "9.json",
     R"({"uid": 9, "name": "Gamma", "owner": 1, "officers": [], "members": []})");
   WriteRaw(root / "characters" / "9.json",
     R"({"uid": 9, "name": "Delta"})");
-  std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+
+  // Контроль направления: до планового прохода ответ ещё «занято» — то есть
+  // чинит именно проход, а не время само по себе.
+  assert(not source.IsGuildNameUnique("NobodyHasThisName"));
+  source.TickNameIndexMaintenance();
 
   assert(source.IsGuildNameUnique("NobodyHasThisName"));
   assert(not source.IsGuildNameUnique("Gamma"));
@@ -286,6 +299,192 @@ void TestCharacterNameGateRefusesUnstorableNames()
   std::filesystem::remove_all(root, error);
 }
 
+
+//! ★РЕМОНТ ИНДЕКСА ПРИХОДИТ ПО РАСПИСАНИЮ, А НЕ ЗА ЧУЖОЙ ПОИСК (ревью, 9).
+//!
+//! До этой правки индекс персонажей чинил РОВНО ОДИН путь —
+//! `IsCharacterNameUnique`, то есть создание или переименование персонажа. Файл,
+//! нечитаемый на старте и починенный через минуту, оставался невидимым для
+//! подарка, друга, письма и приглашения в заезд НЕОГРАНИЧЕННО ДОЛГО: поиск
+//! перестройку не звал, а создавать персонажа на живом шарде может никто и не
+//! начать. Здесь проверяются ОБА направления сразу:
+//!   * сколько ни ищи по имени — индекс НЕ чинится (поиск не покупает обход);
+//!   * плановый проход чинит его БЕЗ единого поиска.
+void TestScheduledPassRepairsTheIndexAndLookupsDoNot()
+{
+  const auto root = MakeSandbox("scheduled-repair");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "1.json", R"({"uid": 1, "name": "Alpha"})");
+  WriteRaw(root / "characters" / "2.json", R"({"uid": 2, "name": "Beta"})");
+
+  // Один файл нечитаем на СТАРТЕ: индекс выходит неполным, и это ровно тот
+  // случай, ради которого «имя, которое мы не видели, читается как занятое».
+  WriteRaw(root / "characters" / "1.json", "{ this is not json");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  // Индекс неполон: любое имя читается как ЗАНЯТОЕ, даже заведомо свободное.
+  assert(not source.IsCharacterNameUnique("Gamma"));
+  // А `Beta` при этом прочиталась и адресуется — путь успеха не потерян.
+  assert(source.RetrieveCharacterUidByName("Beta") == server::data::Uid{2});
+  assert(source.RetrieveCharacterUidByName("Alpha") == server::data::InvalidUid);
+
+  // Файл ПОЧИНЕН на диске рядом с работающим сервером.
+  WriteRaw(root / "characters" / "1.json", R"({"uid": 1, "name": "Alpha"})");
+
+  // ★СКОЛЬКО НИ ИЩИ — ИНДЕКС НЕ ЧИНИТСЯ. Именно это и было платой: раньше
+  // каждый такой промах мог заказать полный обход каталога.
+  for (int attempt = 0; attempt < 500; ++attempt)
+  {
+    assert(source.RetrieveCharacterUidByName("Alpha") == server::data::InvalidUid);
+  }
+  assert(not source.IsCharacterNameUnique("Gamma"));
+
+  // ★А ПЛАНОВЫЙ ПРОХОД — ЧИНИТ, И БЕЗ ЕДИНОГО ПОИСКА. Первый проход после
+  // старта идёт без ожидания: неполная стартовая сборка не имеет права ждать
+  // минуту.
+  source.TickNameIndexMaintenance();
+
+  assert(source.RetrieveCharacterUidByName("Alpha") == server::data::Uid{1});
+  assert(source.IsCharacterNameUnique("Gamma"));      // индекс снова полон
+  assert(not source.IsCharacterNameUnique("alpha"));  // и говорит правду
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★ИМЯ, КОТОРОЕ ЛЕЖИТ НА ДИСКЕ, ОБЯЗАНО НАХОДИТЬСЯ — ДАЖЕ ЕСЛИ СЕГОДНЯ ТАК
+//! НАЗВАТЬ УЖЕ НЕЛЬЗЯ (ревью, итерация 9).
+//!
+//! Имя персонажа — ПОЛЕ ВНУТРИ файла, названного uid'ом, а не компонент пути.
+//! Гейт создания отвергает `/` и `\` совершенно правильно; поставленный в
+//! ПОИСК, тот же гейт делал персонажа `A/B` вечно неадресуемым — притом что
+//! до-раундовый точный поиск его находил, а индекс его прекрасно видит. Это
+//! обмен пути успеха на путь отказа, и здесь проверено, что обмена больше нет,
+//! И ЧТО СОЗДАНИЕ ПРИ ЭТОМ НЕ ОСЛАБЛО.
+void TestLegacyNameIsFindableButNotCreatable()
+{
+  const auto root = MakeSandbox("legacy-name-lookup");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "9.json", R"({"uid": 9, "name": "A/B"})");
+  WriteRaw(root / "characters" / "10.json", R"({"uid": 10, "name": "Ordinary"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  // НАХОДИТСЯ: подарок, друг, письмо и приглашение в заезд ходят сюда.
+  assert(source.RetrieveCharacterUidByName("A/B") == server::data::Uid{9});
+  assert(source.RetrieveCharacterUidByName("a/b") == server::data::Uid{9});
+  // И тем же поиском — обычное имя: гейт не стал «всегда да».
+  assert(source.RetrieveCharacterUidByName("Ordinary") == server::data::Uid{10});
+  assert(source.RetrieveCharacterUidByName("Nobody") == server::data::InvalidUid);
+
+  // НЕ СОЗДАЁТСЯ: гейт создания остался строгим, и это разные направления.
+  assert(not source.IsCharacterNameUnique("A/B"));
+  assert(not source.IsCharacterNameUnique("C\\D"));
+
+  // Поиск всё-таки ОГРАНИЧЕН: то, что ломает журнал или обрывает строку, и то,
+  // что длиннее потолка индекса, отбивается до всякой работы.
+  assert(source.RetrieveCharacterUidByName(std::string("A\nB")) == server::data::InvalidUid);
+  assert(source.RetrieveCharacterUidByName(std::string("A\rB")) == server::data::InvalidUid);
+  assert(source.RetrieveCharacterUidByName(std::string("A\0B", 3)) == server::data::InvalidUid);
+  assert(source.RetrieveCharacterUidByName(std::string(4096, 'x')) == server::data::InvalidUid);
+  assert(source.RetrieveCharacterUidByName("") == server::data::InvalidUid);
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★ДВА НАПИСАНИЯ ОДНОГО ЧИСЛА — ЭТО ДВА ФАЙЛА, А НЕ ОДНА ЗАПИСЬ (ревью, 9).
+//!
+//! `007.json` читался индексом как uid 7. Одинокий `007.json` индексировался
+//! под 7, а `DeleteCharacter(7)` удалял НЕСУЩЕСТВУЮЩИЙ `7.json`, считал ENOENT
+//! успехом, забывал имя — и оставлял `007.json` живым с именем, которое теперь
+//! числится свободным. Личность записи обязана быть однозначной; при этом ПОЛ
+//! СЧЁТЧИКА uid обязан вести себя ПРОТИВОПОЛОЖНО и алиас резервировать, иначе
+//! фикс сам раздал бы занятый uid.
+void TestNoncanonicalFileNameIsNotARecord()
+{
+  const auto root = MakeSandbox("noncanonical-name");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "007.json", R"({"uid": 7, "name": "Alias"})");
+  WriteRaw(root / "characters" / "3.json", R"({"uid": 3, "name": "Real"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  // Алиас — НЕ запись: его имя индекс не знает.
+  assert(source.RetrieveCharacterUidByName("Alias") == server::data::InvalidUid);
+  // Каноническая запись рядом читается как обычно.
+  assert(source.RetrieveCharacterUidByName("Real") == server::data::Uid{3});
+  // ★И ИНДЕКС ПРИ ЭТОМ ПОЛОН: посторонний файл в каталоге не имеет права
+  // отказывать в создании ВСЕХ имён сразу.
+  assert(source.IsCharacterNameUnique("Delta"));
+
+  // ★А ПОЛ СЧЁТЧИКА uid АЛИАС ВСЁ-ТАКИ РЕЗЕРВИРУЕТ. Иначе следующий персонаж
+  // получил бы uid 7, `ProduceDataFilePath` написал бы `7.json` — и рядом
+  // остались бы два живых файла на одну личность.
+  server::data::Character created;
+  source.CreateCharacter(created);
+  assert(created.uid() > server::data::Uid{7});
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
+//! ★ПОЛНОТА И СОДЕРЖИМОЕ — ОДНО НАБЛЮДЕНИЕ (ревью, итерация 9).
+//!
+//! Настоящее окно этой находки — межпоточное: A промахивается по НЕПОЛНОМУ
+//! индексу, B успевает пересобрать его и объявить полным, A читает НОВУЮ
+//! полноту при СТАРОМ промахе и объявляет живое имя свободным. Стенд такую
+//! чередовку не воспроизводит, и честнее сказать это, чем сделать вид, что
+//! воспроизводит: детерминированный наблюдатель формы живёт в
+//! `tools/name_index_invariants_gate.py` (проверка «один-снимок»), а здесь
+//! проверяется ПОСЛЕДСТВИЕ, которое обязано держаться в любом случае: пока
+//! индекс неполон, «свободно» не отвечается НИКОГДА, ни одним из двух путей.
+void TestIncompleteIndexNeverAnswersFree()
+{
+  const auto root = MakeSandbox("incomplete-never-free");
+  std::filesystem::create_directories(root / "characters");
+  WriteRaw(root / "characters" / "1.json", "{ broken");
+  WriteRaw(root / "characters" / "2.json", R"({"uid": 2, "name": "Beta"})");
+
+  server::FileDataSource source;
+  source.Initialize(root);
+
+  std::atomic_bool stop{false};
+  std::atomic_bool sawFree{false};
+
+  // Читатель спрашивает заведомо свободное имя; писатель тем временем гоняет
+  // индекс через переименования, то есть через обмен флага полноты.
+  std::thread reader([&]()
+    {
+      while (not stop.load())
+      {
+        if (source.IsCharacterNameUnique("Gamma"))
+          sawFree.store(true);
+      }
+    });
+
+  for (int round = 0; round < 3000; ++round)
+    source.StoreCharacter(2, [&]{
+      server::data::Character character;
+      character.uid = 2;
+      character.name = std::string((round % 2) ? "Beta" : "Beta2");
+      return character; }());
+
+  stop.store(true);
+  reader.join();
+
+  // Индекс всё это время неполон (`1.json` так и не починен), значит ответ
+  // «свободно» не имел права прозвучать ни разу.
+  assert(not sawFree.load());
+
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+}
+
 } // namespace
 
 int main()
@@ -296,5 +495,9 @@ int main()
   TestGuildNameGateRefusesUnstorableNames();
   TestGuildNameCeilingComesFromTheIndex();
   TestCharacterNameGateRefusesUnstorableNames();
+  TestScheduledPassRepairsTheIndexAndLookupsDoNot();
+  TestLegacyNameIsFindableButNotCreatable();
+  TestNoncanonicalFileNameIsNotARecord();
+  TestIncompleteIndexNeverAnswersFree();
   std::puts("TestFileDataSource: ok");
 }

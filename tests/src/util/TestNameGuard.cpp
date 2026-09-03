@@ -192,8 +192,44 @@ void TestBudget()
 
 } // namespace
 
+//! ★ГЕЙТ ПОИСКА ОГРАНИЧЕН, НО НЕ СТРОГ — И ЭТО РАЗНЫЕ НАПРАВЛЕНИЯ (ревью, 9).
+//!
+//! `IsStorableNameShaped` отвергает `/` и `\` правильно: он решает, какие имена
+//! ВПРЕДЬ ЗАВОДИТЬ. Но имя персонажа — ПОЛЕ ВНУТРИ файла, названного uid'ом, и
+//! тот же гейт, поставленный в ПОИСК, делал уже лежащего на диске `A/B` вечно
+//! неадресуемым. Здесь проверено, что гейты разошлись и каждый делает своё.
+void TestLookupKeyGuardIsBoundedButNotStrict()
+{
+  using server::util::IsLookupKeyShaped;
+  using server::util::IsStorableNameShaped;
+
+  // То, что лежит на диске, ищется — даже когда так больше не назвать.
+  assert(IsLookupKeyShaped("A/B"));
+  assert(IsLookupKeyShaped("C\\D"));
+  assert(IsLookupKeyShaped("имя с пробелом"));
+  assert(IsLookupKeyShaped(std::string("tab\there")));
+  // ...и создание при этом осталось строгим: направления не сошлись в одно.
+  assert(not IsStorableNameShaped("A/B"));
+  assert(not IsStorableNameShaped("C\\D"));
+
+  // Но поиск ОГРАНИЧЕН: пусто, длиннее потолка, и то, что рвёт строку журнала
+  // или обрывает C-строку.
+  assert(not IsLookupKeyShaped(""));
+  assert(not IsLookupKeyShaped(std::string(65, 'x')));
+  assert(IsLookupKeyShaped(std::string(64, 'x')));
+  assert(not IsLookupKeyShaped(std::string("a\nb")));
+  assert(not IsLookupKeyShaped(std::string("a\rb")));
+  assert(not IsLookupKeyShaped(std::string("a\0b", 3)));
+
+  // Потолок — параметр, ровно как у соседа: имя длиннее сегодняшней константы
+  // обязано быть спрашиваемым, если оно лежит в индексе.
+  assert(IsLookupKeyShaped(std::string(100, 'x'), 128));
+  assert(not IsLookupKeyShaped(std::string(100, 'x'), 64));
+}
+
 int main()
 {
+  TestLookupKeyGuardIsBoundedButNotStrict();
   TestLoginNameSafe();
   TestStorableNameShaped();
   TestCeilingComesFromWhatIsStored();
