@@ -83,6 +83,7 @@ from secret_write_gate import (  # noqa: E402
     splice_line_continuations,
     strip_comments,
     unreadable_literals,
+    unsupported_preprocessing,
 )
 
 SCOPES = ("src/libserver/data", "include/libserver/data")
@@ -245,8 +246,87 @@ SELFTEST_FIXTURES = [
 ]
 
 
-def selftest() -> int:
+#! ═══════════════════════════════════════════════════════════════════════════
+#! ФИКСТУРЫ, ПРОГОНЯЕМЫЕ ЧЕРЕЗ НАСТОЯЩИЙ ВХОД (правка ревью, итерация 9,
+#! находка 8). `analyse` — не единственное, что стоит между файлом и вердиктом;
+#! останов на непрочитываемой форме живёт в `main`, и проверять его вызовом
+#! `analyse` значило бы снова проверять не то место, где была дыра.
+TREE_FIXTURES = [
+    ("псевдоним самого `std` прячет чтение по пути", 2, "псевдоним-std",
+     {"src/libserver/data/Alias.cpp": (
+         "namespace s = std;\n"
+         "void Load(const char* path)\n"
+         "{\n"
+         "  s::ifstream file(path);\n"
+         "}\n")}),
+    ("склейка токенов собирает имя, которого в тексте нет", 2, "макрос-склейка",
+     {"src/libserver/data/Paste.cpp": (
+         "#define JOIN(a, b) a##b\n"
+         "void Load(const char* path)\n"
+         "{\n"
+         "  std::JOIN(ifs, tream) file(path);\n"
+         "}\n")}),
+    ("включение, названное макросом", 2, "включение-через-макрос",
+     {"src/libserver/data/MacroInclude.cpp": (
+         "#define HDR <fstream>\n"
+         "#include HDR\n")}),
+    ("обычный файл останов не вызывает", 0, "ЧИСТО",
+     {"src/libserver/data/Clean.cpp": (
+         "#include <string>\n"
+         "// про ## и `namespace s = std` здесь только проза\n"
+         "const char* kNote = \"namespace s = std; a##b\";\n"
+         "void Load(const char* path)\n"
+         "{\n"
+         "  const auto data = server::util::ReadManagedFile(path);\n"
+         "}\n")}),
+]
+
+
+def selftest_tree() -> bool:
+    """Гоняет `main` КАК ПРОЦЕСС по настоящим деревьям на диске."""
+    import shutil
+    import subprocess
+    import tempfile
+
     ok = True
+    for name, expected_code, expected_text, files in TREE_FIXTURES:
+        sandbox = Path(tempfile.mkdtemp(prefix="path-gate-selftest-"))
+        try:
+            for relative, content in files.items():
+                target = sandbox / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            for scope in SCOPES:
+                (sandbox / scope).mkdir(parents=True, exist_ok=True)
+            environment = dict(os.environ)
+            environment["ROOT"] = str(sandbox)
+            # Пол слепоты снят намеренно: фикстура проверяет ПУТЬ СБОРА, а не
+            # охват дерева, и пол дал бы код 2 по другой причине — то есть
+            # фикстура согласилась бы случайно.
+            environment["PATH_GATE_MIN_FILES"] = "0"
+            done = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve())],
+                capture_output=True, text=True, env=environment)
+            problems = []
+            if done.returncode != expected_code:
+                problems.append(f"код {done.returncode}, ожидался {expected_code}")
+            if expected_text not in done.stdout:
+                problems.append(f"в выводе нет «{expected_text}»")
+            verdict = "ok" if not problems else "ПРОВАЛ"
+            if problems:
+                ok = False
+            print(f"  [{verdict}] через main: {name}"
+                  + ("" if not problems else " — " + "; ".join(problems)))
+            if problems:
+                for line in done.stdout.splitlines():
+                    print(f"        {line}")
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    return ok
+
+
+def selftest() -> int:
+    ok = selftest_tree()
     for name, expected, fixture in SELFTEST_FIXTURES:
         violations = analyse(fixture, f"<fixture {name}>")
         got = len(violations)
@@ -276,10 +356,36 @@ def main() -> int:
         print("         часть дерева не прочитана — «0 нарушений» читать нельзя.")
         return 2
 
+    # ★СНАЧАЛА — ЧИТАЕТСЯ ЛИ ДЕРЕВО ВООБЩЕ (правка ревью, итерация 9, находка 8).
+    # Псевдоним `namespace s = std;` пишет `s::ifstream file(path);` — ровно то
+    # чтение ПО ПУТИ, ради которого гейт существует, — и не содержит ни `std`, ни
+    # `filesystem`, то есть ключа, по которому гейт судит. Запрет псевдонимов
+    # ФАЙЛОВОЙ СИСТЕМЫ ниже эту форму не покрывал: он ждал слова `filesystem`.
+    # Разбирать псевдонимы значит вести их таблицу по всей единице трансляции;
+    # честный ответ — отказаться заверять, как это делают гарды R72.
+    unreadable: list[tuple[str, str]] = []
+    texts: dict[Path, str] = {}
+    for path in sources:
+        relative = str(path.relative_to(root))
+        texts[path] = path.read_text(encoding="utf-8", errors="replace")
+        unreadable += unsupported_preprocessing(texts[path], relative)
+    if unreadable:
+        print("=== path-anchored gate ===")
+        print(f"дерево          : {root}")
+        print(f"файлов прочитано: {len(sources)}")
+        print(f"форм вне чтения : {len(unreadable)} (ожидалось 0)")
+        print("ОСТАНОВ: дерево использует форму, которую этот гейт читать не умеет.")
+        for location, reason in unreadable:
+            print(f"  ✗ {location}: {reason}")
+        print("         `std`, переименованный псевдонимом, и имя, собранное из `##`,")
+        print("         не совпадут ни с одним шаблоном ниже — «нарушений 0» означало бы")
+        print("         «я не смотрел». Пиши обычным образом либо расширяй гейт сознательно.")
+        print("=== ИТОГ: ПРОВЕРКА НЕДЕЙСТВИТЕЛЬНА ===")
+        return 2
+
     violations: list[tuple[str, str]] = []
     for path in sources:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        violations += analyse(text, str(path.relative_to(root)))
+        violations += analyse(texts[path], str(path.relative_to(root)))
 
     print("=== path-anchored gate ===")
     print(f"дерево          : {root}")
