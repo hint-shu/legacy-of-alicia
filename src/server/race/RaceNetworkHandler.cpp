@@ -4842,8 +4842,8 @@ void RaceNetworkHandler::HandleRelay(
       // ★ПРЕЖНИЙ ДОВОД «формат-строку не трогаем, иначе поедет маркер лесенки» ОТМЕНЁН
       // СОЗНАТЕЛЬНО: маркер — это инструмент проверки, а не ограничение на фикс. Новый
       // маркер назван в отчёте раунда.
-      uint64_t suppressed = 0;
-      if (_relayPayloadTypeThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_relayPayloadTypeThrottle.Allow(suppressed, total))
       {
         const size_t loggedBytes = std::min<size_t>(
           command.data.size(), MaxLoggedRelayPayloadBytes);
@@ -4912,8 +4912,8 @@ void RaceNetworkHandler::HandleRelay(
     if (raceInstance.IsAiRacerOid(command.fromOid))
       return;
 
-    uint64_t suppressed = 0;
-    if (_relayEnvelopeThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_relayEnvelopeThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Relay from racer {} claimed foreign oid {} in the envelope (suppressed {})",
         senderRacer.oid,
@@ -4950,8 +4950,8 @@ void RaceNetworkHandler::HandleRelay(
       && raceInstance.IsAiRacerOid(static_cast<tracker::Oid>(relayClaim.actorId)))
       return;
 
-    uint64_t suppressed = 0;
-    if (_relayActorThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_relayActorThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Relay from racer {} carried payload type {:#04x} acting as {} (suppressed {})",
         senderRacer.oid,
@@ -4977,8 +4977,8 @@ void RaceNetworkHandler::HandleRelay(
   if (relayClaim.referenceKind == race::RelayReferenceKind::EffectInstanceId
     && not raceInstance.GetTracker().HasIssuedEffectInstanceId(relayClaim.referencedId))
   {
-    uint64_t suppressed = 0;
-    if (_relayReferenceThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_relayReferenceThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Relay from racer {} named an unissued effect instance {} (suppressed {})",
         senderRacer.oid,
@@ -5095,8 +5095,8 @@ void RaceNetworkHandler::HandleRequestMagicItem(
     // ★Эти две строки ревью не называло — их нашёл гейт правила
     // (`tools/check_race_rejection_throttle.sh`). Именно для этого гейт и написан:
     // список мест устаревает, правило — нет ([[sweep-must-key-on-the-defect]]).
-    uint64_t suppressed = 0;
-    if (_racerImpersonationThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_racerImpersonationThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Client tried to perform action on behalf of different racer "
         "in HandleRequestMagicItem (suppressed {})",
@@ -5171,8 +5171,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
       return;
 
     // LOA-fix (R71-27, находка ревью 5 #1, СПЛОШНАЯ ЗАМЕНА): дроссель, см. выше.
-    uint64_t suppressed = 0;
-    if (_racerImpersonationThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_racerImpersonationThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Client tried to perform action on behalf of different racer "
         "in HandleUseMagicItem (suppressed {})",
@@ -5222,8 +5222,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // R57-5), сюда доходит только собственный oid отправителя.
   if (command.magicItemId != racer.magicItem.value())
   {
-    uint64_t suppressed = 0;
-    if (_magicOwnershipThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicOwnershipThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} tried to cast magic {} while holding {} (suppressed {})",
         racer.oid,
@@ -5246,8 +5246,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // лишнее», а «клиент прислал невозможное».
   if (command.targetList.size() > MaxMagicTargetListSize)
   {
-    uint64_t suppressed = 0;
-    if (_magicTargetCountThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicTargetCountThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} named {} magic targets, max is {} (suppressed {})",
         racer.oid,
@@ -5300,8 +5300,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // атаку».
   if (magicApplication == MagicApplication::Unknown)
   {
-    uint64_t suppressed = 0;
-    if (_magicTypeUnknownThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicTypeUnknownThrottle.Allow(suppressed, total))
       server::util::QuietLogError(
         "Racer {} cast magic type {} which no application class covers; the cast is "
         "refused (suppressed {})",
@@ -5339,8 +5339,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   if (isIceWall != command.iceWallProperties.has_value()
     || (isIceWall && not IsFiniteIceWallPlacement(command.iceWallProperties.value())))
   {
-    uint64_t suppressed = 0;
-    if (_magicPayloadThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicPayloadThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} sent an ice-wall payload inconsistent with resolved magic type {} "
         "(payload present: {}, suppressed {})",
@@ -5383,8 +5383,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // до постановки джоба. Отказ обязан не оставить после себя ничего.
   if (isIceWall && not race::IsKnownIceWallSegmentCount(command.targetList.size()))
   {
-    uint64_t suppressed = 0;
-    if (_iceWallShapeThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_iceWallShapeThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} cast ice wall {} with {} segments; the protocol has only {} or {} "
         "(suppressed {})",
@@ -5447,8 +5447,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
       if (isParticipant)
         continue;
 
-      uint64_t suppressed = 0;
-      if (_magicTargetRosterThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_magicTargetRosterThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Racer {} named {} as a target of magic {}, but it is not a participant of "
           "this race (suppressed {})",
@@ -5476,8 +5476,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
 
   if (not raceInstance.GetTracker().CanIssueEffectInstances(racer.oid, issuedInstanceCount))
   {
-    uint64_t suppressed = 0;
-    if (_effectInstanceCapacityThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_effectInstanceCapacityThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} exhausted its own effect-instance budget ({} live, {} issued per race), "
         "cast of magic {} refused; other racers are unaffected (suppressed {})",
@@ -5721,8 +5721,8 @@ void RaceNetworkHandler::HandleUseMagicItem(
   // как уже применённые сервером, то есть клиентские отчёты по ним запрещаем.
   if (switchAppliedEffect != (magicApplication == MagicApplication::ServerAppliedAtCast))
   {
-    uint64_t suppressed = 0;
-    if (_magicClassificationThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicClassificationThrottle.Allow(suppressed, total))
       server::util::QuietLogError(
         "Magic type {} is classified as {} but the cast switch {} apply it; "
         "client activation reports for instance {} are refused (suppressed {})",
@@ -5813,8 +5813,8 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
     if (raceInstance.IsAiRacerOid(command.characterOid))
       return;
 
-    uint64_t suppressed = 0;
-    if (_itemGetOwnershipThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_itemGetOwnershipThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} claimed an item pickup for racer {} (suppressed {})",
         racer.oid,
@@ -5966,8 +5966,8 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
     // на каждый пакет: соседний комментарий про «тихую обработку дубля» относится к
     // ветке кулдауна НИЖЕ и этой ветки не касался. Свой дроссель, а не общий: флуд
     // подделанным номером не должен глушить жалобы других гардов раунда.
-    uint64_t suppressed = 0;
-    if (_itemDeckUnknownThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_itemDeckUnknownThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Client {} picked up untracked item deck {} (suppressed {})",
         clientId,
@@ -6031,8 +6031,8 @@ void RaceNetworkHandler::HandleUserRaceItemGet(
             // LOA-fix (R71-27, находка ревью 5 #1, СПЛОШНАЯ ЗАМЕНА): дроссель.
             // Тип предмета выбирает сервер, но ПАКЕТ подбора шлёт клиент, и на
             // расстроенном конфиге деки эта строка писалась бы на каждый подбор.
-            uint64_t suppressed = 0;
-            if (_pickupItemTypeThrottle.Allow(suppressed))
+            uint64_t suppressed = 0, total = 0;
+            if (_pickupItemTypeThrottle.Allow(suppressed, total))
               server::util::QuietLogWarn(
                 "Player {} picked up unknown item type {} (suppressed {})",
                 clientId, deck.currentItem, suppressed);
@@ -6177,8 +6177,8 @@ void RaceNetworkHandler::HandleStartMagicTarget(
     // другом месте (15 350 строк за час) и ради которого в раунде вообще появился
     // дроссель; здесь он просто не был доведён до конца
     // ([[total-invariant-beats-list-of-sites]] — правило, а не список мест).
-    uint64_t suppressed = 0;
-    if (_magicTargetOwnershipThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicTargetOwnershipThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Character OID mismatch in HandleStartMagicTarget (suppressed {})",
         suppressed);
@@ -6201,8 +6201,8 @@ void RaceNetworkHandler::HandleStartMagicTarget(
     if (not raceInstance.IsAiRacerOid(command.targetOid))
     {
       // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. выше.
-      uint64_t suppressed = 0;
-      if (_magicTargetLookupThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_magicTargetLookupThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Target OID {} not found in HandleStartMagicTarget (suppressed {})",
           command.targetOid,
@@ -6249,8 +6249,8 @@ void RaceNetworkHandler::HandleStartMagicTarget(
 
   if (not instanceIsDragonCast)
   {
-    uint64_t suppressed = 0;
-    if (_dragonTargetThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_dragonTargetThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} started targeting {} with effect instance {} the server did not "
         "issue as its summon (issued: {}, suppressed {})",
@@ -6284,8 +6284,8 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
       return;
 
     // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. `HandleStartMagicTarget`.
-    uint64_t suppressed = 0;
-    if (_magicTargetOwnershipThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_magicTargetOwnershipThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Character OID mismatch in HandleChangeMagicTarget (suppressed {})",
         suppressed);
@@ -6299,8 +6299,8 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
     // держит один гонщик из восьми и только несколько секунд, поэтому 2000 пакетов
     // подряд дают 2000 строк под замком комнат. Флуд-негатив на этот путь стоит на
     // стенде (`P-flood-nodragon`).
-    uint64_t suppressed = 0;
-    if (_dragonHoldingThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_dragonHoldingThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Caster does not have dragon in HandleChangeMagicTarget (suppressed {})",
         suppressed);
@@ -6323,8 +6323,8 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
   if (command.effectInstanceId != heldMagicTarget.effectInstanceId
     || command.casterOid != heldMagicTarget.casterOid)
   {
-    uint64_t suppressed = 0;
-    if (_dragonTargetThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_dragonTargetThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} tried to pass summon instance {} by caster {} while holding "
         "instance {} by caster {} (suppressed {})",
@@ -6354,8 +6354,8 @@ void RaceNetworkHandler::HandleChangeMagicTarget(
     if (not raceInstance.IsAiRacerOid(command.targetOid2))
     {
       // LOA-fix (R71-27, находка ревью 5 #1): дроссель, см. выше.
-      uint64_t suppressed = 0;
-      if (_magicTargetLookupThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_magicTargetLookupThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Target OID {} not found in HandleStartMagicTarget (suppressed {})",
           command.targetOid,
@@ -6483,8 +6483,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     if (raceInstance.IsAiRacerOid(command.targetOid))
       return;
 
-    uint64_t suppressed = 0;
-    if (_skillTargetThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_skillTargetThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} declared a skill effect on foreign racer {} (suppressed {})",
         targetRacer.oid,
@@ -6524,8 +6524,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
 
   if (not effectIdRegistered || not IsSchedulableEffectId(command.effectId))
   {
-    uint64_t suppressed = 0;
-    if (_skillEffectIdThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_skillEffectIdThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} activated unknown skill effect id {} (registered: {}, suppressed {})",
         targetRacer.oid,
@@ -6614,8 +6614,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   // правило обязано быть на ОБОИХ концах, иначе оно снова станет «списком мест».
   if (reportedApplication == MagicApplication::Unknown)
   {
-    uint64_t suppressed = 0;
-    if (_reportedMagicTypeThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_reportedMagicTypeThrottle.Allow(suppressed, total))
       server::util::QuietLogWarn(
         "Racer {} reported magic type {} which no application class covers; the "
         "report is dropped (suppressed {})",
@@ -6635,8 +6635,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
   {
     if (reportedApplication != MagicApplication::TargetReportedAttack)
     {
-      uint64_t suppressed = 0;
-      if (_aiAttackerThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_aiAttackerThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Racer {} claimed AI racer {} applied magic {} to it; only attacks are "
           "reportable for AI casters (suppressed {})",
@@ -6702,8 +6702,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
 
     if (not instanceAuthorized)
     {
-      uint64_t suppressed = 0;
-      if (_effectInstanceThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_effectInstanceThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Racer {} reported effect instance {} the server never issued for magic {} "
           "by racer {} against it (issued: {}, named by the cast: {}, suppressed {})",
@@ -6725,8 +6725,8 @@ void RaceNetworkHandler::HandleActivateSkillEffect(
     if (not raceInstance.GetTracker().ConsumeEffectInstanceTarget(
           command.effectInstanceId, command.targetOid))
     {
-      uint64_t suppressed = 0;
-      if (_effectReplayThrottle.Allow(suppressed))
+      uint64_t suppressed = 0, total = 0;
+      if (_effectReplayThrottle.Allow(suppressed, total))
         server::util::QuietLogWarn(
           "Racer {} reported effect instance {} (magic {}) more than once "
           "(suppressed {})",
@@ -6989,8 +6989,8 @@ RaceNetworkHandler::EffectVerdict RaceNetworkHandler::ScheduleSkillEffect(
   // зависит от того, какой из путей до неё дошёл.
   if (not IsSchedulableEffectId(magicSlotInfo.skillEffectId))
   {
-    uint64_t suppressed = 0;
-    if (_scheduleEffectRangeThrottle.Allow(suppressed))
+    uint64_t suppressed = 0, total = 0;
+    if (_scheduleEffectRangeThrottle.Allow(suppressed, total))
       server::util::QuietLogError(
         "ScheduleSkillEffect: skillEffectId {} out of range (max {}, suppressed {})",
         magicSlotInfo.skillEffectId,

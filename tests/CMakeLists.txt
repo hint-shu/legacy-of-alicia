@@ -288,4 +288,3 @@ if (BASH_PROGRAM)
     set_tests_properties(RelayAuthzGate PROPERTIES
             ENVIRONMENT "ROOT=${CMAKE_SOURCE_DIR}")
 endif ()
-

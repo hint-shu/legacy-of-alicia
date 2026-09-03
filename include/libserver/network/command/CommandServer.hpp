@@ -27,6 +27,7 @@
 #include "libserver/util/QuietLog.hpp"
 #include "libserver/util/Stream.hpp"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -167,10 +168,13 @@ public:
       }
       catch (const std::exception& x)
       {
-        static server::util::LogThrottle malformedPayloadThrottle;
+        //! ★ЯВНОЕ ОКНО (итерация 12): конструктор `LogThrottle` редакции R72,
+        //! которая лежит в `main`, значения по умолчанию не имеет. Пять секунд —
+        //! то же окно, что было у умолчания прежней редакции R71.
+        static server::util::LogThrottle malformedPayloadThrottle{std::chrono::seconds(5)};
 
-        uint64_t suppressed = 0;
-        if (malformedPayloadThrottle.Allow(suppressed))
+        uint64_t suppressed = 0, total = 0;
+        if (malformedPayloadThrottle.Allow(suppressed, total))
           server::util::QuietLogWarn(
             "Malformed payload for command '{}' from client '{}': {} (suppressed {})",
             protocol::GetCommandName(C::GetCommand()),

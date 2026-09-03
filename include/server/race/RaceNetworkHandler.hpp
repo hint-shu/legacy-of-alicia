@@ -37,6 +37,7 @@
 #include "libserver/util/LogThrottle.hpp"
 #include "server/race/RelayAuthz.hpp"
 
+#include <chrono>
 #include <random>
 #include <unordered_map>
 
@@ -490,30 +491,35 @@ private:
   //! остаются прежними, поэтому код НЕтронутых методов кодируется так же — а значит
   //! «неподвижный контрольный символ» лесенки остаётся честной уликой, а не
   //! случайностью компоновки.
-  util::LogThrottle _magicOwnershipThrottle;
-  util::LogThrottle _magicTargetCountThrottle;
-  util::LogThrottle _magicPayloadThrottle;
-  util::LogThrottle _skillTargetThrottle;
-  util::LogThrottle _skillEffectIdThrottle;
-  util::LogThrottle _relayEnvelopeThrottle;
-  util::LogThrottle _relayActorThrottle;
-  util::LogThrottle _itemGetOwnershipThrottle;
-  util::LogThrottle _relayPayloadTypeThrottle;
-  util::LogThrottle _scheduleEffectRangeThrottle;
-  util::LogThrottle _itemDeckUnknownThrottle;
-  util::LogThrottle _relayReferenceThrottle;
-  util::LogThrottle _effectInstanceThrottle;
-  util::LogThrottle _effectInstanceCapacityThrottle;
+  //! ★ЯВНОЕ ОКНО, А НЕ УМОЛЧАНИЕ (итерация 12): `LogThrottle` принадлежит R72,
+  //! который лёг в `main` первым, и его конструктор объявлен БЕЗ значения по
+  //! умолчанию. Пять секунд — то самое окно, на которое эти поля полагались через
+  //! умолчание прежней редакции R71; поведение не меняется, меняется способ его
+  //! назвать. Правило владения файлом — спека §2.0.
+  util::LogThrottle _magicOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetCountThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicPayloadThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _skillTargetThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _skillEffectIdThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayEnvelopeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayActorThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _itemGetOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayPayloadTypeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _scheduleEffectRangeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _itemDeckUnknownThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayReferenceThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _effectInstanceThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _effectInstanceCapacityThrottle{std::chrono::seconds(5)};
   //! LOA-fix (R71-22/R71-24, ревью 3 #1-#3): жалобы новых гардов отчёта и наводки.
   //! Каждая заказывается клиентским пакетом, значит каждая обязана быть задросселена.
-  util::LogThrottle _effectReplayThrottle;
-  util::LogThrottle _aiAttackerThrottle;
-  util::LogThrottle _dragonTargetThrottle;
-  util::LogThrottle _magicClassificationThrottle;
+  util::LogThrottle _effectReplayThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _aiAttackerThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _dragonTargetThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicClassificationThrottle{std::chrono::seconds(5)};
   //! LOA-fix (R71-25, находка ревью 4 #1): у каста и у отчёта СВОИ дроссели —
   //! общий гасил бы одну жалобу из-за другой, и раунд снова судил бы по молчанию.
-  util::LogThrottle _magicTypeUnknownThrottle;
-  util::LogThrottle _reportedMagicTypeThrottle;
+  util::LogThrottle _magicTypeUnknownThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _reportedMagicTypeThrottle{std::chrono::seconds(5)};
   //! LOA-fix (R71-27, находка ревью 5 #1): ТОТАЛЬНОЕ ПРАВИЛО ДЛЯ СЕМЕЙСТВА НАВОДКИ.
   //!
   //! Ни одна жалоба, которую умеет заказать клиентский пакет, не пишется сырой —
@@ -522,15 +528,15 @@ private:
   //! цель не участник заезда): общий дроссель гасил бы одну жалобу из-за другой, и
   //! гард снова судился бы по молчанию. Проверяется сборочным гейтом
   //! `tools/check_race_rejection_throttle.sh`.
-  util::LogThrottle _magicTargetOwnershipThrottle;
-  util::LogThrottle _magicTargetLookupThrottle;
-  util::LogThrottle _dragonHoldingThrottle;
-  util::LogThrottle _magicTargetRosterThrottle;
-  util::LogThrottle _iceWallShapeThrottle;
+  util::LogThrottle _magicTargetOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetLookupThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _dragonHoldingThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetRosterThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _iceWallShapeThrottle{std::chrono::seconds(5)};
   //! ★НАЙДЕНЫ ГЕЙТОМ, А НЕ РЕВЬЮ: три сырые жалобы вне семейства наводки
   //! (подмена гонщика в двух хендлерах, неизвестный тип подобранного предмета).
-  util::LogThrottle _racerImpersonationThrottle;
-  util::LogThrottle _pickupItemTypeThrottle;
+  util::LogThrottle _racerImpersonationThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _pickupItemTypeThrottle{std::chrono::seconds(5)};
 };
 
 } // namespace server
