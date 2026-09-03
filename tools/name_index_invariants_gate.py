@@ -56,14 +56,30 @@ def die(message):
 
 
 def normalized(path):
-    """Текст файла после тех же фаз трансляции, что применяют соседние гейты."""
+    """Текст файла после тех же фаз трансляции, что применяют соседние гейты.
+
+    ★ЧИТАЕТСЯ ВЫВОД, А НЕ КОД ВОЗВРАТА (правка ревью, итерация 11). Режим
+    `--unsupported` ПЕЧАТАЕТ находки и ВСЕГДА возвращает ноль — он задуман как
+    справка для вызывающего, а не как вердикт. Прежняя редакция смотрела ровно
+    на код возврата, поэтому псевдоним `std`, склейка `##` и включение через
+    макрос молча НОРМАЛИЗОВЫВАЛИСЬ вместо останова: гейт объявлял чистым текст,
+    который прочитать не умеет ([[a-check-nobody-reads-is-not-a-check]]).
+    Здесь останов даёт ЛЮБАЯ непустая находка, а ненулевой код — отдельно.
+    """
     unsupported = subprocess.run(
         [sys.executable, SECRET_GATE, "--unsupported", path],
         capture_output=True, text=True)
     if unsupported.returncode != 0:
         sys.stdout.write(unsupported.stdout)
         sys.stderr.write(unsupported.stderr)
-        die("%s: неподдерживаемая форма препроцессора — разобрать нельзя" % path)
+        die("%s: детектор неподдерживаемых форм отказал (код %d)"
+            % (path, unsupported.returncode))
+    findings = [line for line in unsupported.stdout.splitlines() if line.strip()]
+    if findings:
+        for line in findings:
+            print("  ✗ неподдерживаемая форма: %s" % line, file=sys.stderr)
+        die("%s: %d неподдерживаемая(ых) форма(ы) препроцессора — разобрать "
+            "нельзя, «чисто» отсюда не следует" % (path, len(findings)))
     result = subprocess.run(
         [sys.executable, SECRET_GATE, "--normalize-code", path],
         capture_output=True, text=True)
@@ -198,7 +214,16 @@ def check_repair_is_scheduled(text, bodies, violations):
                 "ремонт-по-расписанию",
                 "'%s' зовёт перестройку индекса — имя с провода покупает "
                 "обход каталога" % name))
-    tick = require_body(bodies, "TickNameIndexMaintenance", violations)
+    # ★ТЕЛО ПРОХОДА ЖИВЁТ В `TickNameIndexMaintenanceAt` (итерация 11): у
+    # свойства «пол не опускается просьбой» иначе нет наблюдателя, а взять
+    # верхнюю обёртку значило бы судить одну строку делегирования.
+    entry = require_body(bodies, "TickNameIndexMaintenance", violations)
+    if entry is not None and "TickNameIndexMaintenanceAt(" not in entry:
+        violations.append((
+            "ремонт-по-расписанию",
+            "боевой плановый проход не делегирует TickNameIndexMaintenanceAt — "
+            "у прохода снова два тела"))
+    tick = require_body(bodies, "TickNameIndexMaintenanceAt", violations)
     if tick is not None:
         for callee in ("ReconcileCharacterNameIndexIfBroken",
                        "ReconcileGuildNameIndexIfBroken"):
@@ -308,27 +333,178 @@ def check_canonical_identity(bodies, violations):
                 "'%s' не берёт личность записи строгим разбором" % name))
 
 
-def check_scan_generation(bodies, violations):
-    """W6: публикация обхода учитывает поколение своих неудач."""
-    publisher = require_body(bodies, "RebuildUserNameIndexUnderRebuildGuard",
-                             violations)
-    if publisher is not None:
-        at = publisher.find("_userIndexStampValid.store(")
-        window = publisher[at:at + 400] if at >= 0 else ""
-        if "_userIndexFailedGeneration" not in window:
-            violations.append((
-                "поколение-обхода",
-                "публикация отпечатка не смотрит на поколение своих неудач: "
-                "устаревший обход снова перезапишет 'false' на 'true'"))
-    indexer = require_body(bodies, "IndexUserName", violations)
-    if indexer is not None and "_userIndexFailedGeneration" not in indexer:
+def write_sites(text, member):
+    """Смещения всех ЗАПИСЕЙ в член `member` — перепись, а не список мест.
+
+    ★КЛЮЧ — ДЕФЕКТ, А НЕ ФОРМА ОДНОГО МЕСТА. Ищутся ВСЕ вхождения имени, и
+    каждое классифицируется: `.load(` — чтение, всё прочее (`.store(`,
+    `.exchange(`, `.fetch_*(`, присваивание) — запись. Перечислять «известные
+    места записи» значило бы завести список, который следующий автор пополнит
+    молча ([[total-invariant-beats-list-of-sites]]).
+    """
+    sites = []
+    start = 0
+    while True:
+        at = text.find(member, start)
+        if at < 0:
+            return sites
+        start = at + len(member)
+        tail = text[start:start + 24].lstrip()
+        if tail.startswith(".load("):
+            continue
+        line_start = text.rfind("\n", 0, at) + 1
+        if "std::atomic" in text[line_start:at]:
+            continue                      # объявление члена
+        sites.append(at)
+
+
+def line_at(text, at):
+    line_start = text.rfind("\n", 0, at) + 1
+    line_end = text.find("\n", at)
+    return text[line_start:line_end if line_end > 0 else len(text)].strip()
+
+
+def check_repair_floor_is_not_client_resettable(text, bodies, spans, violations):
+    """B2 (итерация 11): просьба с провода НЕ умеет опустить пол ремонта.
+
+    ★СЕМАНТИЧЕСКАЯ, А НЕ ПО ТОКЕНУ. Прежняя проверка спрашивала «зовёт ли поиск
+    Reconcile» — и молчала о том, ЧТО ИМЕННО делал путь запроса: он ставил часы
+    планового прохода в прошлое, то есть отменял шестидесятисекундный пол,
+    оставаясь при этом «не зовущим Reconcile». Здесь переписываются ВСЕ записи
+    в часы: писать их вправе только тело планового прохода.
+    """
+    clock = "_nameIndexMaintenanceLastRun"
+    tick_span = spans.get("TickNameIndexMaintenanceAt")
+    if tick_span is None:
         violations.append((
-            "поколение-обхода",
-            "неудача регистрации имени не отмечает своё поколение"))
+            "пол-ремонта",
+            "TickNameIndexMaintenanceAt не найден — часы планового прохода "
+            "проверить нечем"))
+        return
+    for at in write_sites(text, clock):
+        if tick_span[0] <= at < tick_span[1]:
+            continue
+        violations.append((
+            "пол-ремонта",
+            "часы планового прохода пишутся вне его тела: %s — пол ремонта "
+            "снова отменяем снаружи" % line_at(text, at)))
+
+    request = require_body(bodies, "RequestScheduledNameIndexRepair", violations)
+    if request is not None:
+        if clock in request:
+            violations.append((
+                "пол-ремонта",
+                "путь запроса трогает часы планового прохода — имя с провода "
+                "снова покупает обход раньше пола"))
+        if "_nameIndexRepairPending" not in request:
+            violations.append((
+                "пол-ремонта",
+                "путь запроса не взводит флаг просьбы — просить стало нечем"))
+
+    tick = text[tick_span[0]:tick_span[1]]
+    floor = tick.find("kScheduledNameIndexRepairGap")
+    store = tick.find(clock + ".store(")
+    stop = tick.find("return;")
+    if floor < 0 or store < 0 or stop < 0 or not floor < stop < store:
+        violations.append((
+            "пол-ремонта",
+            "плановый проход переставляет часы, не выйдя раньше по полу "
+            "kScheduledNameIndexRepairGap — пола больше нет"))
+    if "_nameIndexRepairPending" not in tick:
+        violations.append((
+            "пол-ремонта",
+            "плановый проход не смотрит на флаг просьбы — просьба потеряна"))
+
+
+def check_stamp_has_one_locked_writer(text, bodies, spans, violations):
+    """W6 (итерация 11): отметку индекса аккаунтов пишет ОДНА функция, под замком.
+
+    ★СЕМАНТИЧЕСКАЯ, А НЕ ПО ПРИСУТСТВИЮ ТОКЕНА. Прежняя проверка требовала,
+    чтобы рядом с публикацией ВСТРЕЧАЛОСЬ слово `_userIndexFailedGeneration`, —
+    и это выполнялось при живой чередовке: путь отказа писал `false` и поднимал
+    поколение ДВУМЯ записями без замка, а обход между ними публиковал `true`.
+    Здесь проверяется само свойство: писатель ровно один, он под замком, и
+    отметка о неудаче поднимает поколение в ТОЙ ЖЕ критической секции.
+    """
+    writer = "StoreUserIndexStampValidLocked"
+    writer_span = spans.get(writer)
+    if writer_span is None:
+        violations.append((
+            "отметка-под-замком",
+            "функция %s не найдена — единственного писателя отметки нет"
+            % writer))
+        return
+    sites = write_sites(text, "_userIndexStampValid")
+    inside = [at for at in sites if writer_span[0] <= at < writer_span[1]]
+    for at in sites:
+        if at in inside:
+            continue
+        violations.append((
+            "отметка-под-замком",
+            "отметка индекса аккаунтов пишется вне %s: %s — правило "
+            "публикации снова существует в двух экземплярах"
+            % (writer, line_at(text, at))))
+    if len(inside) != 1:
+        violations.append((
+            "отметка-под-замком",
+            "единственный писатель отметки пишет её %d раз(а) — писателя "
+            "снова нет" % len(inside)))
+    body = text[writer_span[0]:writer_span[1]]
+    if "_userIndexFailedGeneration" not in body:
+        violations.append((
+            "отметка-под-замком",
+            "писатель отметки не смотрит на поколение неудач"))
+
+    failure = require_body(bodies, "MarkUserIndexFailure", violations)
+    if failure is not None:
+        if "_userNameIndexMutex" not in failure:
+            violations.append((
+                "отметка-под-замком",
+                "отметка о неудаче ставится БЕЗ замка индекса: между её "
+                "половинами снова помещается опоздавший обход"))
+        for needed in (writer + "(", "RaiseAtomicWatermark("):
+            if needed not in failure:
+                violations.append((
+                    "отметка-под-замком",
+                    "отметка о неудаче не делает %s — половины протокола "
+                    "разъехались" % needed))
+    indexer = require_body(bodies, "IndexUserName", violations)
+    if indexer is not None and "MarkUserIndexFailure()" not in indexer:
+        violations.append((
+            "отметка-под-замком",
+            "путь отказа регистрации имени не отмечает неудачу"))
+
+    # Каждый ЗОВУЩИЙ писателя обязан держать замок к моменту зова.
+    start = 0
+    while True:
+        at = text.find(writer + "(", start)
+        if at < 0:
+            break
+        start = at + 1
+        if writer_span[0] <= at < writer_span[1]:
+            continue
+        if text[max(0, at - 2):at] == "::":
+            continue                      # это ОПРЕДЕЛЕНИЕ писателя, не зов
+        holder = None
+        for name, span in spans.items():
+            if span and span[0] <= at < span[1]:
+                if holder is None or span[0] > spans[holder][0]:
+                    holder = name
+        if holder is None:
+            violations.append((
+                "отметка-под-замком",
+                "писателя отметки зовут из неизвестного места — под замком ли "
+                "этот зов, сказать нечем: %s" % line_at(text, at)))
+            continue
+        if "_userNameIndexMutex" not in text[spans[holder][0]:at]:
+            violations.append((
+                "отметка-под-замком",
+                "%s зовёт писателя отметки, не взяв замок индекса" % holder))
 
 
 CHECKS = ("один-снимок", "ремонт-по-расписанию", "снять-полноту-до-мутации",
-          "гейт-поиска-отдельно", "каноническая-личность", "поколение-обхода")
+          "гейт-поиска-отдельно", "каноническая-личность",
+          "пол-ремонта", "отметка-под-замком")
 
 
 def analyse(tree):
@@ -351,6 +527,10 @@ def analyse(tree):
                  "IndexGuildName", "ParseRecordUid", "HighestUidInDirectory",
                  "RebuildCharacterNameIndex", "RebuildGuildNameIndex",
                  "RebuildUserNameIndexUnderRebuildGuard", "IndexUserName",
+                 "TickNameIndexMaintenanceAt",
+                 "RequestScheduledNameIndexRepair",
+                 "StoreUserIndexStampValidLocked", "MarkUserIndexFailure",
+                 "TryPublishStaleUserIndexStampForTest",
                  "ReconcileCharacterNameIndexIfBroken",
                  "ReconcileGuildNameIndexIfBroken",
                  "MarkCharacterNameIndexBroken", "MarkGuildNameIndexBroken"):
@@ -363,8 +543,56 @@ def analyse(tree):
     check_invalidate_before_mutate(bodies, violations)
     check_guard_split(bodies, violations)
     check_canonical_identity(bodies, violations)
-    check_scan_generation(bodies, violations)
+    check_repair_floor_is_not_client_resettable(
+        joined, bodies, spans, violations)
+    check_stamp_has_one_locked_writer(joined, bodies, spans, violations)
     return violations
+
+
+UNSUPPORTED_FIXTURES = (
+    ("псевдоним-std", "namespace alias = std;\nint value = 0;\n"),
+    ("макрос-склейка", "#define JOIN(a, b) a ## b\nint JOIN(x, y) = 0;\n"),
+    ("включение-через-макрос", "#define HEADER <vector>\n#include HEADER\n"),
+)
+
+
+def selftest_unsupported():
+    """Непрочитываемая форма обязана ОСТАНАВЛИВАТЬ, а не нормализоваться.
+
+    ★ЭТО САМА НАХОДКА ИТЕРАЦИИ 10 (№3), А НЕ ЕЁ ПЕРЕСКАЗ. Режим `--unsupported`
+    печатает находки и ВСЕГДА возвращает ноль; гейт смотрел на код возврата и
+    потому объявлял чистым текст, который прочитать не умеет. Здесь каждая из
+    трёх форм подаётся на вход настоящему `normalized()`, и от него требуется
+    ОСТАНОВ с кодом 2 — а от чистого файла требуется тишина. Проверка, чья
+    канарейка молчит, — ОСТАНОВ ([[a-gate-must-prove-itself-first]]).
+    """
+    failures = []
+    with tempfile.TemporaryDirectory() as sandbox:
+        clean = os.path.join(sandbox, "clean.cpp")
+        with open(clean, "w", encoding="utf-8") as handle:
+            handle.write("#include <vector>\nint value = 0;\n")
+        try:
+            normalized(clean)
+            print("  ✓ читаемый файл проходит нормализацию")
+        except SystemExit:
+            failures.append("нормализатор останавливается на ЧИТАЕМОМ файле")
+
+        for name, payload in UNSUPPORTED_FIXTURES:
+            fixture = os.path.join(sandbox, "fixture.cpp")
+            with open(fixture, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            try:
+                normalized(fixture)
+            except SystemExit as stop:
+                if stop.code == 2:
+                    print("  ✓ форма %s даёт ОСТАНОВ" % name)
+                    continue
+                failures.append("форма %s остановила гейт кодом %s (ждали 2)"
+                                % (name, stop.code))
+                continue
+            failures.append("форма %s молча НОРМАЛИЗОВАНА — гейт снова читает "
+                            "код возврата вместо находок" % name)
+    return failures
 
 
 def selftest():
@@ -396,14 +624,20 @@ def selftest():
         ("каноническая-личность",
          "  if (stem.size() > 1 && stem.front() == '0')\n    return std::nullopt;\n",
          ""),
-        ("поколение-обхода",
-         "        && _userIndexFailedGeneration.load(std::memory_order::relaxed)\n"
-         "             < generation,",
-         "        ,"),
+        # ★КАНАРЕЙКИ ИТЕРАЦИИ 11: ровно те две формы, в которых дефект БЫЛ.
+        ("пол-ремонта",
+         "  _nameIndexRepairPending.store(true, std::memory_order::relaxed);",
+         "  _nameIndexMaintenanceLastRun.store(\n"
+         "    std::chrono::steady_clock::time_point{}, std::memory_order::relaxed);"),
+        ("отметка-под-замком",
+         "  const std::unique_lock indexLock(_userNameIndexMutex);\n"
+         "  // Порядок половин внутри секции безразличен",
+         "  // Порядок половин внутри секции безразличен"),
     ]
 
     failures = []
     print("=== самопроверка гейта инвариантов индекса имён ===")
+    failures.extend(selftest_unsupported())
     clean = analyse(TREE)
     if clean:
         for reason, detail in clean:
