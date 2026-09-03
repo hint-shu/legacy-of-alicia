@@ -72,6 +72,16 @@ std::vector<protocol::AcCmdRCAchievementUpdateNotify> AchievementSystem::OnServe
   if (not characterRecord.IsAvailable())
     return notifies;
 
+  // LOA-fix (R70-fix-8, backlog #58, находка Codex 6 WARN-5): ★МЕСТО ПОД
+  // НОТИФИКАЦИИ БЕРЁТСЯ ДО ВХОДА В `Mutable`. Внутри лямбды `push_back` может
+  // бросить `bad_alloc` УЖЕ ПОСЛЕ того, как прогресс и отметки тиров записаны
+  // в `data::Character`: бросок уводит управление мимо `_patchListener()`, и
+  // запись остаётся изменённой, но НЕ помеченной грязной — тир, который игрок
+  // уже увидел в логе, не доехал бы до базы. Одна строка снимает единственный
+  // источник аллокации на этом пути: `matching.size()` — верхняя граница числа
+  // кадров по построению (по кадру на запись каталога, не больше).
+  notifies.reserve(matching.size());
+
   characterRecord.Mutable(
     [&notifies, &matching, &provenConditions, &context, characterUid, increment](
       data::Character& character)
