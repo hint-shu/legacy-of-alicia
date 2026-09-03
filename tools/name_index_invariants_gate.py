@@ -333,29 +333,65 @@ def check_canonical_identity(bodies, violations):
                 "'%s' не берёт личность записи строгим разбором" % name))
 
 
-def write_sites(text, member):
-    """Смещения всех ЗАПИСЕЙ в член `member` — перепись, а не список мест.
+READ_FORMS = (".load(",)
+WRITE_FORMS = (".store(", ".exchange(", ".fetch_add(", ".fetch_sub(",
+               ".compare_exchange_weak(", ".compare_exchange_strong(")
 
-    ★КЛЮЧ — ДЕФЕКТ, А НЕ ФОРМА ОДНОГО МЕСТА. Ищутся ВСЕ вхождения имени, и
-    каждое классифицируется: `.load(` — чтение, всё прочее (`.store(`,
-    `.exchange(`, `.fetch_*(`, присваивание) — запись. Перечислять «известные
-    места записи» значило бы завести список, который следующий автор пополнит
-    молча ([[total-invariant-beats-list-of-sites]]).
+
+def squeeze(text):
+    """Текст без единого пробельного символа.
+
+    ★ЗАЧЕМ. Проверка предиката обязана судить ВЫРАЖЕНИЕ, а не его вёрстку:
+    перенос строки между `now - last` и `>=` не меняет смысла, а `>=` вместо
+    `<` меняет всё. Сжатие делает первое невидимым, а второе — видимым.
     """
-    sites = []
+    return "".join(text.split())
+
+
+def member_uses(text, member):
+    """(записи, утечки) — перепись ВСЕХ обращений к члену, а не список мест.
+
+    ★КЛЮЧ — ДЕФЕКТ, А НЕ ФОРМА ОДНОГО МЕСТА. Каждое вхождение имени обязано
+    опознаться: `.load(` — чтение, `.store(`/`.exchange(`/`.fetch_*`/CAS —
+    запись, строка объявления — объявление. ВСЁ ОСТАЛЬНОЕ — УТЕЧКА: член
+    связали ссылкой, взяли адрес или передали по ссылке, и с этого момента
+    перепись слепа ([[a-blind-checker-says-clean]]). Утечка — это НАРУШЕНИЕ, а
+    не молчание: гейт обязан сказать, что смотреть перестал.
+
+    ★ХВОСТ СЖИМАЕТСЯ. `.load (` с пробелом — то же чтение; прежняя редакция
+    считала его записью, то есть давала ложно-КРАСНЫЙ, а такой гейт отключают
+    ровно так же, как ложно-зелёный.
+    """
+    writes, escapes = [], []
     start = 0
     while True:
         at = text.find(member, start)
         if at < 0:
-            return sites
+            return writes, escapes
         start = at + len(member)
-        tail = text[start:start + 24].lstrip()
-        if tail.startswith(".load("):
-            continue
         line_start = text.rfind("\n", 0, at) + 1
-        if "std::atomic" in text[line_start:at]:
+        head = text[line_start:at]
+        # ★ОБЪЯВЛЕНИЕ ОТЛИЧАЕТСЯ ОТ СВЯЗЫВАНИЯ ССЫЛКОЙ (правка ревью,
+        # итерация 12). Прежнее «в строке есть std::atomic → это объявление»
+        # пропускало `std::atomic_bool& alias = _member;` — то есть ровно ту
+        # форму, ради которой перепись и заведена. Объявление члена — без `&`,
+        # без `*` и без присваивания.
+        if ("std::atomic" in head and "&" not in head and "*" not in head
+                and "=" not in head):
             continue                      # объявление члена
-        sites.append(at)
+        tail = squeeze(text[start:start + 40])
+        if any(tail.startswith(form) for form in READ_FORMS):
+            continue
+        if any(tail.startswith(form) for form in WRITE_FORMS):
+            writes.append(at)
+            continue
+        escapes.append(at)
+
+
+def write_sites(text, member):
+    """Только записи — совместимость с прежними вызовами."""
+    writes, _ = member_uses(text, member)
+    return writes
 
 
 def line_at(text, at):
@@ -381,7 +417,14 @@ def check_repair_floor_is_not_client_resettable(text, bodies, spans, violations)
             "TickNameIndexMaintenanceAt не найден — часы планового прохода "
             "проверить нечем"))
         return
-    for at in write_sites(text, clock):
+    clock_writes, clock_escapes = member_uses(text, clock)
+    for at in clock_escapes:
+        violations.append((
+            "пол-ремонта",
+            "часы планового прохода используются формой, которую перепись не "
+            "читает (связывание ссылкой, взятие адреса, передача по ссылке): "
+            "%s" % line_at(text, at)))
+    for at in clock_writes:
         if tick_span[0] <= at < tick_span[1]:
             continue
         violations.append((
@@ -415,6 +458,23 @@ def check_repair_floor_is_not_client_resettable(text, bodies, spans, violations)
             "пол-ремонта",
             "плановый проход не смотрит на флаг просьбы — просьба потеряна"))
 
+    # ★САМИ ПРЕДИКАТЫ, А НЕ ПОРЯДОК ТОКЕНОВ (правка ревью, итерация 12,
+    # находка 1). Порядок «пол → return → часы» держится и при `>=`,
+    # заменённом на `<`: сравнение переворачивается, пол исчезает, а гейт
+    # молчит. Поэтому здесь сверяются САМИ ВЫРАЖЕНИЯ, сжатые по пробелам:
+    # вёрстку это прощает, смену оператора — нет.
+    for what, expected in (
+            ("пол", "constboolfloorPassed=never||now-last>="
+                    "kScheduledNameIndexRepairGap;"),
+            ("период", "constboolperiodicDue=never||now-last>="
+                       "kPeriodicNameIndexSweepGap;"),
+            ("выход", "if(notfloorPassed||not(requested||periodicDue))return;")):
+        if expected not in squeeze(tick):
+            violations.append((
+                "пол-ремонта",
+                "предикат '%s' планового прохода не совпал с ожидаемым (%s): "
+                "сравнение или условие выхода изменено" % (what, expected)))
+
 
 def check_stamp_has_one_locked_writer(text, bodies, spans, violations):
     """W6 (итерация 11): отметку индекса аккаунтов пишет ОДНА функция, под замком.
@@ -434,7 +494,13 @@ def check_stamp_has_one_locked_writer(text, bodies, spans, violations):
             "функция %s не найдена — единственного писателя отметки нет"
             % writer))
         return
-    sites = write_sites(text, "_userIndexStampValid")
+    sites, stamp_escapes = member_uses(text, "_userIndexStampValid")
+    for at in stamp_escapes:
+        violations.append((
+            "отметка-под-замком",
+            "отметка индекса аккаунтов используется формой, которую перепись "
+            "не читает (ссылка, адрес, передача по ссылке): %s"
+            % line_at(text, at)))
     inside = [at for at in sites if writer_span[0] <= at < writer_span[1]]
     for at in sites:
         if at in inside:
@@ -454,6 +520,19 @@ def check_stamp_has_one_locked_writer(text, bodies, spans, violations):
         violations.append((
             "отметка-под-замком",
             "писатель отметки не смотрит на поколение неудач"))
+    # ★САМ ПРЕДИКАТ ПУБЛИКАЦИИ (правка ревью, итерация 12, находка 1).
+    # `<`, заменённое на `>=`, оставляет и единственного писателя, и замок, и
+    # упоминание поколения на местах — а публикация начинает объявлять
+    # отпечаток действительным ИМЕННО ТОГДА, когда неудача уже отмечена.
+    expected_stamp = ("_userIndexStampValid.store(scanWasClean&&"
+                      "_userIndexFailedGeneration.load("
+                      "std::memory_order::relaxed)<generation,"
+                      "std::memory_order::relaxed);")
+    if expected_stamp not in squeeze(body):
+        violations.append((
+            "отметка-под-замком",
+            "предикат публикации отметки не совпал с ожидаемым (%s): "
+            "сравнение поколений изменено" % expected_stamp))
 
     failure = require_body(bodies, "MarkUserIndexFailure", violations)
     if failure is not None:
@@ -638,6 +717,25 @@ def selftest():
          "  const std::unique_lock indexLock(_userNameIndexMutex);\n"
          "  // Порядок половин внутри секции безразличен",
          "  // Порядок половин внутри секции безразличен"),
+        # ★КАНАРЕЙКИ-ПЕРЕВОРОТЫ ОПЕРАТОРА (итерация 12, находка 1). Именно на
+        # них прежняя редакция молчала: порядок токенов и наличие имён при
+        # перевороте сравнения не меняются, а свойство исчезает.
+        ("пол-ремонта",
+         "    const bool floorPassed = never || now - last >= kScheduledNameIndexRepairGap;",
+         "    const bool floorPassed = never || now - last < kScheduledNameIndexRepairGap;"),
+        ("отметка-под-замком",
+         "      && _userIndexFailedGeneration.load(std::memory_order::relaxed)\n"
+         "           < generation,",
+         "      && _userIndexFailedGeneration.load(std::memory_order::relaxed)\n"
+         "           >= generation,"),
+        # ★КАНАРЕЙКА-ПСЕВДОНИМ: член связан ссылкой и пишется через неё. Пока
+        # перепись читала только `имя.store(`, такая запись была ей невидима.
+        ("отметка-под-замком",
+         "  _userIndexStampValid.store(\n"
+         "    scanWasClean",
+         "  std::atomic_bool& stampAlias = _userIndexStampValid;\n"
+         "  stampAlias.store(\n"
+         "    scanWasClean"),
     ]
 
     failures = []

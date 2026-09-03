@@ -593,9 +593,16 @@ void TestBrokenIndexRepairsItselfAtTheFloorWithoutAnyRequest()
   source.TickNameIndexMaintenanceAt(base);
   CHECK(source.ScheduledNameIndexPassCount() == 1,
     "первый проход не состоялся");
-  // Файл всё ещё бит: индекс остался неполным и НЕ отвечает «свободно».
-  CHECK(not source.IsCharacterNameUnique("Gamma"),
-    "неполный индекс ответил «имя свободно»");
+  // ★НАБЛЮДАЕМ НЕ ПРОСЯЩИМ ПУТЁМ (правка ревью, итерация 12, находка 3).
+  // Здесь стоял `IsCharacterNameUnique`, а он на промахе по НЕПОЛНОМУ индексу
+  // сам зовёт `RequestScheduledNameIndexRepair` — то есть тест, называющийся
+  // «без единой просьбы», просьбу и подавал. Снятие перевзвода в
+  // `Reconcile*IfBroken` он бы после этого не заметил. `RetrieveCharacterUidByName`
+  // индекс не чинит и ни о чём не просит: это ЧИСТОЕ наблюдение.
+  CHECK(source.RetrieveCharacterUidByName("Alpha") == server::data::InvalidUid,
+    "имя из нечитаемого файла адресуется до починки");
+  CHECK(source.RetrieveCharacterUidByName("Beta") == server::data::Uid{2},
+    "соседнее читаемое имя перестало адресоваться");
 
   // Файл ПОЧИНЕН на диске. Ни одного поиска, ни одной просьбы с провода.
   WriteRaw(root / "characters" / "1.json", R"({"uid": 1, "name": "Alpha"})");
@@ -637,12 +644,30 @@ std::size_t g_interleaveGeneration = 0;
 bool g_interleaveHookRan = false;
 bool g_interleavePublished = false;
 
+//! ★ПОПЫТКА ИДЁТ ИЗ ДРУГОГО ПОТОКА, И ЭТО НЕ УКРАШЕНИЕ (правка ревью,
+//! итерация 12, находка 2).
+//!
+//! Прежняя редакция звала `try_lock` ТЕМ ЖЕ потоком, который уже держит
+//! `_userNameIndexMutex`. Повторный захват `std::shared_mutex` одним потоком —
+//! НЕОПРЕДЕЛЁННОЕ ПОВЕДЕНИЕ; libstdc++ сегодня возвращает `false`, и тест
+//! читал этот `false` как доказательство «замок занят». Доказательство,
+//! опирающееся на UB, доказательством не является.
+//!
+//! Здесь попытку делает ОТДЕЛЬНЫЙ поток, для которого замок — чужой, а
+//! `try_lock` — законная неблокирующая операция. `join` внутри критической
+//! секции безопасен именно потому, что попытка неблокирующая: поток B не ждёт
+//! замка, он сразу отвечает «не смог».
 void AttemptStalePublicationFromInsideTheFailure()
 {
   g_interleaveHookRan = true;
-  g_interleavePublished =
-    g_interleaveSource->TryPublishStaleUserIndexStampForTest(
-      g_interleaveGeneration);
+  std::thread stalePublisher(
+    []()
+    {
+      g_interleavePublished =
+        g_interleaveSource->TryPublishStaleUserIndexStampForTest(
+          g_interleaveGeneration);
+    });
+  stalePublisher.join();
 }
 
 void TestStaleScanCannotPublishOverAFailure()
@@ -668,7 +693,7 @@ void TestStaleScanCannotPublishOverAFailure()
   CHECK(g_interleaveHookRan,
     "наблюдатель не был позван — тест не смотрел на предмет");
   CHECK(not g_interleavePublished,
-    "опоздавший обход опубликовал отметку ВНУТРИ отметки о неудаче");
+    "ДРУГОЙ ПОТОК опубликовал отметку ВНУТРИ отметки о неудаче");
   CHECK(not source.UserIndexStampValidForTest(),
     "после неудачи регистрации индекс объявлен полным");
 
