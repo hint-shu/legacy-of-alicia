@@ -29,7 +29,7 @@
 #include "libserver/registry/BreedingOdds.hpp"
 #include "libserver/registry/HorseRegistry.hpp"
 
-#include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +41,36 @@
 
 namespace
 {
+
+constexpr const char* kTestFile = "TestGenetics.cpp";
+
+//! ★НЕ `assert` (Codex finding 4, iteration 1). Образ и юнит-прогон раунда
+//! собираются `RelWithDebInfo`, а он несёт `-DNDEBUG` — то есть `assert`
+//! выкидывается препроцессором и тест, написанный на нём, ПРОХОДИТ ВСЕГДА.
+//! Ровно этот запрет уже написан в `tests/src/util/TestLogThrottle.cpp:34`, и
+//! первая версия этого файла его нарушила: 28 `assert`, зелёных по построению.
+//! Своя проверка живёт вне зависимости от NDEBUG и валит процесс кодом 1.
+void Check(
+  const bool condition,
+  const char* const what,
+  const int line)
+{
+  if (condition)
+    return;
+
+  std::fprintf(
+    stderr,
+    "%s:%d: ПРОВАЛ — %s\n",
+    kTestFile,
+    line,
+    what);
+  std::fflush(stderr);
+  std::exit(1);
+}
+
+//! Вариадический на случай запятых внутри выражения (`std::accumulate(a, b, 0)`).
+#define CHECK(...) Check((__VA_ARGS__), #__VA_ARGS__, __LINE__)
+
 
 using server::registry::BuildEmblemTierChoices;
 using server::registry::BuildPotentialTypeChoices;
@@ -60,9 +90,25 @@ HorseRegistry LoadHorses()
 //! Star tier maps onto the OddsRare column in stock order.
 void TestCoatTierMapsToOddsColumn()
 {
-  assert(CoatTierToOddsIndex(Coat::Tier::Common) == 0);
-  assert(CoatTierToOddsIndex(Coat::Tier::Uncommon) == 1);
-  assert(CoatTierToOddsIndex(Coat::Tier::Rare) == 2);
+  CHECK(CoatTierToOddsIndex(Coat::Tier::Common) == 0);
+  CHECK(CoatTierToOddsIndex(Coat::Tier::Uncommon) == 1);
+  CHECK(CoatTierToOddsIndex(Coat::Tier::Rare) == 2);
+}
+
+//! ★R77-fix-2 (Codex finding 2). A value outside the enum must have NO column.
+//! The old code answered `0` — the common-coat column — for every such value,
+//! and the YAML parser could produce one by casting any integer into the enum.
+void TestUnknownCoatTierHasNoColumn()
+{
+  for (const int32_t bogus : {0, 4, 7, 255, -1})
+  {
+    const auto index = CoatTierToOddsIndex(static_cast<Coat::Tier>(bogus));
+    CHECK(not index.has_value());
+  }
+
+  // And the three real tiers still answer, so "always nullopt" is not a pass.
+  CHECK(CoatTierToOddsIndex(Coat::Tier::Common).has_value());
+  CHECK(CoatTierToOddsIndex(Coat::Tier::Rare).has_value());
 }
 
 //! I4. Stock EmblemRatioInfo sums to 92, and the missing 8 is a real outcome.
@@ -71,28 +117,28 @@ void TestNoEmblemShareComesFromTheData()
   // Stock ratios.
   const std::vector<EmblemRatio> stock = {{1, 77}, {2, 13}, {3, 2}};
   const auto choices = BuildEmblemTierChoices(stock);
-  assert(choices.values.size() == 4);
-  assert(choices.values[3] == kNoEmblemTier);
-  assert(choices.weights[3] == 8);
-  assert(std::accumulate(choices.weights.begin(), choices.weights.end(), 0) == 100);
+  CHECK(choices.values.size() == 4);
+  CHECK(choices.values[3] == kNoEmblemTier);
+  CHECK(choices.weights[3] == 8);
+  CHECK(std::accumulate(choices.weights.begin(), choices.weights.end(), 0) == 100);
 
   // Ratios that already sum to 100 must produce NO sentinel: the share is a
   // consequence of the data, never a hardcoded eight percent.
   const std::vector<EmblemRatio> full = {{1, 80}, {2, 18}, {3, 2}};
   const auto fullChoices = BuildEmblemTierChoices(full);
-  assert(fullChoices.values.size() == 3);
+  CHECK(fullChoices.values.size() == 3);
   for (const uint32_t tier : fullChoices.values)
-    assert(tier != kNoEmblemTier);
+    CHECK(tier != kNoEmblemTier);
 
   // Rows with a non-positive ratio stay out, as before the round.
   const std::vector<EmblemRatio> withZero = {{1, 77}, {2, 0}, {3, 2}};
   const auto zeroChoices = BuildEmblemTierChoices(withZero);
-  assert(zeroChoices.values.size() == 3);
-  assert(zeroChoices.values[2] == kNoEmblemTier);
-  assert(zeroChoices.weights[2] == 21);
+  CHECK(zeroChoices.values.size() == 3);
+  CHECK(zeroChoices.values[2] == kNoEmblemTier);
+  CHECK(zeroChoices.weights[2] == 21);
 
   // An empty table must not invent a "no emblem" branch out of nothing.
-  assert(BuildEmblemTierChoices({}).empty());
+  CHECK(BuildEmblemTierChoices({}).empty());
 }
 
 //! Live check of the shipped potential.yaml through the same call Genetics makes.
@@ -123,22 +169,22 @@ void TestPotentialChoicesFollowTheCoatTier()
   const auto rare = BuildPotentialTypeChoices(registry, 2);
 
   // Every type is a candidate on every tier; only the weights move.
-  assert(common.values.size() == 14);
-  assert(uncommon.values.size() == 14);
-  assert(rare.values.size() == 14);
+  CHECK(common.values.size() == 14);
+  CHECK(uncommon.values.size() == 14);
+  CHECK(rare.values.size() == 14);
 
   const int32_t commonTotal = std::accumulate(common.weights.begin(), common.weights.end(), 0);
   const int32_t rareTotal = std::accumulate(rare.weights.begin(), rare.weights.end(), 0);
-  assert(commonTotal == 430);
-  assert(rareTotal == 490);
+  CHECK(commonTotal == 430);
+  CHECK(rareTotal == 490);
 
   // The whole point of M6: a common coat leans weak, a rare coat leans strong.
-  assert(bandWeight(common, weak) > bandWeight(common, strong));
-  assert(bandWeight(rare, strong) > bandWeight(rare, weak));
+  CHECK(bandWeight(common, weak) > bandWeight(common, strong));
+  CHECK(bandWeight(rare, strong) > bandWeight(rare, weak));
 
   // And the lean is monotone across the three tiers, not merely different.
-  assert(bandWeight(common, strong) < bandWeight(uncommon, strong));
-  assert(bandWeight(uncommon, strong) < bandWeight(rare, strong));
+  CHECK(bandWeight(common, strong) < bandWeight(uncommon, strong));
+  CHECK(bandWeight(uncommon, strong) < bandWeight(rare, strong));
 }
 
 //! I5. The realised distribution differs from uniform, measured not assumed.
@@ -173,14 +219,14 @@ void TestSampledDistributionIsTierDependent()
   const double rareShare = sampleStrongShare(2);
 
   // Expected from potential.yaml: 25/430, 125/470, 300/490.
-  assert(std::fabs(commonShare - 25.0 / 430.0) < 0.01);
-  assert(std::fabs(uncommonShare - 125.0 / 470.0) < 0.01);
-  assert(std::fabs(rareShare - 300.0 / 490.0) < 0.01);
+  CHECK(std::fabs(commonShare - 25.0 / 430.0) < 0.01);
+  CHECK(std::fabs(uncommonShare - 125.0 / 470.0) < 0.01);
+  CHECK(std::fabs(rareShare - 300.0 / 490.0) < 0.01);
 
   // A uniform roll over 14 types would give 5/14 = 0.357 on every tier.
   constexpr double kUniformStrongShare = 5.0 / 14.0;
-  assert(std::fabs(commonShare - kUniformStrongShare) > 0.05);
-  assert(std::fabs(rareShare - kUniformStrongShare) > 0.05);
+  CHECK(std::fabs(commonShare - kUniformStrongShare) > 0.05);
+  CHECK(std::fabs(rareShare - kUniformStrongShare) > 0.05);
 }
 
 //! I5b, behaviour side. All-zero weights must yield NO candidates, so the caller
@@ -191,7 +237,7 @@ void TestZeroWeightsYieldNoCandidates()
   // The shipped registry has no zero column, so build the degenerate case from a
   // hand-made one: an out-of-range tier index behaves like "no data for this tier".
   const auto choices = BuildPotentialTypeChoices(registry, 3);
-  assert(choices.empty());
+  CHECK(choices.empty());
 }
 
 } // namespace
@@ -199,6 +245,7 @@ void TestZeroWeightsYieldNoCandidates()
 int main()
 {
   TestCoatTierMapsToOddsColumn();
+  TestUnknownCoatTierHasNoColumn();
   TestNoEmblemShareComesFromTheData();
   TestPotentialChoicesFollowTheCoatTier();
   TestSampledDistributionIsTierDependent();
