@@ -43,6 +43,7 @@ namespace
 
 using server::race::ClassifyMagicApplication;
 using server::race::MagicApplication;
+using server::race::IsKnownIceWallSegmentCount;
 
 int failures = 0;
 

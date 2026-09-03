@@ -20,6 +20,7 @@
 #ifndef SERVER_RACE_MAGIC_APPLICATION_HPP
 #define SERVER_RACE_MAGIC_APPLICATION_HPP
 
+#include <cstddef>
 #include <cstdint>
 
 namespace server::race
