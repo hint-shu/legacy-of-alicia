@@ -764,9 +764,10 @@ void TestLoginFrameBudget()
   const auto rawSize = measure(poisoned, threw);
   std::printf("t13: кадр на собственных потолках клиентских полей = %zu байт "
               "(буфер команды %zu)\n", rawSize, MaxCommandDataSize);
-  Check(rawSize > MaxCommandDataSize,
-    "t13: без бюджета кадр НЕ влезает (иначе арка ничего не доказывает)",
-    static_cast<long long>(rawSize), static_cast<long long>(MaxCommandDataSize));
+  Check(rawSize > server::protocol::MaxClientPacketDataBytes,
+    "t13: без бюджета кадр НЕ влезает в потолок КЛИЕНТА",
+    static_cast<long long>(rawSize),
+    static_cast<long long>(server::protocol::MaxClientPacketDataBytes));
 
   // (б) с бюджетом обязан влезть, и сброшено обязано быть НАЗВАНО.
   const auto shed = server::protocol::BudgetLoginFrame(poisoned);
@@ -774,12 +775,21 @@ void TestLoginFrameBudget()
   std::printf("t13: после BudgetLoginFrame = %zu байт, запас %zu, маска сброса 0x%x, "
               "представление %zu байт\n",
     budgetedSize,
-    budgetedSize < MaxCommandDataSize ? MaxCommandDataSize - budgetedSize : 0,
+    budgetedSize < server::protocol::MaxClientPacketDataBytes
+      ? server::protocol::MaxClientPacketDataBytes - budgetedSize : 0,
     shed, poisoned.introduction.size());
   Check(not threw, "t13: забюджетированный кадр пишется без броска");
-  Check(budgetedSize <= MaxCommandDataSize,
-    "t13: забюджетированный кадр влезает в буфер команды",
-    static_cast<long long>(budgetedSize), static_cast<long long>(MaxCommandDataSize));
+  // ★W2-5: цель — ПОТОЛОК КЛИЕНТА (7168 по собственному RE проекта), а не
+  // буфер сервера: 8192 физически ограничивает запись, но кадр в полосе
+  // 7169..8192 сервер запишет, а клиент не прочтёт.
+  Check(budgetedSize <= server::protocol::MaxClientPacketDataBytes,
+    "t13: забюджетированный кадр влезает в ПОТОЛОК КЛИЕНТА",
+    static_cast<long long>(budgetedSize),
+    static_cast<long long>(server::protocol::MaxClientPacketDataBytes));
+  Check(server::protocol::MaxClientPacketDataBytes < MaxCommandDataSize,
+    "t13: потолок клиента строго ниже буфера сервера",
+    static_cast<long long>(server::protocol::MaxClientPacketDataBytes),
+    static_cast<long long>(MaxCommandDataSize));
   Check(shed != static_cast<uint32_t>(server::protocol::LoginFrameShed::Nothing),
     "t13: сброс НАЗВАН, а не сделан молча", shed, 1);
   Check((shed & static_cast<uint32_t>(server::protocol::LoginFrameShed::StillTooLarge)) == 0,
@@ -886,13 +896,15 @@ void TestMacroAcceptingBranch()
 
 // ------------------------------------------------------------------ тест 16
 
-//! 16: ЧАСТИЧНЫЙ ПРИЁМ БЛОКА МАКРОСОВ (★R74-fix-2, subreview #1 WARN 3).
+//! 16: ЧАСТИЧНЫЙ ПРИЁМ БЛОКА МАКРОСОВ (★subreview #1 WARN 3, #2 WARN 1 и NIT 4).
 //!
-//! Проверяет саму арифметику отбора «сколько слотов влезает» — ту, что стоит в
-//! `HandleUpdateUserSettings`. Приём «всё или ничего» терял и те слоты, что
-//! влезали, а клиент при этом видел «сохранено».
+//! ★ЗОВЁТ ХЕЛПЕР, А НЕ ПОВТОРЯЕТ ЕГО. Прежняя редакция переписывала цикл
+//! отбора копией, а сам обработчик в тестовый бинарь не линкуется — значит
+//! мутация оригинала оставляла тест зелёным. Теперь отбор живёт в libserver
+//! (`SelectMacroSlotsWithinBudget`), и обе стороны зовут ОДНО И ТО ЖЕ.
 void TestMacroPartialAcceptance()
 {
+  // (а) блок целиком сверх бюджета, слоты одинаковые — принимается префикс.
   server::protocol::MacroOptions oversized{};
   for (auto& macro : oversized.macros)
     macro = std::string(1800, 'A');
@@ -901,18 +913,7 @@ void TestMacroPartialAcceptance()
     "t16: исходный блок действительно сверх бюджета");
 
   server::protocol::MacroOptions accepted{};
-  std::size_t slots = 0;
-  for (std::size_t slot = 0; slot < accepted.macros.size(); ++slot)
-  {
-    server::protocol::MacroOptions probe = accepted;
-    probe.macros[slot] = oversized.macros[slot];
-    if (server::protocol::MeasureMacroBlockWireSize(probe)
-          > server::protocol::MaxMacroBlockWireBytes)
-      break;
-    accepted = probe;
-    ++slots;
-  }
-
+  const auto slots = server::protocol::SelectMacroSlotsWithinBudget(oversized, accepted);
   std::printf("t16: слотов принято %zu из 8, размер принятого блока %zu из %zu\n",
     slots,
     server::protocol::MeasureMacroBlockWireSize(accepted),
@@ -925,13 +926,194 @@ void TestMacroPartialAcceptance()
           <= server::protocol::MaxMacroBlockWireBytes,
     "t16: принятое влезает в бюджет");
 
-  // NIT 2: размер сверх мерочного скретча описывается честно.
+  // (б) ★ГЛАВНЫЙ СЛУЧАЙ subreview #2 WARN 1: ПЕРВЫЙ слот один бьёт бюджет,
+  //     остальные семь крошечные. Прежний отбор `break`-ал на слоте 0 и давал
+  //     НОЛЬ принятых, затирая хранимый блок восемью пустыми строками.
+  server::protocol::MacroOptions headHeavy{};
+  headHeavy.macros[0] = std::string(2100, 'A');
+  for (std::size_t slot = 1; slot < headHeavy.macros.size(); ++slot)
+    headHeavy.macros[slot] = "abc";
+
+  server::protocol::MacroOptions kept{};
+  const auto keptSlots = server::protocol::SelectMacroSlotsWithinBudget(headHeavy, kept);
+  std::printf("t16: голова 2100 Б + семь коротких -> принято %zu слотов\n", keptSlots);
+  Check(keptSlots == 7,
+    "t16: семь влезающих слотов принимаются, несмотря на неподъёмный слот 0",
+    static_cast<long long>(keptSlots), 7);
+  Check(kept.macros[0].empty(),
+    "t16: неподъёмный слот 0 пропущен");
+  Check(kept.macros[7] == "abc",
+    "t16: ИНДЕКСЫ СОХРАНЕНЫ — слот 7 остался слотом 7");
+  std::size_t nonEmpty = 0;
+  for (const auto& macro : kept.macros)
+    if (not macro.empty())
+      ++nonEmpty;
+  Check(nonEmpty == 7, "t16: хранимый блок НЕ пуст",
+    static_cast<long long>(nonEmpty), 7);
+
+  // (в) ни один слот не влезает — принимать нечего, и это отличимо от «всё ок».
+  server::protocol::MacroOptions allHuge{};
+  for (auto& macro : allHuge.macros)
+    macro = std::string(3000, 'A');
+  server::protocol::MacroOptions none{};
+  Check(server::protocol::SelectMacroSlotsWithinBudget(allHuge, none) == 0,
+    "t16: ни один слот не влез — принято 0 (вызывающий не трогает хранимое)");
+
+  // NIT 2 итерации 1: размер сверх мерочного скретча описывается честно.
   const auto unknown = server::protocol::DescribeMacroBlockWireSize(
     std::numeric_limits<std::size_t>::max());
   Check(unknown.find("exact size unknown") != std::string::npos,
     "t16: неизмеримый размер не печатается как число байт");
   Check(server::protocol::DescribeMacroBlockWireSize(123) == "123 bytes",
     "t16: измеримый размер печатается как есть");
+}
+
+// ------------------------------------------------------------------ тест 17
+
+//! 17: СУХОЙ ПРОГОН НЕ ОСТАВЛЯЕТ НИ СТРОКИ, НИ СЧЁТЧИКА ОКНА
+//!     (★subreview #2, WARN 2).
+void TestDryRunLeavesNoTrace()
+{
+  auto captured = std::make_shared<std::ostringstream>();
+  const auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(*captured);
+  const auto previous = spdlog::default_logger();
+  auto probe = std::make_shared<spdlog::logger>("dry-run-probe", sink);
+  probe->set_level(spdlog::level::trace);
+  spdlog::set_default_logger(probe);
+
+  const auto data = Fill<Quad>(40);
+  {
+    // Измерение: жалоб быть не должно ВООБЩЕ.
+    const server::util::ScopedBoundedListSilence silence;
+    std::array<std::byte, 4096> storage{};
+    SinkStream measured{std::span{storage}};
+    server::util::WriteBoundedList<uint8_t>(
+      measured, data, {.maxCount = 4, .name = "t17"});
+  }
+  probe->flush();
+  const auto afterDryRun = captured->str();
+
+  // Настоящая запись с ТОЙ ЖЕ площадки обязана дать строку — то есть окно
+  // подавления сухим прогоном НЕ взведено.
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream real{std::span{storage}};
+    server::util::WriteBoundedList<uint8_t>(
+      real, data, {.maxCount = 4, .name = "t17"});
+  }
+  probe->flush();
+  spdlog::set_default_logger(previous);
+  const auto afterReal = captured->str();
+
+  Check(afterDryRun.find("bounded list truncated: t17") == std::string::npos,
+    "t17: сухой прогон не печатает ни одной строки усечения");
+  Check(afterReal.find("bounded list truncated: t17") != std::string::npos,
+    "t17: настоящая запись после сухого прогона строку ДАЁТ — окно не сожжено");
+}
+
+// ------------------------------------------------------------------ тест 18
+
+//! 18: ОДИН ПЕРЕРОСШИЙ ЭЛЕМЕНТ НЕ ОБНУЛЯЕТ СТРАНИЦУ (★subreview #2, WARN 4).
+void TestOversizedElementIsSkipped()
+{
+  server::protocol::ChatCmdLetterListAckOk page{};
+  page.mailboxFolder = server::protocol::MailboxFolder::Inbox;
+  page.mailboxInfo.hasMoreMail = 0;
+
+  // Элемент 0 — отравленное письмо, за ним девять коротких.
+  auto& poisoned = page.inboxMails.emplace_back();
+  poisoned.uid = 1;
+  poisoned.sender = "attacker";
+  poisoned.date = "00:00:00 01/01/2026 UTC";
+  poisoned.struct0.unk0 = "\x0F";
+  poisoned.struct0.body = std::string(4040, 'X');
+  for (uint32_t index = 0; index < 9; ++index)
+  {
+    auto& mail = page.inboxMails.emplace_back();
+    mail.uid = 100 + index;
+    mail.sender = "friend";
+    mail.date = "00:00:00 01/01/2026 UTC";
+    mail.struct0.unk0 = "\x0F";
+    mail.struct0.body = "hi";
+  }
+
+  // Кадр чаттера, а не команды: 4092 минус четырёхбайтовый заголовок.
+  std::array<std::byte, 4088> storage{};
+  SinkStream sink{std::span{storage}};
+  bool threw = false;
+  try
+  {
+    server::protocol::ChatCmdLetterListAckOk::Write(page, sink);
+  }
+  catch (const std::exception&)
+  {
+    threw = true;
+  }
+
+  // u8 folder, затем u32 счётчик.
+  const auto declared = ReadCount<uint32_t>(storage, 1);
+  std::printf("t18: на проводе объявлено %u писем из 10 (кадр %zu Б)\n",
+    declared, sink.GetCursor());
+  Check(not threw, "t18: страница пишется без броска");
+  Check(declared >= 9,
+    "t18: девять коротких писем доезжают, несмотря на переросшее письмо 0",
+    declared, 9);
+}
+
+// ------------------------------------------------------------------ тест 19
+
+//! 19: ОБРЕЗКА ПРЕДСТАВЛЕНИЯ НЕ РВЁТ МНОГОБАЙТНЫЙ СИМВОЛ (★subreview #2, NIT 5).
+void TestIntroductionTruncationKeepsCharacters()
+{
+  const auto isValidUtf8 = [](const std::string& value)
+  {
+    std::size_t index = 0;
+    while (index < value.size())
+    {
+      const auto lead = static_cast<unsigned char>(value[index]);
+      std::size_t length = 0;
+      if (lead < 0x80) length = 1;
+      else if ((lead & 0xE0) == 0xC0) length = 2;
+      else if ((lead & 0xF0) == 0xE0) length = 3;
+      else if ((lead & 0xF8) == 0xF0) length = 4;
+      else return false;
+      if (index + length > value.size())
+        return false;
+      for (std::size_t k = 1; k < length; ++k)
+        if ((static_cast<unsigned char>(value[index + k]) & 0xC0) != 0x80)
+          return false;
+      index += length;
+    }
+    return true;
+  };
+
+  // Хангыль (3 байта на символ) и кириллица (2) — те, что рвутся; все прежние
+  // фикстуры раунда были ASCII и этого не видели.
+  for (const auto* sample : {"\uD55C", "\u043F"})
+  {
+    std::string text;
+    while (text.size() < 4096)
+      text += sample;
+
+    server::protocol::LobbyCommandLoginOK login{};
+    login.name = "wedge";
+    login.introduction = text;
+    login.settings.typeBitset.set(server::protocol::Settings::Keyboard);
+    login.settings.keyboardOptions.bindings.resize(255);
+    login.settings.typeBitset.set(server::protocol::Settings::Gamepad);
+    login.settings.gamepadOptions.bindings.resize(254);
+    login.settings.typeBitset.set(server::protocol::Settings::Macros);
+    const auto perMacro = server::protocol::MaxMacroBlockWireBytes / 8 - 1;
+    for (auto& macro : login.settings.macroOptions.macros)
+      macro = std::string(perMacro, 'm');
+    for (uint32_t index = 0; index < 69; ++index)
+      login.systemContent.values.emplace(index, index);
+
+    (void)server::protocol::BudgetLoginFrame(login);
+    Check(isValidUtf8(login.introduction),
+      "t19: после обрезки представление остаётся валидным UTF-8",
+      static_cast<long long>(login.introduction.size()), 0);
+  }
 }
 
 } // namespace
@@ -952,6 +1134,9 @@ int main()
   TestEquipmentCeilingIsConsistent();
   TestMacroAcceptingBranch();
   TestMacroPartialAcceptance();
+  TestDryRunLeavesNoTrace();
+  TestOversizedElementIsSkipped();
+  TestIntroductionTruncationKeepsCharacters();
 
   if (failures != 0)
   {
