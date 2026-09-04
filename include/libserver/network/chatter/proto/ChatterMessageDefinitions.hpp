@@ -77,7 +77,15 @@ enum class ChatterErrorCode : uint32_t
   GroupRenameDuplicateName = 23,
   GroupDeleteGroupDoesNotExist = 24,
   GroupDeleteDefaultFriendGroupMissing = 25,
-  ChatLoginFailed = 26
+  ChatLoginFailed = 26,
+  //! ★R74-fix-3 (subreview #2, WARN 4): тело письма длиннее того, что вмещает
+  //! страница почты получателя. Значение ДОБАВЛЕНО, а не переиспользовано:
+  //! ни один из существующих кодов этого случая не описывает, а отправить
+  //! отказ с чужим смыслом хуже, чем с кодом, который клиент не знает —
+  //! неизвестный код у него уходит в общий путь ошибки, а неверно
+  //! ПОНЯТЫЙ увёл бы игрока не туда. Перечисление это серверное: все двадцать
+  //! шесть имён выше даны в этом репозитории.
+  LetterSendBodyTooLong = 27
 };
 
 struct Presence

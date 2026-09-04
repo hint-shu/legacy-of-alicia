@@ -19,6 +19,7 @@
 
 #include "server/messenger/MessengerDirector.hpp"
 #include "server/messenger/MessengerSessionEviction.hpp"
+#include "libserver/util/LogThrottle.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
@@ -36,6 +37,44 @@ namespace server
 constexpr auto FriendsCategoryUid = 0;
 constexpr auto OnlinePlayersCategoryUid = std::numeric_limits<uint32_t>::max() - 2;
 constexpr std::string_view DateTimeFormat = "{:%H:%M:%S %d/%m/%Y} UTC";
+
+//! LOA-fix (R74-fix-3, subreview #2, WARN 4): ПОТОЛОК ТЕЛА ПИСЬМА, В БАЙТАХ.
+//!
+//! ★ЧТО БЫЛО ОТКРЫТО. Тело письма не ограничивалось ничем (здесь же стоял
+//! собственный `// TODO: enforce any character limit?`). Письмо кладётся в
+//! НАЧАЛО инбокса получателя, то есть всегда становится элементом 0 первой
+//! страницы. Одно письмо на ~4 КБ делало страницу почты жертвы пустой: список
+//! обрывался на первом невлезающем элементе, жертва не видела ни одного
+//! письма, не узнавала uid отравленного и не могла его удалить. Лечилось
+//! только оператором.
+//!
+//! ★ЧИСЛО ВЫВЕДЕНО ИЗ КАДРА, А НЕ ВЫБРАНО. Арифметика целиком:
+//!
+//!   кадр чаттера, потолок длины              4092   (`ChatterServer.cpp`, проверка header.length)
+//!   − заголовок `ChatterCommandHeader`          4   (u16 length + u16 commandId)
+//!   = бюджет полезной нагрузки               4088
+//!
+//!   `ChatCmdLetterListAckOk`, постоянная часть:
+//!   − `mailboxFolder` (u8)                      1
+//!   − слот счётчика (u32)                       4
+//!   − `hasMoreMail` (u8)                        1
+//!
+//!   одна запись `InboxMail`, всё кроме тела:
+//!   − `uid` (u32)                               4
+//!   − `type` (`MailType : uint32_t`)            4
+//!   − `claimUid` (u32)                          4
+//!   − `sender` — имя персонажа, ≤16 + NUL      17
+//!   − `date` — "HH:MM:SS DD/MM/YYYY UTC" + NUL 24
+//!   − `struct0.unk0` — "\x0F" + NUL             2
+//!   − NUL самого тела                           1
+//!   ---------------------------------------------
+//!   = потолок тела                           4026
+//!
+//! ★ПОЧЕМУ ПРОВЕРКА ПО UTF-8 ДАЁТ ПОТОЛОК НА ПРОВОДЕ. Тело хранится в UTF-8, а
+//! уезжает через `locale::FromUtf8` в EUC-KR, где ASCII 1→1, а хангыль 3→2:
+//! длина на проводе НИКОГДА не больше длины в UTF-8. Тот же довод уже принят
+//! для представления (`MaxIntroductionLength`, R72).
+constexpr std::size_t MaxMailBodyLength = 4026;
 
 const std::string GetSystemNameFromType(data::Mail::MailType type)
 {
@@ -1912,7 +1951,35 @@ void MessengerDirector::HandleChatterLetterSend(
     return;
   }
 
-  // TODO: enforce any character limit?
+  // ★R74-fix-3 (subreview #2, WARN 4): ОТБРАСЫВАЕМ ДО ЗАПИСИ, А НЕ ПОСЛЕ.
+  // Письмо, которое не влезает в страницу почты, нельзя ни сохранить, ни
+  // показать: сохранённое, оно навсегда занимает первую позицию инбокса
+  // жертвы. Отказ штатный — у команды есть форма отказа, и отправитель
+  // узнаёт причину, а не молча теряет письмо.
+  if (command.body.size() > MaxMailBodyLength)
+  {
+    static util::LogThrottle oversizedMailThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (oversizedMailThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "refused an oversized mail body from client {}: {} bytes exceed the {}-byte"
+        " limit derived from the chatter frame; the recipient's mailbox page would"
+        " not have fit it (suppressed {} more, {} in total)",
+        clientId,
+        command.body.size(),
+        MaxMailBodyLength,
+        suppressed,
+        total);
+    }
+
+    protocol::ChatCmdLetterSendAckCancel cancel{
+      .errorCode = protocol::ChatterErrorCode::LetterSendBodyTooLong};
+    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+    return;
+  }
+
   // TODO: bad word checks and/or deny sending the letter as a result?
 
   const auto& clientContext = GetClientContext(clientId);

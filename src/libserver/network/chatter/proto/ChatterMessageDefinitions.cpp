@@ -470,7 +470,9 @@ void server::protocol::ChatCmdLetterListAckOk::Write(
         stream,
         mailCountSlot,
         command.sentMails,
-        {.maxCount = MaxMailsPerResponse, .name = "ChatCmdLetterListAckOk.sentMails"},
+        {.maxCount = MaxMailsPerResponse,
+         .name = "ChatCmdLetterListAckOk.sentMails",
+         .skipOversizedElements = true},
         [](SinkStream& sink, const auto& sentMail)
         {
           // TODO: break this out into it's own struct write function
@@ -488,7 +490,14 @@ void server::protocol::ChatCmdLetterListAckOk::Write(
         stream,
         mailCountSlot,
         command.inboxMails,
-        {.maxCount = MaxMailsPerResponse, .name = "ChatCmdLetterListAckOk.inboxMails"},
+        // ★R74-fix-3 (subreview #2, WARN 4): ОДНО ПИСЬМО НЕ ИМЕЕТ ПРАВА ОБНУЛЯТЬ
+        // СТРАНИЦУ. Письмо приходит в НАЧАЛО инбокса, то есть становится
+        // элементом 0 первой страницы; при обрыве на первом невлезающем жертва
+        // получала корректную ПУСТУЮ страницу и не могла узнать uid
+        // отравленного письма, а значит и удалить его.
+        {.maxCount = MaxMailsPerResponse,
+         .name = "ChatCmdLetterListAckOk.inboxMails",
+         .skipOversizedElements = true},
         [](SinkStream& sink, const auto& mail)
         {
           sink.Write(mail.uid)
