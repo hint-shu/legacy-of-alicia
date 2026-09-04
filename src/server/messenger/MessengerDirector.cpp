@@ -374,14 +374,31 @@ void MessengerDirector::SendStallionReward(
     });
 
   // Check if recipient is online for live mail delivery
+  //
+  // LOA-fix (R78-fix3, round78, backlog #255, находка Codex 2 итерации 2):
+  // ЧИТАЕМ ПО СНИМКУ ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ, а не по живой карте.
+  //
+  // ★ЭТО ВТОРОЙ ЧУЖОЙ ПОТОК, И Я ЕГО ПРОПУСТИЛА. Путь измерен ревьюером и
+  // проверен мной: `RanchDirector::HandleUnregisterStallion` ->
+  // `BreedingMarket::UnregisterStallion` -> `SendBreedingPayoutMail` ->
+  // `SendStallionReward`. То есть перебор идёт с потока РАНЧА и может совпасть
+  // с фазой 1 вытеснения, которая пишет элементы этой же карты с потока чата.
+  // Первая редакция замка закрыла только `GetClientByCharacterUid` — «сколько
+  // ещё читателей у карты» надо было СЧИТАТЬ, а не осматривать.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
+
   auto client = std::ranges::find_if(
-    _clients,
+    clientsSnapshot,
     [characterUid](const std::pair<network::ClientId, ClientContext>& client)
     {
       return client.second.characterUid == characterUid;
     });
 
-  if (client == _clients.cend())
+  if (client == clientsSnapshot.cend())
     // Character is not online, all good and handled
     return;
 
@@ -412,7 +429,14 @@ void MessengerDirector::HandleClientConnected(const network::ClientId clientId)
   server::util::QuietLogDebug("Client {} connected to the messenger server from {}",
     clientId,
     _chatterServer.GetClientAddress(clientId).to_string());
-  _clients.try_emplace(clientId);
+  // LOA-fix (R78-fix3, round78, backlog #255): ВСТАВКА — ПОД ИСКЛЮЧИТЕЛЬНЫМ
+  // ЗАМКОМ. Найдено ПЕРЕПИСЬЮ всех 18 обращений к карте, а не осмотром: ревью
+  // указало, что «сколько ещё читателей» надо считать. Вставка способна вызвать
+  // РЕХЭШ, то есть для копирующего с чужого потока она опаснее правки значений.
+  {
+    const std::unique_lock lock(_clientsMutex);
+    _clients.try_emplace(clientId);
+  }
 }
 
 void MessengerDirector::HandleClientDisconnected(const network::ClientId clientId)
@@ -423,7 +447,41 @@ void MessengerDirector::HandleClientDisconnected(const network::ClientId clientI
   // бросающая работа, а запись реестра снималась после неё. Осиротевшая запись
   // держит присутствие живым: друзья видят игрока в сети, пока сервер не
   // перезапустят.
-  const util::RegistryEraser eraser{_clients, clientId};
+  // LOA-fix (R78-fix3, round78, backlog #255, находка Codex 1 итерации 2):
+  // СНЯТИЕ ЗАПИСИ — ПОД ИСКЛЮЧИТЕЛЬНЫМ ЗАМКОМ.
+  //
+  // ★ПОЧЕМУ ЭТО ДЕЛО ИМЕННО R78. Прежний `util::RegistryEraser` о замке ничего не
+  // знает и стирает запись голыми руками — ровно тогда, когда карту может
+  // копировать `GetClientByCharacterUid` с потока ранча или заезда. Удаление к
+  // тому же способно вызвать рехэш, то есть это ХУЖЕ правки значений. До раунда
+  // сюда приходили только настоящие разрывы; ВЫТЕСНЕНИЕ (R78) зовёт этот путь
+  // САМО, синхронно из `DisconnectClient`, — значит гонку приводит сюда раунд,
+  // и закрыть её обязан он же.
+  //
+  // ★ГАРАНТИЯ R50 СОХРАНЕНА: страж остаётся RAII и снимает запись на выходе при
+  // любом исходе, просто теперь под замком. Форма — та же, что у
+  // `LobbyNetworkHandler::HandleClientDisconnected` (R64-3).
+  //
+  // ★САМОЗАХВАТА НЕТ: замок берётся ТОЛЬКО в деструкторе, то есть после
+  // `RunCleanupStep`, а фаза 2 вытеснения освобождает замок до `DisconnectClient`.
+  struct LockedContextEraser final
+  {
+    MessengerDirector& director;
+    network::ClientId clientId;
+
+    ~LockedContextEraser() noexcept
+    {
+      try
+      {
+        const std::unique_lock lock(director._clientsMutex);
+        director._clients.erase(clientId);
+      }
+      catch (...)
+      {
+        // Бросок из деструктора — это `std::terminate` (урок round49).
+      }
+    }
+  } const eraser{*this, clientId};
 
   // Call update state like a client would do before disconnect
   util::RunCleanupStep(
