@@ -301,6 +301,17 @@ if (NOT WIN32)
     add_test(NAME ToolTrackJournalGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/round/check_track_journal.py
                     ${CMAKE_SOURCE_DIR})
+    # LOA (R78-fix3, round78, backlog #255, находка Codex 2 итерации 2): гейт
+    # замка над картой клиентов мессенджера. ★ЕДИНСТВЕННАЯ проверка раунда,
+    # которая умеет покраснеть на пропущенной синхронизации: гонку данных стенд
+    # детерминированно не воспроизводит, поэтому проверка структурная — перепись
+    # обращений к карте и требование замка там, где он обязан быть. Гейт сперва
+    # доказывает себя: снимает каждый из пяти замков по очереди и требует, чтобы
+    # покраснел ровно тот.
+    add_test(NAME ToolMessengerClientMapLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py --selftest)
+    add_test(NAME ToolMessengerClientMapLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()
