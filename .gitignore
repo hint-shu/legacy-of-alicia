@@ -36,4 +36,11 @@ resources/config/server/config.local.yaml
 # Python bytecode from tools/*.py
 __pycache__/
 *.pyc
+
+# Per-round throwaway test images (`~/rounds/r<N>cand/Dockerfile.tests`) stay out of
+# git. The rule is unanchored on purpose so it catches them wherever a round is built —
+# which also swallowed the CANONICAL recipe until it was excepted below. That recipe is
+# repository content: rounds must build it and not hand-write a copy (see
+# docs/ROUND-PROTOCOL.md §2).
 Dockerfile.tests
+!tools/round/Dockerfile.tests

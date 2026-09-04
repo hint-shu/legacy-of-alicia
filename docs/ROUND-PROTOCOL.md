@@ -86,6 +86,25 @@ Two of the script's guards are there because the underlying commands lie:
   can shift code generation across the entire binary — the ladder then differs
   everywhere and the cause is not your code.
 
+### Tests: `tools/round/Dockerfile.tests`
+
+The shipping image is compiled with `-DBUILD_TESTS=False`, so the tests are a second
+build. Every arm of a round — candidate and each negative — runs it with the recipe that
+lives in the repository, `docker build -f tools/round/Dockerfile.tests -t
+alicia-tests:r<N>cand ~/rounds/r<N>cand`, and never with a copy written next to the
+round's clone. The copies R75, R76 and R78 hand-wrote all ended in
+`ctest … 2>&1 | tee /ctest.log` under `/bin/sh`, where a pipeline's exit code is the exit
+code of its last stage — `tee`, always 0. Measured 2026-09-04: three R78 negatives whose
+ctest honestly failed ("3 tests failed out of 27") produced `docker build` rc=0, so the
+arm that exists to show "the tests catch this" reported success without checking
+anything; the lesson is filed as `pipe-swallows-exit-code`. The canonical recipe runs
+under `bash -o pipefail` and passes `--no-tests=error`, so a failing test and an empty
+test set both fail the build, and the `tee` stays because the log is the evidence.
+`bash tools/round/check_tests_recipe.sh` builds that file against a fixture in the same
+base image and shows it going red on a failing test, red on no tests, and — with only
+the pipefail line removed — green on that same failing test; run it whenever the recipe
+or the base digest changes.
+
 ---
 
 ## 3. Negatives

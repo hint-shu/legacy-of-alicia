@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# tools/round/Dockerfile.tests — THE test recipe for a round. Build it with the round's
+# clone as the context and read the exit code:
+#
+#   docker build -f tools/round/Dockerfile.tests -t alicia-tests:r<N>cand ~/rounds/r<N>cand
+#
+# 0 means ctest passed; anything else means it did not. When the log is wanted as
+# evidence, take it out of the image: `docker create` the tag, `docker cp <cid>:/ctest.log`.
+#
+# WHY THIS FILE LIVES IN THE REPOSITORY
+#   Every round used to write its own throwaway Dockerfile.tests next to its clone, and
+#   the copies drifted. Measured 2026-09-04 (R78): the copies R75, R76 and R78 used all
+#   ended the test stage with
+#
+#       RUN cd ./build && ctest --output-on-failure 2>&1 | tee /ctest.log
+#
+#   under the default `/bin/sh -c`, where the exit code of a pipeline is the exit code of
+#   its LAST stage — `tee`, which always succeeds. Three R78 negatives whose ctest
+#   honestly failed ("3 tests failed out of 27") still gave `docker build` rc=0, so the
+#   arm that exists to show "the tests catch this" reported success while checking
+#   nothing. The lesson is filed as `pipe-swallows-exit-code`.
+#
+#   Two lines below answer that, and neither is taken on trust —
+#   `tools/round/check_tests_recipe.sh` builds this very file against a fixture and shows
+#   both firing:
+#     * `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` — the pipeline now reports ctest's
+#       code, so a failing test fails the build. The `tee` stays: the log is the evidence.
+#       It sits before the first RUN so that any pipeline added to this file later is
+#       covered too, not only the ctest one.
+#     * `--no-tests=error` — a run that found no tests is the loudest false green there
+#       is (broken BUILD_TESTS wiring, a renamed target), and plain `ctest` reports that
+#       case with a warning and exit 0.
+#
+# pinned: the same base digest as ./Dockerfile, deliberately — the tests must run on the
+# toolchain that builds the shipped binary. Bump the two together, in one commit.
+FROM gcc:15@sha256:486d5379b2d679f18bca957901d628952aa0ebc2d82817047bbef1dbfbc13d70 AS build
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Setup the build environment
+RUN apt-get update -y
+RUN apt-get install git cmake libboost-dev libicu-dev libpq-dev -y --no-install-recommends
+
+ARG SERVER_BUILD_TYPE=RelWithDebInfo
+
+# Build the server WITH the tests (the shipping Dockerfile builds with BUILD_TESTS=False)
+WORKDIR /build/alicia-server
+
+# Prepare the source
+COPY . .
+
+ENV PATH="/usr/local/bin:${PATH}"
+
+RUN git init
+RUN git submodule update --init --recursive
+
+RUN cmake -DCMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE} -DBUILD_TESTS=True . -B ./build
+RUN cmake --build ./build --parallel 8
+
+RUN cd ./build && ctest --output-on-failure --no-tests=error 2>&1 | tee /ctest.log
