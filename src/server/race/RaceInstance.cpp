@@ -727,6 +727,20 @@ void RaceInstance::Stop()
           "Room {}: the per-race horse record of character {} was not credited",
           this->GetRoomUid(),
           characterUid);
+      // ★ТРЕТИЙ ИСХОД ПОЯСА — НЕ «ПОЧТИ УСПЕХ» (R75 ит.4, Codex #1).
+      // `AppliedNotPersisted` означает: рекорд в памяти УЖЕ обновлён, а просьба
+      // сохранить запись не поставлена (`_patchListener` умеет бросить УЖЕ
+      // ПОСЛЕ применения — ровно поэтому у пояса три ответа, а не два).
+      // Молча проехать мимо — значит потерять ВЕЧНОЕ поле честного игрока при
+      // ближайшем перезапуске. Договор пояса на этот случай один и уже
+      // используется в дереве (`BreedingMarket`): досылаем просьбу сохранить
+      // через `util::TrySave` по кэшу той же записи.
+      else if (outcome == server::util::MutateOutcome::AppliedNotPersisted)
+        (void)server::util::TrySave(
+          _raceNetworkHandler.GetServerInstance().GetDataDirector()
+            .GetHorseCache(),
+          mountUid,
+          "a horse with a new per-race record");
     }
   }
 
@@ -874,6 +888,18 @@ void RaceInstance::Stop()
             "Room {}: the per-course record of character {} was not credited",
             this->GetRoomUid(),
             characterUid);
+        // ★ТОТ ЖЕ ТРЕТИЙ ИСХОД, ТОТ ЖЕ ДОГОВОР (R75 ит.4, Codex #1). Условие
+        // разделено с предупреждением выше нарочно: «не применено» и
+        // «применено, но не сохранено» — разные состояния записи, и лечатся они
+        // разным. Досылка идёт только когда изменение РЕАЛЬНО состоялось
+        // (`credited`), иначе мы просили бы сохранить нетронутую запись.
+        if (outcome == server::util::MutateOutcome::AppliedNotPersisted
+          && credited)
+          (void)server::util::TrySave(
+            _raceNetworkHandler.GetServerInstance().GetDataDirector()
+              .GetCharacterCache(),
+            characterUid,
+            "a character with a new per-course record");
       }
     }
   }
