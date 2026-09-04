@@ -99,6 +99,19 @@ struct BoundedListOptions
   //! единообразия» — вход в комнату разрешался бы с ТИХО ОБРЕЗАННЫМ ростером,
   //! то есть гард остался бы на месте и перестал бы работать.
   bool rethrowOnCapacity{false};
+  //! ★R74-fix-3 (subreview #2, WARN 4): true — элемент, который НЕ ВЛЕЗ,
+  //! ПРОПУСКАЕТСЯ, и запись списка продолжается со следующего.
+  //!
+  //! Значение по умолчанию (false) обрывает список на первом невлезающем
+  //! элементе, и для списков с элементами ПЕРЕМЕННОЙ ДЛИНЫ это значит, что
+  //! один большой элемент в начале обнуляет всю страницу. Живой случай:
+  //! письмо на ~4 КБ кладётся в НАЧАЛО инбокса, и жертва получала корректную
+  //! ПУСТУЮ страницу почты — не видела ни одного письма, не узнавала uid
+  //! отравленного и не могла его удалить.
+  //!
+  //! Ставится там, где элементы переменной длины и порядок не несёт смысла
+  //! «первые N»: пропуск одного письма честнее страницы из нуля записей.
+  bool skipOversizedElements{false};
 };
 
 //! Жалуется на усечение списка, не чаще одного раза в окно на площадку
@@ -126,6 +139,41 @@ void BoundedListReport(
   std::size_t bound,
   bool capacityHit,
   const std::source_location& where) noexcept;
+
+//! ПОКА ЖИВЁТ — `BoundedListReport` МОЛЧИТ И НЕ ТРАТИТ ОКНО ПОДАВЛЕНИЯ.
+//!
+//! ★R74-fix-3 (subreview #2, WARN 2): СУХОЙ ПРОГОН НЕ ИМЕЕТ ПРАВА ОСТАВЛЯТЬ
+//! СЛЕДОВ. Бюджет кадра входа сериализует кадр по нескольку раз, чтобы узнать,
+//! влезает ли он; после свипа сериализатор не бросает, а КЛАМПИТ И ЖАЛУЕТСЯ, —
+//! и в журнал уходили настоящие строки `bounded list truncated:` о кадрах,
+//! которые никто не получил. Это ловилось не рассуждением: в собственном логе
+//! раунда (`results/candidate/server-candidate.log`) стояли две такие строки
+//! про привязки геймпада и миссии, тогда как доставленный кадр нёс и то, и
+//! другое целиком.
+//!
+//! Хуже строки был её побочный эффект: фантомная жалоба взводила пятиминутное
+//! окно СВОЕЙ площадки, и настоящее усечение там же в ближайшие пять минут
+//! схлопывалось в счётчик. Маркер лесенки при этом переставал значить
+//! «игрок получил короткий список».
+//!
+//! ★ПОЧЕМУ `thread_local`, А НЕ ФЛАГ В `BoundedListOptions`: измерение зовёт
+//! ЧУЖОЙ писатель целого кадра, внутри которого десятки площадок со своими
+//! опциями; протащить флаг через них значило бы править все 70 площадок и
+//! всё равно пропустить вложенные. Область видимости здесь — не площадка, а
+//! ПРОХОД, и `thread_local` — ровно она. Вложенность разрешена: конструктор
+//! запоминает прежнее состояние.
+class ScopedBoundedListSilence final
+{
+public:
+  ScopedBoundedListSilence() noexcept;
+  ~ScopedBoundedListSilence() noexcept;
+
+  ScopedBoundedListSilence(const ScopedBoundedListSilence&) = delete;
+  ScopedBoundedListSilence& operator=(const ScopedBoundedListSilence&) = delete;
+
+private:
+  bool _previous;
+};
 
 namespace detail
 {
@@ -175,6 +223,7 @@ template <typename Container, typename ElementWriter>
   const Container& container,
   std::size_t planned,
   bool rethrowOnCapacity,
+  bool skipOversizedElements,
   ElementWriter&& writeElement,
   bool& capacityHit)
 {
@@ -201,6 +250,10 @@ template <typename Container, typename ElementWriter>
       if (rethrowOnCapacity)
         throw;
       capacityHit = true;
+      // ★ПРОПУСК ВМЕСТО ОБРЫВА (см. `skipOversizedElements`): пробуем
+      // следующий элемент, а не сдаём всю страницу из-за одного большого.
+      if (skipOversizedElements)
+        continue;
       break;
     }
     ++written;
@@ -249,6 +302,7 @@ std::size_t WriteBoundedList(
     container,
     planned,
     options.rethrowOnCapacity,
+    options.skipOversizedElements,
     std::forward<ElementWriter>(writeElement),
     capacityHit);
 
@@ -301,6 +355,13 @@ std::size_t WriteBoundedBytes(
   const std::source_location where = std::source_location::current())
 {
   const auto countLimit = detail::BoundedListCountLimit(options);
+  // ★R74-fix-3 (subreview #2, NIT 2): ЧЕТВЁРТЫЙ ПИСАТЕЛЬ СЧЁТЧИКА ТОЖЕ БЕРЁТ
+  // НАСЫЩЕННЫЙ МАСШТАБ. Потолок этой же функции на масштаб ДЕЛИТ, а счётчик
+  // писался без множителя вовсе — две половины примитива расходились в том,
+  // что `countScale` значит. Сегодня латентно (единственный вызов оставляет
+  // масштаб 1), но расхождение в примитиве, через который идут все площадки,
+  // не оставляют «потому что недостижимо».
+  const auto scale = detail::BoundedListScale(options);
 
   const auto cursorAfterCount = stream.GetCursor() + sizeof(CountType);
   const std::size_t remaining = stream.Size() > cursorAfterCount
@@ -310,7 +371,7 @@ std::size_t WriteBoundedBytes(
   const auto byCount = std::min<std::size_t>(bytes.size(), countLimit);
   const auto n = std::min<std::size_t>(byCount, remaining);
 
-  stream.Write(static_cast<CountType>(n));
+  stream.Write(static_cast<CountType>(n * scale));
   if (n > 0)
     stream.Write(bytes.data(), n);
 
@@ -370,6 +431,7 @@ std::size_t WriteBoundedListInto(
     container,
     planned,
     options.rethrowOnCapacity,
+    options.skipOversizedElements,
     std::forward<ElementWriter>(writeElement),
     capacityHit);
 

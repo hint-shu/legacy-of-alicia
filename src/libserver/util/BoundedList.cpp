@@ -42,7 +42,22 @@ namespace
 //! означала бы, что об усечении у ВТОРОГО игрока не узнать никогда.
 constexpr auto BoundedListReportWindow = std::chrono::minutes{5};
 
+//! Идёт ли на этом потоке СУХОЙ ПРОГОН (измерение кадра, чьи байты никто не
+//! получит). См. `ScopedBoundedListSilence`.
+thread_local bool g_silenced = false;
+
 } // namespace
+
+ScopedBoundedListSilence::ScopedBoundedListSilence() noexcept
+  : _previous(g_silenced)
+{
+  g_silenced = true;
+}
+
+ScopedBoundedListSilence::~ScopedBoundedListSilence() noexcept
+{
+  g_silenced = _previous;
+}
 
 void BoundedListReport(
   const std::string_view name,
@@ -52,6 +67,12 @@ void BoundedListReport(
   const bool capacityHit,
   const std::source_location& where) noexcept
 {
+  // ★ВЫХОД ДО ВСЕГО: сухой прогон не оставляет ни строки, ни счётчика окна.
+  // Проверка стоит ПЕРВОЙ строкой, а не внутри `try`, чтобы измерение не
+  // трогало даже карту площадок.
+  if (g_silenced)
+    return;
+
   try
   {
     // ★ПОДАВЛЕНИЕ — НА ЧУЖОМ, УЖЕ ВЫКАЧЕННОМ ПРИМИТИВЕ (`util::LogThrottle`,
