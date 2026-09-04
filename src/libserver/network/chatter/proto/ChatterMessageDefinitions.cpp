@@ -19,7 +19,20 @@
 
 #include "libserver/network/chatter/proto/ChatterMessageDefinitions.hpp"
 
+#include "libserver/util/BoundedList.hpp"
+
+#include <cstddef>
 #include <stdexcept>
+
+namespace
+{
+
+//! LOA-fix (R74, round74, backlog #170): то же число, что уже стоит НА ВХОДЕ
+//! (`MessengerDirector`, `MaxMailsPerRequest`) — раунд не выдумывает потолка,
+//! а объявляет на стороне записи тот, по которому уже нарезается выборка.
+constexpr std::size_t MaxMailsPerResponse = 10;
+
+} // namespace
 
 void server::protocol::ChatCmdLogin::Write(
   const ChatCmdLogin&,
@@ -64,24 +77,30 @@ void server::protocol::ChatCmdLoginAckOK::Write(
     .Write(command.mailAlarm.unreadMailCount)
     .Write(command.mailAlarm.hasMail);
 
-  stream.Write(static_cast<uint32_t>(command.groups.size()));
-  for (auto& group : command.groups)
-  {
-    stream.Write(group.uid)
-      .Write(group.name);
-  }
+  util::WriteBoundedList<uint32_t>(
+    stream,
+    command.groups,
+    {.name = "ChatCmdLoginAckOK.groups"},
+    [](SinkStream& sink, const auto& group)
+    {
+      sink.Write(group.uid)
+        .Write(group.name);
+    });
 
-  stream.Write(static_cast<uint32_t>(command.friends.size()));
-  for (const auto& fr : command.friends)
-  {
-    stream.Write(fr.uid)
-      .Write(fr.categoryUid)
-      .Write(fr.name)
-      .Write(fr.status)
-      .Write(fr.member5)
-      .Write(fr.scene)
-      .Write(fr.sceneUid);
-  }
+  util::WriteBoundedList<uint32_t>(
+    stream,
+    command.friends,
+    {.name = "ChatCmdLoginAckOK.friends"},
+    [](SinkStream& sink, const auto& fr)
+    {
+      sink.Write(fr.uid)
+        .Write(fr.categoryUid)
+        .Write(fr.name)
+        .Write(fr.status)
+        .Write(fr.member5)
+        .Write(fr.scene)
+        .Write(fr.sceneUid);
+    });
 }
 
 void server::protocol::ChatCmdLoginAckOK::Read(
@@ -430,39 +449,58 @@ void server::protocol::ChatCmdLetterListAckOk::Write(
   SinkStream& stream)
 {
   stream.Write(command.mailboxFolder);
-  // TODO: break this out into it's own struct write function
-  stream.Write(command.mailboxInfo.mailCount)
-    .Write(command.mailboxInfo.hasMoreMail);
+
+  // ★R74. СЧЁТЧИК И ТЕЛО СЧИТАЛИ РАЗНОЕ. На провод уезжал
+  // `mailboxInfo.mailCount` (его заполняет директор из числа ОТФИЛЬТРОВАННЫХ
+  // писем), а телом был цикл по ДРУГОМУ вектору — то есть счётчик мог оказаться
+  // больше тела уже сегодня, и клиент дочитывал бы следующее сообщение как
+  // письмо. Теперь счётчик — зарезервированный слот, который переписывается
+  // фактически записанным числом; между ним и телом остаётся, как и раньше,
+  // поле `hasMoreMail`, ради чего и существует резервная форма хелпера.
+  // Поле `mailboxInfo.mailCount` в структуре остаётся (его заполняет
+  // директор), но НА ПРОВОД больше не идёт.
+  const util::BoundedListSlot<uint32_t> mailCountSlot{stream};
+  stream.Write(command.mailboxInfo.hasMoreMail);
 
   switch (command.mailboxFolder)
   {
     case MailboxFolder::Sent:
     {
-      for (const auto& sentMail : command.sentMails)
-      {
-        // TODO: break this out into it's own struct write function
-        stream.Write(sentMail.mailUid)
-          .Write(sentMail.recipient);
-        // TODO: break this out into it's own struct write function
-        stream.Write(sentMail.content.date)
-          .Write(sentMail.content.body);
-      }
+      util::WriteBoundedListInto<uint32_t>(
+        stream,
+        mailCountSlot,
+        command.sentMails,
+        {.maxCount = MaxMailsPerResponse, .name = "ChatCmdLetterListAckOk.sentMails"},
+        [](SinkStream& sink, const auto& sentMail)
+        {
+          // TODO: break this out into it's own struct write function
+          sink.Write(sentMail.mailUid)
+            .Write(sentMail.recipient);
+          // TODO: break this out into it's own struct write function
+          sink.Write(sentMail.content.date)
+            .Write(sentMail.content.body);
+        });
       break;
     }
     case MailboxFolder::Inbox:
     {
-      for (const auto& mail : command.inboxMails)
-      {
-        stream.Write(mail.uid)
-          .Write(mail.type)
-          .Write(mail.claimUid)
-          .Write(mail.sender)
-          .Write(mail.date);
+      util::WriteBoundedListInto<uint32_t>(
+        stream,
+        mailCountSlot,
+        command.inboxMails,
+        {.maxCount = MaxMailsPerResponse, .name = "ChatCmdLetterListAckOk.inboxMails"},
+        [](SinkStream& sink, const auto& mail)
+        {
+          sink.Write(mail.uid)
+            .Write(mail.type)
+            .Write(mail.claimUid)
+            .Write(mail.sender)
+            .Write(mail.date);
 
-        // TODO: break this out into it's own struct write function
-        stream.Write(mail.struct0.unk0)
-          .Write(mail.struct0.body);
-      }
+          // TODO: break this out into it's own struct write function
+          sink.Write(mail.struct0.unk0)
+            .Write(mail.struct0.body);
+        });
       break;
     }
     default:
@@ -738,12 +776,15 @@ void server::protocol::ChatCmdEnterRoomAckOk::Write(
   const ChatCmdEnterRoomAckOk& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint32_t>(command.unk1.size()));
-  for (const auto& item : command.unk1)
-  {
-    stream.Write(item.unk0)
-      .Write(item.unk1);
-  }
+  util::WriteBoundedList<uint32_t>(
+    stream,
+    command.unk1,
+    {.name = "ChatCmdEnterRoomAckOk.unk1"},
+    [](SinkStream& sink, const auto& item)
+    {
+      sink.Write(item.unk0)
+        .Write(item.unk1);
+    });
 }
 
 void server::protocol::ChatCmdEnterRoomAckOk::Read(
@@ -1009,11 +1050,8 @@ void server::protocol::ChatCmdGuildLoginAckOK::Write(
   SinkStream& stream)
 {
   // Guild members array size (u32)
-  stream.Write(static_cast<uint32_t>(command.guildMembers.size()));
-  for (const auto& struct1Element : command.guildMembers)
-  {
-    stream.Write(struct1Element);
-  }
+  util::WriteBoundedList<uint32_t>(
+    stream, command.guildMembers, {.name = "ChatCmdGuildLoginAckOK.guildMembers"});
 }
 
 void server::protocol::ChatCmdGuildLoginAckOK::Read(
