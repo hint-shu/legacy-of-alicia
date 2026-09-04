@@ -1932,7 +1932,14 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
     static util::KeyedLogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
     uint64_t suppressed = 0;
     const uint64_t total = 0;
-    if (loginFrameShedThrottle.Allow(clientContext.characterUid, suppressed))
+    // ★КЛЮЧ — `response.uid`, А НЕ `clientContext.characterUid`. Снимок
+    // контекста берётся в начале этой функции, ДО того как uid персонажа в нём
+    // проставляется отдельной мутацией под замком, — то есть здесь он ещё
+    // `InvalidUid` У ВСЕХ, все логины попадали бы в одно ведро и дроссель
+    // остался бы процессным, каким и был. Поймано стендом: на негативном
+    // образе строка сброса для `loatest-5` пропала, потому что окно занял
+    // `loatest-4`. `response.uid` заполнен выше из записи персонажа.
+    if (loginFrameShedThrottle.Allow(response.uid, suppressed))
     {
       util::QuietLogWarn(
         "login frame over budget for user '{}': shed mask 0x{:x}"
