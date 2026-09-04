@@ -28,16 +28,27 @@
 //! ослабление там было бы регрессом безопасности в двух чужих путях.
 //! До раунда эти свойства не проверял никто.
 //!
-//! ★ЧЕГО ЗДЕСЬ НЕТ. Срок жизни одноразового кода — 30 секунд; ждать их в тесте
-//! значит не проверять. Время в `OtpSystem` не подаётся снаружи, поэтому
-//! истечение проверяется стендом, а здесь — только одноразовость.
+//! ★СРОК ЖИЗНИ ОДНОРАЗОВОГО КОДА ПРОВЕРЯЕТСЯ ЗДЕСЬ, И ЭТО СТОИТ 31 СЕКУНДУ
+//! РЕАЛЬНОГО ВРЕМЕНИ. Первая редакция этого файла писала, что истечение
+//! проверяет стенд, — и это было НЕПРАВДОЙ (находка Codex 3): стендовая арка
+//! `ttl` проверяет ровно обратное утверждение, что НОВЫЙ ключ мессенджера
+//! переживает 36 секунд, а по ранч- и заезд-коду не ходила вовсе. Утверждение
+//! «одноразовый код по-прежнему протухает» не фальсифицировала ни одна
+//! проверка раунда.
+//! `OtpSystem` берёт время у `steady_clock` напрямую, подать его снаружи
+//! нельзя, поэтому единственный честный способ — подождать. Цена признаётся
+//! осознанно: раунд переносит на LTK ровно один директор, а ранч и заезд
+//! остаются на этом коде, и потеря его срока была бы регрессом
+//! безопасности в двух чужих путях.
 //!
 //! ★ПОЧЕМУ НЕ `assert`: образ собирается Release, `NDEBUG` гасит `assert`
 //! целиком — тест, который не умеет провалиться, читается как зелёный.
 
 #include "server/system/OtpSystem.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 namespace
 {
@@ -165,6 +176,70 @@ void TestCodeAndLtkAreIndependent()
     "трата одноразового кода не должна задевать LTK на том же ключе");
 }
 
+//! ★СТОРОЖ ЧУЖИХ ПУТЕЙ, ЧАСТЬ ВТОРАЯ: одноразовый код обязан ПРОТУХАТЬ.
+//! Ждём реальные 31 с (TTL = 30 с, `OtpSystem.cpp:16`). Единственный тест
+//! раунда, который что-то ждёт; см. разбор в шапке файла.
+void TestCodeExpiresAfterTtl()
+{
+  server::OtpSystem otp;
+  const uint32_t code = otp.GrantCode(KeyA);
+
+  // Контроль самой проверки: до истечения код обязан подходить, иначе
+  // «протух» ничего не доказывает — мы бы не отличили TTL от опечатки в ключе.
+  server::OtpSystem control;
+  const uint32_t controlCode = control.GrantCode(KeyA);
+  Check(control.AuthorizeCode(KeyA, controlCode),
+    "свежий одноразовый код обязан подходить — иначе тест ниже вакуумен");
+
+  std::this_thread::sleep_for(std::chrono::seconds(31));
+
+  Check(not otp.AuthorizeCode(KeyA, code),
+    "★одноразовый код, пролежавший 31 с, обязан быть отбит: ранч и заезд "
+    "по-прежнему зависят от его срока жизни");
+
+  // И LTK в тех же условиях обязан ВЫЖИТЬ — иначе «протух» означало бы, что
+  // сломалось время, а не что сроки у двух видов ключей разные.
+  const uint32_t ltk = otp.GrantLtk(KeyB, AddressA);
+  Check(otp.AuthorizeLtk(KeyB, ltk, AddressA),
+    "LTK не имеет срока — обязан подходить и после ожидания");
+}
+
+//! LOA (R78-fix1, находка Codex 1): снятие ключа вместе с сеансом.
+void TestLtkRevokeIsCodeMatched()
+{
+  server::OtpSystem otp;
+  const uint32_t code = otp.GrantLtk(KeyA, AddressA);
+
+  Check(not otp.RevokeLtk(KeyA, code + 1u),
+    "снятие ЧУЖИМ значением обязано ничего не сделать");
+  Check(otp.AuthorizeLtk(KeyA, code, AddressA),
+    "после неудачного снятия ключ обязан остаться рабочим");
+
+  Check(otp.RevokeLtk(KeyA, code), "снятие СВОИМ значением обязано сработать");
+  Check(not otp.AuthorizeLtk(KeyA, code, AddressA),
+    "★снятый ключ обязан перестать подходить — иначе выход из игры не "
+    "ограничивает срок жизни ключа");
+  Check(not otp.RevokeLtk(KeyA, code), "повторное снятие обязано вернуть false");
+}
+
+//! ★ГОНКА «ОПОЗДАВШИЙ ВЫХОД СТИРАЕТ СВЕЖИЙ КЛЮЧ». Уборка разорванного
+//! соединения приходит ПОЗЖЕ события; игрок, успевший перезайти, уже держит
+//! новый ключ. Снятие обязано пройти мимо него.
+void TestLateRevokeDoesNotKillTheNewKey()
+{
+  server::OtpSystem otp;
+  const uint32_t oldCode = otp.GrantLtk(KeyA, AddressA);
+  const uint32_t newCode = otp.GrantLtk(KeyA, AddressA);  // перезаход
+
+  if (oldCode == newCode)
+    return;  // один шанс на 2^32; проверять нечего
+
+  Check(not otp.RevokeLtk(KeyA, oldCode),
+    "опоздавшее снятие СТАРЫМ значением не должно ничего снять");
+  Check(otp.AuthorizeLtk(KeyA, newCode, AddressA),
+    "★свежий ключ обязан пережить опоздавший выход прошлой сессии");
+}
+
 } // namespace
 
 int main()
@@ -177,6 +252,9 @@ int main()
   TestCodeIsStillSingleUse();
   TestCodeIsNotConsumedOnFailure();
   TestCodeAndLtkAreIndependent();
+  TestLtkRevokeIsCodeMatched();
+  TestLateRevokeDoesNotKillTheNewKey();
+  TestCodeExpiresAfterTtl();
 
   if (g_failures != 0)
   {
