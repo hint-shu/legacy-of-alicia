@@ -33,11 +33,23 @@ namespace server::protocol
 namespace
 {
 
-//! Влезает ли кадр входа в буфер команды. Мерит НАСТОЯЩИМ писателем — «длина
-//! в полях» к байтам провода отношения не имеет (строки уезжают в EUC-KR).
+//! Влезает ли кадр входа в ПОТОЛОК КЛИЕНТА. Мерит НАСТОЯЩИМ писателем —
+//! «длина в полях» к байтам провода отношения не имеет (строки уезжают в
+//! EUC-KR).
+//!
+//! ★СКРЕТЧ РАЗМЕРОМ РОВНО В ЦЕЛЬ (`MaxClientPacketDataBytes`), а не в буфер
+//! сервера: «влезает» обязано значить «влезает у ЧИТАТЕЛЯ». Серверный буфер
+//! больше, и мерить им значило бы разрешать кадры в полосе 7169..8192, которые
+//! сервер запишет, а клиент не прочтёт.
+//!
+//! ★ПРОГОН СУХОЙ. `ScopedBoundedListSilence` гасит жалобы площадок на время
+//! измерения: после свипа сериализатор не бросает, а кламппит И ЖАЛУЕТСЯ, и
+//! без этого в журнал уходили строки об усечении в кадрах, которые никто не
+//! получил, — да ещё и взводили пятиминутное окно своей площадки.
 [[nodiscard]] bool LoginFrameFits(const LobbyCommandLoginOK& command)
 {
-  static thread_local std::vector<std::byte> scratch(util::MaxCommandDataSizeBytes);
+  static thread_local std::vector<std::byte> scratch(MaxClientPacketDataBytes);
+  const util::ScopedBoundedListSilence silence;
   SinkStream sink{std::span{scratch}};
   try
   {
@@ -50,6 +62,24 @@ namespace
     return false;
   }
   return true;
+}
+
+//! Отрезает строку UTF-8 по ГРАНИЦЕ СИМВОЛА, а не по байту.
+//!
+//! ★R74-fix-3 (subreview #2, NIT 5): резать посередине многобайтного символа
+//! нельзя. Замерено живым ICU: обрубок не даёт ни ошибки, ни броска — хвост
+//! молча превращается в `U+FFFD` и уезжает на провод как битый глиф. Кириллица
+//! (2 байта на символ) на чётных длинах уцелевала случайно, хангыль (3 байта)
+//! рвётся почти всегда, а все фикстуры раунда были ASCII и этого не видели.
+void TruncateUtf8AtCharacterBoundary(std::string& value, const std::size_t limit)
+{
+  if (value.size() <= limit)
+    return;
+  std::size_t cut = limit;
+  // Продолжающие байты UTF-8 имеют вид 10xxxxxx — отступаем до начала символа.
+  while (cut > 0 && (static_cast<unsigned char>(value[cut]) & 0xC0) == 0x80)
+    --cut;
+  value.resize(cut);
 }
 
 } // namespace
@@ -292,7 +322,8 @@ uint32_t BudgetLoginFrame(LobbyCommandLoginOK& command)
   {
     while (not command.introduction.empty() && not LoginFrameFits(command))
     {
-      command.introduction.resize(command.introduction.size() / 2);
+      TruncateUtf8AtCharacterBoundary(
+        command.introduction, command.introduction.size() / 2);
       shed |= static_cast<uint32_t>(LoginFrameShed::Introduction);
     }
     if (LoginFrameFits(command))
