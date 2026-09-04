@@ -24,6 +24,8 @@
 //! конфигурации, которая едет в прод. Каждая проверка — явный `if`, печать и
 //! ненулевой код возврата.
 
+#include <libserver/data/DataDefinitions.hpp>
+#include <libserver/data/helper/ProtocolHelper.hpp>
 #include <libserver/network/command/proto/CommonStructureDefinitions.hpp>
 #include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
 #include <libserver/network/command/proto/RaceMessageDefinitions.hpp>
@@ -36,6 +38,7 @@
 #include <spdlog/spdlog.h>
 
 #include <array>
+#include <limits>
 #include <sstream>
 #include <cstdint>
 #include <cstdio>
@@ -210,16 +213,27 @@ void TestCountScale()
       ReadCount<uint8_t>(storage, 0), 30);
   }
   {
-    // scale == 0 не имеет права поделить на ноль.
+    // ★R74-fix-2 (subreview #1, WARN 5): ПРОВЕРКА СУДИТ ИНВАРИАНТ, А НЕ
+    // ПОВЕДЕНИЕ РЕАЛИЗАЦИИ. Прежняя формулировка утверждала `declared == 0`
+    // при `written == 5` как ОЖИДАЕМЫЙ результат — то есть единственная
+    // проверка, способная поймать «счётчик лжёт о теле» внутри примитива, была
+    // написана по тому, что код делает, а не по тому, что он обязан делать.
+    // Инвариант: объявлено == записано × НАСЫЩЕННЫЙ масштаб.
     std::array<std::byte, 4096> storage{};
     SinkStream sink{std::span{storage}};
     const auto data = Fill<Quad>(5);
     const auto written = server::util::WriteBoundedList<uint8_t>(
       sink, data, {.maxCount = 8, .countScale = 0, .name = "t6c"});
+    const long long declared = ReadCount<uint8_t>(storage, 0);
     Check(written == 5, "t6c: scale 0 does not divide by zero",
       static_cast<long long>(written), 5);
-    Check(ReadCount<uint8_t>(storage, 0) == 0, "t6c: declared 5*0",
-      ReadCount<uint8_t>(storage, 0), 0);
+    Check(declared == static_cast<long long>(written * 1),
+      "t6c: declared == written * max(scale, 1) — счётчик НЕ ЛЖЁТ о теле",
+      declared, static_cast<long long>(written));
+    Check(sink.GetCursor() == 1 + written * 4,
+      "t6c: тело действительно записано целиком",
+      static_cast<long long>(sink.GetCursor()),
+      static_cast<long long>(1 + written * 4));
   }
   {
     // Потолок по счётчику при масштабе 3: 255/3 == 85, а не 255.
@@ -370,19 +384,19 @@ void TestMacroBudget()
 {
   server::protocol::MacroOptions small{};
   for (auto& macro : small.macros)
-    macro = std::string(100, 'a');
+    macro = std::string(200, 'a');
   const auto smallSize = server::protocol::MeasureMacroBlockWireSize(small);
   Check(smallSize <= server::protocol::MaxMacroBlockWireBytes,
-    "t9: 8x100 bytes of macros are within the budget",
+    "t9: 8x200 bytes of macros are within the budget",
     static_cast<long long>(smallSize),
     static_cast<long long>(server::protocol::MaxMacroBlockWireBytes));
 
   server::protocol::MacroOptions huge{};
   for (auto& macro : huge.macros)
-    macro = std::string(900, 'A');
+    macro = std::string(1800, 'A');
   const auto hugeSize = server::protocol::MeasureMacroBlockWireSize(huge);
   Check(hugeSize > server::protocol::MaxMacroBlockWireBytes,
-    "t9: 8x900 bytes of macros are over the budget",
+    "t9: 8x1800 bytes of macros are over the budget",
     static_cast<long long>(hugeSize),
     static_cast<long long>(server::protocol::MaxMacroBlockWireBytes));
 
@@ -554,7 +568,10 @@ void TestRiskiestMessages()
     cmd.characterUid = 1;
     cmd.characterEquipment.resize(255 + Overshoot);
     cmd.mountEquipment.resize(10);
-    ProbeMessage("AcCmdCRUpdateEquipmentNotify", cmd, false, 255, 4, 1);
+    // ★R74-fix-2 (WARN 2): потолок здесь ТОТ ЖЕ, что у того же хранимого
+    // списка в кадре входа и в `RanchCharacter`, — 16, а не дефолтные 255.
+    ProbeMessage("AcCmdCRUpdateEquipmentNotify", cmd, false,
+      static_cast<long long>(server::protocol::MaxCharacterEquipmentCount), 4, 1);
   }
   {
     server::protocol::AcCmdCRRequestStorageOK cmd{};
@@ -682,6 +699,241 @@ void TestReportThrottle()
     static_cast<long long>(lines), 1);
 }
 
+
+// ------------------------------------------------------------------ тест 13
+
+//! 13: БЮДЖЕТ КАДРА ВХОДА (★R74-fix-2, subreview #1 WARN 1).
+//!
+//! Профиль, собранный из СОБСТВЕННЫХ ПОТОЛКОВ трёх полей, длину которых задаёт
+//! клиент: представление 4096 (`MaxIntroductionLength`), 255 клавиатурных и 254
+//! геймпадных привязки (столько принимает `Settings::Read`), полный блок
+//! макросов на бюджете и 16 предметов экипировки. Такой кадр НЕ ВЛЕЗАЕТ в
+//! буфер команды — и это не гипотеза, тест это печатает. `BudgetLoginFrame`
+//! обязан сделать его отправляемым, не тронув ничего на диске.
+void TestLoginFrameBudget()
+{
+  const auto build = []()
+  {
+    server::protocol::LobbyCommandLoginOK login{};
+    login.name = std::string(16, 'n');
+    login.notice = std::string(255, 'o');
+    login.val6 = std::string(255, 'v');
+    login.introduction = std::string(4096, 'i');
+    for (uint32_t idx = 0; idx < 16; ++idx)
+      login.equipmentItems.push_back(Item{.uid = idx, .tid = idx, .count = 1});
+    for (uint32_t idx = 0; idx < 17; ++idx)
+    {
+      auto& mission = login.missions.emplace_back();
+      mission.progress.resize(4);
+    }
+    login.skillRanks.values.resize(20);
+    login.trainingProgression.mapProggressInfos.resize(20);
+    for (uint32_t idx = 0; idx < 69; ++idx)
+      login.systemContent.values.emplace(idx, idx);
+    login.settings.typeBitset.set(server::protocol::Settings::Keyboard);
+    login.settings.keyboardOptions.bindings.resize(255);
+    login.settings.typeBitset.set(server::protocol::Settings::Gamepad);
+    login.settings.gamepadOptions.bindings.resize(254);
+    login.settings.typeBitset.set(server::protocol::Settings::Macros);
+    const auto perMacro = server::protocol::MaxMacroBlockWireBytes / 8 - 1;
+    for (auto& macro : login.settings.macroOptions.macros)
+      macro = std::string(perMacro, 'm');
+    return login;
+  };
+
+  const auto measure = [](const server::protocol::LobbyCommandLoginOK& login,
+                          bool& threw)
+  {
+    static std::array<std::byte, 1 << 20> big{};
+    SinkStream sink{std::span{big}};
+    threw = false;
+    try
+    {
+      server::protocol::LobbyCommandLoginOK::Write(login, sink);
+    }
+    catch (const std::exception&)
+    {
+      threw = true;
+    }
+    return sink.GetCursor();
+  };
+
+  // (а) без бюджета кадр обязан НЕ влезать — иначе тест ничего не судит.
+  auto poisoned = build();
+  bool threw = false;
+  const auto rawSize = measure(poisoned, threw);
+  std::printf("t13: кадр на собственных потолках клиентских полей = %zu байт "
+              "(буфер команды %zu)\n", rawSize, MaxCommandDataSize);
+  Check(rawSize > MaxCommandDataSize,
+    "t13: без бюджета кадр НЕ влезает (иначе арка ничего не доказывает)",
+    static_cast<long long>(rawSize), static_cast<long long>(MaxCommandDataSize));
+
+  // (б) с бюджетом обязан влезть, и сброшено обязано быть НАЗВАНО.
+  const auto shed = server::protocol::BudgetLoginFrame(poisoned);
+  const auto budgetedSize = measure(poisoned, threw);
+  std::printf("t13: после BudgetLoginFrame = %zu байт, запас %zu, маска сброса 0x%x, "
+              "представление %zu байт\n",
+    budgetedSize,
+    budgetedSize < MaxCommandDataSize ? MaxCommandDataSize - budgetedSize : 0,
+    shed, poisoned.introduction.size());
+  Check(not threw, "t13: забюджетированный кадр пишется без броска");
+  Check(budgetedSize <= MaxCommandDataSize,
+    "t13: забюджетированный кадр влезает в буфер команды",
+    static_cast<long long>(budgetedSize), static_cast<long long>(MaxCommandDataSize));
+  Check(shed != static_cast<uint32_t>(server::protocol::LoginFrameShed::Nothing),
+    "t13: сброс НАЗВАН, а не сделан молча", shed, 1);
+  Check((shed & static_cast<uint32_t>(server::protocol::LoginFrameShed::StillTooLarge)) == 0,
+    "t13: причина влезания — клиентские поля, а не что-то ещё", shed, 0);
+
+  // (в) честный профиль не трогается вовсе.
+  server::protocol::LobbyCommandLoginOK honest{};
+  honest.name = "Nmax";
+  honest.introduction = std::string(120, 'i');
+  honest.settings.typeBitset.set(server::protocol::Settings::Keyboard);
+  honest.settings.keyboardOptions.bindings.resize(40);
+  honest.settings.typeBitset.set(server::protocol::Settings::Macros);
+  for (auto& macro : honest.settings.macroOptions.macros)
+    macro = std::string(40, 'm');
+  const auto honestShed = server::protocol::BudgetLoginFrame(honest);
+  Check(honestShed == static_cast<uint32_t>(server::protocol::LoginFrameShed::Nothing),
+    "t13: честный профиль не сбрасывается ничем", honestShed, 0);
+  Check(honest.introduction.size() == 120,
+    "t13: честное представление не тронуто",
+    static_cast<long long>(honest.introduction.size()), 120);
+  Check(honest.settings.typeBitset.test(server::protocol::Settings::Macros),
+    "t13: честные макросы остались в кадре");
+}
+
+// ------------------------------------------------------------------ тест 14
+
+//! 14: ОДИН ХРАНИМЫЙ СПИСОК — ОДИН ПОТОЛОК НА ВСЕХ ТРЁХ ПЛОЩАДКАХ
+//!     (★R74-fix-2, subreview #1 WARN 2).
+void TestEquipmentCeilingIsConsistent()
+{
+  constexpr std::size_t Seeded = 20;
+
+  server::protocol::AcCmdCRUpdateEquipmentNotify notify{};
+  notify.characterUid = 1;
+  notify.characterEquipment.resize(Seeded);
+  notify.mountEquipment.resize(2);
+
+  std::array<std::byte, MaxCommandDataSize> notifyStorage{};
+  SinkStream notifySink{std::span{notifyStorage}};
+  server::protocol::AcCmdCRUpdateEquipmentNotify::Write(notify, notifySink);
+  // u32 characterUid, затем счётчик экипировки.
+  const auto notifyDeclared = ReadCount<uint8_t>(notifyStorage, 4);
+
+  server::protocol::RanchCharacter ranchCharacter{};
+  ranchCharacter.uid = 1;
+  ranchCharacter.characterEquipment.resize(Seeded);
+  std::array<std::byte, MaxCommandDataSize> ranchStorage{};
+  SinkStream ranchSink{std::span{ranchStorage}};
+  server::protocol::RanchCharacter::Write(ranchCharacter, ranchSink);
+
+  server::protocol::LobbyCommandLoginOK login{};
+  login.equipmentItems.resize(Seeded);
+  std::array<std::byte, MaxCommandDataSize> loginStorage{};
+  SinkStream loginSink{std::span{loginStorage}};
+  server::protocol::LobbyCommandLoginOK::Write(login, loginSink);
+  const auto loginOffset = 16 + login.name.size() + 1 + login.notice.size() + 1 + 1
+    + login.introduction.size() + 1;
+  const auto loginDeclared = ReadCount<uint8_t>(loginStorage, loginOffset);
+
+  Check(loginDeclared == server::protocol::MaxCharacterEquipmentCount,
+    "t14: LoginOK объявляет потолок экипировки", loginDeclared,
+    static_cast<long long>(server::protocol::MaxCharacterEquipmentCount));
+  Check(notifyDeclared == server::protocol::MaxCharacterEquipmentCount,
+    "t14: AcCmdCRUpdateEquipmentNotify объявляет ТОТ ЖЕ потолок",
+    notifyDeclared, static_cast<long long>(server::protocol::MaxCharacterEquipmentCount));
+}
+
+// ------------------------------------------------------------------ тест 15
+
+//! 15: ВЕТКА ПРИНЯТИЯ БЛОКА МАКРОСОВ ИСПОЛНЯЕТСЯ (★R74-fix-2, subreview #1 WARN 4).
+//!
+//! До этой проверки ни один образ и ни один тест не проходил по ветке, которая
+//! макросы ПРИНИМАЕТ: все прод-записи идут с `macros: null`, а стенд сеял только
+//! яд. Строка `a6_macros_bit` не имела образа, на котором обязана краснеть, —
+//! то есть нарушала собственный стандарт вердикта.
+void TestMacroAcceptingBranch()
+{
+  server::data::Settings stored{};
+  std::array<std::string, 8> macros{};
+  for (auto& macro : macros)
+    macro = std::string(20, 'a');
+  stored.macros() = macros;
+
+  server::protocol::Settings published{};
+  server::protocol::BuildProtocolSettings(published, stored);
+
+  Check(published.typeBitset.test(server::protocol::Settings::Macros),
+    "t15: блок макросов В БЮДЖЕТЕ обязан быть ОПУБЛИКОВАН");
+  Check(published.macroOptions.macros[0] == macros[0],
+    "t15: опубликован именно сохранённый блок, а не пустой");
+
+  // Зеркало: отравленная запись обязана НЕ публиковаться.
+  server::data::Settings poisoned{};
+  std::array<std::string, 8> poisonedMacros{};
+  for (auto& macro : poisonedMacros)
+    macro = std::string(1800, 'A');
+  poisoned.macros() = poisonedMacros;
+
+  server::protocol::Settings withheld{};
+  server::protocol::BuildProtocolSettings(withheld, poisoned);
+  Check(not withheld.typeBitset.test(server::protocol::Settings::Macros),
+    "t15: блок макросов СВЕРХ бюджета не публикуется");
+}
+
+// ------------------------------------------------------------------ тест 16
+
+//! 16: ЧАСТИЧНЫЙ ПРИЁМ БЛОКА МАКРОСОВ (★R74-fix-2, subreview #1 WARN 3).
+//!
+//! Проверяет саму арифметику отбора «сколько слотов влезает» — ту, что стоит в
+//! `HandleUpdateUserSettings`. Приём «всё или ничего» терял и те слоты, что
+//! влезали, а клиент при этом видел «сохранено».
+void TestMacroPartialAcceptance()
+{
+  server::protocol::MacroOptions oversized{};
+  for (auto& macro : oversized.macros)
+    macro = std::string(1800, 'A');
+  Check(server::protocol::MeasureMacroBlockWireSize(oversized)
+          > server::protocol::MaxMacroBlockWireBytes,
+    "t16: исходный блок действительно сверх бюджета");
+
+  server::protocol::MacroOptions accepted{};
+  std::size_t slots = 0;
+  for (std::size_t slot = 0; slot < accepted.macros.size(); ++slot)
+  {
+    server::protocol::MacroOptions probe = accepted;
+    probe.macros[slot] = oversized.macros[slot];
+    if (server::protocol::MeasureMacroBlockWireSize(probe)
+          > server::protocol::MaxMacroBlockWireBytes)
+      break;
+    accepted = probe;
+    ++slots;
+  }
+
+  std::printf("t16: слотов принято %zu из 8, размер принятого блока %zu из %zu\n",
+    slots,
+    server::protocol::MeasureMacroBlockWireSize(accepted),
+    server::protocol::MaxMacroBlockWireBytes);
+  Check(slots > 0, "t16: хотя бы один слот обязан быть принят",
+    static_cast<long long>(slots), 1);
+  Check(slots < 8, "t16: но не все — иначе блок не был бы сверх бюджета",
+    static_cast<long long>(slots), 7);
+  Check(server::protocol::MeasureMacroBlockWireSize(accepted)
+          <= server::protocol::MaxMacroBlockWireBytes,
+    "t16: принятое влезает в бюджет");
+
+  // NIT 2: размер сверх мерочного скретча описывается честно.
+  const auto unknown = server::protocol::DescribeMacroBlockWireSize(
+    std::numeric_limits<std::size_t>::max());
+  Check(unknown.find("exact size unknown") != std::string::npos,
+    "t16: неизмеримый размер не печатается как число байт");
+  Check(server::protocol::DescribeMacroBlockWireSize(123) == "123 bytes",
+    "t16: измеримый размер печатается как есть");
+}
+
 } // namespace
 
 int main()
@@ -696,6 +948,10 @@ int main()
   TestRiskiestMessages();
   TestMailCounterMatchesBody();
   TestReportThrottle();
+  TestLoginFrameBudget();
+  TestEquipmentCeilingIsConsistent();
+  TestMacroAcceptingBranch();
+  TestMacroPartialAcceptance();
 
   if (failures != 0)
   {
