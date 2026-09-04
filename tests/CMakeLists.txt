@@ -341,6 +341,8 @@ if (NOT WIN32)
     # раунд. Самопроверка на семи фикстурах доказывает, что он умеет краснеть,
     # ДО того, как он что-либо судит; боевой прогон живёт в сборщике раунда,
     # потому что негативная ветка обязана оставаться собираемой.
+    # ★R74-fix-2: боевой прогон этих двух живёт в `tools/round/Dockerfile.tests`
+    # (канон раунда с 52750a0b) — своей ступени `tests` раунд больше не держит.
     add_test(NAME ToolCheckBoundedListsSelftest
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_bounded_lists.py --self-test
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
