@@ -21,6 +21,7 @@
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
+#include "libserver/util/LogThrottle.hpp"
 #include "server/ServerInstance.hpp"
 
 #include <libserver/data/helper/ProtocolHelper.hpp>
@@ -29,6 +30,9 @@
 #include <spdlog/spdlog.h>
 #include <zlib.h>
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <random>
 
 namespace server
@@ -2736,7 +2740,13 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
       std::format("Failed to create or retrieve settings for user '{}'", clientContext.userName));
   }
 
-  settingsRecord.Mutable([&settingsUid, &command](data::Settings& settings)
+  // ★R74 (backlog #170). Флаг ставится ВНУТРИ `Mutable`, а жалоба печатается
+  // ПОСЛЕ выхода из него: держать логгер под замком записи не за чем.
+  bool macroBlockRefused = false;
+  std::size_t macroBlockWireSize = 0;
+
+  settingsRecord.Mutable([&settingsUid, &command, &macroBlockRefused, &macroBlockWireSize](
+    data::Settings& settings)
   {
     // Copy the keyboard bindings if present in the command.
     if (command.settings.typeBitset.test(protocol::Settings::Keyboard))
@@ -2777,11 +2787,56 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     // Copy the macros if present in the command.
     if (command.settings.typeBitset.test(protocol::Settings::Macros))
     {
-      settings.macros() = command.settings.macroOptions.macros;
+      // ★R74 (backlog #170). МАКРОСЫ — ЕДИНСТВЕННОЕ ПОЛЕ ПРОФИЛЯ, ЧЬЮ ДЛИНУ
+      // ЗАДАЁТ КЛИЕНТ, КОТОРОЕ ПЕРСИСТИТСЯ НАВСЕГДА И УЕЗЖАЕТ НА ПРОВОД ПРИ
+      // КАЖДОМ ВХОДЕ.
+      //
+      // До этой проверки восемь строк произвольной длины копировались дословно:
+      // один поддельный `AcCmdCLUpdateUserSettings` на ~7 КБ макросов делал
+      // `LobbyCommandLoginOK` неупаковываемым (буфер команды — 8192 Б),
+      // поставщик записи бросал `std::overflow_error`, `Client::WriteLoop` звал
+      // `End()` — и персонаж не входил в игру больше НИКОГДА, потому что запись
+      // уже лежала на диске. Что клин случался, видно по апстриму: там есть
+      // GM-команда, единственное действие которой — обнулить все 8 макросов.
+      //
+      // ОТКАЗ ШТАТНЫЙ: остальные блоки настроек применяются, СТАРЫЕ макросы
+      // остаются, соединение живо. Мы не рвём соединение из-за настроек.
+      macroBlockWireSize = protocol::MeasureMacroBlockWireSize(
+        command.settings.macroOptions);
+
+      if (macroBlockWireSize <= protocol::MaxMacroBlockWireBytes)
+      {
+        settings.macros() = command.settings.macroOptions.macros;
+      }
+      else
+      {
+        macroBlockRefused = true;
+      }
     }
 
     settingsUid = settings.uid();
   });
+
+  if (macroBlockRefused)
+  {
+    // Жалоба задросселирована: команду настроек шлёт клиент, то есть повторить
+    // её можно сколько угодно раз, и незадросселированная строка сама стала бы
+    // флудом, управляемым снаружи.
+    static util::LogThrottle macroRefusalThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (macroRefusalThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "refused an oversized macro block from user '{}': {} wire bytes over the {} byte budget;"
+        " the stored macros were left unchanged (suppressed {} more, {} in total)",
+        clientContext.userName,
+        macroBlockWireSize,
+        protocol::MaxMacroBlockWireBytes,
+        suppressed,
+        total);
+    }
+  }
 
   if (wasCreated)
   {

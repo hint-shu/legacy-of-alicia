@@ -5,6 +5,11 @@
 #include "libserver/data/helper/ProtocolHelper.hpp"
 
 #include "libserver/data/DataDefinitions.hpp"
+#include "libserver/util/LogThrottle.hpp"
+#include "libserver/util/QuietLog.hpp"
+
+#include <chrono>
+#include <cstdint>
 
 namespace server
 {
@@ -402,9 +407,40 @@ void BuildProtocolSettings(
 
   if (settingsRecord.macros())
   {
-    settings.typeBitset.set(Settings::Macros);
+    // ★R74 (backlog #170). ЕДИНСТВЕННАЯ ТОЧКА ДАННЫЕ→ПРОТОКОЛ ДЛЯ МАКРОСОВ.
+    //
+    // Запись могла быть отравлена ДО того, как появился входной бюджет в
+    // `HandleUpdateUserSettings`, — или чужим инструментом, пишущим
+    // `data/settings/*.json` напрямую. Тогда блок макросов на провод не идёт
+    // вовсе: персонаж входит БЕЗ макросов вместо «не входит никогда».
+    // Миграции данных раунд не делает намеренно — менять протокол и переписывать
+    // записи на диске в одном раунде значило бы сделать два необратимых шага
+    // сразу; отравленная запись просто перестаёт публиковаться.
+    MacroOptions candidate{};
+    candidate.macros = settingsRecord.macros().value();
 
-    settings.macroOptions.macros = settingsRecord.macros().value();
+    const auto wireSize = MeasureMacroBlockWireSize(candidate);
+    if (wireSize <= MaxMacroBlockWireBytes)
+    {
+      settings.typeBitset.set(Settings::Macros);
+      settings.macroOptions = candidate;
+    }
+    else
+    {
+      static util::LogThrottle poisonedMacroThrottle{std::chrono::minutes{5}};
+      uint64_t suppressed = 0;
+      uint64_t total = 0;
+      if (poisonedMacroThrottle.Allow(suppressed, total))
+      {
+        util::QuietLogWarn(
+          "stored macros exceed the wire budget ({} bytes over {}); the macro block is"
+          " withheld from this login (suppressed {} more, {} in total)",
+          wireSize,
+          MaxMacroBlockWireBytes,
+          suppressed,
+          total);
+      }
+    }
   }
 }
 
