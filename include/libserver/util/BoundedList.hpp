@@ -33,6 +33,15 @@
 namespace server::util
 {
 
+//! Байты данных ОДНОЙ команды протокола (без магии).
+//!
+//! ★ОДНО ОПРЕДЕЛЕНИЕ НА ВЕСЬ СЕРВЕР. До этого число жило литералом в анонимном
+//! пространстве имён `CommandServer.cpp` и повторялось по месту всякий раз,
+//! когда кому-то нужен был бюджет кадра. Бюджет, списанный с копии константы,
+//! молча разъезжается с настоящим буфером — а именно бюджетами кадра этот
+//! раунд и занят.
+inline constexpr std::size_t MaxCommandDataSizeBytes = 8192;
+
 //! LOA-fix (R74, round74, backlog #170): ЕДИНСТВЕННЫЙ СЕРИАЛИЗАТОР СПИСКА.
 //!
 //! ★ЧТО БЫЛО ОТКРЫТО. Сообщение протокола, чьё тело раздувается данными
@@ -126,6 +135,24 @@ namespace detail
 //! ★ДЕЛЕНИЕ, А НЕ УМНОЖЕНИЕ. Проверять надо `written * countScale <= max`, но
 //! само умножение при большом `written` переполнилось бы раньше проверки.
 //! `max(scale, 1)` — защита от `countScale == 0`, то есть от деления на ноль.
+//! ЕДИНСТВЕННЫЙ МАСШТАБ, КОТОРЫМ ПОЛЬЗУЮТСЯ ВСЕ ТРИ ПИСАТЕЛЯ СЧЁТЧИКА.
+//!
+//! ★R74-fix-2 (subreview #1, WARN 5). Раньше насыщение нуля жило ЛОКАЛЬНОЙ
+//! переменной внутри расчёта потолка, а счётчик писался умножением на СЫРОЙ
+//! `options.countScale`. При `countScale == 0` потолок оставался широким,
+//! `planned` — ненулевым, счётчик уходил нулём, а тело писалось ЦЕЛИКОМ: то
+//! есть счётчик лгал о теле внутри примитива, через который идут все площадки
+//! свипа. Обе страховки при этом молчали (`written != planned` ложно,
+//! `requested > written` ложно) — не было даже строки в логе.
+//! Воспроизведено ревью компиляцией против настоящего заголовка:
+//! `written=5 declared=0 cursor=21`.
+template <Numeric CountType>
+[[nodiscard]] constexpr std::size_t BoundedListScale(
+  const BoundedListOptions<CountType>& options) noexcept
+{
+  return std::max<std::size_t>(options.countScale, 1);
+}
+
 template <Numeric CountType>
 [[nodiscard]] constexpr std::size_t BoundedListCountLimit(
   const BoundedListOptions<CountType>& options) noexcept
@@ -135,7 +162,7 @@ template <Numeric CountType>
     "CountType должен быть целым: у enum std::numeric_limits<>::max() равен нулю, "
     "и потолок молча стал бы нулевым");
 
-  const auto scale = std::max<std::size_t>(options.countScale, 1);
+  const auto scale = BoundedListScale(options);
   const auto widest = static_cast<std::size_t>(std::numeric_limits<CountType>::max()) / scale;
   return std::min<std::size_t>(options.maxCount, widest);
 }
@@ -203,6 +230,9 @@ std::size_t WriteBoundedList(
   const std::source_location where = std::source_location::current())
 {
   const auto countLimit = detail::BoundedListCountLimit(options);
+  // ★Масштаб берётся УЖЕ НАСЫЩЕННЫМ (см. `BoundedListScale`): нулевой масштаб
+  // обязан вести себя как единичный ВЕЗДЕ, а не только в расчёте потолка.
+  const auto scale = detail::BoundedListScale(options);
   const std::size_t requested = container.size();
   const std::size_t planned = std::min<std::size_t>(requested, countLimit);
 
@@ -211,7 +241,7 @@ std::size_t WriteBoundedList(
   // не-списочное содержимое кадра уже съело буфер команды. Это ЗА пределами
   // того, что раунд обещает закрыть, и молчаливое «списка не будет» скрыло бы
   // отказ вместо того, чтобы его назвать.
-  stream.Write(static_cast<CountType>(planned * options.countScale));
+  stream.Write(static_cast<CountType>(planned * scale));
 
   bool capacityHit = false;
   const auto written = detail::BoundedListWriteBody(
@@ -226,7 +256,7 @@ std::size_t WriteBoundedList(
   {
     const auto end = stream.GetCursor();
     stream.Seek(countCursor);
-    stream.Write(static_cast<CountType>(written * options.countScale));
+    stream.Write(static_cast<CountType>(written * scale));
     stream.Seek(end);
   }
 
@@ -330,6 +360,7 @@ std::size_t WriteBoundedListInto(
   const std::source_location where = std::source_location::current())
 {
   const auto countLimit = detail::BoundedListCountLimit(options);
+  const auto scale = detail::BoundedListScale(options);
   const std::size_t requested = container.size();
   const std::size_t planned = std::min<std::size_t>(requested, countLimit);
 
@@ -344,7 +375,7 @@ std::size_t WriteBoundedListInto(
 
   const auto end = stream.GetCursor();
   stream.Seek(slot.cursor());
-  stream.Write(static_cast<CountType>(written * options.countScale));
+  stream.Write(static_cast<CountType>(written * scale));
   stream.Seek(end);
 
   if (requested > written)
