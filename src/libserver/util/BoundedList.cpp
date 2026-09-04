@@ -25,8 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
-#include <mutex>
-#include <string>
+#include <shared_mutex>
 #include <utility>
 
 namespace server::util
@@ -63,21 +62,42 @@ void BoundedListReport(
     // ★КАРТА НЕ РАСТЁТ ОТ КЛИЕНТА: ключ — файл+строка вызова, то есть множество
     // ограничено по построению числом площадок свипа. Это не повторение
     // безразмерного `_events` из #130-C6.
-    static std::mutex mutex;
-    static std::map<std::pair<std::string, std::uint_least32_t>, LogThrottle> sites;
+    //
+    // ★R74-fix-2 (subreview #1, NIT 4): КЛЮЧ БЕЗ АЛЛОКАЦИИ И БЕЗ ЭКСКЛЮЗИВНОГО
+    // ЗАМКА НА ПОДАВЛЁННОМ ПУТИ. Раньше ключ строился как `std::string` от
+    // имени файла (кратчайший basename здесь 26 символов против SSO 15 — то
+    // есть КУЧА) внутри критической секции, и замок брался ДО решения о
+    // подавлении. При окне 5 минут подавлено практически 100% вызовов, то есть
+    // платили полной ценой ровно там, где ничего не делаем.
+    //
+    // Ключ теперь — УКАЗАТЕЛЬ на литерал имени файла плюс строка. Для одной
+    // точки вызова `source_location::current()` даёт один и тот же статический
+    // объект, поэтому указатель стабилен; если линкер склеит одинаковые
+    // литералы разных TU, совпадение указателя И строки означает буквально ту
+    // же площадку — ключ верен в обе стороны. Узлы `std::map` стабильны, так
+    // что найденный `LogThrottle` переживает освобождение замка.
+    using SiteKey = std::pair<const char*, std::uint_least32_t>;
+    static std::shared_mutex mutex;
+    static std::map<SiteKey, LogThrottle> sites;
+
+    const SiteKey key{where.file_name(), where.line()};
+    LogThrottle* throttle = nullptr;
+    {
+      const std::shared_lock lock(mutex);
+      const auto it = sites.find(key);
+      if (it != sites.end())
+        throttle = &it->second;
+    }
+    if (throttle == nullptr)
+    {
+      const std::unique_lock lock(mutex);
+      throttle = &sites.try_emplace(key, BoundedListReportWindow).first->second;
+    }
 
     std::uint64_t suppressed = 0;
     std::uint64_t total = 0;
-
-    {
-      const std::scoped_lock lock(mutex);
-      const auto [it, inserted] = sites.try_emplace(
-        std::pair{std::string{where.file_name()}, where.line()},
-        BoundedListReportWindow);
-
-      if (not it->second.Allow(suppressed, total))
-        return;
-    }
+    if (not throttle->Allow(suppressed, total))
+      return;
 
     // ★СТРОКА НАЗЫВАЕТ ПОЛНЫЙ СЧЁТ, а не только себя: «одна строка» иначе
     // читалась бы как «случилось один раз».
