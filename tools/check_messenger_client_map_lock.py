@@ -45,8 +45,27 @@ MUST_LOCK = {
     # меняют СТРУКТУРУ карты (вставка/удаление -> рехэш и инвалидация)
     "HandleClientConnected",
     "HandleClientDisconnected",
-    # пишет значения чужих записей (это и приводит сюда R78)
+    # пишут значения записей (это и приводит сюда R78)
     "EvictOtherSessionsOfCharacter",
+    "CloseSessionsOfCharacter",
+    # LOA (R78-fix6, находка ревю W5): вход — ПИСАТЕЛЬ той же карты, и
+    # предыдущая редакция гейта его не стерегла. Замок, взятый только
+    # читателем, синхронизацией не является.
+    "HandleChatterLogin",
+}
+
+#: Функции, которые карту МЕНЯЮТ: им мало «какого-нибудь» замка, нужен
+#: исключительный.
+#: ★ЗАКРЫВАЕТ ОБХОД, НАЙДЕННЫЙ РЕВЮ (остаток 1): прежний `LOCK_RE` не различал
+#: `shared_lock` и `unique_lock`, поэтому мутант, переводивший фазу 1 вытеснения
+#: на РАЗДЕЛЯЕМЫЙ замок — то есть на запись под замком для чтения, — гейт
+#: проходил насквозь.
+MUST_LOCK_EXCLUSIVELY = {
+    "HandleClientConnected",
+    "HandleClientDisconnected",
+    "EvictOtherSessionsOfCharacter",
+    "CloseSessionsOfCharacter",
+    "HandleChatterLogin",
 }
 
 #: Ниже этого числа обращений файл заведомо не тот — проверка слепа.
@@ -57,7 +76,16 @@ FUNC_RE = re.compile(
     r"Config::Messenger&)\s+MessengerDirector::(\w+)")
 LOCK_RE = re.compile(r"std::(?:shared_lock|unique_lock)\s+lock\(\s*"
                      r"(?:director\.)?_clientsMutex\s*\)")
+UNIQUE_LOCK_RE = re.compile(r"std::unique_lock\s+lock\(\s*"
+                            r"(?:director\.)?_clientsMutex\s*\)")
 ACCESS_RE = re.compile(r"(?<!_)_clients\b(?!Mutex)")
+#: ЗАПИСЬ ЧЕРЕЗ ССЫЛКУ, полученную из `GetClientContext`. ★Гейт первой редакции
+#: видел только текстовые обращения к `_clients` и такие записи ПРОПУСКАЛ — а
+#: именно ими вход и портил карту, пока чужие потоки читали её под замком
+#: (находка ревю W5). Ссылка указывает ВНУТРЬ карты, поэтому запись через неё —
+#: то же обращение к карте, просто написанное иначе.
+CONTEXT_WRITE_RE = re.compile(
+    r"\bclientContext\.\w+\s*(?:=[^=]|\.emplace\(|\.reset\(\))")
 
 
 class Invalid(Exception):
@@ -68,6 +96,32 @@ def _strip_comment(line: str) -> str:
     """Убрать `//`-комментарий: упоминание `_clients` в прозе — не обращение."""
     idx = line.find("//")
     return line if idx < 0 else line[:idx]
+
+
+def _function_body(text: str, name: str) -> str | None:
+    """Тело функции `MessengerDirector::<name>` как текст, или None."""
+    lines = text.splitlines()
+    start = None
+    for number, raw in enumerate(lines):
+        match = FUNC_RE.match(raw)
+        if match and match.group(1) == name:
+            start = number
+            break
+    if start is None:
+        return None
+    depth = 0
+    opened = False
+    body = []
+    for raw in lines[start:]:
+        code = _strip_comment(raw)
+        body.append(raw)
+        depth += code.count("{")
+        if depth > 0:
+            opened = True
+        depth -= code.count("}")
+        if opened and depth <= 0:
+            break
+    return "\n".join(body)
 
 
 def analyse(text: str):
@@ -106,7 +160,10 @@ def analyse(text: str):
             # Замок объявлен на ТЕКУЩЕЙ глубине и действует до её закрытия.
             lock_depths.append(depth)
 
-        if ACCESS_RE.search(code) and func is not None:
+        is_access = bool(ACCESS_RE.search(code))
+        is_context_write = (func in MUST_LOCK_EXCLUSIVELY
+                            and bool(CONTEXT_WRITE_RE.search(code)))
+        if (is_access or is_context_write) and func is not None:
             protected = bool(lock_depths)
             accesses.append((number, func, protected))
             if func in MUST_LOCK and not protected:
@@ -134,6 +191,14 @@ def judge(tree: Path) -> int:
 
     accesses, violations, seen = analyse(text)
 
+    exclusive_missing = []
+    for name in sorted(MUST_LOCK_EXCLUSIVELY):
+        body = _function_body(text, name)
+        if body is None:
+            raise Invalid(f"функции {name} в файле нет — гейт стерёг бы пустоту")
+        if not UNIQUE_LOCK_RE.search(body):
+            exclusive_missing.append(name)
+
     if len(accesses) < MIN_ACCESSES:
         raise Invalid(
             f"обращений к карте найдено {len(accesses)}, минимум {MIN_ACCESSES} — "
@@ -144,9 +209,13 @@ def judge(tree: Path) -> int:
             f"функции {missing} в файле нет — гейт стерёг бы то, чего не существует")
 
     guarded = [a for a in accesses if a[1] in MUST_LOCK]
+    for name in exclusive_missing:
+        violations.append((0, name, "меняет карту, но исключительного замка в "
+                                    "функции нет (есть только разделяемый)"))
     print("=== gate: замок над картой клиентов мессенджера ===")
     print(f"дерево            : {tree}")
-    print(f"обращений к карте : {len(accesses)} (минимум {MIN_ACCESSES})")
+    print(f"обращений к карте : {len(accesses)} (минимум {MIN_ACCESSES}) — "
+          f"включая записи через ссылку из GetClientContext")
     print(f"обязаны быть под замком : {len(guarded)} в {len(MUST_LOCK)} функциях")
     print(f"нарушений         : {len(violations)} (ожидалось 0)")
     if violations:
