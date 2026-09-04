@@ -19,7 +19,10 @@
 
 #include "libserver/network/command/proto/CommonStructureDefinitions.hpp"
 
+#include "libserver/util/BoundedList.hpp"
+
 #include <cassert>
+#include <limits>
 
 namespace server::protocol
 {
@@ -86,12 +89,8 @@ void KeyboardOptions::Option::Read(Option& option, SourceStream& stream)
 
 void KeyboardOptions::Write(const KeyboardOptions& value, SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(value.bindings.size()));
-
-  for (const auto& binding : value.bindings)
-  {
-    stream.Write(binding);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, value.bindings, {.name = "KeyboardOptions.bindings"});
 }
 
 void KeyboardOptions::Read(KeyboardOptions& value, SourceStream& stream)
@@ -122,6 +121,25 @@ void MacroOptions::Read(MacroOptions& value, SourceStream& stream)
   }
 }
 
+std::size_t MeasureMacroBlockWireSize(const MacroOptions& value)
+{
+  // Скретч вдвое больше бюджета: замер обязан УЗНАТЬ размер перебора, а не
+  // уместить его. Всё, что не влезло даже сюда, — заведомо не влезает.
+  std::array<std::byte, 2 * MaxMacroBlockWireBytes> scratch{};
+  SinkStream sink{std::span{scratch}};
+
+  try
+  {
+    MacroOptions::Write(value, sink);
+  }
+  catch (const std::overflow_error&)
+  {
+    return std::numeric_limits<std::size_t>::max();
+  }
+
+  return sink.GetCursor();
+}
+
 void GamepadOptions::Option::Write(const Option& option, SinkStream& stream)
 {
   stream.Write(option.secondaryButton)
@@ -140,12 +158,8 @@ void GamepadOptions::Option::Read(Option& option, SourceStream& stream)
 
 void GamepadOptions::Write(const GamepadOptions& value, SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(value.bindings.size()));
-
-  for (const auto& binding : value.bindings)
-  {
-    stream.Write(binding);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, value.bindings, {.name = "GamepadOptions.bindings"});
 }
 
 void GamepadOptions::Read(GamepadOptions& value, SourceStream& stream)
@@ -170,15 +184,17 @@ void Settings::Write(const Settings& value, SinkStream& stream)
   if (value.typeBitset.test(Type::Keyboard))
   {
     const auto& keyboard = value.keyboardOptions;
-    stream.Write(static_cast<uint8_t>(keyboard.bindings.size()));
-
-    for (const auto& binding : keyboard.bindings)
-    {
-      stream.Write(binding.type)
-        .Write(binding.unused)
-        .Write(binding.primaryKey)
-        .Write(binding.secondaryKey);
-    }
+    util::WriteBoundedList<uint8_t>(
+      stream,
+      keyboard.bindings,
+      {.name = "Settings.keyboardOptions.bindings"},
+      [](SinkStream& sink, const auto& binding)
+      {
+        sink.Write(binding.type)
+          .Write(binding.unused)
+          .Write(binding.primaryKey)
+          .Write(binding.secondaryKey);
+      });
   }
 
   // Write the macro options if specified in the option type mask.
@@ -202,15 +218,17 @@ void Settings::Write(const Settings& value, SinkStream& stream)
   if (value.typeBitset.test(Type::Gamepad))
   {
     const auto& gamepad = value.gamepadOptions;
-    stream.Write(static_cast<uint8_t>(gamepad.bindings.size()));
-
-    for (const auto& binding : gamepad.bindings)
-    {
-      stream.Write(binding.type)
-        .Write(binding.unused)
-        .Write(binding.primaryButton)
-        .Write(binding.secondaryButton);
-    }
+    util::WriteBoundedList<uint8_t>(
+      stream,
+      gamepad.bindings,
+      {.name = "Settings.gamepadOptions.bindings"},
+      [](SinkStream& sink, const auto& binding)
+      {
+        sink.Write(binding.type)
+          .Write(binding.unused)
+          .Write(binding.primaryButton)
+          .Write(binding.secondaryButton);
+      });
   }
 
   stream.Write(value.age)
@@ -639,11 +657,14 @@ void RanchCharacter::Write(const RanchCharacter& ranchCharacter, SinkStream& str
   stream.Write(ranchCharacter.character)
     .Write(ranchCharacter.mount);
 
-  stream.Write(static_cast<uint8_t>(ranchCharacter.characterEquipment.size()));
-  for (const Item& item : ranchCharacter.characterEquipment)
-  {
-    stream.Write(item);
-  }
+  // ★R74. Тот же список, что уезжает в `LobbyCommandLoginOK`, где потолок 16.
+  // До раунда на ранчо он уезжал как «не более 255» — одна и та же экипировка
+  // имела два разных потолка в одном протоколе. Раунд эту несогласованность
+  // снимает, а не описывает.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    ranchCharacter.characterEquipment,
+    {.maxCount = MaxCharacterEquipmentCount, .name = "RanchCharacter.characterEquipment"});
 
   // Guild
   const auto& struct5 = ranchCharacter.guild;
@@ -767,11 +788,8 @@ void SkillSet::Write(const SkillSet& value, SinkStream& stream)
   // Gamemode needs recasting to uint32_t for the command
   stream.Write(static_cast<uint32_t>(value.gamemode)); 
   
-  stream.Write(static_cast<uint8_t>(value.skills.size()));
-  for (const auto& skill : value.skills)
-  {
-    stream.Write(skill);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, value.skills, {.maxCount = MaxSkillSetSkillCount, .name = "SkillSet.skills"});
 }
 
 void SkillSet::Read(SkillSet& value, SourceStream& stream)

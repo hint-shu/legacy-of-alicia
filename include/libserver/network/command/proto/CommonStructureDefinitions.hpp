@@ -25,6 +25,7 @@
 #include <array>
 #include <bitset>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -122,6 +123,39 @@ struct MacroOptions
   static void Write(const MacroOptions& value, SinkStream& stream);
   static void Read(MacroOptions& value, SourceStream& stream);
 };
+
+//! LOA-fix (R74, round74, backlog #170): БЮДЖЕТ ВСЕГО БЛОКА ИЗ 8 МАКРОСОВ,
+//! В БАЙТАХ ПРОВОДА (EUC-KR плюс NUL на каждую строку).
+//!
+//! ★ЗАЧЕМ. `MacroOptions::Read` читает восемь строк ПРОИЗВОЛЬНОЙ ДЛИНЫ из
+//! клиентского пакета (`SourceStream::Read(std::string&)` ограничен только
+//! размером пакета, 8192 Б), `HandleUpdateUserSettings` копировал их дословно
+//! без единой проверки, они ПЕРСИСТЯТСЯ в `data/settings/*.json` и уезжают на
+//! провод при КАЖДОМ входе внутри `LobbyCommandLoginOK`. Один поддельный
+//! `AcCmdCLUpdateUserSettings` на ~7 КБ макросов делал кадр входа
+//! неупаковываемым: поставщик записи бросал, `Client::WriteLoop` звал `End()`,
+//! и персонаж не входил в игру больше никогда. Хелпер `WriteBoundedList` этот
+//! случай не ловит по построению — счётчика у блока нет вовсе.
+//!
+//! ★ЧИСЛО НЕ «НА ВКУС»: его ПРОВЕРЯЕТ юнит-тест `ProtocolTestBoundedList`
+//! (тест 9) — реалистичный худший `LobbyCommandLoginOK` с полным блоком
+//! макросов обязан укладываться в `MaxCommandDataSize` (8192) с положительным
+//! запасом, и тест этот запас печатает. Съест кто-нибудь запас — краснеет тест,
+//! а не игрок сообщает, что не может войти.
+constexpr std::size_t MaxMacroBlockWireBytes = 1024;
+
+//! Сколько байт провода займёт блок макросов.
+//!
+//! ★МЕРЯЕТ РЕАЛЬНЫМ ПИСАТЕЛЕМ (`MacroOptions::Write`) в скретч-поток, а не
+//! самодельным пересчётом длин: строки уезжают через `locale::FromUtf8`, и
+//! «длина в символах» к байтам провода отношения не имеет. Форма замера уже
+//! выкачена и отревьюена в гарде входа в комнату (`RaceNetworkHandler.cpp`).
+//! Скретч ровно вдвое больше бюджета: нам надо УЗНАТЬ размер, а не уместить
+//! его; перебор всё равно отбивается, каким бы большим он ни был.
+//!
+//! @returns Размер блока в байтах провода, либо `SIZE_MAX`, если блок не влез
+//!          даже в скретч (то есть «заведомо не влезает»).
+[[nodiscard]] std::size_t MeasureMacroBlockWireSize(const MacroOptions& value);
 
 struct GamepadOptions
 {
@@ -512,6 +546,14 @@ struct RanchHorse
   static void Read(RanchHorse& value, SourceStream& stream);
 };
 
+//! LOA-fix (R74, round74, backlog #170): ПРОТОКОЛЬНЫЙ ПОТОЛОК СПИСКА НАДЕТЫХ
+//! ПРЕДМЕТОВ. Число не выдумано раундом: ровно его объявлял
+//! `LobbyCommandLoginOK::Write` для ТОГО ЖЕ САМОГО списка (там оно стояло
+//! локальной `constexpr` и охранялось броском). На ранчо тот же список уезжал
+//! без потолка вовсе, то есть одна и та же экипировка имела в одном протоколе
+//! два разных предела; константа делает согласованность структурной.
+constexpr std::size_t MaxCharacterEquipmentCount = 16;
+
 //!
 struct RanchCharacter
 {
@@ -623,6 +665,12 @@ enum class BonusCourseType : uint16_t
   Experience = 2,
   CarrotsAndExperience = 3
 };
+
+//! LOA-fix (R74, round74, backlog #170): потолок взят из уже стоявшего рядом
+//! `assert(value.skills.size() == 2)` — раунд не выдумывает новых пределов,
+//! а переносит объявленные туда, где они КЛАМПЯТ, а не только документируют
+//! (в боевой сборке `RelWithDebInfo` несёт `-DNDEBUG`, и `assert` инертен).
+constexpr std::size_t MaxSkillSetSkillCount = 2;
 
 struct SkillSet
 {
