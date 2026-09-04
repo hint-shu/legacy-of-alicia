@@ -173,6 +173,26 @@ rather than arguing scope; if you genuinely disagree after three rounds on the s
 finding, escalate instead of looping. Keep the verdicts verbatim next to the round's
 records.
 
+### The verdict belongs to a tree, not to a branch name
+
+A verdict counts only on a tree whose merge-base is the **current** `main`, **or** on a
+tree whose `git merge-tree` against `main` is textually clean with hunks disjoint from
+whatever landed meanwhile. In that second case a deploy-time rebase is allowed, and it
+must be followed by a rebuild, `ctest` on the merged tree, the round's stand subset and
+the ladder — the verdict then rides on what those produce, not on the approval of the
+pre-rebase tree.
+
+A content conflict voids the verdict outright. So does a **shared new entity**: a file,
+class or field that two rounds each created independently. That collision hides from
+`merge-tree` — both sides only add, so the merge reads clean — and still leaves a tree
+nobody reviewed. Either case needs a full iteration before review, not a rebase.
+
+> **Example — R71/R72, `LogThrottle`.** Both rounds introduced a time-window log throttle
+> of their own. R72 shipped first, so `include/libserver/util/LogThrottle.hpp` lives in
+> `main` (`61362966`); R71 still carries its own `LogThrottle.hpp` plus a `KeyedLogThrottle`
+> built on top of it. Rebasing R71 onto `main` raises no conflict worth the name — it
+> produces two throttles under one name. R71 goes back through a full iteration.
+
 ---
 
 ## 7. Stage the image on the production host
@@ -194,6 +214,12 @@ echo "transfer rc=$?"          # with pipefail this is the FIRST failing stage
 
 Without `pipefail` the exit code you read is `docker load`'s, and a `docker save` that
 died halfway reads as success.
+
+> **Shell gotcha:** `$PIPESTATUS` is a **bash** array. **zsh has no `$PIPESTATUS`** — its
+> equivalent is the lowercase `$pipestatus` — so a deploy script that reads `${PIPESTATUS[0]}`
+> under zsh reads an empty string and every pipe looks like it succeeded. Run the deploy
+> scripts under `bash` explicitly. Treat this as a belt, not the gate: what makes the
+> transfer safe is the image-id comparison on both ends, never the pipe's return code.
 
 Then compare the id **on both ends** before touching anything:
 
