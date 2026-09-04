@@ -3321,8 +3321,33 @@ void LobbyNetworkHandler::HandleGetMessengerInfo(
   size_t identityHash = std::hash<uint32_t>()(clientContext.characterUid);
   boost::hash_combine(identityHash, MessengerOtpConstant);
 
-  // Grant otp code to character
-  const uint32_t code = _serverInstance.GetOtpSystem().GrantCode(identityHash);
+  // LOA-fix (R78-3, round78, backlog #255): ВЫДАЁМ LTK, А НЕ ОДНОРАЗОВЫЙ КОД.
+  //
+  // Парная правка к `MessengerDirector::HandleChatterLogin`. Клиент помнит этот
+  // код всю сессию и присылает его при КАЖДОМ переподключении мессенджера, а
+  // `GrantCode` выдавал код, который живёт 30 секунд и тратится первым же
+  // входом. Разбор — там же, у места сверки.
+  //
+  // ★АДРЕС БЕРЁТСЯ У ЖИВОГО СОКЕТА, И ЭТО МОЖЕТ БРОСИТЬ.
+  // `CommandServer::GetClientAddress` уходит в `Server::GetClient`, который
+  // бросает «Invalid client», если запись клиента уже снята (`Server.cpp:471`).
+  // Внутри обработчика пакета этого же клиента такого быть не должно, но
+  // необработанный бросок здесь стоил бы соединения; а отвечать ушедшему
+  // клиенту всё равно некому — молча выходим.
+  uint32_t endpointAddress{};
+  try
+  {
+    endpointAddress = _commandServer.GetClientAddress(clientId).to_uint();
+  }
+  catch (const std::exception&)
+  {
+    return;
+  }
+
+  // Grant long-term key to character
+  const uint32_t code = _serverInstance.GetOtpSystem().GrantLtk(
+    identityHash,
+    endpointAddress);
 
   protocol::AcCmdCLGetMessengerInfoOK response{
     .code = code,
