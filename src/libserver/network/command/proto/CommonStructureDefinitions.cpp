@@ -22,7 +22,9 @@
 #include "libserver/util/BoundedList.hpp"
 
 #include <cassert>
+#include <format>
 #include <limits>
+#include <string>
 
 namespace server::protocol
 {
@@ -121,6 +123,13 @@ void MacroOptions::Read(MacroOptions& value, SourceStream& stream)
   }
 }
 
+std::string DescribeMacroBlockWireSize(const std::size_t measured)
+{
+  if (measured == std::numeric_limits<std::size_t>::max())
+    return std::format("over {} bytes, exact size unknown", 2 * MaxMacroBlockWireBytes);
+  return std::format("{} bytes", measured);
+}
+
 std::size_t MeasureMacroBlockWireSize(const MacroOptions& value)
 {
   // Скретч вдвое больше бюджета: замер обязан УЗНАТЬ размер перебора, а не
@@ -132,8 +141,15 @@ std::size_t MeasureMacroBlockWireSize(const MacroOptions& value)
   {
     MacroOptions::Write(value, sink);
   }
-  catch (const std::overflow_error&)
+  catch (...)
   {
+    // ★R74-fix-2 (subreview #1, NIT 1): ЛОВИМ ВСЁ, А НЕ ТОЛЬКО ПЕРЕПОЛНЕНИЕ.
+    // Любое другое исключение из писателя (например из `locale::FromUtf8` или
+    // `bad_alloc`) уходило мимо, поднималось через `BuildProtocolSettings` и
+    // два вложенных `Immutable`-колбэка и гасилось молча выше — кадр входа не
+    // доставлялся ВООБЩЕ и БЕЗ строки в логе. «Не смог измерить» обязано
+    // означать «заведомо не влезает» и уводить запись в уже существующую
+    // ветку «придержать макросы», а не терять вход.
     return std::numeric_limits<std::size_t>::max();
   }
 

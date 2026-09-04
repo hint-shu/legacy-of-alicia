@@ -433,9 +433,9 @@ void BuildProtocolSettings(
       if (poisonedMacroThrottle.Allow(suppressed, total))
       {
         util::QuietLogWarn(
-          "stored macros exceed the wire budget ({} bytes over {}); the macro block is"
+          "stored macros exceed the wire budget ({} over {}); the macro block is"
           " withheld from this login (suppressed {} more, {} in total)",
-          wireSize,
+          DescribeMacroBlockWireSize(wireSize),
           MaxMacroBlockWireBytes,
           suppressed,
           total);
