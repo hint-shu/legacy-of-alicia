@@ -19,16 +19,15 @@
 
 #include "server/authentication/LocalAuthenticationBackend.hpp"
 #include "libserver/util/AtomicFile.hpp"
+#include "libserver/util/NameGuard.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include <array>
 #include <cstddef>
-#include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
 #include <string>
-#include <system_error>
 
 #include <nlohmann/json.hpp>
 
@@ -98,13 +97,17 @@ bool WriteUserJsonAtomic(const std::filesystem::path& path, const nlohmann::json
   // незаписанным паролем.
   try
   {
-    server::util::WriteFileAtomically(path, json.dump(2), "User file");
+    // ★ЭТОТ ФАЙЛ НЕСЁТ ХЕШ И СОЛЬ ПАРОЛЯ — единственный класс `Secret` здесь
+    // (LOA-fix R73-1, #206). Один вызов обслуживает ОБЕ ветки записи аккаунта:
+    // регистрацию при первом входе и «дедовскую» ветку старых файлов.
+    server::util::WriteFileAtomically(
+      path, json.dump(2), "User file", server::util::FileSensitivity::Secret);
     return true;
   }
   catch (const std::exception& x)
   {
     server::util::QuietLogError(
-      "Failed to write the user file '{}': {}", path.string(), x.what());
+      "Failed to write the user file '{}': {}", server::util::LogPath(path), x.what());
     return false;
   }
 }
@@ -115,6 +118,18 @@ LocalAuthenticationBackend::LocalAuthenticationBackend(
   std::filesystem::path usersDirectory)
   : _usersDirectory(std::move(usersDirectory))
 {
+  // ★ПРИЁМНИК ПРЕДУПРЕЖДЕНИЙ ФАЙЛОВОГО ПОМОЩНИКА (LOA-fix R73-5, ревью 4).
+  // `AtomicFile.hpp` сознательно не тянет spdlog, поэтому редкие жалобы —
+  // отвергнутая ссылка, сужение поздно пришедшего файла — выходят наружу через
+  // указатель на функцию. Ставится и здесь, и в `FileDataSource::Initialize`:
+  // указатель один и тот же, повторная установка безвредна, а порядок создания
+  // этих двух объектов не гарантирован ничем — тот, кто окажется первым, и
+  // включит звук.
+  server::util::SetFileWarningSink(
+    [](const std::string_view message)
+    {
+      server::util::QuietLogWarn("{}", message);
+    });
 }
 
 std::optional<bool> LocalAuthenticationBackend::Authenticate(
@@ -125,17 +140,11 @@ std::optional<bool> LocalAuthenticationBackend::Authenticate(
   // инсталляторе/лаунчере). Разом закрывает path traversal (нет '/', '\\',
   // '.', '..'), NUL/control-байты и unicode-трюки → имя ВСЕГДА безопасное имя
   // файла в каталоге users. Сервер не доверяет клиенту — проверяет сам.
-  if (userName.empty() || userName.size() > 48)
+  // ★ОПРЕДЕЛЕНИЕ КЛАССА ПЕРЕЕХАЛО В `util::IsLoginNameSafe` (R73-3): та же
+  // проверка была нужна `FileDataSource::IsUserNameUnique`, а два независимых
+  // определения одного класса умеют разъехаться молча.
+  if (not server::util::IsLoginNameSafe(userName))
     return false;
-  for (const char nameChar : userName)
-  {
-    const bool allowed = (nameChar >= 'A' && nameChar <= 'Z')
-      || (nameChar >= 'a' && nameChar <= 'z')
-      || (nameChar >= '0' && nameChar <= '9')
-      || nameChar == '_' || nameChar == '-';
-    if (not allowed)
-      return false;
-  }
 
   // #18c: userToken == authKey из settings.json == ПАРОЛЬ. Пустой пароль не
   // регистрируем и не пускаем (HandleLogin уже отсекает пустой authKey — дубль).
@@ -144,17 +153,39 @@ std::optional<bool> LocalAuthenticationBackend::Authenticate(
 
   const std::filesystem::path userPath = _usersDirectory / (userName + ".json");
 
-  std::error_code ec;
-  const bool exists = std::filesystem::exists(userPath, ec);
-  if (ec)
-    return false; // fail-closed на ошибке ФС
+  // ★ОДНО ОТКРЫТИЕ ВМЕСТО «СУЩЕСТВУЕТ?» И ПОТОМ `ifstream` (LOA-fix R73-6,
+  // правка ревью, итерация 4).
+  //
+  // Прежняя пара `exists(path)` + `std::ifstream in(path)` ХОДИЛА ПО ССЫЛКЕ
+  // дважды: `data/users/Alice.json`, ставший ссылкой на чужой файл 0644, здесь
+  // открывался, его хеш принимался как пароль Алисы — при том что проход
+  // сужения эту запись не трогал, а индекс имён её не знал. Три потребителя
+  // отвечали по-разному на вопрос, существует ли аккаунт. Теперь ответ один:
+  // ссылка под `data/` не управляемая запись и НЕ АУТЕНТИФИЦИРУЕТ.
+  //
+  // ★И КЛАСС `Secret` ЗДЕСЬ НЕ УКРАШЕНИЕ: `ReadManagedFile` сузит режим файла,
+  // положенного рядом помощником с обычным umask (0644), ПРЕЖДЕ чем отдаст его
+  // содержимое, — то есть первый же вход чинит поздно пришедший аккаунт, не
+  // дожидаясь ни перезапуска, ни следующего сохранения.
+  //
+  // ★ЗАОДНО ИСЧЕЗЛА ГОНКА «ПРОВЕРИЛИ-И-ОТКРЫЛИ»: решение «новое имя или нет»
+  // принимается по ИСХОДУ ОТКРЫТИЯ, а не по отдельному предварительному
+  // вопросу к файловой системе, ответ на который к моменту открытия мог
+  // устареть.
+  const auto userRead = server::util::ReadManagedFile(
+    userPath, server::util::FileSensitivity::Secret);
+  if (userRead.status == server::util::ManagedReadStatus::Refused
+    || userRead.status == server::util::ManagedReadStatus::Failed)
+  {
+    return false; // fail-closed: ссылка, канал, ошибка ФС
+  }
 
   // --- Ветка 1: новое имя → register-on-first-use ---
   // Создаём аккаунт с солью+хешем присланного пароля. characterUid=0
   // (InvalidUid) → игрок пойдёт в создание персонажа. CreateUser в
   // FileDataSource — заглушка, поэтому пишем файл здесь (иначе пароль негде
   // сохранить: login-флоу пароля не видит).
-  if (not exists)
+  if (userRead.status == server::util::ManagedReadStatus::Missing)
   {
     const std::string salt = GenerateSaltHex();
     const std::string hash = StretchPassword(salt, userToken);
@@ -173,10 +204,7 @@ std::optional<bool> LocalAuthenticationBackend::Authenticate(
   nlohmann::json json;
   try
   {
-    std::ifstream in(userPath);
-    if (not in.is_open())
-      return false;
-    json = nlohmann::json::parse(in);
+    json = nlohmann::json::parse(userRead.content);
   }
   catch (const std::exception&)
   {

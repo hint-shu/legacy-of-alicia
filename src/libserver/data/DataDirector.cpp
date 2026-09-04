@@ -758,9 +758,10 @@ DataDirector::DataDirector(const std::filesystem::path& basePath)
       })
 {
   _primaryDataSource = std::make_unique<FileDataSource>();
-  if (auto* fileDataSource = dynamic_cast<FileDataSource*>(_primaryDataSource.get()))
+  _fileDataSource = dynamic_cast<FileDataSource*>(_primaryDataSource.get());
+  if (_fileDataSource != nullptr)
   {
-    fileDataSource->Initialize(basePath);
+    _fileDataSource->Initialize(basePath);
   }
 }
 
@@ -865,6 +866,17 @@ void DataDirector::Tick()
   catch (std::exception& x)
   {
     server::util::QuietLogError("Unhandled exception ticking the scheduler in the data director: {}", x.what());
+  }
+
+  // ★ПЛАНОВЫЙ РЕМОНТ ИНДЕКСОВ ИМЁН (правка ревью, итерация 9, R73). Повод
+  // осмотреть индексы обязан быть НЕЗАВИСИМ от того, что прислал клиент: до
+  // этой правки индекс персонажей чинился только через `IsCharacterNameUnique`,
+  // то есть создание персонажа, и починенный на диске файл оставался невидимым
+  // для подарка, друга, письма и приглашения в заезд неограниченно долго.
+  // Сам вызов `noexcept` и сам себя ограничивает по частоте.
+  if (_fileDataSource != nullptr)
+  {
+    _fileDataSource->TickNameIndexMaintenance();
   }
 }
 

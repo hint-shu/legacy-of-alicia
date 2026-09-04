@@ -23,28 +23,308 @@
 #include <limits>
 #include <ranges>
 #include "libserver/util/AtomicFile.hpp"
+// LOA-fix (R73-3, #130-C8): структурный гейт имени и ASCII-сравнение вместо
+// регулярного выражения, собиравшегося из присланного клиентом имени. ★Само
+// слово-токен здесь не пишется: гейт `tools/no_name_regex_gate.sh` ищет его по
+// всему `src/libserver/data/`, и упоминание в комментарии сделало бы гейт
+// красным на честном коде.
+#include "libserver/util/NameGuard.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <format>
-#include <limits>
+#include <optional>
+#include <string_view>
 
 #include <spdlog/spdlog.h>
-#include <fstream>
-#include <regex>
 
 #include <nlohmann/json.hpp>
 
 namespace
 {
 
+//! ПРЕДЕЛ ЧАСТОТЫ СВЕРКИ ИНДЕКСА АККАУНТОВ С ДИСКОМ (правка ревью, итерация 3).
+//!
+//! ★ЭТО НЕ «ТЮНИНГ», А ГРАНИЦА КЛАССА. Промах индекса имеет право переспросить
+//! диск, иначе аккаунт, заведённый рядом с работающим сервером, не находился бы
+//! до перезапуска. Но право «переспросить» без потолка означает, что стоимость
+//! пакета снова становится O(число аккаунтов): staff-клиент, чередуя
+//! сохранение записи (оно меняет mtime каталога) с запросом отсутствующего
+//! имени, заказывает по полному обходу на пару. Потолок превращает «на пакет» в
+//! «не чаще раза в пять секунд», сколько бы пакетов и потоков ни пришло.
+constexpr auto kUserIndexReconcileGap = std::chrono::seconds(5);
+
+//! Как часто ПЛАНОВЫЙ проход осматривает индексы имён.
+//!
+//! ★ВЕЛИЧИНА ВЫВЕДЕНА ИЗ СТОИМОСТИ, А НЕ ВЫБРАНА КРАСИВОЙ. Полная перестройка
+//! индекса персонажей на прод-шарде замерена стендом в 0.7-1.0 с; при неполном
+//! индексе (только тогда проход что-то делает) минута между попытками означает
+//! верхнюю границу нагрузки около 1-2 % одного ядра на потоке директора данных
+//! — и при этом «файл починили» становится «имя снова находится в течение
+//! минуты», а не «до следующего перезапуска».
+constexpr auto kScheduledNameIndexRepairGap = std::chrono::seconds(60);
+
+//! ПОЛ ЧАСТОТЫ ПРОХОДА — ЭТО `kScheduledNameIndexRepairGap` ВЫШЕ; а это —
+//! ПЕРИОД, с которым проход случается САМ, без чьей-либо просьбы.
+//!
+//! ★ЗАЧЕМ ДВЕ ВЕЛИЧИНЫ, А НЕ ОДНА (правка ревью, итерация 11). Пол отвечает на
+//! вопрос «как часто это МОЖНО делать» и обязан быть неснижаемым: его читает
+//! путь, до которого достаёт имя с провода. Период отвечает на другой вопрос —
+//! «как часто это надо делать, если никто не просил», и он вправе быть реже:
+//! неполный индекс уже отвечает безопасно, а просьба (флаг) всё равно поднимет
+//! осмотр до пола. Одна величина на два вопроса означала бы, что ускорить
+//! ремонт можно только ускорив холостые обходы.
+constexpr auto kPeriodicNameIndexSweepGap = std::chrono::minutes(5);
+
+//! ПОЛ ЧАСТОТЫ: раз в минуту промах сверяется с диском ДАЖЕ при совпавшем
+//! отпечатке.
+//!
+//! ★ОТПЕЧАТОК КАТАЛОГА НЕ СВОБОДЕН ОТ КОЛЛИЗИЙ (найдено ревью, итерация 3).
+//! Файловая система с грубым разрешением времени, восстановление из копии,
+//! возвращающее каталогу прежний mtime, — и новый файл живёт под старым
+//! отпечатком. Признак «изменилось» тогда молчит НАВСЕГДА. Принудительная
+//! сверка ограничивает это молчание минутой и стоит один обход в минуту — и
+//! только при промахах, то есть только когда кто-то спрашивает.
+constexpr auto kUserIndexStaleAfter = std::chrono::seconds(60);
+
+//! ПРЕДЕЛ ЧАСТОТЫ ПОПЫТОК ПЕРЕСОБРАТЬ СЛОМАННЫЙ ИНДЕКС ИМЁН (правка ревью,
+//! итерация 7).
+//!
+//! ★ЗАЧЕМ ВООБЩЕ ПОПЫТКИ. Индекс, объявленный неполным, отвечает «занято» на
+//! ЛЮБОЕ имя — это безопасно, но это и остановка создания персонажей и гильдий.
+//! Без пути к самопочинке один файл, который был нечитаем ровно в момент
+//! старта, стоил бы отказа в создании ДО ПЕРЕЗАПУСКА, хотя на диске всё давно
+//! в порядке.
+//!
+//! ★ПОТОЛКА ЧАСТОТЫ ЗДЕСЬ БОЛЬШЕ НЕТ, И ЭТО НЕ ОСЛАБЛЕНИЕ (правка ревью,
+//! итерация 9). Двухсекундный `ClaimNameIndexRetry` существовал ровно затем,
+//! чтобы КАЖДЫЙ пакет создания не заказывал полный обход каталога. Теперь
+//! ремонт вообще не достижим с пути запроса: его зовёт только плановый проход
+//! `TickNameIndexMaintenance`, у которого свой потолок —
+//! `kScheduledNameIndexRepairGap`, то есть шестьдесят секунд вместо двух.
+//! Оставить оба значило бы, что первый же тик после старта (а старт только что
+//! переставил отметку попытки) НЕ ЧИНИТ неполный индекс и ждёт следующей
+//! минуты — то есть «починиться сразу после старта» не выполнялось бы.
+
+//! РАЗБИРАЕТ uid ЗАПИСИ ИЗ ИМЕНИ ФАЙЛА (правка ревью, итерация 7).
+//!
+//! ★ЛИЧНОСТЬ ЗАПИСИ — ЭТО ИМЯ ФАЙЛА, А НЕ ПОЛЕ ВНУТРИ НЕГО. `StoreGuild`,
+//! `DeleteGuild`, `StoreCharacter` и `DeleteCharacter` адресуют файл ИМЕНЕМ
+//! (`ProduceDataFilePath(dir, std::format("{}", uid))`), а перестройка индекса
+//! брала uid из `json["uid"]`. Эти два числа независимы: `7.json` с полем
+//! `uid: 8` заводил обратную запись под 8, и `DeleteGuild(7)` не снимал имя —
+//! оно оставалось занятым до перезапуска. Два файла с ОДНИМ полем `uid` и
+//! разными именами давали обратное: живое имя становилось свободным.
+//!
+//! ★РАЗБОР СТРОГИЙ, ПО ТОЙ ЖЕ ПРИЧИНЕ, ЧТО В `HighestUidInDirectory`:
+//! `std::stoul` принимает знак и игнорирует хвост.
+//!
+//! @return uid или `std::nullopt`, если имя файла не является записью.
+//! ЧИСЛО ИЗ ИМЕНИ ФАЙЛА — БЕЗ ТРЕБОВАНИЯ КАНОНИЧНОСТИ. Только для ПОЛА
+//! СЧЁТЧИКА uid.
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНАЯ, БОЛЕЕ СНИСХОДИТЕЛЬНАЯ ФУНКЦИЯ (правка ревью, итерация 9).
+//! Пол счётчика — это утверждение об ИМЕНАХ, которые каталог уже занял: если
+//! рядом лежит `007.json`, выдать следующему персонажу uid 7 нельзя, потому что
+//! `ProduceDataFilePath` напишет `7.json`, а `007.json` останется вторым живым
+//! файлом на ту же личность. Ужесточи мы РАЗБОР ПОЛА вместе с разбором
+//! личности — пол опустился бы ровно на тех именах, из-за которых он и заведён
+//! ([[dont-trade-success-path-for-failure-path]]). Поэтому: пол РЕЗЕРВИРУЕТ
+//! алиасы, индекс их НЕ ПРИЗНАЁТ.
+std::optional<server::data::Uid> ParseUidLikeStem(const std::string& stem)
+{
+  if (stem.empty()
+    || not std::ranges::all_of(stem, [](const unsigned char symbol)
+      {
+        return symbol >= '0' && symbol <= '9';
+      }))
+  {
+    return std::nullopt;
+  }
+
+  // ★ВЕДУЩИЕ НУЛИ СНИМАЮТСЯ ДО ГРАНИЦЫ ДЛИНЫ (правка ревью, итерация 11).
+  // Прежде граница в десять байт стояла ПЕРВОЙ, и `00000000007.json`
+  // (одиннадцать байт) не был ни записью, ни АЛИАСОМ: пол счётчика его не
+  // резервировал, то есть следующему персонажу выдался бы uid 7, а `7.json` лёг бы
+  // рядом с уже живым файлом на ту же личность. Граница судит ЗНАЧЕНИЕ, а не
+  // ширину написания: сколько бы нулей ни дописали слева, это то же число.
+  std::string_view digits(stem);
+  while (digits.size() > 1 && digits.front() == '0')
+    digits.remove_prefix(1);
+
+  if (digits.size() > 10)
+    return std::nullopt;
+
+  uint64_t parsed = 0;
+  for (const char symbol : digits)
+    parsed = parsed * 10 + static_cast<uint64_t>(symbol - '0');
+
+  if (parsed == 0 || parsed >= std::numeric_limits<uint32_t>::max())
+    return std::nullopt;
+
+  return static_cast<server::data::Uid>(parsed);
+}
+
+//! ЛИЧНОСТЬ ЗАПИСИ — ТОЛЬКО КАНОНИЧЕСКОЕ ДЕСЯТИЧНОЕ ИМЯ (правка ревью,
+//! итерация 9).
+//!
+//! ★ЧТО ЛОМАЛОСЬ, ПОКА `007.json` ЧИТАЛОСЬ КАК uid 7. Личность записи в индексе
+//! бралась из имени файла ИМЕННО ПОТОМУ, что этим именем запись адресуют
+//! `Store*` и `Delete*`. Но адресуют они РОВНО ОДНИМ написанием —
+//! `std::format("{}", uid)`, то есть `7.json`. Одинокий `007.json`
+//! индексировался под 7, а `DeleteGuild(7)` удалял НЕСУЩЕСТВУЮЩИЙ `7.json`,
+//! считал ENOENT успехом, забывал имя — и оставлял `007.json` живым, с именем,
+//! которое теперь числится свободным. При обоих написаниях сразу два разных
+//! физических файла схлопывались в одну личность обратной карты. То есть
+//! «личность = имя файла» держалась только пока написание одно; требование
+//! каноничности и делает её однозначной.
+//!
+//! ★НЕКАНОНИЧЕСКИЙ ФАЙЛ — НЕ УПРАВЛЯЕМАЯ ЗАПИСЬ, а посторонний файл в каталоге:
+//! он НЕ индексируется, НЕ делает индекс неполным и не подметается — ровно как
+//! `.bak-*` и `.tmp`. Названным он быть обязан (одна строка на перестройку),
+//! иначе «мы его не видим» стало бы «его нет».
+std::optional<server::data::Uid> ParseRecordUid(const std::string& stem)
+{
+  // Ведущий ноль — это ВТОРОЕ написание того же числа, и именно
+  // многозначность имени делала личность записи неоднозначной.
+  if (stem.size() > 1 && stem.front() == '0')
+    return std::nullopt;
+  return ParseUidLikeStem(stem);
+}
+
+//! УДАЛЯЕТ ЗАПИСЬ ИЛИ ГОВОРИТ ВСЛУХ, ЧТО НЕ УДАЛИЛ (правка ревью, итерация 7).
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ `if` В ПЯТНАДЦАТИ МЕСТАХ. Пятнадцать копий
+//! одного `if` — это список мест: шестнадцатый `Delete*`, написанный через
+//! полгода по образцу соседей, унаследует ту форму, которую увидит. Здесь форма
+//! ровно одна, и `[[nodiscard]]` у `RemoveManagedFile` не даёт написать другую.
+//!
+//! ★БРОСОК, А НЕ КОД ВОЗВРАТА, ПОТОМУ ЧТО ЕГО КТО-ТО ЛОВИТ. `DataDirector`
+//! оборачивает каждый `Delete*` в `try` и на исключении возвращает `false`, а
+//! `DataStorage::ProcessDeleteQueue` при `false` ОСТАВЛЯЕТ запись доступной в
+//! кэше. То есть бросок здесь — это ровно та проводка, которая была у прежнего
+//! `std::filesystem::remove(path)` (бросающая перегрузка), и восстановление
+//! этого пути ничего нового не заводит.
+void RemoveDataFileOrThrow(
+  const std::filesystem::path& path, const std::string_view what)
+{
+  if (server::util::RemoveManagedFile(path))
+    return;
+
+  throw std::runtime_error(
+    std::format(
+      "{} '{}' could not be deleted",
+      what, server::util::LogPath(path)));
+}
+
+//! Вносит uid в отсортированный список имени (LOA-fix R73-4, правка ревью 1).
+//!
+//! ★СПИСОК, А НЕ ЕДИНСТВЕННЫЙ ПОБЕДИТЕЛЬ. Столкновение имён на диске возможно
+//! (ext4 регистрозависим, а ключ индекса — ASCII-нижний регистр), и прежняя
+//! редакция проигравшие uid ТЕРЯЛА. Стоило победителю переименоваться или
+//! удалиться — и имя переставало разрешаться до перезапуска, хотя второй файл с
+//! этим именем лежал на месте. Порядок по возрастанию делает правило «меньший
+//! uid — старшая запись» одинаковым при старте и в рантайме и превращает снятие
+//! победителя в ДЕТЕРМИНИРОВАННОЕ повышение следующего.
+//!
+//! @return размер списка ПОСЛЕ вставки: 1 — имя уникально, больше — столкновение.
+std::size_t AttachNameKey(
+  std::unordered_map<std::string, std::vector<server::data::Uid>>& index,
+  const std::string& key,
+  const server::data::Uid uid)
+{
+  auto& bucket = index[key];
+  const auto position = std::ranges::lower_bound(bucket, uid);
+  // Повторная вставка того же uid — не столкновение, а тот же самый персонаж.
+  if (position == bucket.end() || *position != uid)
+    bucket.insert(position, uid);
+  return bucket.size();
+}
+
+//! Снимает uid со списка имени; пустой список убирает ключ целиком.
+void DetachNameKey(
+  std::unordered_map<std::string, std::vector<server::data::Uid>>& index,
+  const std::string& key,
+  const server::data::Uid uid)
+{
+  const auto entry = index.find(key);
+  if (entry == index.end())
+    return;
+  auto& bucket = entry->second;
+  const auto position = std::ranges::lower_bound(bucket, uid);
+  if (position != bucket.end() && *position == uid)
+    bucket.erase(position);
+  if (bucket.empty())
+    index.erase(entry);
+}
+
+//! Монотонная верхняя отметка: поднимает значение и никогда не опускает.
+//!
+//! ★ОДНА ФУНКЦИЯ НА ДВА ПРИМЕНЕНИЯ (потолок длины имени и поколение обхода),
+//! потому что свойство одно: «значение умеет только расти». Написанное дважды,
+//! оно умеет разъехаться в CAS-цикле молча.
+void RaiseAtomicWatermark(std::atomic_size_t& watermark, const std::size_t candidate)
+{
+  std::size_t current = watermark.load(std::memory_order::relaxed);
+  while (candidate > current
+    && not watermark.compare_exchange_weak(
+      current, candidate, std::memory_order::relaxed))
+  {
+  }
+}
+
+//! Поднимает потолок длины имени, никогда его не опуская.
+void RaiseNameCeiling(std::atomic_size_t& ceiling, const std::size_t candidate)
+{
+  RaiseAtomicWatermark(ceiling, candidate);
+}
+
+//! ЕДИНСТВЕННОЕ ЧТЕНИЕ ФАЙЛА ДАННЫХ В ЭТОМ КЛАССЕ (LOA-fix R73-6, ревью 4).
+//!
+//! ★ЗАЧЕМ ОДНА ФУНКЦИЯ ВМЕСТО ДЕВЯТНАДЦАТИ ОДИНАКОВЫХ ТРОЙЧАТОК. Каждое чтение
+//! было написано как `std::ifstream file(path)` + проверка `is_open` + разбор.
+//! `ifstream` ХОДИТ ПО СИМВОЛИЧЕСКОЙ ССЫЛКЕ и открывает именованные каналы,
+//! поэтому свойство «под `data/` читается только управляемая запись» было
+//! ложным в девятнадцати местах сразу, а двадцатое чтение, написанное через
+//! полгода, унаследовало бы дефект по образцу соседей. Теперь оно одно, и
+//! свойство держится построением, а не перечнем починенных мест.
+//!
+//! ★ТЕКСТ БРОСКА СОХРАНЁН ДОСЛОВНО. `"{} '{}' not accessible"` — маркер лесенки
+//! прошлых раундов; переписать его значило бы объявить контроль сдвинувшимся
+//! там, где поведение не менялось.
+nlohmann::json ReadManagedJson(
+  const std::filesystem::path& path,
+  const std::string_view what,
+  const server::util::FileSensitivity sensitivity)
+{
+  const auto read = server::util::ReadManagedFile(path, sensitivity);
+  if (read.status != server::util::ManagedReadStatus::Ok)
+  {
+    throw std::runtime_error(
+      std::format("{} '{}' not accessible", what, server::util::LogPath(path)));
+  }
+  return nlohmann::json::parse(read.content);
+}
+
+//! ★СОЗДАНИЕ КАТАЛОГА ТОЖЕ НЕ ХОДИТ ПО ССЫЛКАМ (правка ревью, итерация 6).
+//!
+//! Прежняя редакция звала `exists` + `create_directories` ПО ПУТИ, то есть
+//! инвариант «под `data/` не ходят по ссылкам» держался у чтения, записи и
+//! обхода, но не у создания: подмена `data/characters/equipment` ссылкой на
+//! чужое дерево заставляла сервер СОЗДАТЬ там `items` — и всё дальнейшее шло
+//! мимо `data/`. Здесь единственное место, через которое рождаются ВСЕ пути
+//! данных этого класса, поэтому и правка одна.
 std::filesystem::path ProduceDataFilePath(
   const std::filesystem::path& root,
   const std::string& filename)
 {
-  if (not std::filesystem::exists(root))
-    std::filesystem::create_directories(root);
+  if (not server::util::CreateManagedDirectories(root))
+  {
+    throw std::runtime_error(
+      std::format(
+        "Data directory '{}' could not be created without following a symbolic "
+        "link", server::util::LogPath(root)));
+  }
   return root / (filename + ".json");
 }
 
@@ -96,19 +376,44 @@ uint32_t NextUid(std::atomic<uint32_t>& counter, const std::string_view what)
   }
 }
 
-uint32_t HighestUidInDirectory(const std::filesystem::path& root)
+//! Пол счётчика uid, снятый с каталога, ВМЕСТЕ с честностью снимка.
+//!
+//! ★ЧИСЛО БЕЗ ПРИЗНАКА ПОЛНОТЫ — ЛОЖНО-ЗЕЛЁНОЕ ПО ПОСТРОЕНИЮ (правка ревью,
+//! итерация 3). Оборванный обход возвращает МЕНЬШИЙ максимум, неотличимый от
+//! честного: пол 99 вместо 100 выглядит как каталог, в котором просто нет
+//! сотого файла. Признак обязан ехать вместе со значением, иначе вызывающий
+//! физически не может его учесть.
+struct UidFloorScan
 {
   uint32_t highest = 0;
+  bool incomplete = false;
+};
 
-  std::error_code error;
-  if (not std::filesystem::is_directory(root, error) || error)
-    return highest;
+UidFloorScan HighestUidInDirectory(const std::filesystem::path& root)
+{
+  UidFloorScan scan;
 
-  for (const auto& entry : std::filesystem::directory_iterator(root, error))
+  // ★ОБХОД ЧЕРЕЗ `ListRegularFiles` (правка ревью, итерация 2): продвижение
+  // итератора в range-for бросает, а счётчик uid считается на СТАРТЕ — исключение
+  // отсюда роняло бы процесс до первого игрока.
+  const auto listing = server::util::ListRegularFiles(root);
+  scan.incomplete = listing.incomplete;
+
+  // ★ОТВЕРГНУТАЯ ССЫЛКА ВСЁ РАВНО ЗАНИМАЕТ ИМЯ (правка ревью, итерация 4). Пол
+  // счётчика — это утверждение об ИМЕНАХ в каталоге, а не о инодах: если
+  // `characters/100.json` стал ссылкой, читать её мы отказываемся, но выдать
+  // uid 100 следующему персонажу нельзя тем более — запись легла бы на занятое
+  // имя. Прежняя редакция ссылку молча пропускала, то есть пол опускался ровно
+  // на том имени, из-за которого он и заведён.
+  std::vector<std::filesystem::path> occupied = listing.files;
+  occupied.insert(
+    occupied.end(),
+    listing.refusedSymlinks.begin(),
+    listing.refusedSymlinks.end());
+
+  for (const auto& entryPath : occupied)
   {
-    if (error)
-      break;
-    if (not entry.is_regular_file() || entry.path().extension() != ".json")
+    if (entryPath.extension() != ".json")
       continue;
 
     // ★РАЗБОР СТРОГИЙ, И ЭТО НЕ ПЕДАНТИЗМ. `std::stoul` принимает знак и
@@ -116,46 +421,82 @@ uint32_t HighestUidInDirectory(const std::filesystem::path& root)
     // UINT32_MAX — а следующий `++счётчик` завернул бы его в 0, то есть в
     // `InvalidUid`. Фикс, поставленный ПРОТИВ обнуления счётчиков, сам открыл
     // бы дорогу к обнулению. Найдено ревью (итерация 1).
-    const auto stem = entry.path().stem().string();
-    if (stem.empty() || stem.size() > 10
-      || not std::ranges::all_of(stem, [](const unsigned char symbol)
-        {
-          return symbol >= '0' && symbol <= '9';
-        }))
-    {
-      continue;
-    }
-
-    uint64_t parsed = 0;
-    for (const char symbol : stem)
-      parsed = parsed * 10 + static_cast<uint64_t>(symbol - '0');
-
-    // Значение, не помещающееся в счётчик, — тоже не наша запись.
-    if (parsed == 0 || parsed >= std::numeric_limits<uint32_t>::max())
+    // ★А ЗДЕСЬ РАЗБОР НАМЕРЕННО СНИСХОДИТЕЛЬНЕЕ, ЧЕМ У ИНДЕКСА (правка ревью,
+    // итерация 9). Индекс требует КАНОНИЧЕСКОГО написания, потому что личность
+    // записи обязана быть однозначной; пол счётчика требует обратного — он
+    // обязан считать занятым ЛЮБОЕ имя, которое может столкнуться с будущей
+    // записью, включая `007.json`. Ужесточи мы разбор и здесь — фикс,
+    // поставленный против схлопывания личностей, опустил бы пол и дал бы
+    // выдать занятый uid.
+    const auto parsed = ParseUidLikeStem(entryPath.stem().string());
+    if (not parsed)
       continue;
 
-    highest = std::max(highest, static_cast<uint32_t>(parsed));
+    scan.highest = std::max(scan.highest, static_cast<uint32_t>(*parsed));
   }
 
-  return highest;
+  return scan;
 }
 
 } // anon namespace
 
 void server::FileDataSource::Initialize(const std::filesystem::path& path)
 {
+  // ★СВЕРКА ИДЁТ С ТЕМ, ЧЕМ ЧЛЕН РЕАЛЬНО ИНИЦИАЛИЗИРУЕТСЯ (правка ревью,
+  // итерация 2). Прежняя редакция сверяла гейт с ЛИТЕРАЛОМ, написанным в самом
+  // `static_assert`, а инициализатор члена нёс свой собственный литерал: правка
+  // `{64}` -> `{32}` проходила компиляцию молча, то есть защита от расхождения
+  // была объявлена, но не работала. Теперь сверяется именно та константа,
+  // которой инициализируется потолок.
+  //
+  // Утверждения стоят В ТЕЛЕ МЕТОДА, а не в области имён файла, потому что
+  // константы приватные: членская функция имеет к ним доступ, свободная — нет.
+  static_assert(server::util::kMaxStoredNameBytes == kCharacterNameCeilingFloor,
+    "the character name ceiling floor has drifted from the name guard's bound");
+  static_assert(server::util::kMaxLoginNameBytes == kLoginNameCeilingFloor,
+    "the login name ceiling floor has drifted from the name guard's bound");
+
+  // ★ПРИЁМНИК ПРЕДУПРЕЖДЕНИЙ ФАЙЛОВОГО ПОМОЩНИКА СТАВИТСЯ ЗДЕСЬ (LOA-fix R73-5,
+  // ревью 4). `AtomicFile.hpp` сознательно не тянет spdlog (см. его заголовок),
+  // поэтому редкие жалобы — отвергнутая ссылка, не усыновлённый владелец,
+  // сужение поздно пришедшего файла — выходят через указатель на функцию.
+  // Установка ДО первого обращения к диску: иначе первое же сообщение ушло бы в
+  // тишину, а «сузили молча» неотличимо от «не сузили».
+  server::util::SetFileWarningSink(
+    [](const std::string_view message)
+    {
+      server::util::QuietLogWarn("{}", message);
+    });
+
   _dataPath = path;
   _metaFilePath = _dataPath;
 
   const auto prepareDataPath = [this](const std::filesystem::path& folder)
   {
     const auto path = _dataPath / folder;
-    create_directories(path);
-
+    // ★БЕЗ ПЕРЕХОДА ПО ССЫЛКАМ (правка ревью, итерация 6): `create_directories`
+    // разрешала путь именами, и ссылка на месте промежуточного каталога уводила
+    // создание — а с ним и все записи и удаления — за пределы `data/`.
+    if (not server::util::CreateManagedDirectories(path))
+    {
+      throw std::runtime_error(
+        std::format(
+          "Data directory '{}' could not be created without following a "
+          "symbolic link", server::util::LogPath(path)));
+    }
     return path;
   };
 
   // Prepare the data paths.
+  // ★РЕЖИМ ПРИНУДИТЕЛЬНО СУЖАЕТСЯ РОВНО У ОДНОГО КАТАЛОГА — `users`: только в
+  // нём лежат `passwordHash` и `passwordSalt` (StoreUser ниже). Остальные
+  // ПЯТНАДЦАТЬ создаются как создавались и их режим НЕ ТРОГАЕТСЯ ВОВСЕ.
+  //
+  // ★ПРАВКА РЕВЬЮ (итерация 1): прежняя редакция ставила всем пятнадцати ТОЧНЫЙ
+  // 0755. Это не «оставить как было», а НАЗНАЧИТЬ: у оператора, который сузил
+  // `mails` или `infractions` вручную либо поставил на каталог setgid, каждый
+  // старт сервера молча возвращал бы права ШИРЕ. Правка, взявшаяся сужать, не
+  // имеет права расширять.
   _userDataPath = prepareDataPath("users");
   _infractionDataPath = prepareDataPath("infractions");
   _characterDataPath = prepareDataPath("characters");
@@ -173,6 +514,84 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
   _stallionDataPath = prepareDataPath("stallions");
   _rewardDataPath = prepareDataPath("rewards");
 
+  // ★СУЖЕНИЕ СУЩЕСТВУЮЩЕГО, а не только создание с правами: `data/users` на
+  // проде создан давно и стоит 0755 — создание его не тронет (LOA-fix R73-2).
+  if (not server::util::EnsureDirectoryMode(_userDataPath, 0700))
+  {
+    server::util::QuietLogError(
+      "Data directory '{}': could not restrict the directory permissions to {:o}",
+      server::util::LogPath(_userDataPath), 0700);
+  }
+
+  // ★И САМИ ИНОДЫ, А НЕ ТОЛЬКО КАТАЛОГ (LOA-fix R73-2b, правка ревью 1).
+  // Обязательный `FileSensitivity` чинит режим НА ПЕРВОЙ ЗАПИСИ, но аккаунт, в
+  // который сервер больше не пишет (игрок не заходит), первой записи не
+  // дождётся никогда и остался бы 0644 бессрочно. Один проход на старте, без
+  // единой перезаписи содержимого.
+  //
+  // ★ЭТОТ ПРОХОД НЕ ЛИШНИЙ ПРИ ТОМ, ЧТО ПЕРЕСТРОЙКА ИНДЕКСА НИЖЕ СУЖАЕТ ТЕ ЖЕ
+  // ФАЙЛЫ (пояснение к правке ревью, итерация 4). Сужают оба, но ВЕРДИКТ выносит
+  // только этот: перестройка живёт и на пути запроса, поэтому она обязана
+  // ЖУРНАЛИРОВАТЬ отказ, а не бросать — иначе staff-команда рвалась бы вместо
+  // ответа. Единственное место, где «хеш пароля не удалось защитить» может
+  // КОГО-ТО ОСТАНОВИТЬ, — старт; здесь оно и стоит. Убрать этот проход значило
+  // бы оставить сужение без единого читателя вердикта, то есть вернуть
+  // инвариант, который умеет не выполниться и никого не остановить.
+  const auto hardening =
+    server::util::HardenSecretFilesInDirectory(_userDataPath);
+  if (hardening.narrowed > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account files in '{}': {} of {} examined were group/other-readable and "
+      "were narrowed to owner-only",
+      server::util::LogPath(_userDataPath), hardening.narrowed, hardening.examined);
+  }
+
+  // ★ССЫЛКА В КАТАЛОГЕ АККАУНТОВ НАЗЫВАЕТСЯ ВСЛУХ, А НЕ ПРОПУСКАЕТСЯ (правка
+  // ревью, итерация 4). Прежде проход рапортовал полный успех, ни разу не
+  // тронув `Alice.json`, ставший ссылкой на файл 0644, — и это было ХУЖЕ
+  // отсутствия прохода: отчёт утверждал ровно то, чего не произошло.
+  //
+  // ★ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ, и это не смягчение политики. Ссылка теперь
+  // отвергается ВСЕМИ потребителями: вход по ней не аутентифицирует
+  // (`ReadManagedFile` даёт `ELOOP`), индекс её не заводит, запись сквозь неё
+  // бросает. То есть аккаунт УЖЕ недоступен — падать сверх этого значило бы
+  // отнять сервер у всех остальных из-за мусора, положенного рядом.
+  if (hardening.refusedLinks > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account files in '{}': {} entry(ies) are symbolic links and were refused; "
+      "they are neither hardened, indexed nor authenticated from",
+      server::util::LogPath(_userDataPath), hardening.refusedLinks);
+  }
+
+  // ★ОТКАЗ СУЖЕНИЯ ОСТАНАВЛИВАЕТ СТАРТ (правка ревью, итерация 2). Прежняя
+  // редакция считала отказы и печатала строку, после чего сервер начинал
+  // обслуживать игроков — то есть при `EPERM`/`EROFS`/`EIO` хеш пароля
+  // оставался читаемым для group/other, а корневой инвариант раунда («секрет не
+  // лежит в файле, доступном кому-то кроме владельца») держался бы только на
+  // том, что кто-то прочитает лог. Инвариант, который умеет не выполниться и
+  // никого не остановить, — не инвариант.
+  //
+  // ★НЕЗАВЕРШЁННЫЙ ОБХОД ТОЖЕ ФАТАЛЕН. `incomplete` означает, что часть файлов
+  // мы НЕ ОСМОТРЕЛИ: «0 отказов» тогда говорит не «всё чисто», а «мы не знаем».
+  // Отличить эти два случая обязан код, а не читатель лога.
+  if (hardening.failed > 0 || hardening.incomplete)
+  {
+    server::util::QuietLogError(
+      "Account files in '{}': {} of {} examined could not be secured{}; "
+      "refusing to start with password hashes readable beyond their owner",
+      server::util::LogPath(_userDataPath), hardening.failed, hardening.examined,
+      hardening.incomplete ? ", and the directory scan did not finish" : "");
+
+    throw std::runtime_error(
+      std::format(
+        "Account files in '{}' could not be restricted to owner-only "
+        "({} failed, {} examined, scan {})",
+        server::util::LogPath(_userDataPath), hardening.failed, hardening.examined,
+        hardening.incomplete ? "incomplete" : "complete"));
+  }
+
   // Read the meta-data file and parse the sequential UIDs.
   const std::filesystem::path metaFilePath = ProduceDataFilePath(
     _metaFilePath, "meta");
@@ -183,28 +602,32 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
 
   nlohmann::json meta = nlohmann::json::object();
 
-  std::ifstream metaFile(metaFilePath);
-  if (not metaFile.is_open())
+  // ★ЧЕРЕЗ ТОТ ЖЕ ЕДИНСТВЕННЫЙ ВХОД В ЧТЕНИЕ (правка ревью, итерация 4): мета
+  // лежит под `data/` и подчиняется той же политике, что остальные записи —
+  // ссылка на него не читается.
+  const auto metaRead = server::util::ReadManagedFile(
+    metaFilePath, server::util::FileSensitivity::Public);
+  if (metaRead.status != server::util::ManagedReadStatus::Ok)
   {
     // ★РАНЬШЕ ЗДЕСЬ БЫЛ ТИХИЙ `return` — без единой строки в логе. Он и делал
     // потерю мета-файла беззвучной катастрофой: все счётчики оставались нулями,
     // следующий персонаж получал uid 1 и затирал файл старейшего игрока.
     server::util::QuietLogError(
       "Sequential uid metadata '{}' is missing. Uid counters will be derived from "
-      "the data on disk", metaFilePath.string());
+      "the data on disk", server::util::LogPath(metaFilePath));
   }
   else
   {
     try
     {
-      meta = nlohmann::json::parse(metaFile);
+      meta = nlohmann::json::parse(metaRead.content);
     }
     catch (const std::exception& x)
     {
       // Битый мета тоже не повод падать: пол из данных сильнее любого файла.
       server::util::QuietLogError(
         "Sequential uid metadata '{}' is unreadable ({}). Uid counters will be "
-        "derived from the data on disk", metaFilePath.string(), x.what());
+        "derived from the data on disk", server::util::LogPath(metaFilePath), x.what());
       meta = nlohmann::json::object();
     }
   }
@@ -234,28 +657,75 @@ void server::FileDataSource::Initialize(const std::filesystem::path& path)
       counter.store(observed);
   };
 
-  raiseFloor(_infractionSequentialUid, HighestUidInDirectory(_infractionDataPath));
-  raiseFloor(_characterSequentialUid, HighestUidInDirectory(_characterDataPath));
+  // ★НЕПОЛНЫЙ СНИМОК КАТАЛОГА НЕ ИМЕЕТ ПРАВА СТАТЬ ПОЛОМ (правка ревью,
+  // итерация 3). Оборванный обход отдаёт МЕНЬШИЙ максимум, и «пол применён»
+  // тогда означает «пол занижен»: `meta` потерян, обход не дошёл до
+  // `characters/100.json`, счётчик восстановлен как 99 — и следующий персонаж
+  // получает uid 100, а `WriteFileAtomically` кладёт его ПОВЕРХ живого файла.
+  // Ровно тот дефект, против которого пол и заведён, только с другой стороны.
+  // Поэтому неполнота фатальна: не выдать uid лучше, чем выдать занятый.
+  const auto uidFloor = [](const std::filesystem::path& root)
+  {
+    const auto scan = HighestUidInDirectory(root);
+    if (scan.incomplete)
+    {
+      server::util::QuietLogError(
+        "Uid floor: the scan of '{}' did not finish; the highest uid on disk is "
+        "unknown, so the next entity could be handed an occupied uid and "
+        "overwrite a live record",
+        server::util::LogPath(root));
+
+      throw std::runtime_error(
+        std::format(
+          "Uid floor scan of '{}' did not finish", server::util::LogPath(root)));
+    }
+    return scan.highest;
+  };
+
+  raiseFloor(_infractionSequentialUid, uidFloor(_infractionDataPath));
+  raiseFloor(_characterSequentialUid, uidFloor(_characterDataPath));
   // ★Один счётчик на ДВА каталога — лошади и предметы делят нумерацию.
   raiseFloor(_equipmentSequentialUid, std::max(
-    HighestUidInDirectory(_horseDataPath), HighestUidInDirectory(_itemDataPath)));
-  raiseFloor(_storageItemSequentialUid, HighestUidInDirectory(_storageItemPath));
-  raiseFloor(_eggSequentialUid, HighestUidInDirectory(_eggDataPath));
-  raiseFloor(_petSequentialUid, HighestUidInDirectory(_petDataPath));
-  raiseFloor(_housingSequentialUid, HighestUidInDirectory(_housingDataPath));
-  raiseFloor(_guildSequentialId, HighestUidInDirectory(_guildDataPath));
-  raiseFloor(_settingsSequentialId, HighestUidInDirectory(_settingsDataPath));
+    uidFloor(_horseDataPath), uidFloor(_itemDataPath)));
+  raiseFloor(_storageItemSequentialUid, uidFloor(_storageItemPath));
+  raiseFloor(_eggSequentialUid, uidFloor(_eggDataPath));
+  raiseFloor(_petSequentialUid, uidFloor(_petDataPath));
+  raiseFloor(_housingSequentialUid, uidFloor(_housingDataPath));
+  raiseFloor(_guildSequentialId, uidFloor(_guildDataPath));
+  raiseFloor(_settingsSequentialId, uidFloor(_settingsDataPath));
   raiseFloor(_dailyQuestGroupSequentialId,
-    HighestUidInDirectory(_dailyQuestGroupDataPath));
-  raiseFloor(_mailSequentialId, HighestUidInDirectory(_mailDataPath));
-  raiseFloor(_questSequentialId, HighestUidInDirectory(_questDataPath));
-  raiseFloor(_stallionSequentialUid, HighestUidInDirectory(_stallionDataPath));
-  raiseFloor(_rewardSequentialUid, HighestUidInDirectory(_rewardDataPath));
+    uidFloor(_dailyQuestGroupDataPath));
+  raiseFloor(_mailSequentialId, uidFloor(_mailDataPath));
+  raiseFloor(_questSequentialId, uidFloor(_questDataPath));
+  raiseFloor(_stallionSequentialUid, uidFloor(_stallionDataPath));
+  raiseFloor(_rewardSequentialUid, uidFloor(_rewardDataPath));
+
+  // LOA-fix (R73-4, #130-C8): индекс имён строится ОДИН раз, здесь. После
+  // `raiseFloor` намеренно: обход каталога персонажей уже прогрет, и порядок
+  // «сперва счётчики, потом индекс» держит стартовые инварианты в одном месте.
+  RebuildCharacterNameIndex();
+  RebuildUserNameIndex();
+  // ★И ИНДЕКС ГИЛЬДИЙ (правка ревью, итерация 6): пока его не было, проверка
+  // уникальности имени обходила каталог гильдий на каждый пакет создания.
+  RebuildGuildNameIndex();
 }
 
 void server::FileDataSource::Terminate()
 {
   SaveMetadata();
+  // ★ПРОВЕРКА, ЧЕЙ ВЕРДИКТ КТО-ТО ЧИТАЕТ. Структурный гейт имени молчит на
+  // каждом пакете НАМЕРЕННО (иначе клиент сам себе делает поток строк в лог —
+  // ровно дефект R57: HandleRaceUserPos дал 15 350 строк/час). Но гейт, о
+  // котором нельзя узнать, работал ли он, — это не гейт; поэтому счётчик один
+  // и печатается один раз.
+  // ★ДВЕ СТРОКИ, А НЕ ОДНА (правка ревью, итерация 9): один счётчик считал и
+  // отбитые ПОИСКИ, и отказанные СОЗДАНИЯ, а подпись говорила только про поиски.
+  server::util::QuietLogInfo(
+    "Name lookup guard: rejected {} out-of-class name lookups",
+    _rejectedNameLookups.load(std::memory_order::relaxed));
+  server::util::QuietLogInfo(
+    "Name creation guard: refused {} out-of-class name creations",
+    _refusedNameCreations.load(std::memory_order::relaxed));
 }
 
 void server::FileDataSource::SaveMetadata()
@@ -291,7 +761,8 @@ void server::FileDataSource::SaveMetadata()
   // молчать больше нельзя.
   try
   {
-    server::util::WriteFileAtomically(metaFilePath, meta.dump(2), "Meta file");
+    server::util::WriteFileAtomically(
+      metaFilePath, meta.dump(2), "Meta file", server::util::FileSensitivity::Public);
   }
   catch (const std::exception& x)
   {
@@ -315,14 +786,8 @@ void server::FileDataSource::RetrieveUser(const std::string_view& name, data::Us
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _userDataPath, user.name());
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("User file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "User file", server::util::FileSensitivity::Secret);
   user.name = json.value("name", std::string{});
   user.token = json.value("token", std::string{});
   user.characterUid = json.value("characterUid", data::Uid{});
@@ -350,31 +815,571 @@ void server::FileDataSource::StoreUser(const std::string_view&, const data::User
   json["passwordHash"] = user.passwordHash();
   json["passwordSalt"] = user.passwordSalt();
 
+  // ★ЕДИНСТВЕННЫЙ ФАЙЛ, В КОТОРЫЙ ЭТОТ КЛАСС ПИШЕТ ХЕШ ПАРОЛЯ (см. выше,
+  // `passwordHash`/`passwordSalt`).
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "User file");
+    dataFilePath, json.dump(2), "User file",
+    server::util::FileSensitivity::Secret);
+
+  // ★ИНДЕКС ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, как и у персонажей: бросок оставляет диск в
+  // прежнем состоянии, и индекс обязан остаться согласованным с диском.
+  IndexUserName(user.name());
 }
 
 bool server::FileDataSource::IsUserNameUnique(const std::string_view& name)
 {
-  const std::regex rg(
-    std::format("{}.*", name),
-    std::regex_constants::ECMAScript | std::regex_constants::icase);
-
-  for (const auto& file : std::filesystem::directory_iterator(_userDataPath))
+  // ★СНАЧАЛА КЛАСС ИМЕНИ, ПОТОМ ЧТО-ЛИБО ЕЩЁ. Прежняя редакция СОБИРАЛА
+  // РЕГУЛЯРНОЕ ВЫРАЖЕНИЕ из присланного имени (`std::format("{}.*", name)`) до
+  // всякой проверки. Имя вида `(a{200}){200}` разворачивает автомат libstdc++ в
+  // миллионы состояний ещё на КОНСТРУКЦИИ, а имя `[` бросает `regex_error`
+  // наружу — то есть строка `[error]` на КАЖДЫЙ пакет.
+  //
+  // Потолок берётся из ИНДЕКСА, а не из константы (правка ревью, итерация 1):
+  // аккаунт, заведённый до появления проверки #18b, может быть длиннее
+  // сегодняшних 48 байт, и отбить его на входе значило бы сделать реального
+  // игрока неадресуемым для staff-команды.
+  //
+  // ★ГЕЙТ ПОИСКА — СТРУКТУРНЫЙ, А НЕ ALLOWLIST АУТЕНТИФИКАЦИИ (правка ревью,
+  // итерация 3). Прежняя редакция звала здесь `IsLoginNameSafe`, то есть
+  // сегодняшний класс РЕГИСТРАЦИИ `[A-Za-z0-9_-]`. Но индекс строится из имён
+  // ФАЙЛОВ и никакого класса не требует: `data/users/john.doe.json`, заведённый
+  // до появления проверки #18b (или скриптом), попадает в индекс как
+  // `john.doe` — и тут же становится неадресуемым, потому что гейт отбивает
+  // точку ДО обращения к индексу. `//infraction list john.doe` отвечал бы
+  // «пользователя нет» про существующего пользователя, хотя обход, который мы
+  // заменили индексом, его находил. Гейт, который строже индекса, который он
+  // охраняет, отнимает путь успеха у честного администратора.
+  //
+  // Поэтому здесь стоит ТОТ ЖЕ структурный гейт, что и у поиска персонажа:
+  // непустое, не длиннее потолка, без управляющих байтов и без разделителей
+  // пути. Он по-прежнему отбивает всё, ради чего гейт заводился (регулярка из
+  // имени, 8 КБ с провода, `../`), но не выдумывает класса символов, которого
+  // на диске нет. Строгий allowlist остаётся там, где он и уместен, — в
+  // `LocalAuthenticationBackend` (вход и регистрация): это правило о том, какие
+  // имена МОЖНО ЗАВЕСТИ, а не о том, какие УЖЕ лежат.
+  if (not server::util::IsStorableNameShaped(
+    name, _loginNameCeiling.load(std::memory_order::relaxed)))
   {
-    // LOA-fix (R58-7, round58, backlog #175): сравнение идёт по ИМЕНИ ФАЙЛА, и
-    // без этого фильтра осиротевший `Вася.json.tmp` сделал бы имя «Вася»
-    // занятым навсегда. Это условие безопасности самой атомарной записи, а не
-    // косметика: фикс иначе породил бы дефект, которого до него не было.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
-      continue;
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    // Имя, которого не может существовать, «уникально»: вызывающий (staff-
+    // команда `//infraction`, ChatSystem.cpp) ответит «пользователя нет», а не
+    // наоборот. Регистрации через этот путь нет — `LocalAuthenticationBackend`
+    // проверяет имя сам.
+    return true;
+  }
 
-    const auto existingUserName = file.path().filename().string();
-    if (std::regex_match(existingUserName, rg))
+  // ★ИНДЕКС ВМЕСТО ОБХОДА КАТАЛОГА (LOA-fix R73-4b, правка ревью 1). Снять
+  // регулярку было половиной дела: обход `data/users` на КАЖДУЮ staff-команду
+  // оставлял стоимость пакета линейной по числу аккаунтов, то есть заявленный
+  // класс «имя с провода не вызывает обхода файловой системы» оставался
+  // открытым. Сравнение по-прежнему ASCII-регистронезависимое — ключ индекса
+  // и есть имя в нижнем ASCII-регистре, поэтому смысл ответа не изменился.
+  const auto key = server::util::AsciiLowerKey(name);
+
+  bool present = false;
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    present = _userNameKeys.contains(key);
+  }
+
+  // ★ПРОМАХ ПЕРЕСПРАШИВАЕТ ИНДЕКС, А НЕ ФАЙЛОВУЮ СИСТЕМУ ПО ТОЧНОМУ ИМЕНИ
+  // (правка ревью, итерация 2). Прежняя редакция добирала промах одним
+  // `stat` пути `<name>.json` — и этим МОЛЧА теряла регистронезависимость:
+  // индекс сравнивает по ASCII-нижнему регистру (и прежний обход сравнивал
+  // регуляркой с `icase`), а `stat` на ext4 регистрозависим. Аккаунт
+  // `Alice.json`, заведённый скриптом рядом с работающим сервером, на команду
+  // `//infraction list alice` отвечал бы «такого игрока нет», хотя обход,
+  // который мы заменили, его находил. Это потеря пути успеха у честного
+  // администратора — ровно то, чего замена обхода индексом делать не должна.
+  //
+  // ★И ЭТО НЕ ВОЗВРАТ ОБХОДА НА ПАКЕТ. Перестройка ограничена и по поводу, и по
+  // частоте: не чаще одного раза в `kUserIndexReconcileGap` (см. ниже), сколько
+  // бы промахов ни пришло и сколько бы потоков ни промахнулось одновременно.
+  //
+  // ★СВЕРКА ИДЁТ И ПРИ ПОПАДАНИИ, А НЕ ТОЛЬКО ПРИ ПРОМАХЕ (правка ревью,
+  // итерация 4). Прежняя редакция возвращала «имя занято» прямо из индекса и
+  // до диска не доходила ВООБЩЕ — то есть УСТАРЕВШАЯ ПОЛОЖИТЕЛЬНАЯ запись жила
+  // вечно: `Alice.json` переименовали рядом с работающим сервером, а
+  // `//infraction list Alice` продолжал отвечать «запись временно недоступна»
+  // до перезапуска, потому что путь к сверке проходил только через промах.
+  // Ограничение частоты — потолок в `kUserIndexReconcileGap` и пол в
+  // `kUserIndexStaleAfter` — общее для обоих исходов, поэтому единый путь
+  // ничего не удорожает: он ровно тот же обход, только теперь он достижим и
+  // тогда, когда индекс ошибается в другую сторону.
+  if (RefreshUserNameIndexIfDirectoryChanged())
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    present = _userNameKeys.contains(key);
+  }
+
+  // ★ИНДЕКС, О КОТОРОМ ИЗВЕСТНО, ЧТО ОН НЕПОЛОН, НЕ ОТВЕЧАЕТ «СВОБОДНО»
+  // (правка ревью, итерация 7).
+  //
+  // Отпечаток объявляется недействительным ровно тогда, когда обход не дошёл до
+  // конца, файл не удалось сузить или регистрация имени не удалась. Прежде
+  // такой индекс всё равно отвечал по своему содержимому, а пол частоты
+  // (`kUserIndexReconcileGap`) стоит ВЫШЕ проверки действительности — то есть
+  // до пяти секунд промах читался как «такого аккаунта нет», хотя мы знаем, что
+  // видели не всё. Пол не трогаем (он и держит стоимость пакета), меняем
+  // ОТВЕТ: «не знаю» — это «занято», а не «свободно». Регистрацию это не
+  // ломает: её проверяет `LocalAuthenticationBackend` по самому файлу.
+  if (not present && not _userIndexStampValid.load(std::memory_order::relaxed))
+    return false;
+
+  return not present;
+}
+
+bool server::FileDataSource::NeedsUserIndexReconcile(
+  const std::filesystem::file_time_type stamp,
+  const bool stampUnreadable,
+  const std::chrono::steady_clock::time_point now) const
+{
+  // Вызывается ТОЛЬКО с удержанным `_userNameIndexMutex` (любым из двух
+  // режимов): читает три поля индекса и ничего не блокирует сам.
+
+  // ★ПОТОЛОК ЧАСТОТЫ — ПЕРВЫЙ, И ЭТО ГЛАВНАЯ ПРАВКА (ревью, итерация 3).
+  // Перестройка стоит O(число аккаунтов), а СВОЯ ЖЕ запись аккаунта меняет
+  // mtime каталога: staff-клиент, чередуя безобидное `//infraction remove <имя>
+  // 0` (ChatSystem.cpp:1345 сохраняет запись даже когда удалять нечего) с
+  // запросом отсутствующего имени, заказывал по полному обходу на пару. Здесь
+  // же стоит и КОАЛЕСЦЕНЦИЯ: тот же вопрос задаётся повторно под эксклюзивным
+  // замком, и поток, дождавшийся чужой перестройки, видит свежий `_lastScan` и
+  // не перестраивает второй раз.
+  if (now - _userIndexLastScan < kUserIndexReconcileGap)
+    return false;
+
+  // ★А ЭТО — ПОЛ ЧАСТОТЫ, И ОН ЗАКРЫВАЕТ РАВЕНСТВО ОТПЕЧАТКОВ (ревью,
+  // итерация 3, WARN о коллизиях mtime). Отпечаток каталога НЕ является
+  // свободным от коллизий признаком изменения: на файловой системе с грубым
+  // разрешением времени, а равно после восстановления из копии, которая
+  // возвращает каталогу прежний mtime, только что появившийся `Alice.json`
+  // остаётся под старым отпечатком — и без принудительной сверки не нашёлся бы
+  // до перезапуска. Раз в `kUserIndexStaleAfter` промах сверяется с диском
+  // независимо от отпечатка, поэтому «никогда» превращается в «в течение
+  // минуты».
+  if (now - _userIndexLastScan >= kUserIndexStaleAfter)
+    return true;
+
+  // Отпечаток совпал — каталог не менялся с последней ПОЛНОЙ перестройки,
+  // значит промах индекса и есть ответ «такого аккаунта нет».
+  return stampUnreadable
+    || not _userIndexStampValid.load(std::memory_order::relaxed)
+    || stamp != _userIndexDirectoryStamp;
+}
+
+bool server::FileDataSource::RefreshUserNameIndexIfDirectoryChanged()
+{
+  const auto now = std::chrono::steady_clock::now();
+
+  std::error_code error;
+  const auto stamp = std::filesystem::last_write_time(_userDataPath, error);
+
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
       return false;
   }
 
+  // ★ОБХОД ФАЙЛОВОЙ СИСТЕМЫ ИДЁТ ПОД СВОИМ ЗАМКОМ, А НЕ ПОД ЗАМКОМ ИНДЕКСА
+  // (правка ревью, итерация 5).
+  //
+  // Прежняя редакция держала ЭКСКЛЮЗИВНЫЙ `_userNameIndexMutex` всё время
+  // обхода: одна staff-команда после порога устаревания открывала каталог,
+  // делала `open`/`fstat`/`close` на каждом аккаунте — а `IndexUserName`, то
+  // есть путь сохранения `DataDirector`, стоял в очереди за ней. На живом
+  // шарде в 13 аккаунтов это доли миллисекунды, но стоимость держится не
+  // числом аккаунтов сегодня, а формой: замок, под которым делают ввод-вывод,
+  // рано или поздно останавливает того, кто просто пишет в память.
+  //
+  // Отдельный `_userIndexRebuildMutex` даёт ровно два свойства: обход в один
+  // момент времени ровно один (коалесценция сохранена) и индекс всё это время
+  // ЧИТАЕМ И ПИШЕМ — под замок индекса уходит только публикация готового
+  // набора, то есть один `move` и четыре присваивания.
+  const std::unique_lock rebuildGuard(_userIndexRebuildMutex);
+
+  // ★ПОВТОРНАЯ ПРОВЕРКА ПОД ЗАМКОМ ПЕРЕСТРОЙКИ — ЭТО И ЕСТЬ КОАЛЕСЦЕНЦИЯ
+  // (правка ревью, итерация 3). Прежняя редакция отпускала общий замок и звала
+  // перестройку безусловно: несколько потоков, промахнувшихся одновременно,
+  // проходили проверку все, а потом ПО ОЧЕРЕДИ делали по полному обходу.
+  // Вопрос задаётся тем же `now`, что и снаружи, поэтому перестройка, успевшая
+  // завершиться после нашего входа, гарантированно закрывает нам дорогу.
+  {
+    const std::shared_lock indexLock(_userNameIndexMutex);
+    if (not NeedsUserIndexReconcile(stamp, static_cast<bool>(error), now))
+      return false;
+  }
+
+  RebuildUserNameIndexUnderRebuildGuard();
   return true;
+}
+
+void server::FileDataSource::RebuildUserNameIndex()
+{
+  const std::unique_lock rebuildGuard(_userIndexRebuildMutex);
+  RebuildUserNameIndexUnderRebuildGuard();
+}
+
+void server::FileDataSource::RebuildUserNameIndexUnderRebuildGuard()
+{
+  RaiseNameCeiling(_loginNameCeiling, server::util::kMaxLoginNameBytes);
+
+  // ★ЗАЯВКА НА ПРОПАЖУ: пока идёт обход, `IndexUserName` вправе внести имя,
+  // которого в снимке каталога ещё не было. Публикация набора, снятого ДО этой
+  // регистрации, потеряла бы её до следующей сверки — то есть замена «строим
+  // под замком» на «строим снаружи» стоила бы только что зарегистрированному
+  // игроку ответа `//infraction list`. Поэтому такие имена собираются отдельно
+  // и вливаются в набор при публикации.
+  // ★ПОКОЛЕНИЕ ЭТОГО ОБХОДА (правка ревью, итерация 9). Берётся ДО того, как
+  // обход что-либо увидит: неудача регистрации, случившаяся с этого момента,
+  // принадлежит нам и обязана запретить нам объявить отпечаток действительным.
+  const std::size_t generation =
+    _userIndexScanGeneration.fetch_add(1, std::memory_order::relaxed) + 1;
+
+  {
+    const std::unique_lock indexLock(_userNameIndexMutex);
+    _userNamesAddedDuringScan.clear();
+    _userIndexScanInFlight = true;
+  }
+
+  // ★ФЛАГ ОБХОДА СНИМАЕТСЯ НА ЛЮБОМ ВЫХОДЕ, А НЕ ТОЛЬКО НА УСПЕШНОЙ ПУБЛИКАЦИИ
+  // (правка ревью, итерация 6).
+  //
+  // Между установкой флага и публикацией стоят `push_back`, преобразования
+  // путей и вставки в множество — каждая умеет бросить `bad_alloc`. Прежняя
+  // редакция снимала флаг ТОЛЬКО в блоке публикации, поэтому бросок посреди
+  // обхода оставлял `_userIndexScanInFlight` истинным НАВСЕГДА: каждое
+  // последующее сохранение аккаунта продолжало наполнять
+  // `_userNamesAddedDuringScan`, который никто уже не сливал и не чистил, —
+  // то есть утечка, растущая ровно на пути, который раунд удешевлял.
+  // Обязательство, которое умеет не выполниться, — не обязательство.
+  struct ScanFlagGuard
+  {
+    server::FileDataSource* owner;
+    bool armed = true;
+
+    ~ScanFlagGuard()
+    {
+      if (not armed)
+        return;
+      try
+      {
+        const std::unique_lock indexLock(owner->_userNameIndexMutex);
+        owner->_userNamesAddedDuringScan.clear();
+        owner->_userIndexScanInFlight = false;
+      }
+      catch (...)
+      {
+        // Деструктор не имеет права бросить: отказ самого замка — это уже
+        // остановка процесса другими средствами, а не наша.
+      }
+    }
+  } scanFlagGuard{this};
+
+  // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ОБХОДА, А НЕ ПОСЛЕ. Файл, положенный рядом ВО ВРЕМЯ
+  // обхода, обязан оставить отпечаток «устаревшим», иначе он потерялся бы до
+  // перезапуска. Снимок «до» ошибается только в безопасную сторону — лишняя
+  // перестройка, а не пропущенный аккаунт.
+  std::error_code stampError;
+  const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
+
+  const auto listing = server::util::ListRegularFiles(_userDataPath);
+
+  // ★ПОЗДНО ПРИШЕДШИЙ ФАЙЛ СУЖАЕТСЯ ДО ТОГО, КАК ПОПАДЁТ В ИНДЕКС (LOA-fix
+  // R73-6, правка ревью, итерация 4).
+  //
+  // Стартовый проход `HardenSecretFilesInDirectory` — это СНИМОК. Штатный путь
+  // завести аккаунт рядом с работающим сервером (помощник переименовывает
+  // готовый `Alice.json` в `data/users`) кладёт файл с обычным umask, то есть
+  // 0644, и до перезапуска ИЛИ до следующего сохранения этого аккаунта хеш
+  // пароля лежал читаемым для group/other — а сервер тем временем спокойно им
+  // пользовался. Перестройка индекса и есть тот момент, когда файл впервые
+  // становится ВИДЕН серверу; сузить его позже, чем внести в индекс, значило бы
+  // сделать запись используемой раньше, чем защищённой.
+  //
+  // ★ТОТ ЖЕ СПИСОК, А НЕ ВТОРОЙ ОБХОД: между двумя независимыми обходами лежало
+  // бы окно, в котором сужен один набор файлов, а проиндексирован другой.
+  const auto hardening = server::util::HardenSecretFiles(listing);
+  if (hardening.narrowed > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account name index: {} of {} account files in '{}' were group/other-"
+      "readable and were narrowed to owner-only before being indexed",
+      hardening.narrowed, hardening.examined, server::util::LogPath(_userDataPath));
+  }
+  if (hardening.failed > 0)
+  {
+    // ★ЖУРНАЛ, А НЕ БРОСОК — по той же причине, что и у неполноты ниже: эта
+    // перестройка живёт на пути запроса, и бросок отсюда рвал бы staff-команду.
+    // На СТАРТЕ тот же отказ фатален (`Initialize`), поэтому «не сузили» не
+    // остаётся без остановки там, где остановка возможна.
+    server::util::QuietLogError(
+      "Account name index: {} account file(s) in '{}' could not be narrowed to "
+      "owner-only; they are refused, not indexed, and cannot be authenticated "
+      "from until they are secured",
+      hardening.failed, server::util::LogPath(_userDataPath));
+  }
+  if (hardening.refusedLinks > 0)
+  {
+    server::util::QuietLogWarn(
+      "Account name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they are not indexed and cannot be authenticated from",
+      hardening.refusedLinks, server::util::LogPath(_userDataPath));
+  }
+
+  if (listing.incomplete || hardening.incomplete)
+  {
+    // ★ЗДЕСЬ ЖУРНАЛ, А НЕ ОТКАЗ СТАРТОВАТЬ — И ЭТО НЕ НЕПОСЛЕДОВАТЕЛЬНОСТЬ
+    // (пояснение к правке ревью, итерация 3). Каталог `data/users` на старте
+    // УЖЕ доказан полным: `HardenSecretFilesInDirectory` идёт по нему тем же
+    // обходом раньше в `Initialize` и при неполноте бросает. А в рантайме эта
+    // перестройка живёт на пути запроса: бросок отсюда рвал бы staff-команду
+    // вместо ответа. Неполнота при этом не «прощается»: `_userIndexStampValid`
+    // остаётся ложным (ниже), поэтому следующий промах сверится заново, а
+    // ответом до тех пор будет «такого пользователя нет» — отказ, а не выдача
+    // чужих прав.
+    server::util::QuietLogError(
+      "Account name index: the scan of '{}' did not finish, the index is "
+      "incomplete and will be rebuilt on the next miss", server::util::LogPath(_userDataPath));
+  }
+
+  std::unordered_set<std::string> keys;
+  for (const auto& filePath : listing.files)
+  {
+    // Тот же фильтр, что у прежнего обхода (R58-7): `.json` и только он —
+    // осиротевший `Вася.json.tmp` не имеет права занять имя «Вася».
+    if (filePath.extension() != ".json")
+      continue;
+
+    // ★ФАЙЛ, КОТОРЫЙ НЕ УДАЛОСЬ ПРИВЕСТИ К ПОЛИТИКЕ, В ИНДЕКС НЕ ПОПАДАЕТ
+    // (правка ревью, итерация 5). Прежде перестройка индексировала ВСЕ имена
+    // независимо от того, что сказал проход сужения, и тем самым объявляла
+    // рабочей запись, чтение которой отказано (`ReadManagedFile` теперь даёт
+    // `Failed`). Три потребителя снова разошлись бы в ответе «существует ли
+    // Alice» — то самое расхождение, ради устранения которого заведён общий
+    // вход в чтение. Регистрации это не открывает: `LocalAuthenticationBackend`
+    // спрашивает не индекс, а сам файл, и получает `Failed`, то есть отказ, а
+    // не «имя свободно».
+    if (std::ranges::find(hardening.unsecured, filePath)
+      != hardening.unsecured.end())
+    {
+      continue;
+    }
+
+    // ★КЛЮЧ БЕРЁТСЯ ИЗ ИМЕНИ ФАЙЛА, а не из JSON: именно по имени файла
+    // `LocalAuthenticationBackend` открывает аккаунт, и именно оно решало исход
+    // прежнего обхода. Читать здесь содержимое значило бы разобрать все
+    // аккаунты на старте ради поля, которое ни на что не влияет.
+    const auto stem = filePath.stem().string();
+    if (stem.empty())
+      continue;
+    RaiseNameCeiling(_loginNameCeiling, stem.size());
+    keys.insert(server::util::AsciiLowerKey(stem));
+  }
+
+  // Отпечаток считается действительным ТОЛЬКО у полной перестройки: иначе
+  // «совпал» означало бы «мы уже смотрели», хотя посмотрели не всё.
+  // ★И ОТКАЗ СУЖЕНИЯ ТОЖЕ ДЕЛАЕТ ОТПЕЧАТОК НЕДЕЙСТВИТЕЛЬНЫМ (правка ревью,
+  // итерация 5). Прежде неудача `fchmod` записывалась в лог, а отпечаток
+  // объявлялся действительным — то есть следующая сверка откладывалась до
+  // изменения каталога, и файл, чей режим сузить не удалось, мог остаться
+  // непопробованным сколь угодно долго. Пока хоть один файл вне политики,
+  // сверка обязана повторяться.
+  const std::size_t indexed = keys.size();
+  {
+    const std::unique_lock indexLock(_userNameIndexMutex);
+    for (const auto& late : _userNamesAddedDuringScan)
+      keys.insert(late);
+    _userNamesAddedDuringScan.clear();
+    _userIndexScanInFlight = false;
+    // Публикация состоялась — сторожу больше нечего откатывать.
+    scanFlagGuard.armed = false;
+
+    _userNameKeys = std::move(keys);
+    // ★И НИ ОДНОЙ НЕУДАЧИ РЕГИСТРАЦИИ, ПРИНАДЛЕЖАЩЕЙ ЭТОМУ ОБХОДУ ИЛИ БОЛЕЕ
+    // ПОЗДНЕМУ (правка ревью, итерация 9). Без этого условия обход, снявший
+    // список ДО неудачи, перезаписывал её `false` своим `true` — то есть
+    // отметка о пропавшем аккаунте стиралась тем, кто этого аккаунта не видел.
+    StoreUserIndexStampValidLocked(
+      not stampError && not listing.incomplete
+        && not hardening.incomplete && hardening.failed == 0,
+      generation);
+    _userIndexDirectoryStamp = stamp;
+
+    // ★ВРЕМЯ ОКОНЧАНИЯ, А НЕ НАЧАЛА. Именно оно ограничивает частоту: поток,
+    // вошедший ДО конца этой перестройки, увидит `now - _userIndexLastScan`
+    // отрицательным и перестраивать не станет.
+    _userIndexLastScan = std::chrono::steady_clock::now();
+  }
+
+  server::util::QuietLogInfo(
+    "Account name index: {} account names indexed", indexed);
+}
+
+//! ЕДИНСТВЕННЫЙ ПИСАТЕЛЬ ОТМЕТКИ `_userIndexStampValid` (правка ревью,
+//! итерация 11). Зовётся ТОЛЬКО с уже взятым `_userNameIndexMutex`.
+//!
+//! ★ЗАЧЕМ ОДНО МЕСТО. Отметку писали двое — публикация обхода и путь отказа
+//! регистрации, — и решение «действительна ли она» СОБИРАЛОСЬ у каждого своё:
+//! публикация читала поколение неудач, а неудача просто клала `false` и
+//! ПОСЛЕ этого поднимала поколение. Между двумя её записями помещался целый
+//! обход: он читал ЕЩЁ НЕ поднятое поколение и клал `true` — то есть отметка
+//! объявляла индекс полным при пропавшем аккаунте. Пока писателей двое,
+//! «правило публикации» существует в двух экземплярах и умеет разъехаться
+//! молча; здесь оно одно, и вопрос «под замком ли» задаётся к одной строке.
+void server::FileDataSource::StoreUserIndexStampValidLocked(
+  const bool scanWasClean, const std::size_t generation) noexcept
+{
+  // Отпечаток действителен, только если обход прошёл целиком И ни одна
+  // неудача регистрации не принадлежит этому поколению или более позднему.
+  _userIndexStampValid.store(
+    scanWasClean
+      && _userIndexFailedGeneration.load(std::memory_order::relaxed)
+           < generation,
+    std::memory_order::relaxed);
+}
+
+//! ОТМЕТИТЬ НЕУДАЧУ РЕГИСТРАЦИИ ИМЕНИ — ОДНОЙ КРИТИЧЕСКОЙ СЕКЦИЕЙ (правка
+//! ревью, итерация 11).
+//!
+//! ★ЗАЧЕМ ЗАМОК ЗДЕСЬ. Поднять поколение и снять отметку — это ОДНО
+//! утверждение («индексу верить нельзя»), и разорванное надвое оно
+//! опровергается обходом, успевшим между половинами: он читает старое
+//! поколение и публикует `true`. Под общим замком чередовки нет: любой
+//! публикующий обход видит либо обе половины, либо ни одной, и в первом случае
+//! его собственное поколение уже не старше отмеченного.
+//!
+//! ★ЗАМОК ВЗЯТЬ ЕСТЬ ЧЕМ, ДАЖЕ ЕСЛИ ПАМЯТИ НЕТ. Сюда приходят с пути
+//! `bad_alloc`; взятие `std::shared_mutex` не выделяет памяти, а стек к этому
+//! моменту уже раскручен — то есть замок свободен.
+void server::FileDataSource::MarkUserIndexFailure() noexcept
+{
+  const std::unique_lock indexLock(_userNameIndexMutex);
+  // Порядок половин внутри секции безразличен — снаружи она неделима.
+  StoreUserIndexStampValidLocked(false, std::size_t{0});
+  //! ★ШОВ ДЛЯ НАБЛЮДАТЕЛЯ ЧЕРЕДОВКИ, и он стоит ИМЕННО ЗДЕСЬ — в той точке,
+  //! где у прежней редакции секция кончалась. Тест подставляет сюда попытку
+  //! опоздавшего обхода опубликовать `true`; пока замок наш, попытка не
+  //! проходит, и это наблюдаемо детерминированно, без гонки. В бою указатель
+  //! пуст, и цена — одно расслабленное чтение на пути отказа.
+  if (const auto hook =
+        _userIndexFailureInterleaveHook.load(std::memory_order::relaxed))
+  {
+    hook();
+  }
+  RaiseAtomicWatermark(
+    _userIndexFailedGeneration,
+    _userIndexScanGeneration.load(std::memory_order::relaxed));
+}
+
+//! ШОВ: попытка ОПОЗДАВШЕГО обхода объявить отпечаток действительным.
+//!
+//! Возвращает `false`, если замок индекса занят — то есть публикация в этот
+//! момент НЕВОЗМОЖНА. Именно это и утверждает фикс: пока отметка о неудаче
+//! ставится, опубликовать поверх неё нечего.
+bool server::FileDataSource::TryPublishStaleUserIndexStampForTest(
+  const std::size_t generation) noexcept
+{
+  std::unique_lock indexLock(_userNameIndexMutex, std::try_to_lock);
+  if (not indexLock.owns_lock())
+    return false;
+  StoreUserIndexStampValidLocked(true, generation);
+  return true;
+}
+
+bool server::FileDataSource::UserIndexStampValidForTest() const noexcept
+{
+  return _userIndexStampValid.load(std::memory_order::relaxed);
+}
+
+void server::FileDataSource::SetUserIndexFailureInterleaveHookForTest(
+  void (*hook)()) noexcept
+{
+  _userIndexFailureInterleaveHook.store(hook, std::memory_order::relaxed);
+}
+
+std::size_t server::FileDataSource::BeginUserIndexScanForTest() noexcept
+{
+  return _userIndexScanGeneration.fetch_add(1, std::memory_order::relaxed) + 1;
+}
+
+void server::FileDataSource::MarkUserIndexFailureForTest() noexcept
+{
+  MarkUserIndexFailure();
+}
+
+void server::FileDataSource::RequestScheduledNameIndexRepairForTest() noexcept
+{
+  RequestScheduledNameIndexRepair();
+}
+
+void server::FileDataSource::IndexUserName(const std::string& name)
+{
+  if (name.empty())
+    return;
+
+  // ★НЕУДАЧА ИНДЕКСАЦИИ НЕ ИМЕЕТ ПРАВА ВЫЙТИ НАРУЖУ (правка ревью, итерация 6),
+  // И ЗАЩИЩЁННЫМ ОБЯЗАН БЫТЬ ВЕСЬ ПОСЛЕЗАПИСНОЙ УЧЁТ (правка ревью, итерация 7).
+  //
+  // Нас зовут ПОСЛЕ успешной записи файла (`StoreUser`), поэтому бросок отсюда
+  // сообщил бы вызывающему «сохранить не удалось» про запись, которая на диске
+  // уже лежит, — то есть соврал бы в самую вредную сторону. Итерация 6 закрыла
+  // `try` только вокруг вставок, а `AsciiLowerKey` (аллокация ключа) и взятие
+  // замка стояли ВЫШЕ него: `bad_alloc` из них уходил наружу ровно тем же
+  // путём, что и до правки. Теперь под защитой всё, что делается после записи.
+  //
+  // Индекс — это КЭШ диска: честный ответ на нехватку памяти — объявить
+  // отпечаток недействительным и заставить следующий промах перечитать каталог,
+  // а не отменять сохранение.
+  try
+  {
+    RaiseNameCeiling(_loginNameCeiling, name.size());
+
+    // ★ОТПЕЧАТОК СНИМАЕТСЯ ДО ВЗЯТИЯ ЗАМКА И ПОСЛЕ ЗАПИСИ ФАЙЛА. `StoreUser`
+    // пишет файл, потом зовёт нас, поэтому этот `last_write_time` уже включает
+    // нашу собственную запись. Чужой файл, появившийся ПОСЛЕ снимка, оставит
+    // отпечаток разошедшимся — то есть ошибка идёт в безопасную сторону.
+    std::error_code stampError;
+    const auto stamp = std::filesystem::last_write_time(_userDataPath, stampError);
+
+    auto key = server::util::AsciiLowerKey(name);
+
+    const std::unique_lock indexLock(_userNameIndexMutex);
+
+    // ★ЕСЛИ ПРЯМО СЕЙЧАС ИДЁТ ОБХОД — ИМЯ ЗАПОМИНАЕТСЯ ОТДЕЛЬНО (правка ревью,
+    // итерация 5). Обход теперь работает СНАРУЖИ замка индекса и публикует
+    // готовый набор; набор снят ДО этой регистрации, поэтому без этой строки
+    // публикация затёрла бы только что зарегистрированного игрока и он остался
+    // бы ненаходимым до следующей сверки.
+    if (_userIndexScanInFlight)
+      _userNamesAddedDuringScan.insert(key);
+    _userNameKeys.insert(std::move(key));
+
+    // ★СВОЯ ЗАПИСЬ НЕ ДЕЛАЕТ ИНДЕКС УСТАРЕВШИМ (правка ревью, итерация 3). Ключ
+    // уже внесён строкой выше — индекс СОГЛАСОВАН с диском, — но mtime каталога
+    // от нашей же записи изменился, и без этой строки следующий промах читал бы
+    // «каталог изменился» и заказывал полный обход. Именно это позволяло
+    // staff-клиенту размножать обходы: сохранить запись, спросить отсутствующее
+    // имя, повторить. Принимаем новый отпечаток ТОЛЬКО когда индекс полон
+    // (`_userIndexStampValid`) — у оборванной перестройки принимать нечего.
+    //
+    // Чужой файл, успевший появиться между записью и снимком, будет замаскирован
+    // до принудительной сверки раз в `kUserIndexStaleAfter` — та существует
+    // ровно для этого класса (см. `NeedsUserIndexReconcile`).
+    if (_userIndexStampValid.load(std::memory_order::relaxed) && not stampError)
+      _userIndexDirectoryStamp = stamp;
+  }
+  catch (const std::exception& x)
+  {
+    // ★ОТМЕТКА О НЕУДАЧЕ — ОДНА КРИТИЧЕСКАЯ СЕКЦИЯ, А НЕ ДВЕ ЗАПИСИ (правка
+    // ревью, итерация 11): подробности в `MarkUserIndexFailure`. К моменту
+    // перехвата замок индекса УЖЕ отпущен раскруткой стека, поэтому взять его
+    // снова здесь и можно, и нужно.
+    MarkUserIndexFailure();
+    server::util::QuietLogError(
+      "Account name index: '{}' could not be indexed ({}); the index is marked "
+      "stale and will be rebuilt from disk on the next miss", name, x.what());
+    return;
+  }
 }
 
 void server::FileDataSource::CreateInfraction(data::Infraction& infraction)
@@ -388,14 +1393,8 @@ void server::FileDataSource::RetrieveInfraction(data::Uid uid, data::Infraction&
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
    _infractionDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Infraction file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Infraction file", server::util::FileSensitivity::Public);
   infraction.uid = json.value("uid", data::Uid{});
   infraction.description = json.value("description", std::string{});
   infraction.punishment = json.value("punishment", data::Infraction::Punishment{});
@@ -419,14 +1418,22 @@ void server::FileDataSource::StoreInfraction(data::Uid uid, const data::Infracti
     infraction.createdAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Infraction file");
+    dataFilePath, json.dump(2), "Infraction file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteInfraction(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _infractionDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Infraction file");
 }
 
 void server::FileDataSource::CreateCharacter(data::Character& character)
@@ -440,14 +1447,8 @@ void server::FileDataSource::RetrieveCharacter(data::Uid uid, data::Character& c
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Character file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Character file", server::util::FileSensitivity::Public);
 
   character.uid = json.value("uid", data::Uid{});
   character.name = json.value("name", std::string{});
@@ -1040,64 +2041,467 @@ void server::FileDataSource::StoreCharacter(data::Uid uid, const data::Character
   }
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Character file");
+    dataFilePath, json.dump(2), "Character file",
+    server::util::FileSensitivity::Public);
+
+  // ★ИНДЕКС ОБНОВЛЯЕТСЯ ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, а не до неё. Бросок из
+  // `WriteFileAtomically` оставляет на диске СТАРОЕ имя — индекс обязан остаться
+  // согласованным с диском, а не с намерением.
+  IndexCharacterName(uid, character.name());
 }
 
 void server::FileDataSource::DeleteCharacter(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _characterDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Character file");
+  ForgetCharacterName(uid);
+}
+
+std::size_t server::FileDataSource::ScheduledNameIndexPassCount() const noexcept
+{
+  return _nameIndexMaintenancePasses.load(std::memory_order::relaxed);
+}
+
+void server::FileDataSource::RequestScheduledNameIndexRepair() noexcept
+{
+  // ★ЗАПРОС ПОДНИМАЕТ ФЛАГ И БОЛЬШЕ НИЧЕГО (правка ревью, итерация 11).
+  //
+  // Прежняя редакция сдвигала СРОК ближайшего прохода в прошлое — то есть путь,
+  // достижимый именем с провода, отменял шестидесятисекундный пол. При
+  // постоянно битом файле клиент, повторяющий запрос после каждого неудачного
+  // прохода, покупал полный обход каталога на КАЖДОМ тике директора (50 Гц):
+  // ремонт асинхронный, но оплачен он всё равно вводом клиента. Здесь флаг
+  // только ПРОСИТ, а разрешает по-прежнему часы: `TickNameIndexMaintenance`
+  // не запускает проход раньше пола ни по чьей просьбе.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+}
+
+void server::FileDataSource::TickNameIndexMaintenance() noexcept
+{
+  TickNameIndexMaintenanceAt(std::chrono::steady_clock::now());
+}
+
+void server::FileDataSource::TickNameIndexMaintenanceAt(
+  const std::chrono::steady_clock::time_point now) noexcept
+{
+  try
+  {
+    const auto last =
+      _nameIndexMaintenanceLastRun.load(std::memory_order::relaxed);
+    // Эпоха означает «планового прохода ещё не было»: первый тик после старта
+    // осматривает индексы сразу — ровно тот случай, когда стартовая сборка
+    // вышла неполной и ждать минуту незачем.
+    const bool never = last == std::chrono::steady_clock::time_point{};
+    // ★ПОЛ — ЭТО КОНЪЮНКЦИЯ, А НЕ ВЫБОР ИЗ ДВУХ ПОВОДОВ. Проход идёт, только
+    // если с прошлого прошло не меньше пола И есть повод: чья-то просьба или
+    // наступивший срок периодического осмотра. Просьба УСКОРЯЕТ ожидание
+    // периода, но не умеет опустить пол.
+    const bool floorPassed = never || now - last >= kScheduledNameIndexRepairGap;
+    const bool periodicDue = never || now - last >= kPeriodicNameIndexSweepGap;
+    const bool requested =
+      _nameIndexRepairPending.load(std::memory_order::relaxed);
+    if (not floorPassed || not (requested || periodicDue))
+      return;
+
+    // ★ФЛАГ СНИМАЕТСЯ ПЕРЕД ПРОХОДОМ, А НЕ ПОСЛЕ: просьба, пришедшая ПОКА мы
+    // осматриваем, обязана дожить до следующего прохода — иначе ремонт
+    // оказался бы потерян ровно на том, кто попросил вовремя.
+    _nameIndexRepairPending.store(false, std::memory_order::relaxed);
+    _nameIndexMaintenanceLastRun.store(now, std::memory_order::relaxed);
+    _nameIndexMaintenancePasses.fetch_add(1, std::memory_order::relaxed);
+
+    // Оба индекса, а не только тот, о который кто-то споткнулся: повод здесь
+    // общий и не знает, чьё имя спрашивали.
+    ReconcileCharacterNameIndexIfBroken();
+    ReconcileGuildNameIndexIfBroken();
+  }
+  catch (const std::exception& x)
+  {
+    // Плановый проход не имеет права уронить поток директора данных: индекс
+    // остаётся объявленным неполным, то есть ответ и без ремонта безопасен.
+    try
+    {
+      server::util::QuietLogError(
+        "Name index maintenance: the scheduled pass failed ({}); the indexes "
+        "keep reading every name as taken", x.what());
+    }
+    catch (...)
+    {
+    }
+  }
+  catch (...)
+  {
+  }
+}
+
+void server::FileDataSource::RebuildCharacterNameIndex()
+{
+  const std::unique_lock indexLock(_characterNameIndexMutex);
+  // ★ФЛАГ ПОЛНОТЫ СНИМАЕТСЯ ПЕРВЫМ ДЕЙСТВИЕМ (правка ревью, итерация 7): бросок
+  // посреди обхода обязан оставить индекс объявленным НЕПОЛНЫМ.
+  _characterNameIndexComplete.store(false, std::memory_order::relaxed);
+  _characterNameToUid.clear();
+  _characterUidToName.clear();
+
+  //! Сколько записей мы НЕ СМОГЛИ прочитать. Ноль — и только ноль — даёт право
+  //! отвечать «имя свободно» (правка ревью, итерация 7).
+  std::size_t unresolved = 0;
+  std::size_t duplicates = 0;
+  //! Файлы с числовым, но НЕканоническим именем (`007.json`): не записи.
+  std::size_t noncanonical = 0;
+
+  const auto listing = server::util::ListRegularFiles(_characterDataPath);
+  if (listing.incomplete)
+  {
+    // ★НЕПОЛНЫЙ ИНДЕКС НА СТАРТЕ ФАТАЛЕН (правка ревью, итерация 3). Прежняя
+    // редакция печатала строку и продолжала — то есть сервер начинал
+    // обслуживать игроков, у которых ЖИВОЙ персонаж не находится по имени, а
+    // его имя при этом числится свободным: создание персонажа с тем же именем
+    // прошло бы «уникальность». Строка в логе не отменяет ни того, ни другого.
+    //
+    // Перестройка зовётся РОВНО из `Initialize` (см. объявление в заголовке),
+    // поэтому бросок здесь останавливает старт, а не рвёт живой запрос.
+    server::util::QuietLogError(
+      "Character name index: the scan of '{}' did not finish; refusing to start "
+      "with live characters unaddressable by name and their names readable as free",
+      server::util::LogPath(_characterDataPath));
+
+    throw std::runtime_error(
+      std::format(
+        "Character name index scan of '{}' did not finish",
+        server::util::LogPath(_characterDataPath)));
+  }
+
+  // ★ОТВЕРГНУТАЯ ССЫЛКА НАЗЫВАЕТСЯ ВСЛУХ И ЗДЕСЬ (правка ревью, итерация 4).
+  // Она не индексируется — читать её `ReadManagedFile` отказывается, — но её
+  // ИМЯ уже учтено полом счётчика uid (см. `HighestUidInDirectory`), поэтому
+  // uid под ней не переиспользуется. Молчание же означало бы отчёт о полном
+  // индексе над каталогом, часть которого мы отказались смотреть.
+  if (not listing.refusedSymlinks.empty())
+  {
+    // ★«НЕ СТАЛИ СМОТРЕТЬ» РАВНО «НЕ ВИДЕЛИ» (правка ревью, итерация 7): имя под
+    // отвергнутой ссылкой неизвестно, а неизвестное имя не имеет права читаться
+    // как свободное. Прежде это была только строка в логе.
+    unresolved += listing.refusedSymlinks.size();
+    server::util::QuietLogWarn(
+      "Character name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; they are not indexed and their uids stay reserved",
+      listing.refusedSymlinks.size(), server::util::LogPath(_characterDataPath));
+  }
+
+  for (const auto& filePath : listing.files)
+  {
+    // Тот же фильтр, что у прежнего обхода (R58-8): `.json` и только он.
+    if (filePath.extension() != ".json")
+      continue;
+
+    // ★ЛИЧНОСТЬ ЗАПИСИ — ИМЯ ФАЙЛА, А НЕ `json["uid"]` (правка ревью, итерация
+    // 7). `StoreCharacter` и `DeleteCharacter` адресуют файл ИМЕНЕМ, поэтому
+    // индекс, взявший uid из содержимого, вёл бы учёт про другую запись:
+    // `7.json` с полем `uid: 8` делал `DeleteCharacter(7)` неспособным
+    // освободить имя, а два файла с одним полем `uid` освобождали живое имя.
+    const auto stem = filePath.stem().string();
+    const auto parsedUid = ParseRecordUid(stem);
+    if (not parsedUid)
+    {
+      // ★ФАЙЛ С НЕКАНОНИЧЕСКИМ ЧИСЛОВЫМ ИМЕНЕМ — НЕ УПРАВЛЯЕМАЯ ЗАПИСЬ, А
+      // ПОСТОРОННИЙ ФАЙЛ (правка ревью, итерация 9). `007.json` не создаётся и
+      // не адресуется ни одним путём записи (`std::format("{}", uid)` даёт
+      // ровно `7.json`), поэтому он не делает индекс НЕПОЛНЫМ — иначе чужой
+      // файл, положенный в каталог, отказывал бы в создании всех имён сразу.
+      // Считается и называется он ОДНОЙ строкой на перестройку, не строкой на
+      // файл.
+      if (ParseUidLikeStem(stem))
+        ++noncanonical;
+      else
+      {
+        ++unresolved;
+        server::util::QuietLogWarn(
+          "Character file '{}' is not named after a record identifier; the index "
+          "refuses to guess whose name it carries",
+          server::util::LogPath(filePath));
+      }
+      continue;
+    }
+    const data::Uid existingUid = *parsedUid;
+
+    const auto read = server::util::ReadManagedFile(
+      filePath, server::util::FileSensitivity::Public);
+    if (read.status != server::util::ManagedReadStatus::Ok)
+    { ++unresolved; continue; }
+
+    std::string existingName;
+    try
+    {
+      const auto json = nlohmann::json::parse(read.content);
+      existingName = json.value("name", std::string{});
+    }
+    catch (const std::exception& x)
+    {
+      // ★ПЕРЕХВАТ СОХРАНЁН ПО СМЫСЛУ (R58-8): один битый файл не имеет права
+      // сломать поиск по имени и создание персонажа У ВСЕХ. Текст строки НОВЫЙ
+      // намеренно — старая строка «skipped while looking up a character by
+      // name» ОБЯЗАНА исчезнуть из бинаря, это маркер лесенки.
+      server::util::QuietLogWarn(
+        "Character file '{}' is unreadable ({}) and was skipped while building "
+        "the character name index", server::util::LogPath(filePath), x.what());
+      ++unresolved;
+      continue;
+    }
+
+    if (existingName.empty())
+    { ++unresolved; continue; }
+
+    auto key = server::util::AsciiLowerKey(existingName);
+
+    // ★ОДИН uid ЖИВЁТ РОВНО В ОДНОМ СПИСКЕ. Два файла вправе объявить один и тот
+    // же `uid` в JSON (имя файла и поле внутри независимы), и без этой ветки
+    // второй файл оставил бы первый uid болтаться в чужом списке навсегда.
+    const auto alreadyIndexed = _characterUidToName.find(existingUid);
+    if (alreadyIndexed != _characterUidToName.end())
+    {
+      if (alreadyIndexed->second == key)
+        continue;
+      DetachNameKey(_characterNameToUid, alreadyIndexed->second, existingUid);
+    }
+
+    // ★ВСЕ СТОЛКНУВШИЕСЯ uid ОСТАЮТСЯ В ИНДЕКСЕ, разрешает имя МЕНЬШИЙ. Прежний
+    // обход возвращал того, кто раньше попался `directory_iterator`, — порядок
+    // не был определён стандартом; прежняя редакция индекса выбирала меньший, но
+    // ПРОИГРАВШИХ ВЫБРАСЫВАЛА, и снятие победителя (переименование, удаление)
+    // делало имя неразрешимым до перезапуска. Найдено ревью (итерация 1).
+    const std::size_t collisions =
+      AttachNameKey(_characterNameToUid, key, existingUid);
+    RaiseNameCeiling(_characterNameCeiling, existingName.size());
+    if (collisions > 1)
+    {
+      ++duplicates;
+      const auto& bucket = _characterNameToUid.find(key)->second;
+      server::util::QuietLogWarn(
+        "Duplicate character name '{}' in the data directory: uid {} resolves "
+        "the name, {} further uid(s) kept shadowed",
+        existingName, bucket.front(), bucket.size() - 1);
+    }
+    _characterUidToName[existingUid] = std::move(key);
+  }
+
+  _characterNameIndexComplete.store(
+    unresolved == 0, std::memory_order::relaxed);
+  _characterIndexLastRetry.store(
+    std::chrono::steady_clock::now(), std::memory_order::relaxed);
+
+  server::util::QuietLogInfo(
+    "Character name index: {} names indexed, {} files unresolved, {} duplicates",
+    _characterNameToUid.size(), unresolved, duplicates);
+
+  if (noncanonical > 0)
+  {
+    server::util::QuietLogWarn(
+      "Character name index: {} file(s) in '{}' are named with a noncanonical "
+      "record number (a leading zero); they are not records, are not indexed "
+      "and are not swept",
+      noncanonical, server::util::LogPath(_characterDataPath));
+  }
+
+  if (unresolved != 0)
+  {
+    server::util::QuietLogError(
+      "Character name index: {} character file(s) in '{}' could not be read; "
+      "until they can be, EVERY character name reads as taken rather than free",
+      unresolved, server::util::LogPath(_characterDataPath));
+  }
+}
+
+void server::FileDataSource::IndexCharacterName(
+  const data::Uid uid, const std::string& name)
+{
+  // ★ПУСТОЕ ИМЯ СНИМАЕТ ЗАПИСЬ, А НЕ ЗАВОДИТ КЛЮЧ "". `RebuildCharacterNameIndex`
+  // пропускает записи с пустым именем, и без этой строки персонаж, сохранённый
+  // с пустым именем, занимал бы ключ "" в рантайме и исчезал бы после рестарта —
+  // ровно тот класс «состояние живёт дольше рестарта и расходится с диском»,
+  // который раунд и убирает.
+  if (name.empty())
+  {
+    ForgetCharacterName(uid);
+    return;
+  }
+
+  // ★ОТКАЗ ПОДДЕРЖАНИЯ — ЭТО «ИНДЕКС НЕПОЛОН», А НЕ ПОЛУПЕРЕПИСАННЫЙ ИНДЕКС
+  // (правка ревью, итерация 7; та же правка, что у гильдий, — один класс, одно
+  // правило). Снятие старого ключа стоит ПЕРЕД выделением нового ведра, и
+  // бросок между ними оставлял живое имя вне индекса, то есть читаемым как
+  // свободное.
+  try
+  {
+    auto key = server::util::AsciiLowerKey(name);
+    RaiseNameCeiling(_characterNameCeiling, name.size());
+    const std::unique_lock indexLock(_characterNameIndexMutex);
+    const auto previous = _characterUidToName.find(uid);
+    if (previous != _characterUidToName.end() && previous->second == key)
+      return;                                   // имя не менялось, мутаций нет
+
+    // ★ПОЛНОТА СНИМАЕТСЯ ПОД ТЕМ ЖЕ ЗАМКОМ И ДО ПЕРВОЙ МУТАЦИИ (правка ревью,
+    // итерация 9). Прежде `Mark*NameIndexBroken` стоял в `catch`, то есть ПОСЛЕ
+    // того, как раскрутка стека отпустила уникальный замок: между отпусканием
+    // замка и записью `false` в флаг помещался целый чужой читатель — он брал
+    // общий замок, видел ПОЛУПЕРЕПИСАННЫЕ карты (старый ключ снят, новый ещё
+    // нет) при полноте, всё ещё равной `true`, и отвечал «имя свободно». Теперь
+    // окна нет: пока идут мутации, индекс объявлен НЕПОЛНЫМ, и прежнее значение
+    // возвращается только после того, как ВСЕ вставки удались. Бросок оставляет
+    // `false`, а плановый проход (`TickNameIndexMaintenance`) это чинит.
+    const bool wasComplete = _characterNameIndexComplete.exchange(
+      false, std::memory_order::relaxed);
+
+    if (previous != _characterUidToName.end())
+    {
+      // ★СНИМАЕТСЯ РОВНО НАШ uid, а список старого имени остаётся жить. Если под
+      // тем же именем стоял ещё кто-то (столкновение регистров), он МОЛЧА
+      // становится тем, кто это имя разрешает, — вместо того чтобы имя исчезло.
+      DetachNameKey(_characterNameToUid, previous->second, uid);
+    }
+    AttachNameKey(_characterNameToUid, key, uid);
+    _characterUidToName[uid] = std::move(key);
+
+    // Все вставки удались — индекс снова ровно настолько полон, насколько был.
+    _characterNameIndexComplete.store(wasComplete, std::memory_order::relaxed);
+  }
+  catch (const std::exception& x)
+  {
+    MarkCharacterNameIndexBroken("a character name could not be indexed", x.what());
+  }
+}
+
+void server::FileDataSource::ForgetCharacterName(const data::Uid uid)
+{
+  const std::unique_lock indexLock(_characterNameIndexMutex);
+  const auto previous = _characterUidToName.find(uid);
+  if (previous == _characterUidToName.end())
+    return;
+  // ★УДАЛЕНИЕ ПОБЕДИТЕЛЯ ПОДНИМАЕТ СЛЕДУЮЩЕГО, а не гасит имя: список хранит
+  // всех, кто это имя носит, и `DetachNameKey` убирает ключ, только когда после
+  // снятия не осталось никого.
+  DetachNameKey(_characterNameToUid, previous->second, uid);
+  _characterUidToName.erase(previous);
+}
+
+server::FileDataSource::NameIndexAnswer server::FileDataSource::ReadNameIndexAnswer(
+  std::shared_mutex& mutex,
+  const std::unordered_map<std::string, std::vector<data::Uid>>& index,
+  const std::atomic_bool& complete,
+  const std::string& key)
+{
+  // ★ОДИН ЗАМОК НА ОБА ФАКТА. Полнота — атомарная переменная и читаться могла бы
+  // где угодно; она читается ЗДЕСЬ намеренно, потому что важна не полнота сама
+  // по себе, а полнота ТОГО СОДЕРЖИМОГО, которое мы только что видели. Читать
+  // её вторым действием значило бы отвечать по содержимому одного поколения
+  // индекса и по полноте другого.
+  const std::shared_lock indexLock(mutex);
+  NameIndexAnswer answer;
+  answer.complete = complete.load(std::memory_order::relaxed);
+  const auto found = index.find(key);
+  if (found != index.end() && not found->second.empty())
+  {
+    // Список отсортирован по возрастанию — имя разрешает МЕНЬШИЙ uid, то есть
+    // старшая запись, и это правило одно и то же на старте и в рантайме.
+    answer.uid = found->second.front();
+  }
+  return answer;
 }
 
 server::data::Uid server::FileDataSource::RetrieveCharacterUidByName(const std::string_view& name)
 {
-  const std::regex rg(
-    std::format("{}", name),
-    std::regex_constants::icase);
-
-  for (const auto& file : std::filesystem::directory_iterator(_characterDataPath))
+  // ★СТРУКТУРНЫЙ ГЕЙТ ДО ВСЕГО — до аллокации ключа, до хеша, до диска. Провод
+  // отдаёт до ~8190 байт (Stream.cpp при потолке CommandServer.cpp
+  // `MaxCommandDataSize`), а хранимое имя не длиннее 36 байт UTF-8 (вывод — в
+  // NameGuard.hpp).
+  //
+  // ★ПОТОЛОК БЕРЁТСЯ ИЗ ИНДЕКСА, А НЕ ИЗ КОНСТАНТЫ (правка ревью, итерация 1).
+  // Индекс принимает ЛЮБОЕ имя, лежащее на диске; константа 64 отбивала запрос
+  // ДО индекса. Персонаж, сохранённый до появления `IsNameValid` с именем в 65
+  // байт, был бы проиндексирован и при этом вечно неадресуем — притом что
+  // прежний точный поиск его находил. Потолок = максимум(64, самое длинное
+  // проиндексированное имя): граница остаётся конечной и не режет живых.
+  // ★ГЕЙТ ПОИСКА ОТДЕЛЁН ОТ ГЕЙТА СОЗДАНИЯ (правка ревью, итерация 9). Здесь
+  // стоял `IsStorableNameShaped`, то есть гейт СОЗДАНИЯ: он отвергает `/` и
+  // `\\`, потому что они не годятся в имя файла. Но имя персонажа лежит ПОЛЕМ
+  // внутри файла, названного uid'ом, и персонаж `A/B` читается, индексируется —
+  // и при этом был неадресуем каждым из шести хендлеров, ходящих сюда. Теперь
+  // поиск ограничен (потолок из индекса) и отвергает только то, что именем в
+  // JSON быть не может и ломает журнал: NUL, `\n`, `\r`.
+  if (not server::util::IsLookupKeyShaped(
+    name, _characterNameCeiling.load(std::memory_order::relaxed)))
   {
-    // LOA-fix (R58-8, round58, backlog #175): фильтр расширения (иначе временный
-    // файл станет едой для разбора) и ПЕРЕХВАТ разбора. Раньше один битый файл
-    // ломал поиск по имени и создание персонажа У ВСЕХ — бросок улетал наружу из
-    // цикла. Образец взят у соседней `IsGuildNameUnique` в этом же файле.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
-      continue;
-
-    std::ifstream dataFile(file.path());
-    if (not dataFile.is_open())
-      continue;
-
-    std::string existingCharacterName;
-    data::Uid existingCharacterUid = data::InvalidUid;
-    try
-    {
-      const auto json = nlohmann::json::parse(dataFile);
-      existingCharacterName = json.value("name", std::string{});
-      existingCharacterUid = json.value("uid", data::InvalidUid);
-    }
-    catch (const std::exception& x)
-    {
-      server::util::QuietLogWarn(
-        "Character file '{}' is unreadable ({}) and was skipped while looking up "
-        "a character by name", file.path().string(), x.what());
-      continue;
-    }
-
-    if (existingCharacterName.empty() || existingCharacterUid == data::InvalidUid)
-      continue;
-
-    if (std::regex_match(existingCharacterName, rg))
-      return existingCharacterUid;
+    _rejectedNameLookups.fetch_add(1, std::memory_order::relaxed);
+    return data::InvalidUid;
   }
 
-  return data::InvalidUid;
+  // ★ИНДЕКС ВМЕСТО ОБХОДА. Прежняя редакция открывала и РАЗБИРАЛА КАЖДЫЙ файл
+  // персонажа на КАЖДЫЙ вызов, а зовут её шесть аутентифицированных хендлеров:
+  // подарок (RanchDirector), вызов персонажа, приглашение в гонку
+  // (RaceNetworkHandler), добавление друга и письмо (MessengerDirector). Один
+  // пакет = O(все персонажи) обращений к диску.
+  const auto key = server::util::AsciiLowerKey(name);
+  return ReadNameIndexAnswer(
+    _characterNameIndexMutex, _characterNameToUid,
+    _characterNameIndexComplete, key).uid;
 }
 
 bool server::FileDataSource::IsCharacterNameUnique(const std::string_view& name)
 {
-  return RetrieveCharacterUidByName(name) == data::InvalidUid;
+  // ★ТОТ ЖЕ ОТВЕТ, ЧТО У ГИЛЬДИЙ, И ПО ТОЙ ЖЕ ПРИЧИНЕ (правка ревью, итерация
+  // 7). Структурный гейт у персонажей есть, но он стоит в ПОИСКЕ
+  // (`RetrieveCharacterUidByName`), а поиск отвечает «не нашёл» — и здесь это
+  // превращалось в «имя свободно». Персонаж, созданный с именем, которое
+  // физически не может лежать на диске (управляющий байт, разделитель пути,
+  // длиннее потолка индекса), был бы НАВСЕГДА НЕАДРЕСУЕМ: подарок, приглашение
+  // в заезд, друг и письмо ходят через тот же поиск, который это имя отбивает.
+  //
+  // Создание обязано отказать, а не выдать «свободно», — ровно как у гильдий.
+  // Направление отличается от поиска намеренно: поиск отвечает «такого нет»,
+  // создание — «так назвать нельзя». Сегодня оба вызывающих
+  // (`LobbyNetworkHandler`, `RanchDirector`) зовут `locale::IsNameValid` с
+  // потолком 18 байт до этого места, то есть свойство держалось их
+  // вежливостью; правило переезжает в хранилище, где ему и место.
+  if (not server::util::IsStorableNameShaped(
+    name, _characterNameCeiling.load(std::memory_order::relaxed)))
+  {
+    _refusedNameCreations.fetch_add(1, std::memory_order::relaxed);
+    return false;
+  }
+
+  // ★ОТВЕТ СНИМАЕТСЯ ОДНИМ СНИМКОМ (правка ревью, итерация 9). Прежде здесь
+  // стояли ДВА чтения: `RetrieveCharacterUidByName` под своим общим замком и
+  // отдельное чтение флага полноты после него. Между ними умещалась чужая
+  // перестройка целиком, и промах по СТАРОМУ неполному индексу читался вместе с
+  // НОВОЙ полнотой как «имя свободно» — притом что имя в новом индексе уже
+  // лежало.
+  const auto key = server::util::AsciiLowerKey(name);
+  auto answer = ReadNameIndexAnswer(
+    _characterNameIndexMutex, _characterNameToUid,
+    _characterNameIndexComplete, key);
+
+  // Имя, которое индекс РАЗРЕШАЕТ, занято — тут спорить не о чем.
+  if (answer.uid != data::InvalidUid)
+    return false;
+  if (answer.complete)
+    return true;
+
+  // ★ПРОМАХ ПО НЕПОЛНОМУ ИНДЕКСУ — НЕ «СВОБОДНО» (правка ревью, итерация 7), И
+  // ПОЧИНКУ ЗДЕСЬ БОЛЬШЕ НЕ ПОКУПАЮТ (правка ревью, итерация 9). Раньше отсюда
+  // звалась `ReconcileCharacterNameIndexIfBroken`, то есть имя с провода могло
+  // заказать полный обход каталога персонажей. Теперь путь запроса лишь ПРОСИТ
+  // плановый проход случиться на ближайшем тике; ответ до тех пор — «занято»,
+  // то есть отказ в создании, а не выдача чужого имени.
+  RequestScheduledNameIndexRepair();
+  return false;
 }
 
 void server::FileDataSource::CreateHorse(data::Horse& horse)
@@ -1111,14 +2515,8 @@ void server::FileDataSource::RetrieveHorse(data::Uid uid, data::Horse& horse)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _horseDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Horse file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Horse file", server::util::FileSensitivity::Public);
   horse.uid = json.value("uid", data::Uid{});
   horse.tid = json.value("tid", data::Tid{});
   horse.name = json.value("name", std::string{});
@@ -1322,14 +2720,22 @@ void server::FileDataSource::StoreHorse(data::Uid uid, const data::Horse& horse)
   json["lineage"] = horse.lineage();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Horse file");
+    dataFilePath, json.dump(2), "Horse file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteHorse(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _horseDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Horse file");
 }
 
 void server::FileDataSource::CreateItem(data::Item& item)
@@ -1343,14 +2749,8 @@ void server::FileDataSource::RetrieveItem(data::Uid uid, data::Item& item)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _itemDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Item file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Item file", server::util::FileSensitivity::Public);
 
   item.uid = json.value("uid", data::Uid{});
   item.tid = json.value("tid", data::Tid{});
@@ -1374,14 +2774,22 @@ void server::FileDataSource::StoreItem(data::Uid uid, const data::Item& item)
     item.createdAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Item file");
+    dataFilePath, json.dump(2), "Item file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteItem(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _itemDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Item file");
 }
 
 void server::FileDataSource::CreateStorageItem(data::StorageItem& item)
@@ -1395,14 +2803,8 @@ void server::FileDataSource::RetrieveStorageItem(data::Uid uid, data::StorageIte
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _storageItemPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Storage item file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Storage item file", server::util::FileSensitivity::Public);
 
   storageItem.uid = json.value("uid", data::Uid{});
   storageItem.sender = json.value("sender", std::string{});
@@ -1461,14 +2863,22 @@ void server::FileDataSource::StoreStorageItem(data::Uid uid, const data::Storage
   json["priceId"] = storageItem.priceId();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Storage item file");
+    dataFilePath, json.dump(2), "Storage item file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteStorageItem(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _storageItemPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Storage item file");
 }
 
 void server::FileDataSource::CreateEgg(data::Egg& egg)
@@ -1482,14 +2892,8 @@ void server::FileDataSource::RetrieveEgg(data::Uid uid, data::Egg& egg)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _eggDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Egg file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Egg file", server::util::FileSensitivity::Public);
 
   egg.uid = json.value("uid", data::Uid{});
   egg.itemUid = json.value("itemUid", data::Uid{});
@@ -1516,14 +2920,22 @@ void server::FileDataSource::StoreEgg(data::Uid uid, const data::Egg& egg)
   json["incubatorSlot"] = egg.incubatorSlot();
   json["boostsUsed"] = egg.boostsUsed();
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Egg file");
+    dataFilePath, json.dump(2), "Egg file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteEgg(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _eggDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Egg file");
 }
 
 void server::FileDataSource::CreatePet(data::Pet& pet)
@@ -1537,14 +2949,8 @@ void server::FileDataSource::RetrievePet(data::Uid uid, data::Pet& pet)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _petDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Pet file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Pet file", server::util::FileSensitivity::Public);
 
   pet.uid = json.value("uid", data::Uid{});
   pet.itemUid = json.value("itemUid", data::Uid{});
@@ -1568,14 +2974,22 @@ void server::FileDataSource::StorePet(data::Uid uid, const data::Pet& pet)
     pet.birthDate().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Pet file");
+    dataFilePath, json.dump(2), "Pet file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeletePet(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _petDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Pet file");
 }
 
 void server::FileDataSource::CreateHousing(data::Housing& housing)
@@ -1589,14 +3003,8 @@ void server::FileDataSource::RetrieveHousing(data::Uid uid, data::Housing& housi
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _housingDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Housing file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Housing file", server::util::FileSensitivity::Public);
   housing.uid = json.value("uid", data::Uid{});
   housing.housingId = json.value("housingId", uint32_t{});
   housing.expiresAt = data::Clock::time_point(
@@ -1617,14 +3025,22 @@ void server::FileDataSource::StoreHousing(data::Uid uid, const data::Housing& ho
   json["durability"] = housing.durability();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Housing file");
+    dataFilePath, json.dump(2), "Housing file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteHousing(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _housingDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Housing file");
 }
 
 void server::FileDataSource::CreateGuild(data::Guild& guild)
@@ -1638,14 +3054,8 @@ void server::FileDataSource::RetrieveGuild(data::Uid uid, data::Guild& guild)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _guildDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Guild file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Guild file", server::util::FileSensitivity::Public);
 
   guild.uid = json.value("uid", data::Uid{});
   guild.name = json.value("name", std::string{});
@@ -1681,55 +3091,443 @@ void server::FileDataSource::StoreGuild(data::Uid uid, const data::Guild& guild)
   json["seasonalLosses"] = guild.seasonalLosses();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Guild file");
+    dataFilePath, json.dump(2), "Guild file",
+    server::util::FileSensitivity::Public);
+
+  // ★ИНДЕКС ПОСЛЕ УСПЕШНОЙ ЗАПИСИ, как у персонажей и аккаунтов: бросок
+  // оставляет диск в прежнем состоянии, и индекс обязан остаться согласованным
+  // с диском, а не с намерением.
+  IndexGuildName(uid, guild.name());
 }
 
 void server::FileDataSource::DeleteGuild(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _guildDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Guild file");
+  ForgetGuildName(uid);
 }
 
 bool server::FileDataSource::IsGuildNameUnique(const std::string_view& name)
 {
-  const auto equalsIgnoreCase = [](std::string_view lhs, std::string_view rhs)
+  // ★ИНДЕКС ВМЕСТО ОБХОДА КАТАЛОГА (LOA-fix R73-13, правка ревью, итерация 6).
+  //
+  // Прежняя редакция ЛИСТАЛА каталог гильдий и разбирала каждый файл на каждый
+  // пакет создания гильдии. Итерация 5 сделала этот обход безопасным (общий
+  // список вместо бросающего итератора), но безопасный обход — всё ещё обход:
+  // проверка стоит ДО списания 3000 морковок, поэтому повторение занятого имени
+  // покупало полный проход по файловой системе за ноль. Класс закрывается тем
+  // же способом, что у персонажей и аккаунтов, — индексом, а не третьим частным
+  // случаем: ответ теперь стоит один хеш, независимо от числа гильдий.
+  //
+  // ★СТРУКТУРНЫЙ ГЕЙТ ДО ВСЕГО — до ключа, до хеша, до замка (правка ревью,
+  // итерация 7; директива ведущего требовала провести создание гильдии через
+  // NameGuard И индекс, а итерация 6 поставила только индекс).
+  //
+  // Провод отдаёт до ~8190 байт (`Stream.cpp` при потолке `MaxCommandDataSize`),
+  // а хранимое имя короче на два порядка. Сегодня перед этим вызовом стоит
+  // `locale::IsNameValid(command.name)` с потолком 18 байт — но это ОДИН
+  // вызывающий, и свойство «имя с провода не оплачивается работой хранилища»
+  // держится его вежливостью, а не построением. Второй вызывающий,
+  // написанный по образцу соседей (`RetrieveCharacterUidByName`,
+  // `IsUserNameUnique` — оба со своим гейтом), унаследовал бы отсутствие
+  // гейта. Правило живёт в хранилище, а не в перечне вызывающих.
+  //
+  // ★ПОТОЛОК ИЗ ИНДЕКСА, А НЕ КОНСТАНТА: гейт, который строже индекса, отнял
+  // бы у гильдии, названной до появления валидатора, возможность быть
+  // спрошенной. Пол — тот же `kMaxStoredNameBytes`, что у персонажей.
+  //
+  // ★ОТКАЗ ЧИТАЕТСЯ КАК «ЗАНЯТО», А НЕ КАК «СВОБОДНО», и направление здесь
+  // противоположно `IsUserNameUnique` НЕ по недосмотру: там ответ идёт в
+  // ПОИСК (staff-команда скажет «такого нет»), а здесь — в СОЗДАНИЕ. Имя,
+  // которое физически не может лежать на диске, обязано отказать в создании,
+  // иначе гейт превратился бы в способ пройти проверку уникальности.
+  if (not server::util::IsStorableNameShaped(
+    name, _guildNameCeiling.load(std::memory_order::relaxed)))
   {
-    return std::ranges::equal(
-      lhs, rhs,
-      [](unsigned char a, unsigned char b)
-      {
-        return std::tolower(a) == std::tolower(b);
-      });
-  };
-
-  for (const auto& file : std::filesystem::directory_iterator(_guildDataPath))
-  {
-    // LOA-fix (R58-9, round58, backlog #175): перехват разбора здесь уже есть, а
-    // фильтра расширения не было — временный файл разбирался бы наравне с данными.
-    if (not file.is_regular_file() || file.path().extension() != ".json")
-      continue;
-
-    std::ifstream dataFile(file.path());
-    if (not dataFile.is_open())
-      continue;
-
-    try
-    {
-      const auto json = nlohmann::json::parse(dataFile);
-      const auto existingGuildName = json.value("name", std::string{});
-
-      if (equalsIgnoreCase(existingGuildName, name))
-        return false;
-    }
-    catch (const std::exception&)
-    {
-      // Skip malformed guild files rather than aborting the uniqueness check.
-      continue;
-    }
+    _refusedNameCreations.fetch_add(1, std::memory_order::relaxed);
+    return false;
   }
 
+  // Сравнение по-прежнему ASCII-регистронезависимое: ключ индекса и есть имя в
+  // нижнем ASCII-регистре, ровно то, что делал прежний `equalsIgnoreCase`.
+  const auto key = server::util::AsciiLowerKey(name);
+
+  // ★ТОТ ЖЕ ОДИН СНИМОК, ЧТО У ПЕРСОНАЖЕЙ (правка ревью, итерация 9). Здесь
+  // раздельного чтения не было и до правки, но помощник один на все три места
+  // намеренно: пока правило записано в трёх телах, четвёртое место, написанное
+  // по образцу соседей, унаследует ту форму, которую увидит.
+  auto answer = ReadNameIndexAnswer(
+    _guildNameIndexMutex, _guildNameToUid, _guildNameIndexComplete, key);
+  if (answer.uid != data::InvalidUid)
+    return false;
+  if (answer.complete)
+    return true;
+
+  // ★ИНДЕКС, КОТОРЫЙ ВИДЕЛ НЕ ВСЁ, НЕ ОТВЕЧАЕТ «СВОБОДНО» (правка ревью,
+  // итерация 7). Перестройка МОЛЧА пропускала нечитаемый файл, битый JSON и имя
+  // файла, из которого не читается uid, — и публиковала набор, выглядящий
+  // полным. Гильдия, чей файл на старте оказался временно нечитаемым, отдавала
+  // своё имя следующему желающему НА ВСЁ ВРЕМЯ РАБОТЫ сервера. Сначала одна
+  // попытка починиться (не чаще раза в две секунды), и только потом ответ; если
+  // индекс всё ещё неполон — «занято», то есть отказ в создании, а не выдача
+  // чужого имени.
+  // ★ТА ЖЕ ПРАВКА, ЧТО У ПЕРСОНАЖЕЙ (итерация 9): ремонт — повод плановый, а не
+  // купленный именем с провода. Проверка стоит ДО списания 3000 морковок, и
+  // покупать за ноль полный обход каталога гильдий здесь тем более нечего.
+  RequestScheduledNameIndexRepair();
+  return false;
+}
+
+void server::FileDataSource::MarkGuildNameIndexBroken(
+  const std::string_view what, const std::string_view detail) noexcept
+{
+  // ★ФЛАГ АТОМАРНЫЙ ИМЕННО РАДИ ЭТОГО ПУТИ: сюда приходят с отказа (нехватка
+  // памяти), и требовать здесь замок значило бы уметь НЕ объявить индекс
+  // сломанным ровно тогда, когда он сломан.
+  _guildNameIndexComplete.store(false, std::memory_order::relaxed);
+  // ★СЛОМАННЫЙ ИНДЕКС САМ ПРОСИТ О РЕМОНТЕ (правка ревью, итерация 11).
+  // Повод здесь честнее всего: именно в этот момент индекс стал
+  // неполным. Пол частоты от этого не двигается — его держит
+  // `TickNameIndexMaintenanceAt`, и просьба его опустить не умеет.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+  try
+  {
+    server::util::QuietLogError(
+      "Guild name index: {} ({}); every guild name reads as taken until the "
+      "index is rebuilt from disk", what, detail);
+  }
+  catch (...)
+  {
+    // Отчёт о беде не имеет права стать второй бедой.
+  }
+}
+
+void server::FileDataSource::MarkCharacterNameIndexBroken(
+  const std::string_view what, const std::string_view detail) noexcept
+{
+  _characterNameIndexComplete.store(false, std::memory_order::relaxed);
+  // ★СЛОМАННЫЙ ИНДЕКС САМ ПРОСИТ О РЕМОНТЕ (правка ревью, итерация 11).
+  // Повод здесь честнее всего: именно в этот момент индекс стал
+  // неполным. Пол частоты от этого не двигается — его держит
+  // `TickNameIndexMaintenanceAt`, и просьба его опустить не умеет.
+  _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+  try
+  {
+    server::util::QuietLogError(
+      "Character name index: {} ({}); every character name reads as taken until "
+      "the index is rebuilt from disk", what, detail);
+  }
+  catch (...)
+  {
+  }
+}
+
+bool server::FileDataSource::ReconcileGuildNameIndexIfBroken()
+{
+  {
+    const std::shared_lock indexLock(_guildNameIndexMutex);
+    if (_guildNameIndexComplete)
+      return false;
+  }
+  try
+  {
+    RebuildGuildNameIndex();
+  }
+  catch (const std::exception& x)
+  {
+    // ★БРОСОК ЗДЕСЬ ГАСИТСЯ, И ЭТО НЕ ПРОТИВОРЕЧИТ СТАРТУ. На старте оборванный
+    // обход обязан остановить сервер: там остановка возможна и честна. В
+    // рантайме этот же бросок разорвал бы пакет создания гильдии, а индекс и
+    // так остаётся объявленным неполным — то есть ответ уже безопасный.
+    server::util::QuietLogError(
+      "Guild name index: the rebuild attempt failed ({}); every guild name "
+      "keeps reading as taken", x.what());
+    // ★НЕУДАВШИЙСЯ РЕМОНТ ОСТАВЛЯЕТ ПРОСЬБУ ВЗВЕДЁННОЙ (правка ревью,
+    // итерация 11): индекс всё ещё неполон, и следующий плановый проход
+    // обязан попробовать снова — но не раньше пола.
+    _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+    return false;
+  }
+  {
+    // Перестройка могла опубликовать ВСЁ ЕЩЁ неполный индекс (файл на
+    // диске так и не читается). Тогда повод не исчерпан, и просьба
+    // взводится заново — иначе самопочинка ждала бы периодического
+    // осмотра, то есть переставала бы быть починкой «в течение минуты».
+    const std::shared_lock indexLock(_guildNameIndexMutex);
+    if (not _guildNameIndexComplete)
+      _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+  }
   return true;
+}
+
+bool server::FileDataSource::ReconcileCharacterNameIndexIfBroken()
+{
+  {
+    const std::shared_lock indexLock(_characterNameIndexMutex);
+    if (_characterNameIndexComplete)
+      return false;
+  }
+  try
+  {
+    RebuildCharacterNameIndex();
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Character name index: the rebuild attempt failed ({}); every character "
+      "name keeps reading as taken", x.what());
+    // ★НЕУДАВШИЙСЯ РЕМОНТ ОСТАВЛЯЕТ ПРОСЬБУ ВЗВЕДЁННОЙ (правка ревью,
+    // итерация 11): индекс всё ещё неполон, и следующий плановый проход
+    // обязан попробовать снова — но не раньше пола.
+    _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+    return false;
+  }
+  {
+    // Перестройка могла опубликовать ВСЁ ЕЩЁ неполный индекс (файл на
+    // диске так и не читается). Тогда повод не исчерпан, и просьба
+    // взводится заново — иначе самопочинка ждала бы периодического
+    // осмотра, то есть переставала бы быть починкой «в течение минуты».
+    const std::shared_lock indexLock(_characterNameIndexMutex);
+    if (not _characterNameIndexComplete)
+      _nameIndexRepairPending.store(true, std::memory_order::relaxed);
+  }
+  return true;
+}
+
+void server::FileDataSource::RebuildGuildNameIndex()
+{
+  const std::unique_lock indexLock(_guildNameIndexMutex);
+  // ★ФЛАГ ПОЛНОТЫ СНИМАЕТСЯ ПЕРВЫМ ДЕЙСТВИЕМ (правка ревью, итерация 7): бросок
+  // или отказ посреди обхода обязан оставить индекс объявленным НЕПОЛНЫМ, а не
+  // «таким, каким он был до этого».
+  _guildNameIndexComplete = false;
+  _guildNameToUid.clear();
+  _guildUidToName.clear();
+
+  //! Сколько записей мы НЕ СМОГЛИ прочитать. Ноль — и только ноль — даёт право
+  //! отвечать «имя свободно».
+  std::size_t unresolved = 0;
+  std::size_t duplicates = 0;
+  //! Файлы с числовым, но НЕканоническим именем (`007.json`): не записи.
+  std::size_t noncanonical = 0;
+
+  const auto listing = server::util::ListRegularFiles(_guildDataPath);
+  if (listing.incomplete)
+  {
+    // ★ОБОРВАННЫЙ ОБХОД НА СТАРТЕ ФАТАЛЕН, как и у персонажей: перестройка
+    // зовётся из `Initialize`, где остановка возможна и честна. Из рантайма её
+    // зовёт `ReconcileGuildNameIndexIfBroken`, который этот бросок гасит и
+    // оставляет индекс неполным, то есть отвечающим «занято».
+    server::util::QuietLogError(
+      "Guild name index: the scan of '{}' did not finish; refusing to start "
+      "with taken guild names readable as free",
+      server::util::LogPath(_guildDataPath));
+
+    throw std::runtime_error(
+      std::format(
+        "Guild name index scan of '{}' did not finish",
+        server::util::LogPath(_guildDataPath)));
+  }
+
+  if (not listing.refusedSymlinks.empty())
+  {
+    // ★ОТВЕРГНУТАЯ ССЫЛКА — ЭТО «НЕ ВИДЕЛИ», А НЕ «ТАМ ПУСТО» (правка ревью,
+    // итерация 7). Прежде это была только строка в логе, а имя под ссылкой
+    // читалось как свободное.
+    unresolved += listing.refusedSymlinks.size();
+    server::util::QuietLogWarn(
+      "Guild name index: {} entry(ies) in '{}' are symbolic links and were "
+      "refused; the names they may carry are unknown and read as taken",
+      listing.refusedSymlinks.size(), server::util::LogPath(_guildDataPath));
+  }
+
+  for (const auto& filePath : listing.files)
+  {
+    // Тот же фильтр, что у прежнего обхода (R58-9): осиротевший `7.json.tmp` не
+    // имеет права занять имя.
+    if (filePath.extension() != ".json")
+      continue;
+
+    // ★ЛИЧНОСТЬ ЗАПИСИ БЕРЁТСЯ ИЗ ИМЕНИ ФАЙЛА, А НЕ ИЗ `json["uid"]` (правка
+    // ревью, итерация 7). `StoreGuild` и `DeleteGuild` адресуют файл именем;
+    // индекс, взявший uid из содержимого, отвечал бы про ДРУГУЮ запись:
+    // `7.json` с полем `uid: 8` делал `DeleteGuild(7)` неспособным освободить
+    // имя, а два файла с одним полем `uid` освобождали живое имя.
+    const auto stem = filePath.stem().string();
+    const auto uid = ParseRecordUid(stem);
+    if (not uid)
+    {
+      // Та же граница, что у персонажей: неканоническое числовое имя — не
+      // управляемая запись, а посторонний файл (правка ревью, итерация 9).
+      if (ParseUidLikeStem(stem))
+        ++noncanonical;
+      else
+      {
+        ++unresolved;
+        server::util::QuietLogWarn(
+          "Guild file '{}' is not named after a record identifier; the index "
+          "refuses to guess whose name it carries",
+          server::util::LogPath(filePath));
+      }
+      continue;
+    }
+
+    const auto read = server::util::ReadManagedFile(
+      filePath, server::util::FileSensitivity::Public);
+    if (read.status != server::util::ManagedReadStatus::Ok)
+    {
+      ++unresolved;
+      continue;
+    }
+
+    std::string existingName;
+    try
+    {
+      const auto json = nlohmann::json::parse(read.content);
+      existingName = json.value("name", std::string{});
+    }
+    catch (const std::exception& x)
+    {
+      // ★БИТЫЙ ФАЙЛ БОЛЬШЕ НЕ «ПРОСТО ПРОПУСКАЕТСЯ» (правка ревью, итерация 7).
+      // Пропуск публиковал индекс, выглядящий полным, и имя этой гильдии
+      // становилось свободным до перезапуска.
+      server::util::QuietLogWarn(
+        "Guild file '{}' is unreadable ({}) and was skipped while building the "
+        "guild name index", server::util::LogPath(filePath), x.what());
+      ++unresolved;
+      continue;
+    }
+
+    if (existingName.empty())
+    {
+      ++unresolved;
+      continue;
+    }
+
+    auto key = server::util::AsciiLowerKey(existingName);
+
+    // Один uid живёт ровно в одном списке (см. индекс персонажей).
+    const auto alreadyIndexed = _guildUidToName.find(*uid);
+    if (alreadyIndexed != _guildUidToName.end())
+    {
+      if (alreadyIndexed->second == key)
+        continue;
+      DetachNameKey(_guildNameToUid, alreadyIndexed->second, *uid);
+    }
+
+    const std::size_t collisions =
+      AttachNameKey(_guildNameToUid, key, *uid);
+    // ★ПОТОЛОК ГЕЙТА МЕРЯЕТСЯ ТЕМ, ЧТО ЛЕЖИТ НА ДИСКЕ, а не сегодняшним
+    // валидатором: гильдия, названная до появления `IsNameValid`, обязана
+    // остаться спрашиваемой (тот же вывод, что у персонажей, — итерация 1).
+    RaiseNameCeiling(_guildNameCeiling, existingName.size());
+    if (collisions > 1)
+      ++duplicates;
+    _guildUidToName[*uid] = std::move(key);
+  }
+
+  _guildNameIndexComplete = unresolved == 0;
+  // Момент попытки переставляется и здесь: старт — это тоже попытка, и сразу
+  // после него повторять обход незачем.
+  _guildIndexLastRetry.store(
+    std::chrono::steady_clock::now(), std::memory_order::relaxed);
+
+  server::util::QuietLogInfo(
+    "Guild name index: {} names indexed, {} files unresolved, {} duplicates",
+    _guildNameToUid.size(), unresolved, duplicates);
+
+  if (noncanonical > 0)
+  {
+    server::util::QuietLogWarn(
+      "Guild name index: {} file(s) in '{}' are named with a noncanonical "
+      "record number (a leading zero); they are not records, are not indexed "
+      "and are not swept",
+      noncanonical, server::util::LogPath(_guildDataPath));
+  }
+
+  if (not _guildNameIndexComplete)
+  {
+    server::util::QuietLogError(
+      "Guild name index: {} guild file(s) in '{}' could not be read; until "
+      "they can be, EVERY guild name reads as taken rather than free",
+      unresolved, server::util::LogPath(_guildDataPath));
+  }
+}
+
+void server::FileDataSource::IndexGuildName(
+  const data::Uid uid, const std::string& name)
+{
+  // ★ПУСТОЕ ИМЯ СНИМАЕТ ЗАПИСЬ, А НЕ ЗАВОДИТ КЛЮЧ "" — перестройка такие файлы
+  // пропускает, и без этой строки рантайм и диск разошлись бы после рестарта.
+  if (name.empty())
+  {
+    ForgetGuildName(uid);
+    return;
+  }
+
+  // ★НЕУДАЧА ПОДДЕРЖАНИЯ ИНДЕКСА ОБЪЯВЛЯЕТ ИНДЕКС НЕПОЛНЫМ, А НЕ ОСТАВЛЯЕТ ЕГО
+  // ПОЛУПЕРЕПИСАННЫМ (правка ревью, итерация 7).
+  //
+  // Нас зовут ПОСЛЕ успешной записи файла. Переименование снимало старый ключ
+  // ПЕРЕД тем, как выделить новое ведро, новый вектор и обратную запись:
+  // `bad_alloc` посередине оставлял имя, лежащее на диске, ВНЕ индекса — то
+  // есть занятое имя читалось как свободное, — либо пустой ключ, который ни
+  // один `ForgetGuildName` уже не снимет. Готовить новое состояние до снятия
+  // старого здесь недостаточно: бросить умеет и вставка. Поэтому отказ
+  // обрабатывается ТАК ЖЕ, как неполный обход, — весь индекс объявляется
+  // неполным, ответом становится «занято», а следующая попытка пересобирает его
+  // с диска. Индекс — кэш диска, и его отказ не имеет права соврать про диск.
+  try
+  {
+    auto key = server::util::AsciiLowerKey(name);
+    RaiseNameCeiling(_guildNameCeiling, name.size());
+    const std::unique_lock indexLock(_guildNameIndexMutex);
+    const auto previous = _guildUidToName.find(uid);
+    if (previous != _guildUidToName.end() && previous->second == key)
+      return;                                   // имя не менялось, мутаций нет
+
+    // ★ПОЛНОТА СНИМАЕТСЯ ПОД ТЕМ ЖЕ ЗАМКОМ И ДО ПЕРВОЙ МУТАЦИИ (правка ревью,
+    // итерация 9). Прежде `Mark*NameIndexBroken` стоял в `catch`, то есть ПОСЛЕ
+    // того, как раскрутка стека отпустила уникальный замок: между отпусканием
+    // замка и записью `false` в флаг помещался целый чужой читатель — он брал
+    // общий замок, видел ПОЛУПЕРЕПИСАННЫЕ карты (старый ключ снят, новый ещё
+    // нет) при полноте, всё ещё равной `true`, и отвечал «имя свободно». Теперь
+    // окна нет: пока идут мутации, индекс объявлен НЕПОЛНЫМ, и прежнее значение
+    // возвращается только после того, как ВСЕ вставки удались. Бросок оставляет
+    // `false`, а плановый проход (`TickNameIndexMaintenance`) это чинит.
+    const bool wasComplete = _guildNameIndexComplete.exchange(
+      false, std::memory_order::relaxed);
+
+    if (previous != _guildUidToName.end())
+      DetachNameKey(_guildNameToUid, previous->second, uid);
+    AttachNameKey(_guildNameToUid, key, uid);
+    _guildUidToName[uid] = std::move(key);
+
+    _guildNameIndexComplete.store(wasComplete, std::memory_order::relaxed);
+  }
+  catch (const std::exception& x)
+  {
+    MarkGuildNameIndexBroken("a guild name could not be indexed", x.what());
+  }
+}
+
+void server::FileDataSource::ForgetGuildName(const data::Uid uid)
+{
+  const std::unique_lock indexLock(_guildNameIndexMutex);
+  const auto previous = _guildUidToName.find(uid);
+  if (previous == _guildUidToName.end())
+    return;
+  // Снятие одной гильдии поднимает следующую, носящую то же имя, а не гасит имя.
+  DetachNameKey(_guildNameToUid, previous->second, uid);
+  _guildUidToName.erase(previous);
 }
 
 void server::FileDataSource::CreateSettings(data::Settings& settings)
@@ -1743,14 +3541,8 @@ void server::FileDataSource::RetrieveSettings(data::Uid uid, data::Settings& set
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _settingsDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Settings file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Settings file", server::util::FileSensitivity::Public);
   settings.uid = json.value("uid", data::Uid{});
 
   settings.age = json.value("age", uint32_t{});
@@ -1853,14 +3645,22 @@ void server::FileDataSource::StoreSettings(data::Uid uid, const data::Settings& 
   }
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Settings file");
+    dataFilePath, json.dump(2), "Settings file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteSettings(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _settingsDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Settings file");
 }
 
 void server::FileDataSource::CreateDailyQuestGroup(data::DailyQuestGroup& group)
@@ -1874,14 +3674,8 @@ void server::FileDataSource::RetrieveDailyQuestGroup(data::Uid uid, data::DailyQ
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _dailyQuestGroupDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Daily quest group file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Daily quest group file", server::util::FileSensitivity::Public);
   group.uid          = json.value("uid", data::Uid{});
   group.rewardId     = json.value("rewardId", uint8_t{});
   group.rewardType   = json.value("rewardType", uint8_t{});
@@ -1954,14 +3748,22 @@ void server::FileDataSource::StoreDailyQuestGroup(data::Uid uid, const data::Dai
   }
   json["quests"] = questsJson;
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Daily quest group file");
+    dataFilePath, json.dump(2), "Daily quest group file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteDailyQuestGroup(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _dailyQuestGroupDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Daily quest group file");
 }
 
 void server::FileDataSource::CreateMail(data::Mail& mail)
@@ -1975,14 +3777,8 @@ void server::FileDataSource::RetrieveMail(data::Uid uid, data::Mail& mail)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _mailDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (!dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Mail file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Mail file", server::util::FileSensitivity::Public);
   mail.uid = json.value("uid", data::Uid{});
   mail.from = json.value("from", data::Uid{});
   mail.to = json.value("to", data::Uid{});
@@ -2021,14 +3817,22 @@ void server::FileDataSource::StoreMail(data::Uid uid, const data::Mail& mail)
   json["body"] = mail.body();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Mail file");
+    dataFilePath, json.dump(2), "Mail file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteMail(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _mailDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Mail file");
 }
 
 void server::FileDataSource::CreateQuest(data::Quest& quest)
@@ -2042,14 +3846,8 @@ void server::FileDataSource::RetrieveQuest(data::Uid uid, data::Quest& quest)
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _questDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Quest file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Quest file", server::util::FileSensitivity::Public);
   quest.uid         = json.value("uid", data::Uid{});
   quest.questId     = json.value("questId", uint32_t{});
   quest.isCompleted = json.value("isCompleted", data::Quest::Status{});
@@ -2068,14 +3866,22 @@ void server::FileDataSource::StoreQuest(data::Uid uid, const data::Quest& quest)
   json["progress"]    = quest.progress();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Quest file");
+    dataFilePath, json.dump(2), "Quest file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteQuest(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _questDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Quest file");
 }
 
 void server::FileDataSource::CreateStallion(data::Stallion& stallion)
@@ -2089,14 +3895,8 @@ void server::FileDataSource::RetrieveStallion(data::Uid uid, data::Stallion& sta
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _stallionDataPath, std::format("{}", uid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Stallion file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Stallion file", server::util::FileSensitivity::Public);
   stallion.uid() = json.value("uid", data::InvalidUid);
   stallion.horseUid() = json.value("horseUid", data::InvalidUid);
   stallion.ownerUid() = json.value("ownerUid", data::InvalidUid);
@@ -2125,34 +3925,57 @@ void server::FileDataSource::StoreStallion(data::Uid uid, const data::Stallion& 
     stallion.expiresAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Stallion file");
+    dataFilePath, json.dump(2), "Stallion file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteStallion(data::Uid uid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _stallionDataPath, std::format("{}", uid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Stallion file");
 }
 
 std::vector<server::data::Uid> server::FileDataSource::ListRegisteredStallions()
 {
   std::vector<data::Uid> stallionUids;
 
-  if (!std::filesystem::exists(_stallionDataPath))
+  // ★ОБХОД ЧЕРЕЗ ОБЩИЙ СПИСОК (правка ревью, итерация 5). Прежняя редакция
+  // ходила `directory_iterator`, и оба её шага БРОСАЛИ: продвижение итератора и
+  // `is_regular_file()` без `error_code` (последний — ещё и ПО ССЫЛКЕ). Эта
+  // функция зовётся при инициализации рынка разведения, то есть самоссылающийся
+  // `stallions/x.json` мешал бы подняться службе ранчо. Ссылка не запись, и
+  // ронять из-за неё старт нечем.
+  const auto listing = server::util::ListRegularFiles(_stallionDataPath);
+  if (listing.incomplete)
   {
-    return stallionUids;
+    server::util::QuietLogWarn(
+      "Registered stallions: the scan of '{}' did not finish; the returned list "
+      "is incomplete", server::util::LogPath(_stallionDataPath));
+  }
+  if (not listing.refusedSymlinks.empty())
+  {
+    server::util::QuietLogWarn(
+      "Registered stallions: {} entry(ies) in '{}' are symbolic links and were "
+      "refused", listing.refusedSymlinks.size(), server::util::LogPath(_stallionDataPath));
   }
 
-  for (const auto& entry : std::filesystem::directory_iterator(_stallionDataPath))
+  for (const auto& filePath : listing.files)
   {
-    if (!entry.is_regular_file() || entry.path().extension() != ".json")
+    if (filePath.extension() != ".json")
       continue;
 
     try
     {
       // Extract stallion UID from filename (e.g., "123.json" -> 123)
-      data::Uid stallionUid = std::stoul(entry.path().stem().string());
+      data::Uid stallionUid = std::stoul(filePath.stem().string());
       stallionUids.push_back(stallionUid);
     }
     catch (const std::exception&)
@@ -2175,14 +3998,8 @@ void server::FileDataSource::RetrieveReward(data::Uid claimUid, data::Reward& re
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _rewardDataPath, std::format("{}", claimUid));
 
-  std::ifstream dataFile(dataFilePath);
-  if (not dataFile.is_open())
-  {
-    throw std::runtime_error(
-      std::format("Reward file '{}' not accessible", dataFilePath.string()));
-  }
-
-  const auto json = nlohmann::json::parse(dataFile);
+  const auto json = ReadManagedJson(
+    dataFilePath, "Reward file", server::util::FileSensitivity::Public);
   reward.claimUid() = json.value("claimUid", data::InvalidUid);
   reward.characterUid() = json.value("characterUid", data::InvalidUid);
   reward.type() = static_cast<data::Reward::Type>(json.value("type", uint32_t{0}));
@@ -2211,12 +4028,20 @@ void server::FileDataSource::StoreReward(data::Uid claimUid, const data::Reward&
     reward.claimedAt().time_since_epoch()).count();
 
   server::util::WriteFileAtomically(
-    dataFilePath, json.dump(2), "Reward file");
+    dataFilePath, json.dump(2), "Reward file",
+    server::util::FileSensitivity::Public);
 }
 
 void server::FileDataSource::DeleteReward(data::Uid claimUid)
 {
   const std::filesystem::path dataFilePath = ProduceDataFilePath(
     _rewardDataPath, std::format("{}", claimUid));
-  std::filesystem::remove(dataFilePath);
+  // ★УДАЛЕНИЕ ОТ ДЕСКРИПТОРА КАТАЛОГА, И ЕГО ВЕРДИКТ ЧИТАЕТСЯ (итерации 6 и 7).
+  // `remove` проходит промежуточные ссылки насквозь — это закрыла итерация 6;
+  // но она же ПОТЕРЯЛА отказ: прежний бросающий `remove` доносил `EACCES`/
+  // `EROFS`/`EIO` до `DataDirector`, тот возвращал `false`, и `DataStorage`
+  // ОСТАВЛЯЛ запись в кэше. Замена на код возврата, который никто не читал,
+  // объявляла удаление состоявшимся: файл лежал на диске, имя числилось
+  // свободным, а запись воскресала после перезапуска.
+  RemoveDataFileOrThrow(dataFilePath, "Reward file");
 }

@@ -32,7 +32,6 @@
 #include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
-#include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 
 // LOA-fix (R34-9, round34, backlog #96): <atomic> — под
 // _connectSeqCounter (std::atomic<std::uint64_t>), <cstdint> — под сам
