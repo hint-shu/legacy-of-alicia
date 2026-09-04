@@ -1507,9 +1507,26 @@ void AcCmdCRUpdateEquipmentNotify::Write(
 {
   stream.Write(command.characterUid);
 
+  // ★R74-fix-2 (subreview #1, WARN 2): ТРЕТИЙ СЕРИАЛИЗАТОР ТОГО ЖЕ ХРАНИМОГО
+  // СПИСКА. `MaxCharacterEquipmentCount` стоял на двух площадках из трёх —
+  // в кадре входа и в `RanchCharacter`, — а рассылка смены экипировки соседям
+  // по ранчо оставалась на дефолте 255. Разбор клиента даёт настоящий контракт:
+  // счётчик читается ЗНАКОВЫМ (`movsx eax,al`), элементы кладутся в массив
+  // только пока `idx < 0x10`, то есть 17..127 молча теряются, а на 128..255
+  // счётчик уходит в минус, тело не вычитывается и кадр разъезжается до конца.
+  // Раунд объявил снятие этой несогласованности своей целью — значит она
+  // снимается на всех трёх площадках, а не на двух.
   util::WriteBoundedList<uint8_t>(
-    stream, command.characterEquipment, {.name = "AcCmdCRUpdateEquipmentNotify.characterEquipment"});
+    stream,
+    command.characterEquipment,
+    {.maxCount = MaxCharacterEquipmentCount,
+     .name = "AcCmdCRUpdateEquipmentNotify.characterEquipment"});
 
+  // ★`mountEquipment` ОСТАЁТСЯ НА 255 СОЗНАТЕЛЬНО: числа-предшественника у
+  // этого списка нет нигде в протоколе, а правило раунда — переносить
+  // объявленные потолки, а не изобретать новые. Список питается только
+  // предметами, известными реестру, у которых четыре попарно непересекающихся
+  // слотовых бита, то есть практический потолок и так мал.
   util::WriteBoundedList<uint8_t>(
     stream, command.mountEquipment, {.name = "AcCmdCRUpdateEquipmentNotify.mountEquipment"});
 
