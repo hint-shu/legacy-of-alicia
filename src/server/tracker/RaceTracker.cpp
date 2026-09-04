@@ -18,6 +18,7 @@
  **/
 
 #include "server/tracker/RaceTracker.hpp"
+#include <limits>
 
 namespace server::tracker
 {
@@ -264,13 +265,215 @@ void RaceTracker::RemoveQuestItem(data::Uid characterUid, Oid oid)
     [oid](const QuestItem& e) { return e.oid == oid; });
 }
 
-uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(uint16_t increment)
+uint16_t RaceTracker::GetNextEffectInstanceIdAndIncrementBy(
+  const Oid casterOid,
+  const uint16_t increment)
 {
+  // LOA-fix (R71-22, находка ревью 3 #5): ОБОРОТА ЗДЕСЬ БОЛЬШЕ НЕ БЫВАЕТ.
+  //
+  // Флаг «счётчик обернулся» убран вместе с породившей его уступкой: единственный
+  // вызывающий обязан спросить `CanIssueEffectInstances`, а тот отказывает, как
+  // только выдача переступила бы шестнадцатибитную границу. Молчаливой подгонки
+  // (`== 0 -> 1`) тоже не осталось: она существовала только ради жизни ПОСЛЕ
+  // оборота и маскировала бы его, случись он.
   const uint16_t nextId = _nextEffectInstanceId;
-  _nextEffectInstanceId += increment;
-  if (_nextEffectInstanceId == 0)
-    _nextEffectInstanceId = 1;
+  _nextEffectInstanceId = static_cast<uint16_t>(_nextEffectInstanceId + increment);
+
+  // LOA-fix (R71-25, находка ревью 4 #2): СПИСАНИЕ С БЮДЖЕТА КАСТЕРА СТОИТ ЗДЕСЬ.
+  // Это единственная точка, где номера рождаются, поэтому здесь же они и считаются:
+  // разнеси проверку и списание по разным функциям — и они разъедутся при первой же
+  // правке ([[total-invariant-beats-list-of-sites]]).
+  _issuedEffectInstanceCounts[casterOid] += increment;
+
   return nextId;
+}
+
+bool RaceTracker::CanIssueEffectInstances(
+  const Oid casterOid,
+  const uint16_t count) const
+{
+  // LOA-fix (R71-22, находка ревью 3 #5): СУММАРНАЯ ВЫДАЧА, А НЕ ТОЛЬКО ЖИВЫЕ ЗАПИСИ.
+  //
+  // Первый вопрос — про место под улику (живые записи этого кастера), второй — про
+  // сам номер. Второго не было, и это и был дефект: живая запись освобождается по
+  // слому стены и по её истечению, поэтому «256 живых на кастера» НЕ ограничивало
+  // число ВЫДАННЫХ номеров ничем. Счётчик доходил до оборота, а после оборота
+  // предикат «сервер такой номер выдавал» принимал весь домен.
+  //
+  // LOA-fix (R71-25, находка ревью 4 #2): ПЕРВЫЙ ВОПРОС — ПРО БЮДЖЕТ КАСТЕРА.
+  //
+  // Он же и единственный ДОСТИЖИМЫЙ: 8 мест в комнате x 4096 = 32 768 номеров, то есть
+  // домен исчерпать нельзя, пока каждый кастер сидит в своём бюджете. Отказ поэтому
+  // всегда локален — «у ТЕБЯ кончился», а не «у комнаты кончилось», и честный сосед
+  // продолжает кастовать (находка ревью 4 #2: прежний общий запрет был DoS'ом).
+  const auto issuedIter = _issuedEffectInstanceCounts.find(casterOid);
+  const uint32_t alreadyIssued =
+    issuedIter == _issuedEffectInstanceCounts.cend() ? 0u : issuedIter->second;
+  if (static_cast<uint64_t>(alreadyIssued) + count > MaxEffectInstanceIssuancePerRacer)
+    return false;
+
+  // ★ФЕЙЛ-КЛОУЗ, КОТОРЫЙ НЕДОСТИЖИМ ПО АРИФМЕТИКЕ ВЫШЕ, И ЭТО НАМЕРЕННО: если состав
+  // заезда когда-нибудь перестанет быть ограниченным восемью местами, оборот счётчика
+  // не должен вернуться тихо. Граница строгая — последний допустимый номер 0xFFFE,
+  // чтобы `_nextEffectInstanceId` после инкремента остался представимым и НИКОГДА не
+  // стал нулём.
+  if (static_cast<uint32_t>(_nextEffectInstanceId) + count
+      > std::numeric_limits<uint16_t>::max())
+    return false;
+
+  size_t ownedCount = 0;
+  for (const auto& instance : _effectInstances)
+  {
+    if (instance.casterOid == casterOid)
+      ++ownedCount;
+  }
+
+  return ownedCount + count <= MaxEffectInstancesPerRacer;
+}
+
+bool RaceTracker::HasRoomForOneLiveEffectInstance(const Oid casterOid) const
+{
+  // LOA-fix (R71-26, находка ревью 6): ВОПРОС ТОЛЬКО ПРО МЕСТО, НЕ ПРО БЮДЖЕТ.
+  // Бюджет выдачи уже списан за весь пакет, поэтому спрашивать его ещё раз значит
+  // отказать честному пограничному касту. Место под живую запись от списания не
+  // зависит: его можно переспросить сколько угодно раз, ответ не поедет.
+  size_t ownedCount = 0;
+  for (const auto& instance : _effectInstances)
+  {
+    if (instance.casterOid == casterOid)
+      ++ownedCount;
+  }
+
+  return ownedCount + 1 <= MaxEffectInstancesPerRacer;
+}
+
+void RaceTracker::AddEffectInstances(
+  const uint16_t firstInstanceId,
+  const uint16_t count,
+  const uint32_t magicType,
+  const Oid casterOid,
+  const bool serverApplied,
+  const std::vector<Oid>& authorizedTargets)
+{
+  for (uint16_t i = 0; i < count; ++i)
+  {
+    const auto instanceId = static_cast<uint16_t>(firstInstanceId + i);
+
+    // LOA-fix (R71-22, находка ревью 3 #5): ЧУЖУЮ ЖИВУЮ ЗАПИСЬ НЕ СТИРАЕМ НИКОГДА.
+    //
+    // Здесь стоял `RemoveEffectInstance(instanceId)` с доводом «совпадение бывает
+    // только после оборота, а тогда старая запись мертва». Довод неверен дважды:
+    // после оборота она мертвой быть НЕ ОБЯЗАНА, и сама эта строка была вторым
+    // способом уничтожить улику о живой стене — тем самым, который ревью 2 уже
+    // запретило в другом месте функции. Оборот теперь запрещён в источнике, поэтому
+    // номера внутри заезда уникальны по построению; если совпадение всё-таки
+    // случится, побеждает СТАРАЯ запись, а новая не делается.
+    if (FindEffectInstance(instanceId) != nullptr)
+      continue;
+
+    // LOA-fix (R71-21, находка ревью 2 #3): ВЫТЕСНЕНИЯ НЕТ. Прежняя редакция
+    // стирала самую старую запись, чтобы освободить место, — то есть уничтожала
+    // улику о ЖИВОЙ стене, и честный слом этой стены после переполнения получал
+    // отказ. Место спрашивают ЗАРАНЕЕ (`CanIssueEffectInstances`); если правило
+    // всё-таки нарушено, новая запись не делается, но ничего живого не гибнет.
+    //
+    // LOA-fix (R71-26, находка ревью 6): ЗДЕСЬ СПРАШИВАЕТСЯ ТОЛЬКО МЕСТО.
+    // Стоял полный `CanIssueEffectInstances(casterOid, 1)` — то есть БЮДЖЕТ ВЫДАЧИ
+    // переспрашивался уже ПОСЛЕ того, как этот же пакет с бюджета списан. На касте,
+    // доводящем кастера ровно до потолка, `alreadyIssued` уже равнялся потолку, и
+    // повторный вопрос «влезет ли ещё один» отвечал «нет»: номер выдан, баф списан,
+    // каст разослан — а записей нет, и честный отчёт по ним получал отказ. Бюджет
+    // теперь считается ровно один раз на пакет, до выдачи номеров; здесь остаётся
+    // фейл-клоуз, который от списания не зависит.
+    if (not HasRoomForOneLiveEffectInstance(casterOid))
+      return;
+
+    _effectInstances.push_back(
+      EffectInstance{
+        .instanceId = instanceId,
+        .magicType = magicType,
+        .casterOid = casterOid,
+        .serverApplied = serverApplied,
+        .authorizedTargets = authorizedTargets});
+  }
+}
+
+bool RaceTracker::ConsumeEffectInstanceTarget(
+  const uint16_t instanceId,
+  const Oid targetOid)
+{
+  for (auto& instance : _effectInstances)
+  {
+    if (instance.instanceId != instanceId)
+      continue;
+
+    // LOA-fix (R71-22, находка ревью 3 #1): ОДИН ЭКЗЕМПЛЯР — ОДИН ОТЧЁТ НА ЦЕЛЬ.
+    // Второй отчёт той же цели по тому же номеру — это либо дубль пакета, либо
+    // «переигровка» уже истёкшего эффекта; и то и другое обязано умереть ДО
+    // рассылки, иначе один каст размножается в сколько угодно кадров каждому в
+    // комнате (`ScheduleSkillEffect` рассылает РАНЬШЕ, чем отвергает дубль).
+    for (const Oid consumed : instance.consumedTargets)
+    {
+      if (consumed == targetOid)
+        return false;
+    }
+
+    instance.consumedTargets.push_back(targetOid);
+    return true;
+  }
+
+  return false;
+}
+
+const RaceTracker::EffectInstance* RaceTracker::FindEffectInstance(
+  const uint16_t instanceId) const
+{
+  for (const auto& instance : _effectInstances)
+  {
+    if (instance.instanceId == instanceId)
+      return &instance;
+  }
+
+  return nullptr;
+}
+
+void RaceTracker::MarkEffectInstanceServerApplied(const uint16_t instanceId)
+{
+  for (auto& instance : _effectInstances)
+  {
+    if (instance.instanceId == instanceId)
+    {
+      instance.serverApplied = true;
+      return;
+    }
+  }
+}
+
+void RaceTracker::RemoveEffectInstance(const uint16_t instanceId)
+{
+  std::erase_if(
+    _effectInstances,
+    [instanceId](const EffectInstance& instance)
+    { return instance.instanceId == instanceId; });
+}
+
+void RaceTracker::RemoveEffectInstances(
+  const uint16_t firstInstanceId,
+  const uint16_t count)
+{
+  for (uint16_t i = 0; i < count; ++i)
+    RemoveEffectInstance(static_cast<uint16_t>(firstInstanceId + i));
+}
+
+bool RaceTracker::HasIssuedEffectInstanceId(const uint32_t effectInstanceId) const
+{
+  // Домен идентификатора — шестнадцать бит по построению (`uint16_t` и у счётчика,
+  // и у поля в протоколе). Всё, что шире, сервер выдать не мог.
+  if (effectInstanceId > std::numeric_limits<uint16_t>::max())
+    return false;
+  // LOA-fix (R71-22, находка ревью 3 #5): ни одной ветки «после оборота принимаем
+  // всё» здесь больше нет — оборот запрещён в источнике выдачи.
+  return effectInstanceId < _nextEffectInstanceId;
 }
 
 void RaceTracker::Clear()
@@ -278,6 +481,20 @@ void RaceTracker::Clear()
   _racers.clear();
   _itemDecks.clear();
   _events.clear();
+  // LOA-fix (R71-17/R71-21): экземпляры эффектов живут РОВНО один заезд — как и
+  // гонщики, которые их кастовали. Иначе номер из прошлого заезда остался бы «живым».
+  //
+  // ★СЧЁТЧИК НОМЕРОВ ЧИСТИТСЯ ЗДЕСЬ ЖЕ, И ЭТО ПОЧИНКА, А НЕ КОСМЕТИКА: он не
+  // сбрасывался, а трекер живёт вместе с КОМНАТОЙ — за её жизнь счётчик мог
+  // обернуться, после чего `HasIssuedEffectInstanceId` навсегда отвечал «да» на любой
+  // номер. Сброс ставит номера в один ряд с `_nextItemDeckOid`, который пер-заездным
+  // был всегда; oid'ы персонажей остаются пер-комнатными (клиент их не переназначает).
+  _effectInstances.clear();
+  _nextEffectInstanceId = 0;
+  // LOA-fix (R71-25, находка ревью 4 #2): бюджет выдачи — пер-заездный, как и сам
+  // счётчик. Иначе гонщик, выбравший его в первом заезде, остался бы без кастов на
+  // все следующие заезды той же комнаты.
+  _issuedEffectInstanceCounts.clear();
   _nextItemDeckOid = 1;
   firstPassItemSpawn = true;
 

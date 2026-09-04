@@ -42,6 +42,12 @@ target_sources(util_test_log_throttle PRIVATE
 target_link_libraries(util_test_log_throttle
         PRIVATE project-properties alicia-libserver)
 
+add_executable(util_test_keyed_log_throttle)
+target_sources(util_test_keyed_log_throttle PRIVATE
+        src/util/TestKeyedLogThrottle.cpp)
+target_link_libraries(util_test_keyed_log_throttle
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(util_test_name_guard)
 target_sources(util_test_name_guard PRIVATE
         src/util/TestNameGuard.cpp)
@@ -58,6 +64,41 @@ add_executable(data_test_file_data_source)
 target_sources(data_test_file_data_source PRIVATE
         src/data/TestFileDataSource.cpp)
 target_link_libraries(data_test_file_data_source
+        PRIVATE project-properties alicia-libserver)
+
+add_executable(race_test_relay_authz)
+target_sources(race_test_relay_authz PRIVATE
+        src/race/TestRelayAuthz.cpp)
+target_link_libraries(race_test_relay_authz
+        PRIVATE project-properties alicia-libserver)
+
+add_executable(protocol_test_relay_payload)
+target_sources(protocol_test_relay_payload PRIVATE
+        src/protocol/TestRelayPayload.cpp)
+target_link_libraries(protocol_test_relay_payload
+        PRIVATE project-properties alicia-libserver)
+
+# LOA-fix (R71-22, находки ревью 3 #1 и #5): правила реестра экземпляров эффектов
+# проверяются юнит-тестом. `RaceTracker.cpp` не лежит в `alicia-libserver` (он часть
+# исполняемого сервера), поэтому компилируется в тест напрямую — зависимостей у него
+# ровно две: собственный заголовок и `<limits>`.
+add_executable(race_test_effect_instances)
+target_sources(race_test_effect_instances PRIVATE
+        src/race/TestEffectInstances.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/tracker/RaceTracker.cpp)
+target_include_directories(race_test_effect_instances PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_effect_instances
+        PRIVATE project-properties alicia-libserver)
+
+# LOA-fix (R71-25, находка ревью 4 #1): классификация типа магии — заголовок без
+# зависимостей, поэтому тест собирается из него одного.
+add_executable(race_test_magic_application)
+target_sources(race_test_magic_application PRIVATE
+        src/race/TestMagicApplication.cpp)
+target_include_directories(race_test_magic_application PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_magic_application
         PRIVATE project-properties alicia-libserver)
 
 add_executable(race_test_p2did_pool)
@@ -152,6 +193,7 @@ add_test(NAME UtilTestLocale COMMAND util_test_locale)
 add_test(NAME UtilTestAliciaShopTime COMMAND util_test_alicia_shop_time)
 add_test(NAME UtilTestProfiler COMMAND util_test_profiler)
 add_test(NAME UtilTestLogThrottle COMMAND util_test_log_throttle)
+add_test(NAME UtilTestKeyedLogThrottle COMMAND util_test_keyed_log_throttle)
 add_test(NAME UtilTestNameGuard COMMAND util_test_name_guard)
 add_test(NAME UtilTestAtomicFile COMMAND util_test_atomic_file)
 add_test(NAME DataTestFileDataSource COMMAND data_test_file_data_source)
@@ -163,6 +205,10 @@ add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_noti
 add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
 add_test(NAME RaceTestRaceJournal COMMAND race_test_race_journal)
+add_test(NAME RaceTestEffectInstances COMMAND race_test_effect_instances)
+add_test(NAME RaceTestMagicApplication COMMAND race_test_magic_application)
+add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
+add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -232,4 +278,13 @@ if (NOT WIN32)
                     ${CMAKE_SOURCE_DIR})
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
+endif ()
+# LOA-fix (R71-16): тот же гейт, но как ТЕСТ — чтобы `ctest` тоже краснел, а не
+# только сборка. Две точки вызова ловят разное: цель сборки останавливает выкат,
+# тест показывает вердикт в отчёте прогонов.
+if (BASH_PROGRAM)
+    add_test(NAME RelayAuthzGate
+            COMMAND ${BASH_PROGRAM} "${CMAKE_SOURCE_DIR}/tools/check_relay_authz.sh")
+    set_tests_properties(RelayAuthzGate PROPERTIES
+            ENVIRONMENT "ROOT=${CMAKE_SOURCE_DIR}")
 endif ()

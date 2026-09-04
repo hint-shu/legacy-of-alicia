@@ -34,7 +34,10 @@
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/util/Scheduler.hpp"
+#include "libserver/util/LogThrottle.hpp"
+#include "server/race/RelayAuthz.hpp"
 
+#include <chrono>
 #include <random>
 #include <unordered_map>
 
@@ -184,6 +187,36 @@ public:
   }
 
 private:
+  //! LOA-fix (R71-2, backlog #129-S2 / item 26): ПОТОЛОК СПИСКА ЦЕЛЕЙ ОДНОГО КАСТА.
+  //!
+  //! `AcCmdCRUseMagicItem::targetList` читается счётчиком `uint8_t`
+  //! (RaceMessageDefinitions.cpp:1537-1541) — до 255 элементов. У списка два смысла,
+  //! и оба малы: цели заклинания (их не больше, чем участников комнаты) и сосульки
+  //! ледяной стены (1 у обычной, 3 у критической — комментарий там же,
+  //! RaceMessageDefinitions.hpp:1942-1944).
+  //!
+  //! ★8 — это ТОЧНАЯ вместимость, а не запас с потолка: комната клампится восемью
+  //! (`RaceNetworkHandler.cpp:1580`, `constexpr uint8_t MaxRoomPlayerCount = 8`), и
+  //! ровно восемь УЧАСТНИКОВ ЗАЕЗДА у соло-заезда (:2403-2406 + `SpawnAiRacers`).
+  //! ★Формулировка исправлена по ревью 5 (NIT): восемь — это участники, а НЕ записи
+  //! трекера. В трекере у соло-заезда ровно ОДИН живой гонщик; остальные семь — боты,
+  //! и живут они в `RaceInstance::_aiRacers`, отдельным списком. Целью каста законно
+  //! может быть и бот, поэтому потолок списка считается по участникам, а не по
+  //! `GetRacers().size()`. Поэтому сравнение строгое (`>`), а не `>=`. Число НЕ
+  //! зависит от данных `magic.yaml` — конфиг его сдвинуть не может.
+  static constexpr size_t MaxMagicTargetListSize = 8;
+
+
+  //! LOA-fix (R71-25, находка ревью 4 #3): СКОЛЬКО БАЙТ НЕРАЗОБРАННОЙ НАГРУЗКИ
+  //! ПОПАДАЕТ В ЛОГ.
+  //!
+  //! Дроссель ограничивает ЧАСТОТУ жалобы, но не её РАЗМЕР: длину нагрузки клиент
+  //! задаёт `uint16`, то есть одна разрешённая запись несла до ~192 КиБ hex-дампа —
+  //! лог-флуд того же класса, только пореже. Печатается ПОЛНАЯ длина (её и надо
+  //! знать) плюс префикс, которого хватает опознать кадр: заголовок неизвестного
+  //! типа всегда в первых байтах.
+  static constexpr size_t MaxLoggedRelayPayloadBytes = 32;
+
   enum class EffectVerdict : uint8_t
   {
     Shielded,
@@ -450,6 +483,60 @@ private:
   std::mutex _raceInstancesMutex;
   //! A map of all race instanced indexed by room UIDs.
   std::unordered_map<uint32_t, RaceInstance> _raceInstances;
+
+  //! LOA-fix (R71): по дросселю НА КАЖДУЮ ЗАЩИТУ — флуд одной не должен заглушать
+  //! другую (у каждого своё окно и свой счётчик подавленных).
+  //!
+  //! ★ПОЛЯ ДОБАВЛЕНЫ В КОНЕЦ КЛАССА НАМЕРЕННО. Смещения всех существующих полей
+  //! остаются прежними, поэтому код НЕтронутых методов кодируется так же — а значит
+  //! «неподвижный контрольный символ» лесенки остаётся честной уликой, а не
+  //! случайностью компоновки.
+  //! ★ЯВНОЕ ОКНО, А НЕ УМОЛЧАНИЕ (итерация 12): `LogThrottle` принадлежит R72,
+  //! который лёг в `main` первым, и его конструктор объявлен БЕЗ значения по
+  //! умолчанию. Пять секунд — то самое окно, на которое эти поля полагались через
+  //! умолчание прежней редакции R71; поведение не меняется, меняется способ его
+  //! назвать. Правило владения файлом — спека §2.0.
+  util::LogThrottle _magicOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetCountThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicPayloadThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _skillTargetThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _skillEffectIdThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayEnvelopeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayActorThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _itemGetOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayPayloadTypeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _scheduleEffectRangeThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _itemDeckUnknownThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _relayReferenceThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _effectInstanceThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _effectInstanceCapacityThrottle{std::chrono::seconds(5)};
+  //! LOA-fix (R71-22/R71-24, ревью 3 #1-#3): жалобы новых гардов отчёта и наводки.
+  //! Каждая заказывается клиентским пакетом, значит каждая обязана быть задросселена.
+  util::LogThrottle _effectReplayThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _aiAttackerThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _dragonTargetThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicClassificationThrottle{std::chrono::seconds(5)};
+  //! LOA-fix (R71-25, находка ревью 4 #1): у каста и у отчёта СВОИ дроссели —
+  //! общий гасил бы одну жалобу из-за другой, и раунд снова судил бы по молчанию.
+  util::LogThrottle _magicTypeUnknownThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _reportedMagicTypeThrottle{std::chrono::seconds(5)};
+  //! LOA-fix (R71-27, находка ревью 5 #1): ТОТАЛЬНОЕ ПРАВИЛО ДЛЯ СЕМЕЙСТВА НАВОДКИ.
+  //!
+  //! Ни одна жалоба, которую умеет заказать клиентский пакет, не пишется сырой —
+  //! ни в `HandleStartMagicTarget`, ни в `HandleChangeMagicTarget`. Дроссели РАЗНЫЕ
+  //! по КЛАССУ отказа (чужой отправитель / несуществующая цель / нет дракона /
+  //! цель не участник заезда): общий дроссель гасил бы одну жалобу из-за другой, и
+  //! гард снова судился бы по молчанию. Проверяется сборочным гейтом
+  //! `tools/check_race_rejection_throttle.sh`.
+  util::LogThrottle _magicTargetOwnershipThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetLookupThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _dragonHoldingThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _magicTargetRosterThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _iceWallShapeThrottle{std::chrono::seconds(5)};
+  //! ★НАЙДЕНЫ ГЕЙТОМ, А НЕ РЕВЬЮ: три сырые жалобы вне семейства наводки
+  //! (подмена гонщика в двух хендлерах, неизвестный тип подобранного предмета).
+  util::LogThrottle _racerImpersonationThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _pickupItemTypeThrottle{std::chrono::seconds(5)};
 };
 
 } // namespace server

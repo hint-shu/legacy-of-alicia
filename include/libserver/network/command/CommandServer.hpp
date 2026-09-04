@@ -23,8 +23,11 @@
 #include "CommandProtocol.hpp"
 #include "libserver/Constants.hpp"
 #include "libserver/network/Server.hpp"
+#include "libserver/util/LogThrottle.hpp"
+#include "libserver/util/QuietLog.hpp"
 #include "libserver/util/Stream.hpp"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -129,6 +132,28 @@ public:
 
   //! Registers a command handler.
   //! @param handler Handler of the command.
+  //!
+  //! LOA-fix (R71-18, находка ревью 2 #6): РАЗБОР, УПАВШИЙ НА ДАННЫХ КЛИЕНТА, — ЭТО
+  //! ТИХИЙ ОТКАЗ, А НЕ СТРОКА В ЛОГЕ НА КАЖДЫЙ ПАКЕТ.
+  //!
+  //! ★ЗАЧЕМ ЗДЕСЬ, А НЕ В ХЕНДЛЕРАХ. Гарды раунда стоят ВНУТРИ обработчиков, а
+  //! `C::Read` выполняется ДО них — то есть авторизация обходится, не доходя до
+  //! авторизации: заявить ледяную стену (`magicItemId = 10`) и не дослать шесть
+  //! floats, или прислать известный тип ретрансляции с нулевой нагрузкой. `Read`
+  //! бросает `std::underflow_error` из потока, бросок ловится в
+  //! `CommandServer.cpp:515-527` и печатает `[error]` — по строке на пакет, без
+  //! дросселя. Чинить это в каждом `Read` (их сотни) значило бы вести список мест;
+  //! правило ставится там, где оно тотально по построению: разбор ЛЮБОЙ команды либо
+  //! удался, либо команда не обрабатывается.
+  //!
+  //! ★ДРОССЕЛЬ — СВОЙ НА КАЖДУЮ КОМАНДУ, БЕЗ ЕДИНОЙ КАРТЫ. `static` внутри шаблона
+  //! даёт ровно один экземпляр на КАЖДЫЙ тип `C`: ёмкость фиксирована числом
+  //! зарегистрированных команд, ключа от клиента нет, расти нечему. Флуд разбором
+  //! одной команды не заглушает жалобу на другую.
+  //!
+  //! ★БРОСОК ИЗ САМОГО ХЕНДЛЕРА НЕ ГЛОТАЕТСЯ: он остаётся внешнему `catch`, как и
+  //! был. Это разные события — «клиент прислал мусор» и «сервер не справился», и
+  //! сваливать их в одну ветку значило бы прятать вторую за первой.
   template <ReadableCommandStruct C>
   void RegisterCommandHandler(
     std::function<void(ClientId clientId, const C& command)> handler)
@@ -136,7 +161,29 @@ public:
     _handlers[C::GetCommand()] = [handler](ClientId clientId, SourceStream& source)
     {
       C command;
-      C::Read(command, source);
+
+      try
+      {
+        C::Read(command, source);
+      }
+      catch (const std::exception& x)
+      {
+        //! ★ЯВНОЕ ОКНО (итерация 12): конструктор `LogThrottle` редакции R72,
+        //! которая лежит в `main`, значения по умолчанию не имеет. Пять секунд —
+        //! то же окно, что было у умолчания прежней редакции R71.
+        static server::util::LogThrottle malformedPayloadThrottle{std::chrono::seconds(5)};
+
+        uint64_t suppressed = 0, total = 0;
+        if (malformedPayloadThrottle.Allow(suppressed, total))
+          server::util::QuietLogWarn(
+            "Malformed payload for command '{}' from client '{}': {} (suppressed {})",
+            protocol::GetCommandName(C::GetCommand()),
+            clientId,
+            x.what(),
+            suppressed);
+        return;
+      }
+
       handler(clientId, command);
     };
   }

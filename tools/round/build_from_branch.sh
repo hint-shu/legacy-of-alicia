@@ -101,6 +101,34 @@ sed 's/^/    /' "$WORK/.gate-quiet.log"
 [ "$QRC" -eq 0 ] || die "quiet-logging gate вернул $QRC — сборка не начата"
 say "  quiet-logging gate: EXIT=0 ✓"
 
+# LOA-fix (R71-16, находка ревью 2 #9): гейт полноты relay-классификатора — там же,
+# где и остальные, и ПРОТИВ КЛОНА. В ветке, где этого файла ещё нет (старые раунды),
+# шаг пропускается — но пропуск ГРОМКИЙ, иначе «гейт не найден» читалось бы как
+# «гейт прошёл».
+RELAY_GATE="$WORK/tools/check_relay_authz.sh"
+if [ -f "$RELAY_GATE" ]; then
+  ROOT="$WORK" bash "$RELAY_GATE" > "$WORK/.gate-relay.log" 2>&1
+  RRC=$?
+  sed 's/^/    /' "$WORK/.gate-relay.log"
+  [ "$RRC" -eq 0 ] || die "relay-authz gate вернул $RRC — сборка не начата"
+  say "  relay-authz gate: EXIT=0 ✓"
+else
+  say "  relay-authz gate: файла нет в этой ветке — ПРОПУЩЕН"
+fi
+
+# LOA-fix (R71-27, находка ревью 5 #1): гейт тотального правила дросселя — там же и
+# ПРОТИВ КЛОНА. Пропуск (в старых ветках файла нет) остаётся ГРОМКИМ.
+THROTTLE_GATE="$WORK/tools/check_race_rejection_throttle.sh"
+if [ -f "$THROTTLE_GATE" ]; then
+  ROOT="$WORK" bash "$THROTTLE_GATE" > "$WORK/.gate-throttle.log" 2>&1
+  TRC=$?
+  sed 's/^/    /' "$WORK/.gate-throttle.log"
+  [ "$TRC" -eq 0 ] || die "race-rejection-throttle gate вернул $TRC — сборка не начата"
+  say "  race-rejection-throttle gate: EXIT=0 ✓"
+else
+  say "  race-rejection-throttle gate: файла нет в этой ветке — ПРОПУЩЕН"
+fi
+
 # ---- 4. the base image must be pinned by digest ---------------------------------
 BASE_DIGEST="$(sed -nE 's/^FROM[[:space:]]+[^[:space:]@]+@(sha256:[0-9a-f]{64}).*/\1/p' \
                 "$WORK/Dockerfile" | head -1)"

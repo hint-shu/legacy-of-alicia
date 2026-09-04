@@ -23,6 +23,8 @@
 #include "libserver/util/Stream.hpp"
 
 #include <cassert>
+#include <format>
+#include <stdexcept>
 
 namespace server::protocol
 {
@@ -1212,13 +1214,22 @@ void AcCmdCRRelay::Read(
     std::span{command.data});
   SourceStream payload(payloadData);
 
+  //! LOA-fix (R71-19): разобрали ли мы нагрузку вообще. Правило исчерпания ниже
+  //! применяется ТОЛЬКО к известным типам — с неизвестного спрашивать нечего.
+  bool payloadParsed = true;
+
   switch (command.payloadType)
   {
     case protocol::relay::RelayCommandId::Snapshot:
     {
       // Racer snapshot
       // Payload size for snapshot is 56 bytes.
-      // TODO: if assertion fails, will it break anything with the RaceDirector live?
+      //
+      // LOA-fix (R71-19, находка ревью 2 #2): ЭТОТ `assert` БЫЛ ЕДИНСТВЕННОЙ
+      // «ПРОВЕРКОЙ» РАЗМЕРА — и в боевом образе его нет вовсе (Dockerfile собирает
+      // RelWithDebInfo, то есть `-DNDEBUG`). Настоящую проверку ставит общее правило
+      // исчерпания в конце функции: оно не знает ни одного магического числа, а
+      // сверяет СКОЛЬКО РАЗБОР СЪЕЛ со СКОЛЬКО ПРИЕХАЛО.
       assert(payload.Size() == 56);
 
       payload.Read(command.snapshot.racerOid)
@@ -1316,9 +1327,48 @@ void AcCmdCRRelay::Read(
     }
     default:
     {
-      // Do not process unknown payload
+      // Do not process unknown payload.
+      //
+      // ★Исчерпания с неизвестного типа НЕ ТРЕБУЕТСЯ: разбора не было, значит и
+      // сверять нечего. Такой кадр отбрасывает `HandleRelay` (R71-14) — до
+      // ретрансляции он не доходит.
+      payloadParsed = false;
       break;
     }
+  }
+
+  // LOA-fix (R71-19, находка ревью 2 #2): ИЗВЕСТНЫЙ ТИП ОБЯЗАН БЫТЬ РАЗОБРАН ЦЕЛИКОМ.
+  //
+  // ★ЧТО БЫЛО ОТКРЫТО. Каждая ветка выше читала РОВНО СВОЙ ПРЕФИКС и ни разу не
+  // спрашивала, остались ли байты. `AcCmdCRRelayNotify::Write` (:1375-1388) отдаёт
+  // наружу ВЕСЬ `command.data` дословно, поэтому `Snapshot` из 56 честных байт плюс
+  // восемь килобайт мусора проходил все гарды раунда (свой oid в конверте, свой oid
+  // в нагрузке) и рассылался каждому в комнате — сырой канал ретрансляции с
+  // усилением ×числу гонщиков оставался открытым ПОЗАДИ новых замков. Единственной
+  // «проверкой» был `assert` на 56 байт, выключенный в боевой сборке.
+  //
+  // ★ПРАВИЛО СЧИТАЕТ СОДЕРЖИМОЕ, А НЕ ФОРМУ. Ни одного зашитого размера: сколько
+  // разбор съел (`GetCursor()`), столько и должно было приехать (`Size()`). Добавят
+  // поле в нагрузку — правило поедет вместе с разбором само.
+  //
+  // ★НЕДОБОР ЗАКРЫТ ТЕМ ЖЕ МЕСТОМ ИНАЧЕ: короткая нагрузка бросает уже из потока
+  // (`SourceStream::Read`, underflow). Обе половины уезжают в один и тот же ТИХИЙ
+  // задросселированный отказ `CommandServer::RegisterCommandHandler` (R71-18) —
+  // честного игрока за кривой пакет не отключают.
+  //
+  // ★ЖИВОЙ ЗАХВАТ ПОДТВЕРЖДАЕТ ТОЧНЫЕ РАЗМЕРЫ (28 259 датаграмм настоящего клиента,
+  // 188 с заезда): 0x03 Snapshot — 56 байт (2816 кадров), 0x07 SyncProgress — 10
+  // (187), 0x0d NetSetLayerAnimation — 4 (1), 0x14 SpurLevel — 3 (4396), 0x16
+  // SlidingMotion — 7 (7778). Все пять совпадают с тем, что съедает разбор,
+  // байт в байт; лишнего хвоста честный клиент не шлёт ни разу.
+  if (payloadParsed && payload.GetCursor() != payload.Size())
+  {
+    throw std::runtime_error(
+      std::format(
+        "relay payload type {:#06x}: parsed {} of {} bytes",
+        static_cast<uint32_t>(command.payloadType),
+        payload.GetCursor(),
+        payload.Size()));
   }
 }
 
