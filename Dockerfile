@@ -35,6 +35,38 @@ RUN cmake --install ./build --prefix /usr/local
 RUN mkdir /var/lib/alicia-server/
 RUN cp -r ./resources/* /var/lib/alicia-server/
 
+# ---- tests stage: НЕ участвует в рантайм-образе -----------------------------
+# R74 (backlog #170). На этой машине нет ни cmake, ни заголовков Boost/ICU —
+# то есть хостовой сборки тестов не существует, а невыполнимая проверка тихо
+# выпадает из прогона и становится вечнозелёной. Поэтому юнит-гейты гоняются
+# ВНУТРИ образа.
+#
+# ★РАНТАЙМ-ОБРАЗ ОТ ЭТОЙ СТУПЕНИ НЕ ЗАВИСИТ: финальный стейдж копирует из
+# `build`, а не из `tests`, поэтому обычный `docker build .` эту ступень не
+# собирает вовсе (BuildKit отбрасывает недостижимые стейджи) и байты
+# выкатываемого образа не меняются. Проверяется равенством image id до и
+# после добавления ступени, а не декларацией.
+#
+# ★ПЕРЕИСПОЛЬЗУЕТСЯ КАТАЛОГ `./build`, а не заводится второй: объекты
+# библиотеки уже собраны теми же флагами, и `-DBUILD_TESTS=ON` до собирает
+# ровно тестовые цели. Отдельный `./build-tests` означал бы полную повторную
+# компиляцию на КАЖДЫЙ негативный образ раунда.
+#
+# Запускать явно: docker build --target tests .
+FROM build AS tests
+RUN apt-get install python3 -y --no-install-recommends
+RUN cmake -DCMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE} -DBUILD_TESTS=ON . -B ./build
+RUN cmake --build ./build --parallel 8
+# ★BASE=origin/main — НЕ КОСМЕТИКА. Дельта-гейты R75 судят строки, которые
+# ВЕТКА добавила к main, то есть им нужна ссылка на main. Внутри образа клон
+# стоит на отцепленной голове, локального `main` нет вовсе, и оба гейта честно
+# отвечают «я слеп» (код 2) — а слепой гейт это останов, а не «чисто». Ссылка
+# на ту же базу под её единственным существующим здесь именем возвращает им
+# зрение; исключать их из прогона было бы ровно тем, за что этот раунд
+# критикует построчную перепись.
+# `--no-tests=error`: пустой набор тестов не имеет права выглядеть успехом.
+RUN BASE=origin/main ctest --test-dir ./build --output-on-failure --no-tests=error
+
 # pinned: codegen drift between gcc:15 refreshes makes the binary ladder unreadable (R70-prep).
 # The round protocol compares the candidate binary against the image running in production,
 # symbol size by symbol size. Docker Hub republishes the `gcc:15` tag every few weeks, and a

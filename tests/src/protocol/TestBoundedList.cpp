@@ -1,0 +1,708 @@
+/**
+ * Alicia Server - dedicated server software
+ * Copyright (C) 2024 Story Of Alicia
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ **/
+
+//! LOA (R74, round74, backlog #170): ЮНИТ-ГЕЙТ ОГРАНИЧЕННЫХ СПИСКОВ.
+//!
+//! ★ПРОВЕРКИ НЕ ЧЕРЕЗ `assert`. Боевой образ собирается `RelWithDebInfo`, то
+//! есть с `-DNDEBUG`, и тест на `assert` был бы вечнозелёным ровно в той
+//! конфигурации, которая едет в прод. Каждая проверка — явный `if`, печать и
+//! ненулевой код возврата.
+
+#include <libserver/network/command/proto/CommonStructureDefinitions.hpp>
+#include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
+#include <libserver/network/command/proto/RaceMessageDefinitions.hpp>
+#include <libserver/network/command/proto/RanchMessageDefinitions.hpp>
+#include <libserver/network/chatter/proto/ChatterMessageDefinitions.hpp>
+#include <libserver/util/BoundedList.hpp>
+#include <libserver/util/Stream.hpp>
+
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <sstream>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace
+{
+
+using server::SinkStream;
+using server::protocol::Item;
+
+//! Буфер одной команды. Число не выдумано тестом: столько же стоит в
+//! `CommandServer` (`MaxCommandDataSize`), и превышение его в проде означает
+//! выброшенного клиента.
+constexpr std::size_t MaxCommandDataSize = 8192;
+
+int failures = 0;
+
+void Check(const bool ok, const char* what, const long long got = 0, const long long want = 0)
+{
+  if (ok)
+    return;
+  std::printf("FAIL: %s (got %lld, want %lld)\n", what, got, want);
+  ++failures;
+}
+
+//! Элемент фиксированного размера — 4 байта на провод.
+struct Quad
+{
+  uint32_t value{};
+
+  static void Write(const Quad& v, SinkStream& stream) { stream.Write(v.value); }
+};
+
+//! Элемент 16 байт — столько же весит протокольный `Item`.
+struct Sixteen
+{
+  std::array<uint32_t, 4> value{};
+
+  static void Write(const Sixteen& v, SinkStream& stream)
+  {
+    for (const auto part : v.value)
+      stream.Write(part);
+  }
+};
+
+template <typename T>
+std::vector<T> Fill(const std::size_t count)
+{
+  std::vector<T> out;
+  out.resize(count);
+  return out;
+}
+
+//! Читает счётчик по смещению из уже записанного буфера.
+template <typename CountType>
+CountType ReadCount(const std::span<const std::byte> buffer, const std::size_t offset)
+{
+  CountType value{};
+  std::memcpy(&value, buffer.data() + offset, sizeof(CountType));
+  return value;
+}
+
+// ---------------------------------------------------------------- тесты 1..6
+
+//! 1: список в пределах потолка уезжает целиком.
+//! 2: список сверх потолка объявляется потолком и телом в потолок.
+//! 3: ПОРЯДОК КЛАМПА. 264 элемента при потолке 16 обязаны дать 16, а не 8:
+//!    `static_cast<uint8_t>(264)` == 8, и именно эта форма дефекта убивала кадр.
+//! 4: 256 при потолке 255 обязаны дать 255, а не 0.
+void TestCountBounds()
+{
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(10);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 16, .name = "t1"});
+    Check(written == 10, "t1: written", static_cast<long long>(written), 10);
+    Check(ReadCount<uint8_t>(storage, 0) == 10, "t1: declared", ReadCount<uint8_t>(storage, 0), 10);
+    Check(sink.GetCursor() == 1 + 10 * 4, "t1: cursor",
+      static_cast<long long>(sink.GetCursor()), 41);
+  }
+
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(40);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 16, .name = "t2"});
+    Check(written == 16, "t2: written", static_cast<long long>(written), 16);
+    Check(ReadCount<uint8_t>(storage, 0) == 16, "t2: declared", ReadCount<uint8_t>(storage, 0), 16);
+    Check(sink.GetCursor() == 1 + 16 * 4, "t2: cursor",
+      static_cast<long long>(sink.GetCursor()), 65);
+  }
+
+  {
+    std::array<std::byte, 8192> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(264);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 16, .name = "t3"});
+    Check(written == 16, "t3: written (264 at bound 16)", static_cast<long long>(written), 16);
+    Check(ReadCount<uint8_t>(storage, 0) == 16,
+      "t3: declared must be 16, NOT 8 (264 & 0xFF)", ReadCount<uint8_t>(storage, 0), 16);
+  }
+
+  {
+    std::array<std::byte, 8192> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(256);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 255, .name = "t4"});
+    Check(written == 255, "t4: written (256 at bound 255)", static_cast<long long>(written), 255);
+    Check(ReadCount<uint8_t>(storage, 0) == 255,
+      "t4: declared must be 255, NOT 0 (256 & 0xFF)", ReadCount<uint8_t>(storage, 0), 255);
+  }
+}
+
+//! 5: ВМЕСТИМОСТЬ. 100 элементов по 16 Б в буфер 64 Б: броска нет, счётчик
+//!    равен фактически записанному, курсор стоит на границе целого элемента.
+void TestCapacity()
+{
+  std::array<std::byte, 64> storage{};
+  SinkStream sink{std::span{storage}};
+  const auto data = Fill<Sixteen>(100);
+
+  std::size_t written = 0;
+  bool threw = false;
+  try
+  {
+    written = server::util::WriteBoundedList<uint8_t>(sink, data, {.name = "t5"});
+  }
+  catch (const std::exception&)
+  {
+    threw = true;
+  }
+
+  Check(not threw, "t5: no throw escapes the helper", threw ? 1 : 0, 0);
+  Check(written == 3, "t5: written fits (64 - 1) / 16", static_cast<long long>(written), 3);
+  Check(ReadCount<uint8_t>(storage, 0) == written,
+    "t5: declared == written", ReadCount<uint8_t>(storage, 0), static_cast<long long>(written));
+  Check(sink.GetCursor() == 1 + written * 16, "t5: cursor on an element boundary",
+    static_cast<long long>(sink.GetCursor()), static_cast<long long>(1 + written * 16));
+}
+
+//! 6: МАСШТАБ СЧЁТА. Счётчик кругов объявляет секторы (×3).
+void TestCountScale()
+{
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(10);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 10, .countScale = 3, .name = "t6a"});
+    Check(written == 10, "t6a: written", static_cast<long long>(written), 10);
+    Check(ReadCount<uint8_t>(storage, 0) == 30, "t6a: declared 10*3",
+      ReadCount<uint8_t>(storage, 0), 30);
+  }
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(40);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 10, .countScale = 3, .name = "t6b"});
+    Check(written == 10, "t6b: written clamped", static_cast<long long>(written), 10);
+    Check(ReadCount<uint8_t>(storage, 0) == 30, "t6b: declared 30",
+      ReadCount<uint8_t>(storage, 0), 30);
+  }
+  {
+    // scale == 0 не имеет права поделить на ноль.
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(5);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.maxCount = 8, .countScale = 0, .name = "t6c"});
+    Check(written == 5, "t6c: scale 0 does not divide by zero",
+      static_cast<long long>(written), 5);
+    Check(ReadCount<uint8_t>(storage, 0) == 0, "t6c: declared 5*0",
+      ReadCount<uint8_t>(storage, 0), 0);
+  }
+  {
+    // Потолок по счётчику при масштабе 3: 255/3 == 85, а не 255.
+    std::array<std::byte, 8192> storage{};
+    SinkStream sink{std::span{storage}};
+    const auto data = Fill<Quad>(200);
+    const auto written = server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.countScale = 3, .name = "t6d"});
+    Check(written == 85, "t6d: scaled count limit is max/scale",
+      static_cast<long long>(written), 85);
+    Check(ReadCount<uint8_t>(storage, 0) == 255, "t6d: declared 85*3",
+      ReadCount<uint8_t>(storage, 0), 255);
+  }
+}
+
+// ------------------------------------------------------------------- тест 7
+
+//! 7: БАЙТОВАЯ ТОЖДЕСТВЕННОСТЬ НА НОРМАЛЬНЫХ ДАННЫХ. Эталон пишется руками той
+//!    же примитивной формой, что стояла до свипа.
+void TestByteIdentity()
+{
+  server::protocol::LobbyCommandShowInventoryOK command{};
+  for (uint32_t idx = 0; idx < 50; ++idx)
+    command.items.push_back(Item{.uid = 1000 + idx, .tid = 20000 + idx, .count = idx});
+  command.horses.resize(3);
+
+  std::array<std::byte, MaxCommandDataSize> got{};
+  SinkStream gotSink{std::span{got}};
+  server::protocol::LobbyCommandShowInventoryOK::Write(command, gotSink);
+
+  std::array<std::byte, MaxCommandDataSize> want{};
+  SinkStream wantSink{std::span{want}};
+  wantSink.Write(static_cast<uint8_t>(command.items.size()));
+  for (const auto& item : command.items)
+    wantSink.Write(item);
+  wantSink.Write(static_cast<uint8_t>(command.horses.size()));
+  for (const auto& horse : command.horses)
+    wantSink.Write(horse);
+
+  Check(gotSink.GetCursor() == wantSink.GetCursor(), "t7: same length",
+    static_cast<long long>(gotSink.GetCursor()), static_cast<long long>(wantSink.GetCursor()));
+  Check(std::memcmp(got.data(), want.data(), wantSink.GetCursor()) == 0,
+    "t7: identical bytes for in-bound data");
+
+  // Тот же вопрос для карты системного контента: эталон строится по
+  // ОТСОРТИРОВАННЫМ ключам, потому что порядок обхода `unordered_map` не
+  // определён и до раунда уезжал на провод как попало.
+  server::protocol::LobbyCommandLoginOK::SystemContent content{};
+  for (uint32_t idx = 0; idx < 40; ++idx)
+    content.values.emplace(100 - idx, idx * 7);
+
+  std::array<std::byte, MaxCommandDataSize> sysGot{};
+  SinkStream sysGotSink{std::span{sysGot}};
+  server::protocol::LobbyCommandLoginOK::SystemContent::Write(content, sysGotSink);
+
+  std::array<std::byte, MaxCommandDataSize> sysWant{};
+  SinkStream sysWantSink{std::span{sysWant}};
+  sysWantSink.Write(static_cast<uint8_t>(content.values.size()));
+  for (uint32_t key = 100 - 39; key <= 100; ++key)
+    sysWantSink.Write(key).Write(content.values.at(key));
+
+  Check(std::memcmp(sysGot.data(), sysWant.data(), sysWantSink.GetCursor()) == 0,
+    "t7: system content is written in ascending key order");
+}
+
+// ------------------------------------------------------------------- тест 8
+
+//! 8: БЮДЖЕТЫ ДВУХ ТЯЖЁЛЫХ КАДРОВ ДЛЯ ПРОФИЛЯ АРКИ A1 (264 предмета экипировки).
+//!    Оба обязаны укладываться в буфер команды — иначе арка A1 стенда скрытно
+//!    превратилась бы в арку вместимости и перестала бы судить счётчик.
+void TestFrameBudgets()
+{
+  server::protocol::LobbyCommandLoginOK login{};
+  login.name = "loatest-2";
+  login.notice = std::string(200, 'n');
+  login.introduction = std::string(200, 'i');
+  for (uint32_t idx = 0; idx < 264; ++idx)
+    login.equipmentItems.push_back(Item{.uid = idx, .tid = idx, .count = 1});
+
+  std::array<std::byte, MaxCommandDataSize> storage{};
+  SinkStream sink{std::span{storage}};
+  bool threw = false;
+  try
+  {
+    server::protocol::LobbyCommandLoginOK::Write(login, sink);
+  }
+  catch (const std::exception& e)
+  {
+    threw = true;
+    std::printf("t8: LoginOK threw: %s\n", e.what());
+  }
+  Check(not threw, "t8: LoginOK for the A1 profile packs without throwing");
+  Check(sink.GetCursor() > 0, "t8: LoginOK produced bytes",
+    static_cast<long long>(sink.GetCursor()), 1);
+  // Экипировка идёт сразу за головой кадра; смещение считается по ней, а не
+  // угадывается: 4 (lobbyTime.low) + 4 (high) + 4 (member0) + 4 (uid)
+  // + строки name/notice + 1 (gender) + строка introduction.
+  const auto equipmentCounterOffset = 16
+    + login.name.size() + 1
+    + login.notice.size() + 1
+    + 1
+    + login.introduction.size() + 1;
+  Check(ReadCount<uint8_t>(storage, equipmentCounterOffset) == 16,
+    "t8: LoginOK declares 16 equipment items for the A1 profile",
+    ReadCount<uint8_t>(storage, equipmentCounterOffset), 16);
+  std::printf("t8: LobbyCommandLoginOK (264 equipment, bound 16) = %zu bytes, headroom %zu\n",
+    sink.GetCursor(), MaxCommandDataSize - sink.GetCursor());
+  Check(sink.GetCursor() < MaxCommandDataSize, "t8: LoginOK fits the command buffer",
+    static_cast<long long>(sink.GetCursor()), static_cast<long long>(MaxCommandDataSize));
+
+  server::protocol::AcCmdCREnterRanchOK ranch{};
+  ranch.rancherUid = 2;
+  ranch.rancherName = "loatest-2";
+  ranch.ranchName = "loatest-2's ranch";
+  auto& character = ranch.characters.emplace_back();
+  character.uid = 2;
+  character.name = "loatest-2";
+  character.introduction = std::string(200, 'i');
+  for (uint32_t idx = 0; idx < 264; ++idx)
+    character.characterEquipment.push_back(Item{.uid = idx, .tid = idx, .count = 1});
+
+  std::array<std::byte, MaxCommandDataSize> ranchStorage{};
+  SinkStream ranchSink{std::span{ranchStorage}};
+  threw = false;
+  try
+  {
+    server::protocol::AcCmdCREnterRanchOK::Write(ranch, ranchSink);
+  }
+  catch (const std::exception& e)
+  {
+    threw = true;
+    std::printf("t8: EnterRanchOK threw: %s\n", e.what());
+  }
+  Check(not threw, "t8: EnterRanchOK for the A1 profile packs without throwing");
+  std::printf("t8: AcCmdCREnterRanchOK (one character, 264 equipment, bound 16) = %zu bytes,"
+              " headroom %zu\n",
+    ranchSink.GetCursor(), MaxCommandDataSize - ranchSink.GetCursor());
+  Check(ranchSink.GetCursor() < MaxCommandDataSize, "t8: EnterRanchOK fits the command buffer",
+    static_cast<long long>(ranchSink.GetCursor()), static_cast<long long>(MaxCommandDataSize));
+}
+
+// ------------------------------------------------------------------- тест 9
+
+//! 9: БЮДЖЕТ БЛОКА МАКРОСОВ. Число `MaxMacroBlockWireBytes` не «на вкус»: с
+//!    полным блоком на бюджете реалистичный кадр входа обязан оставаться внутри
+//!    буфера команды, и запас печатается. Съест кто-нибудь запас — краснеет тест.
+void TestMacroBudget()
+{
+  server::protocol::MacroOptions small{};
+  for (auto& macro : small.macros)
+    macro = std::string(100, 'a');
+  const auto smallSize = server::protocol::MeasureMacroBlockWireSize(small);
+  Check(smallSize <= server::protocol::MaxMacroBlockWireBytes,
+    "t9: 8x100 bytes of macros are within the budget",
+    static_cast<long long>(smallSize),
+    static_cast<long long>(server::protocol::MaxMacroBlockWireBytes));
+
+  server::protocol::MacroOptions huge{};
+  for (auto& macro : huge.macros)
+    macro = std::string(900, 'A');
+  const auto hugeSize = server::protocol::MeasureMacroBlockWireSize(huge);
+  Check(hugeSize > server::protocol::MaxMacroBlockWireBytes,
+    "t9: 8x900 bytes of macros are over the budget",
+    static_cast<long long>(hugeSize),
+    static_cast<long long>(server::protocol::MaxMacroBlockWireBytes));
+
+  // Блок ровно на бюджете: 8 строк по (budget/8 - 1) байт плюс NUL каждая.
+  server::protocol::MacroOptions atBudget{};
+  const auto perMacro = server::protocol::MaxMacroBlockWireBytes / 8 - 1;
+  for (auto& macro : atBudget.macros)
+    macro = std::string(perMacro, 'm');
+  const auto atBudgetSize = server::protocol::MeasureMacroBlockWireSize(atBudget);
+  Check(atBudgetSize == server::protocol::MaxMacroBlockWireBytes,
+    "t9: the crafted block measures exactly the budget",
+    static_cast<long long>(atBudgetSize),
+    static_cast<long long>(server::protocol::MaxMacroBlockWireBytes));
+
+  // Реалистичный худший кадр входа: прод-профиль `Nmax` (57 предметов инвентаря
+  // -> в LoginOK едет экипировка на своём бонде, 13 квестов, 5 лошадей) плюс
+  // полный блок макросов и клавиатура с геймпадом.
+  server::protocol::LobbyCommandLoginOK login{};
+  login.name = "Nmax";
+  login.notice = std::string(255, 'n');
+  login.introduction = std::string(255, 'i');
+  login.val6 = std::string(255, 'v');
+  for (uint32_t idx = 0; idx < 16; ++idx)
+    login.equipmentItems.push_back(Item{.uid = idx, .tid = idx, .count = 1});
+  for (uint32_t idx = 0; idx < 16; ++idx)
+    login.expiredItems.push_back(Item{.uid = idx, .tid = idx, .count = 1});
+  for (uint32_t idx = 0; idx < 17; ++idx)
+  {
+    auto& mission = login.missions.emplace_back();
+    mission.id = static_cast<uint16_t>(idx);
+    mission.progress.resize(4);
+  }
+  login.settings.typeBitset.set(server::protocol::Settings::Keyboard);
+  login.settings.keyboardOptions.bindings.resize(64);
+  login.settings.typeBitset.set(server::protocol::Settings::Gamepad);
+  login.settings.gamepadOptions.bindings.resize(64);
+  login.settings.typeBitset.set(server::protocol::Settings::Macros);
+  login.settings.macroOptions = atBudget;
+
+  std::array<std::byte, MaxCommandDataSize> storage{};
+  SinkStream sink{std::span{storage}};
+  bool threw = false;
+  try
+  {
+    server::protocol::LobbyCommandLoginOK::Write(login, sink);
+  }
+  catch (const std::exception& e)
+  {
+    threw = true;
+    std::printf("t9: LoginOK threw: %s\n", e.what());
+  }
+  Check(not threw, "t9: the worst realistic LoginOK packs without throwing");
+  std::printf("t9: worst realistic LobbyCommandLoginOK = %zu bytes, headroom %zu"
+              " (macro block %zu of %zu)\n",
+    sink.GetCursor(),
+    MaxCommandDataSize - sink.GetCursor(),
+    atBudgetSize,
+    server::protocol::MaxMacroBlockWireBytes);
+  Check(sink.GetCursor() < MaxCommandDataSize,
+    "t9: the worst realistic LoginOK still fits the command buffer",
+    static_cast<long long>(sink.GetCursor()), static_cast<long long>(MaxCommandDataSize));
+}
+
+// ------------------------------------------------------------------ тест 10
+
+//! 10: `rethrowOnCapacity` продолжает выпускать бросок наружу — иначе выкаченный
+//!     измерительный гард входа в комнату перестал бы работать, оставшись на
+//!     месте (вход разрешался бы с тихо обрезанным ростером).
+void TestRethrowOnCapacity()
+{
+  std::array<std::byte, 64> storage{};
+  SinkStream sink{std::span{storage}};
+  const auto data = Fill<Sixteen>(100);
+
+  bool threw = false;
+  try
+  {
+    server::util::WriteBoundedList<uint8_t>(
+      sink, data, {.name = "t10", .rethrowOnCapacity = true});
+  }
+  catch (const std::overflow_error&)
+  {
+    threw = true;
+  }
+
+  Check(threw, "t10: overflow_error escapes when rethrowOnCapacity is set");
+  Check(sink.GetCursor() == 1 + 3 * 16,
+    "t10: the cursor is still rolled back to the last whole element",
+    static_cast<long long>(sink.GetCursor()), static_cast<long long>(1 + 3 * 16));
+}
+
+// ------------------------------------------------------------------ тест 11
+
+//! 11: ТАБЛИЧНЫЙ ПРОХОД ПО САМЫМ РИСКОВАННЫМ СООБЩЕНИЯМ. Каждое наполняется
+//!     заведомо сверх своего потолка и обязано СЕРИАЛИЗОВАТЬСЯ БЕЗ БРОСКА в
+//!     буфер команды — кроме входа в комнату, где бросок несущий и ожидаем.
+template <typename Command>
+void ProbeMessage(
+  const char* name,
+  const Command& command,
+  const bool expectLogicError,
+  const long long expectDeclared = -1,
+  const std::size_t counterOffset = 0,
+  const std::size_t counterWidth = 0)
+{
+  std::array<std::byte, MaxCommandDataSize> storage{};
+  SinkStream sink{std::span{storage}};
+
+  bool threwLogic = false;
+  bool threwOther = false;
+  try
+  {
+    Command::Write(command, sink);
+  }
+  catch (const std::logic_error&)
+  {
+    threwLogic = true;
+  }
+  catch (const std::exception& e)
+  {
+    threwOther = true;
+    std::printf("  %s threw: %s\n", name, e.what());
+  }
+
+  if (expectLogicError)
+  {
+    Check(threwLogic, (std::string{"t11: "} + name + " must still throw logic_error").c_str());
+    return;
+  }
+
+  Check(not threwLogic && not threwOther,
+    (std::string{"t11: "} + name + " serialises without throwing").c_str());
+  Check(sink.GetCursor() <= MaxCommandDataSize,
+    (std::string{"t11: "} + name + " stays inside the command buffer").c_str(),
+    static_cast<long long>(sink.GetCursor()), static_cast<long long>(MaxCommandDataSize));
+
+  if (expectDeclared < 0)
+    return;
+
+  long long declared = 0;
+  if (counterWidth == 1)
+    declared = ReadCount<uint8_t>(storage, counterOffset);
+  else if (counterWidth == 2)
+    declared = ReadCount<uint16_t>(storage, counterOffset);
+  else
+    declared = ReadCount<uint32_t>(storage, counterOffset);
+
+  Check(declared == expectDeclared,
+    (std::string{"t11: "} + name + " declares its bound").c_str(), declared, expectDeclared);
+}
+
+void TestRiskiestMessages()
+{
+  constexpr std::size_t Overshoot = 50;
+
+  {
+    server::protocol::LobbyCommandShowInventoryOK cmd{};
+    cmd.items.resize(250 + Overshoot);
+    cmd.horses.resize(10 + Overshoot);
+    ProbeMessage("LobbyCommandShowInventoryOK", cmd, false, 250, 0, 1);
+  }
+  {
+    server::protocol::RanchCommandUserPetInfosOK cmd{};
+    cmd.pets.resize(300);
+    ProbeMessage("RanchCommandUserPetInfosOK", cmd, false);
+  }
+  {
+    server::protocol::AcCmdCRUpdateEquipmentNotify cmd{};
+    cmd.characterUid = 1;
+    cmd.characterEquipment.resize(255 + Overshoot);
+    cmd.mountEquipment.resize(10);
+    ProbeMessage("AcCmdCRUpdateEquipmentNotify", cmd, false, 255, 4, 1);
+  }
+  {
+    server::protocol::AcCmdCRRequestStorageOK cmd{};
+    cmd.storedItems.resize(255 + Overshoot);
+    ProbeMessage("AcCmdCRRequestStorageOK", cmd, false);
+  }
+  {
+    server::protocol::AcCmdCRGuildMemberListOK cmd{};
+    cmd.members.resize(255 + Overshoot);
+    ProbeMessage("AcCmdCRGuildMemberListOK", cmd, false, 255, 0, 1);
+  }
+  {
+    server::protocol::AcCmdCREnterRanchOK cmd{};
+    cmd.rancherUid = 1;
+    cmd.rancherName = "r";
+    cmd.ranchName = "r";
+    cmd.horses.resize(10 + Overshoot);
+    cmd.characters.resize(20 + Overshoot);
+    cmd.housing.resize(13 + Overshoot);
+    ProbeMessage("AcCmdCREnterRanchOK", cmd, false);
+  }
+  {
+    server::protocol::AcCmdCRStartRaceNotify cmd{};
+    cmd.racers.resize(255 + Overshoot);
+    ProbeMessage("AcCmdCRStartRaceNotify", cmd, false);
+  }
+  {
+    server::protocol::AcCmdCRUseMagicItemNotify cmd{};
+    cmd.characterOid = 1;
+    cmd.magicItemId = 0x2;
+    cmd.targetList.resize(255 + Overshoot);
+    ProbeMessage("AcCmdCRUseMagicItemNotify", cmd, false);
+  }
+  {
+    // MUST-NOT-TOUCH: бросок несущий, его ловит гард входа в комнату.
+    server::protocol::AcCmdCREnterRoomOK cmd{};
+    cmd.racers.resize(11);
+    ProbeMessage("AcCmdCREnterRoomOK", cmd, true);
+  }
+  {
+    server::protocol::ChatCmdLoginAckOK cmd{};
+    cmd.groups.resize(100);
+    cmd.friends.resize(100);
+    ProbeMessage("ChatCmdLoginAckOK", cmd, false);
+  }
+  {
+    server::protocol::ChatCmdLetterListAckOk cmd{};
+    cmd.mailboxFolder = server::protocol::MailboxFolder::Inbox;
+    cmd.mailboxInfo.mailCount = 9999;
+    cmd.inboxMails.resize(10 + Overshoot);
+    ProbeMessage("ChatCmdLetterListAckOk", cmd, false);
+  }
+  {
+    server::protocol::AcCmdLCGoodsShopListData cmd{};
+    cmd.data.resize(MaxCommandDataSize * 2);
+    ProbeMessage("AcCmdLCGoodsShopListData", cmd, false);
+  }
+  {
+    server::protocol::LobbyCommandLoginOK cmd{};
+    cmd.equipmentItems.resize(16 + Overshoot);
+    cmd.expiredItems.resize(250 + Overshoot);
+    ProbeMessage("LobbyCommandLoginOK", cmd, false);
+  }
+}
+
+//! Отдельная улика на почту: счётчик обязан совпасть с телом, а не с полем
+//! `mailCount`, которое директор заполняет своим числом.
+void TestMailCounterMatchesBody()
+{
+  server::protocol::ChatCmdLetterListAckOk cmd{};
+  cmd.mailboxFolder = server::protocol::MailboxFolder::Inbox;
+  cmd.mailboxInfo.mailCount = 9999;
+  cmd.mailboxInfo.hasMoreMail = 1;
+  cmd.inboxMails.resize(60);
+
+  std::array<std::byte, MaxCommandDataSize> storage{};
+  SinkStream sink{std::span{storage}};
+  server::protocol::ChatCmdLetterListAckOk::Write(cmd, sink);
+
+  const auto folderWidth = sizeof(server::protocol::MailboxFolder);
+  const auto declared = ReadCount<uint32_t>(storage, folderWidth);
+  Check(declared == 10, "t11m: the mail counter states the body, not mailCount",
+    declared, 10);
+}
+
+//! 12: ПОДАВЛЕНИЕ ПОВТОРА. Одна площадка жалуется не чаще раза в окно.
+//!
+//! ★ЖАЛОБА ПОРОЖДАЕТСЯ КЛИЕНТОМ: список растёт от данных игрока, и вход он
+//! может повторять сколько угодно. Незадросселированная строка стала бы флудом,
+//! управляемым снаружи, — ровно тем, ради чего заведён `util::LogThrottle`.
+//! Проверка ЧИТАЕТ настоящий вывод логгера, а не верит в наличие вызова.
+void TestReportThrottle()
+{
+  auto captured = std::make_shared<std::ostringstream>();
+  const auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(*captured);
+  const auto previous = spdlog::default_logger();
+  auto probe = std::make_shared<spdlog::logger>("bounded-list-probe", sink);
+  probe->set_level(spdlog::level::trace);
+  spdlog::set_default_logger(probe);
+
+  const auto data = Fill<Quad>(40);
+  for (int attempt = 0; attempt < 2; ++attempt)
+  {
+    std::array<std::byte, 4096> storage{};
+    SinkStream sink2{std::span{storage}};
+    // ОДНА И ТА ЖЕ строка вызова оба раза — иначе площадки были бы разные и
+    // подавление тут ни при чём.
+    server::util::WriteBoundedList<uint8_t>(
+      sink2, data, {.maxCount = 4, .name = "t12"});
+  }
+
+  probe->flush();
+  spdlog::set_default_logger(previous);
+
+  const auto text = captured->str();
+  std::size_t lines = 0;
+  std::size_t at = 0;
+  while ((at = text.find("bounded list truncated: t12", at)) != std::string::npos)
+  {
+    ++lines;
+    at += 1;
+  }
+  Check(lines == 1,
+    "t12: two truncations at one site inside the window produce ONE line",
+    static_cast<long long>(lines), 1);
+}
+
+} // namespace
+
+int main()
+{
+  TestCountBounds();
+  TestCapacity();
+  TestCountScale();
+  TestByteIdentity();
+  TestFrameBudgets();
+  TestMacroBudget();
+  TestRethrowOnCapacity();
+  TestRiskiestMessages();
+  TestMailCounterMatchesBody();
+  TestReportThrottle();
+
+  if (failures != 0)
+  {
+    std::printf("TestBoundedList: %d checks FAILED\n", failures);
+    return 1;
+  }
+
+  std::printf("TestBoundedList: all checks passed\n");
+  return 0;
+}
