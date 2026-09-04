@@ -31,6 +31,7 @@
 #include <limits>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -47,6 +48,51 @@ constexpr registry::MapBlockId NewMapsCourseId = 10001;
 constexpr registry::MapBlockId HotMapsCourseId = 10002;
 //! Номер шины достижений «финиш заезда» (UserAchvEvent = 2).
 constexpr uint16_t RaceAchievementEvent = 2;
+
+//! LOA-fix (R76, backlog #30 этап 1, решение лида #2): ИМЯ СЕРВЕРНОГО ИСХОДА
+//! ЗАЕЗДА для журнала трассы.
+//!
+//! ★ЗАЧЕМ СТРОКА, А НЕ ЧИСЛО. Аудит-строку читает ЧЕЛОВЕК (и раунд 2 —
+//! построчным разбором прод-лога). `outcome 3` заставило бы обоих держать в
+//! голове порядок значений `enum class`, а порядок — вещь, которую следующий
+//! раунд имеет право переставить. Имя переживает перестановку.
+//!
+//! ★`default` НЕ СТАВИТСЯ СОЗНАТЕЛЬНО: без него компилятор выдаёт
+//! `-Wswitch` на новом значении перечисления, то есть будущее пополнение
+//! `FinishOutcome` придёт сюда предупреждением сборки, а не молчаливым
+//! «unknown» в проде. Возврат в конце нужен формально — все значения покрыты.
+//! LOA-fix (R76-fix-1, находка Codex 1 BLOCK-1): ИМЯ СОСТОЯНИЯ СОЕДИНЕНИЯ.
+//! Нужно ровно затем, что журнал перестал пропускать отключившихся: без этого
+//! поля «гонщик доехал и вышел» и «гонщик доехал и остался» дают в логе
+//! одинаковые строки, а разбирать их будет раунд 2.
+//! `default` не ставится по той же причине, что у исхода ниже.
+[[nodiscard]] constexpr std::string_view RacerStateName(
+  const tracker::RaceTracker::Racer::State state)
+{
+  using State = tracker::RaceTracker::Racer::State;
+  switch (state)
+  {
+    case State::Disconnected: return "disconnected";
+    case State::Loading: return "loading";
+    case State::Racing: return "racing";
+    case State::Finishing: return "finishing";
+  }
+  return "disconnected";
+}
+
+[[nodiscard]] constexpr std::string_view FinishOutcomeName(
+  const tracker::RaceTracker::Racer::FinishOutcome outcome)
+{
+  using Outcome = tracker::RaceTracker::Racer::FinishOutcome;
+  switch (outcome)
+  {
+    case Outcome::None: return "none";
+    case Outcome::Finished: return "finished";
+    case Outcome::Retired: return "retired";
+    case Outcome::Rejected: return "rejected";
+  }
+  return "none";
+}
 
 //! Одна карта мастерства: имя условия каталога, ИМЯ КАРТЫ и потолок времени.
 //!
@@ -1339,6 +1385,41 @@ void RaceInstance::Stop()
       }
     });
 
+  // LOA-fix (R76, backlog #30 этап 1): журнал трассы — ПОСЛЕДНИЙ шаг ПЕРЕД
+  // блоком достижений R70.
+  //
+  // ★ПОЧЕМУ НЕ «САМЫМ ПОСЛЕДНИМ», КАК ПИСАЛА СПЕКА. Спека §2.8 писалась на
+  // дереве до R70: тогда хвостом Stop() была вот эта лямбда рассылки баланса.
+  // Сегодня последним оператором обязан быть блок достижений — это машинно
+  // держит `tools/round/check_stop_tail.py`, и комментарий самого R70 адресует
+  // этот раунд поимённо: «встать ПЕРЕД этим блоком либо доказать, что твой код
+  // не бросает». Сделано И ТО И ДРУГОЕ.
+  //
+  // ★СОБСТВЕННЫЙ КАТЧ-ОЛЛ — НЕ УКРАШЕНИЕ. LogRaceAudit() строит std::string
+  // (bad_alloc) и форматирует; после латча R75 `_resultsCredited` повторного
+  // Stop() НЕ БУДЕТ, поэтому бросок отсюда не удвоил бы выплату — он молча
+  // СЪЕЛ БЫ достижения всего заезда, которые стоят ниже. Наблюдение не имеет
+  // права стоить игроку значка ([[muffling-a-throw-is-not-a-fix]] читается тут
+  // наоборот: объект после броска не остаётся ни в каком состоянии — журнал
+  // ничего не мутирует, это чистая печать).
+  //
+  // По существу спеки место не изменилось: вызов стоит ПОСЛЕ всех начислений и
+  // ПОСЛЕ рассылки баланса — печать не встаёт перед деньгами.
+  try
+  {
+    LogRaceAudit();
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Race audit failed for room {}: {}", GetRoomUid(), x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Race audit failed for room {}: {}", GetRoomUid(), "unknown exception");
+  }
+
   // === LOA (R70, backlog #58): ДОСТИЖЕНИЯ СОБЫТИЯ 2 (финиш заезда) =========
   //
   // МЕСТО ВЫБРАНО ДВУМЯ ПРИЧИНАМИ, И ОБЕ ОБЯЗАТЕЛЬНЫ.
@@ -1674,6 +1755,154 @@ void RaceInstance::Stop()
     server::util::QuietLogError(
       "Race achievements block failed for room {}: {}", GetRoomUid(),
       "unknown exception");
+  }
+}
+
+void RaceInstance::LogRaceAudit()
+{
+  // `State` здесь больше не нужен: пропуск отключившихся снят (находка Codex 1
+  // BLOCK-1), а имя состояния печатает `RacerStateName`. Оставленный алиас
+  // давал `-Wunused-local-typedefs` на пиннованном gcc 15 (находка Codex 2).
+  using Racer = tracker::RaceTracker::Racer;
+
+  for (const auto& [characterUid, racer] : _tracker.GetRacers())
+  {
+    // ★ОТКЛЮЧИВШИЕСЯ ТОЖЕ ПОПАДАЮТ В ЖУРНАЛ (R76-fix-1, находка Codex 1
+    // BLOCK-1). Первая редакция их ПРОПУСКАЛА «по образцу персиста R24», и это
+    // было неверно дважды:
+    //  (1) довод не применим. Гейт R24 защищает ЗАПИСЬ персонажа, которая в
+    //      teardown может рушиться. Здесь не трогается ни одна запись — только
+    //      поля `Racer` и печать;
+    //  (2) пропуск давал МОДКЛИЕНТУ ОТКАЗ ОТ ЖУРНАЛА. `HandleLeaveRoom`
+    //      (`RaceNetworkHandler.cpp:1983`) ставит `state = Disconnected`, но
+    //      НЕ УДАЛЯЕТ гонщика из трекера; финишировавший, который вышел из
+    //      комнаты раньше, чем доехали остальные, терял единственную свою
+    //      аудит-строку. Наблюдение, от которого можно отписаться выходом, —
+    //      не наблюдение, а тем более не улика античита.
+    // Состояние соединения печатается полем `state`: оно отвечает «где игрок
+    // СЕЙЧАС», а не «ехал ли он» ([[R70]]), и раунд 2 обязан их различать.
+    // ★ДВЕ РАЗНЫЕ ПРАВДЫ, И ОБЕ ИДУТ В СТРОКУ (решение лида #2, R76).
+    //
+    // `finished` — это «клиент объявил финиш, и сервер принял время»
+    // (`racer.courseTime = didNotFinish ? Invalid : finishCourseTime`,
+    // RaceNetworkHandler). Ровно на нём стоят гейты WARN ниже, и менять их
+    // раунд не имеет права: правило «WARN только доехавшим» писалось под эту
+    // величину, а тюнинг порогов по живому логу пойдёт по ней же.
+    //
+    // `outcome` / `proven` — СЕРВЕРНЫЙ ВЕРДИКТ R70/R75: `FinishOutcome`
+    // ставится только пережившему все проверки исходу, а `HasProvenTraversal()`
+    // требует 200 м пути, посчитанных САМИМ сервером из разниц позиций.
+    // Именно эта пара — гейт пер-курсовых рекордов R75.
+    //
+    // ★ОНИ РАСХОДЯТСЯ, И РАСХОЖДЕНИЕ — ЭТО УЛИКА, А НЕ ШУМ. Телепорт-бот и
+    // «заезд в два пакета» дают `finished 1` при `outcome rejected proven 0`:
+    // время сервер принял, а ЕЗДУ не доказал. Печатать только одну из двух
+    // величин значило бы отдать раунду 2 таблицу, в которой «объявил финиш» и
+    // «доказал заезд» слиты в один столбец.
+    const bool finished = racer.courseTime != tracker::InvalidCourseTime;
+    const std::string_view stateName = RacerStateName(racer.state);
+    const std::string_view outcomeName = FinishOutcomeName(racer.finishOutcome);
+    const bool provenTraversal = racer.HasProvenTraversal();
+
+    // Сплиты печатаем ТОЛЬКО значимые — [0, splitsReached). Остальные несут
+    // InvalidSplitMs, и печатать их значило бы врать «порог взят на 4294967295 мс».
+    std::string splitsText;
+    splitsText.reserve(Racer::ProgressSplitCount * 8);
+    for (uint8_t index = 0; index < racer.splitsReached; ++index)
+    {
+      if (index != 0)
+        splitsText += ',';
+      splitsText += std::to_string(racer.progressSplits[index]);
+    }
+
+    // ★distance / topSpeed / gameMode кладём в ТУ ЖЕ строку: они уже посчитаны
+    // R24 и лежат в том же Racer, стоят ноль нового состояния, а «distance по
+    // courseTime» — единственная улика, независимая от progress. Без них
+    // модклиент, рисующий правдоподобную кривую progress, не оставляет в
+    // журнале ни одного следа (слепое пятно B1 спеки), и понадобился бы
+    // третий раунд «дописать в ту же строку».
+    server::util::QuietLogInfo(
+      "race audit: room {} map {} mode {} char {} state {} finished {} "
+      "outcome {} proven {} time {} "
+      "splits {}/{} [{}] samples {} trusted {:.4f} declared {:.4f} "
+      "clipped {} jumps {} discarded {:.1f}m maxJump {:.1f}m "
+      "distance {:.1f}m topSpeed {:.2f}",
+      this->GetRoomUid(),
+      static_cast<uint32_t>(GetMapBlockId()),
+      static_cast<uint32_t>(GetGameModeId()),
+      characterUid,
+      stateName,
+      finished ? 1 : 0,
+      outcomeName,
+      provenTraversal ? 1 : 0,
+      racer.courseTime,
+      racer.splitsReached,
+      static_cast<uint32_t>(Racer::ProgressSplitCount),
+      splitsText,
+      racer.posSampleCount,
+      racer.trustedProgress,
+      racer.maxDeclaredProgress,
+      racer.progressClipped,
+      racer.positionJumps,
+      racer.discardedMetres,
+      racer.maxDiscardedStepMetres,
+      racer.distanceMetres,
+      racer.topSpeedKph);
+
+    // --- WARN 1: «жидкий заезд» --------------------------------------------
+    // ТОЛЬКО ДЛЯ ДОЕХАВШИХ. Честный DNF на 30 % трассы имеет 3 сплита — это не
+    // аномалия, а нормальный отказ ехать дальше, и WARN на нём был бы ложной
+    // тревогой на каждом втором заезде.
+    // ★ДВЕ КЛАУЗЫ, И ВТОРАЯ ОБЯЗАТЕЛЬНА: раунд 0 показал, что после длинной
+    // паузы ОДИН пакет с progress = 1.0 штампует все десять сплитов (бюджет
+    // храповика elapsedMs/30000 вырастает до 4.4). «Сплитов 10» без проверки
+    // ПЛОТНОСТИ пакетов не доказывает, что кто-то ехал.
+    // ★ПЛОТНОСТЬ СЧИТАЕТ `Racer::HasPlausiblePacketDensity` (R76-fix-1,
+    // находка Codex 1 WARN-3): пока выражение стояло здесь по месту, юнит-тест
+    // мог лишь ПОВТОРИТЬ его у себя и оставался зелёным даже со снятым
+    // 64-битным кастом. Теперь бой и тест зовут ОДИН И ТОТ ЖЕ код.
+    if (finished
+      && (racer.splitsReached < tracker::MinPlausibleSplits
+        || not racer.HasPlausiblePacketDensity(racer.courseTime)))
+    {
+      server::util::QuietLogWarn(
+        "race audit WARN thin ride: map {} char {} time {} splits {}/{} samples {}",
+        static_cast<uint32_t>(GetMapBlockId()),
+        characterUid,
+        racer.courseTime,
+        racer.splitsReached,
+        static_cast<uint32_t>(Racer::ProgressSplitCount),
+        racer.posSampleCount);
+    }
+
+    // --- WARN 2: телепорт ---------------------------------------------------
+    // ПО ВЕЛИЧИНЕ ОДНОГО ШАГА, А НЕ ПО ЧИСЛУ ОТБРОСОВ: 24 из 86 честных заездов
+    // живой игры имеют positionJumps > 0 (склеенные пакеты дают dt = 0), а
+    // максимум ОДНОГО честного отброшенного шага — 63.25 м.
+    if (racer.maxDiscardedStepMetres >= tracker::TeleportStepMetres)
+    {
+      server::util::QuietLogWarn(
+        "race audit WARN teleport: map {} char {} maxJump {:.1f}m jumps {} "
+        "discarded {:.1f}m",
+        static_cast<uint32_t>(GetMapBlockId()),
+        characterUid,
+        racer.maxDiscardedStepMetres,
+        racer.positionJumps,
+        racer.discardedMetres);
+    }
+
+    // --- WARN 3: объявленный прогресс вне шкалы ------------------------------
+    // Честные финишные «часовые» доходят до 2.0 (карта 7); потолок 4.0.
+    if (racer.maxDeclaredProgress > tracker::MaxDeclaredProgressCeiling)
+    {
+      server::util::QuietLogWarn(
+        "race audit WARN declared progress: map {} char {} declared {:.4f} "
+        "ceiling {:.1f}",
+        static_cast<uint32_t>(GetMapBlockId()),
+        characterUid,
+        racer.maxDeclaredProgress,
+        tracker::MaxDeclaredProgressCeiling);
+    }
   }
 }
 

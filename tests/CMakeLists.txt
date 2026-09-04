@@ -131,6 +131,20 @@ target_sources(data_test_course_records PRIVATE
 target_link_libraries(data_test_course_records
         PRIVATE project-properties alicia-libserver)
 
+# R76. Журнал трассы: накопление живёт в RaceNetworkHandler, печать — в
+# RaceInstance, обе цели в тестовый бинарь не линкуются, и обе доказываются
+# стендом. Здесь — ЧЕТЫРЕ свойства, которых стенд не видит: самоинициализация
+# полей журнала на замусоренном хранилище, недостижимость сентинела «порог не
+# взят», 64-битный знаменатель проверки плотности и достижимость самих порогов
+# раунда 0. Заголовочно-структурный тест, линкуется к libserver.
+add_executable(race_test_race_journal)
+target_sources(race_test_race_journal PRIVATE
+        src/race/TestRaceJournal.cpp)
+target_include_directories(race_test_race_journal
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_race_journal
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -148,6 +162,7 @@ add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tie
 add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
 add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
 add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
+add_test(NAME RaceTestRaceJournal COMMAND race_test_race_journal)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -198,6 +213,23 @@ if (NOT WIN32)
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_record_access_gate.sh --self-test)
     add_test(NAME ToolR75UserPosLoggingSelftest
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_userpos_logging_gate.sh --self-test)
+    # R76. The track journal's two invariants are properties of the SOURCE, not
+    # of a binary: the position handler must acquire no logging (a remote-driven
+    # path that once produced 15350 error lines an hour), and every journal field
+    # must be reset per race. Neither can be observed on the stand -- the first
+    # because a debug line changes nothing an arc can see, the second because
+    # today the tracker is cleared wholesale anyway and the reset is a guard for
+    # the day someone pools racers instead.
+    # The gate extracts the field names BY PROPERTY from the header block rather
+    # than carrying a list, so a ninth field is covered the moment it is added;
+    # the count is not hardcoded, only a blindness floor is. It proves itself on
+    # four fixtures -- two violations and two blindnesses -- before judging.
+    add_test(NAME ToolTrackJournalSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/round/check_track_journal.py
+                    ${CMAKE_SOURCE_DIR} --self-test)
+    add_test(NAME ToolTrackJournalGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/round/check_track_journal.py
+                    ${CMAKE_SOURCE_DIR})
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

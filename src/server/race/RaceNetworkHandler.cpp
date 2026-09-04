@@ -2363,6 +2363,21 @@ void RaceNetworkHandler::HandleStartRace(
           std::chrono::steady_clock::time_point::max();
         racer.revengeRows.clear();
         racer.revengeCredits = 0;
+        // LOA-fix (R76, #30 этап 1): журнал трассы — пер-заездный, обнуляем в
+        // ТОМ ЖЕ списке, что finishCounted / topSpeedKph / trustedProgress.
+        // Инвариант раунда: НОВОЕ ПОЛЕ ОБЯЗАНО ПОЯВИТЬСЯ ЗДЕСЬ. Сегодня это
+        // защита «на будущее» (Clear() выше по функции сносит гонщиков целиком,
+        // и AddRacer отдаёт свежего) — но ровно та же защита у finishCounted и
+        // R24 стоит по той же причине, и снимать её из «оптимизации» нельзя.
+        racer.progressSplits.fill(
+          tracker::RaceTracker::Racer::InvalidSplitMs);
+        racer.splitsReached = 0;
+        racer.posSampleCount = 0;
+        racer.positionJumps = 0;
+        racer.discardedMetres = 0.0;
+        racer.maxDiscardedStepMetres = 0.0f;
+        racer.progressClipped = 0;
+        racer.maxDeclaredProgress = 0.0f;
         switch (roomPlayer.GetTeam())
         {
           case Room::Player::Team::Solo:
@@ -4323,8 +4338,26 @@ void RaceNetworkHandler::HandleRaceUserPos(
           racer.distanceMetres += static_cast<double>(step);
           acceptedStep = step;
         }
+        else
+        {
+          // LOA-fix (R76, #30 этап 1): отброшенный шаг перестаёт исчезать
+          // молча. Ровно та же ветка, ровно то же условие — меняется только
+          // то, что мы про неё ПОМНИМ. Ни одного лога здесь: путь
+          // удалённо-управляемый, R57/#195 дал 15 350 строк [error] за час
+          // именно на этом хендлере.
+          racer.positionJumps += 1;
+          racer.discardedMetres += static_cast<double>(step);
+          if (step > racer.maxDiscardedStepMetres)
+            racer.maxDiscardedStepMetres = step;
+        }
       }
 
+      // LOA-fix (R76, #30 этап 1): считаем ПОСТ-СТАРТОВЫЕ пакеты позиции.
+      // Место выбрано внутри гейта зелёного света и рядом с hasPositionSample:
+      // это ровно те пакеты, по которым сервер что-то накапливает. Тот же
+      // тройной гейт, что у splits ниже (state == Racing && !finishCounted &&
+      // now >= GetRaceStartTimePoint) — окна samples и splits СОВПАДАЮТ.
+      racer.posSampleCount += 1;
       racer.hasPositionSample = true;
       racer.lastPositionTimePoint = now;
 
@@ -4425,11 +4458,41 @@ void RaceNetworkHandler::HandleRaceUserPos(
               / static_cast<float>(tracker::MinPlausibleCourseTime);
         const float capped = std::min(clientProgress,
           racer.trustedProgress + budget);
+        // LOA-fix (R76, #30 этап 1): помним, что бюджет темпа сработал. Считаем
+        // ДО присвоения — после него разница уже неотличима.
+        if (clientProgress > racer.trustedProgress + budget)
+          racer.progressClipped += 1;
         // ★ХРАПОВИК: только вверх. Понижение своего прогресса — это попытка
         // сфабриковать «меня обогнали», а не движение по трассе.
         if (capped > racer.trustedProgress)
           racer.trustedProgress = std::min(capped, 1.0f);
         racer.trustedProgressTimePoint = revengeNow;
+      }
+
+      // LOA-fix (R76, backlog #30 этап 1): ОТМЕТКИ ВРЕМЕНИ ПО ТРАССЕ.
+      // Порог k взят, когда ДОВЕРЕННЫЙ прогресс впервые достиг 0.1*(k+1).
+      // Цикл, а не одно сравнение: один пакет после долгой паузы законно
+      // перекрывает несколько порогов сразу (бюджет темпа пропорционален
+      // elapsedMs), и такой заезд обязан отличаться от честного НЕ числом
+      // сплитов, а числом пакетов — их считает posSampleCount.
+      // ★МЕСТО: ПОСЛЕ всего блока if/else, а не внутри ветки храповика —
+      // чтобы будущая перестановка веток не оставила сплиты слепыми. На самом
+      // ПЕРВОМ пакете (ветка «только сеет») trustedProgress ещё 0.0f и цикл
+      // законно не выполняется ни разу: 0.0f >= 0.1f ложно.
+      // Стоимость: O(1) амортизированно, тело выполняется суммарно 10 раз за заезд.
+      // Времени берём УЖЕ ИЗМЕРЕННОЕ revengeNow — второй вызов now() дал бы две
+      // разные шкалы в одной функции.
+      while (racer.splitsReached < tracker::RaceTracker::Racer::ProgressSplitCount
+        && racer.trustedProgress
+             >= 0.1f * static_cast<float>(racer.splitsReached + 1))
+      {
+        const auto sinceGreenLight = std::chrono::duration_cast<
+          std::chrono::milliseconds>(
+            revengeNow - raceInstance.GetRaceStartTimePoint()).count();
+        racer.progressSplits[racer.splitsReached] = sinceGreenLight <= 0
+          ? 0u
+          : static_cast<uint32_t>(std::min<int64_t>(sinceGreenLight, 0xFFFFFFFEll));
+        racer.splitsReached += 1;
       }
 
       // --- G7: только командный заезд и только ЧУЖАЯ команда ----------------
@@ -4511,6 +4574,15 @@ void RaceNetworkHandler::HandleRaceUserPos(
 
   racer.worldPosition = command.position;
   racer.raceProgress = command.progress;
+  // LOA-fix (R76, #30 этап 1): максимум СЫРОГО объявления за заезд. Место —
+  // ЕДИНСТВЕННОЕ на функцию, рядом с единственной записью raceProgress: это
+  // тотальный инвариант «что клиент объявил», а не список мест
+  // ([[total-invariant-beats-list-of-sites]]). NaN не проходит: `>` с NaN ложно.
+  // ★ОКНО ШИРЕ, ЧЕМ У ОСТАЛЬНЫХ ПОЛЕЙ: здесь нет ни гейта зелёного света, ни
+  // `state == Racing`, ни `!finishCounted` — намеренно, чтобы предстартовое или
+  // постфинишное «999» тоже попало в журнал. Раунд 2 обязан это учитывать.
+  if (command.progress > racer.maxDeclaredProgress)
+    racer.maxDeclaredProgress = command.progress;
 }
 
 void RaceNetworkHandler::HandleChat(
