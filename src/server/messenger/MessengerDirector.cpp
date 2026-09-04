@@ -18,6 +18,7 @@
  **/
 
 #include "server/messenger/MessengerDirector.hpp"
+#include "server/messenger/MessengerSessionEviction.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
@@ -222,6 +223,50 @@ bool MessengerDirector::IsCharacterOnline(const data::Uid characterUid) const
   return GetClientByCharacterUid(characterUid).has_value();
 }
 
+void MessengerDirector::EvictOtherSessionsOfCharacter(
+  const network::ClientId keepClientId,
+  const data::Uid characterUid)
+{
+  // Фаза 1 — только правка значений на месте, без вставок и удалений.
+  const auto unbound = messenger::UnbindOtherSessionsOfCharacter(
+    _clients, keepClientId, characterUid);
+
+  if (unbound.empty())
+    return;
+
+  // Фаза 2 — закрытие, СТРОГО ВНЕ обхода карты.
+  //
+  // ★ПОЧЕМУ ДВЕ ФАЗЫ, А НЕ ОДИН ЦИКЛ. `Client::End()` СИНХРОННО зовёт
+  // `OnClientDisconnected` (`Server.cpp:85`), тот приходит в наш же
+  // `HandleClientDisconnected`, а он снимает запись из `_clients` стражем
+  // `RegistryEraser`. Отключение внутри обхода стирало бы элемент карты,
+  // по которой мы идём, — инвалидация итератора посреди цикла.
+  //
+  // ★ОТКЛЮЧЕНИЕ БЕЗОПАСНО ТОЛЬКО ПОТОМУ, ЧТО ФЛАГ УЖЕ СНЯТ ФАЗОЙ 1: уборка
+  // соединения рассылает присутствие Offline, а `HandleChatterUpdateState`
+  // выходит на `not isAuthenticated`. Иначе закрытие мёртвого сокета сообщило
+  // бы друзьям, что игрок вышел, — сразу после того, как он вошёл.
+  for (const network::ClientId staleClientId : unbound)
+  {
+    try
+    {
+      _chatterServer.DisconnectClient(staleClientId);
+    }
+    catch (const std::exception&)
+    {
+      // Соединения уже нет — `Server::GetClient` бросает «Invalid client».
+      // Это ровно та цель, которой мы добивались; ронять вход из-за неё нельзя.
+    }
+  }
+
+  // Одна строка на ВХОД, а не на пакет: событие редкое (переподключение
+  // мессенджера), а знать о вытеснении нужно — оно закрывает чужой сокет.
+  server::util::QuietLogInfo(
+    "Evicted {} stale messenger session(s) of character {} on re-login",
+    unbound.size(),
+    characterUid);
+}
+
 void MessengerDirector::SendStallionReward(
   data::Uid characterUid,
   data::Uid horseUid,
@@ -398,10 +443,31 @@ void MessengerDirector::HandleChatterLogin(
   size_t identityHash = std::hash<uint32_t>()(command.characterUid);
   boost::hash_combine(identityHash, MessengerOtpConstant);
 
-  // Authorise the code received in the command against the calculated identity hash
-  clientContext.isAuthenticated = _serverInstance.GetOtpSystem().AuthorizeCode(
+  // LOA-fix (R78-1, round78, backlog #255): МЕССЕНДЖЕР ЖИВЁТ НА LTK, КАК ALL-CHAT.
+  //
+  // Здесь стоял `AuthorizeCode`, а он СТИРАЕТ код при успехе и держит его всего
+  // 30 секунд (`OtpSystem.cpp:22-37`). Код же выдаётся ровно один раз — на
+  // `AcCmdCLGetMessengerInfo` при входе в лобби, и клиент помнит его всю сессию.
+  // Поэтому первый вход код тратил, а любое переподключение мессенджера (возврат
+  // из заезда, обрыв связи) присылало тот же код в пустоту: в проде 09:22:15
+  // `failed authentication with auth code 1854698400` — тот самый код, что прошёл
+  // в 09:03:31, — и 39 минут без лички и писем до полного перезахода.
+  //
+  // ★ЭТО НЕ НОВЫЙ ДИЗАЙН, А ДОВЕДЕНИЕ АПСТРИМНОГО. Апстрим ловил ровно этот баг
+  // у all-chat: `fdf0474a` «Fix all chat disconnecting after entering race», затем
+  // `78a3c287` «Implement LTK codes (all chat fix)» с формулировкой «the game
+  // client keeps persistent key codes in memory». LTK не стирается и не протухает,
+  // но привязан к конечной точке. Мессенджеру ту же правку тогда не сделали.
+  //
+  // ★ЧТО МЕНЯЕТСЯ ДЛЯ АТАКУЮЩЕГО. Раньше подсмотренный код работал 30 секунд
+  // с ЛЮБОГО адреса; теперь — только с того IPv4, с которого пришло лобби-
+  // соединение, получившее код. Для удалённого наблюдателя это ослабление его
+  // возможностей, а не усиление. Ключ по-прежнему считается от `characterUid`
+  // ИЗ ПАКЕТА, поэтому вход под чужим uid с подсмотренным кодом не сходится.
+  clientContext.isAuthenticated = _serverInstance.GetOtpSystem().AuthorizeLtk(
     identityHash,
-    command.code);
+    command.code,
+    _chatterServer.GetClientAddress(clientId).to_uint());
 
   if (not clientContext.isAuthenticated)
   {
@@ -443,6 +509,19 @@ void MessengerDirector::HandleChatterLogin(
       inbox = character.mailbox.inbox();
       character.mailbox.hasNewMail() = false;
     });
+
+  // LOA-fix (R78-2, round78, backlog #255): ВХОД ОСТАВЛЯЕТ РОВНО ОДНУ ПРИВЯЗКУ.
+  //
+  // Стоит ИМЕННО ЗДЕСЬ, а не сразу после авторизации: личность соединения
+  // становится известна только строкой выше — её берут из записи персонажа, а
+  // не из пакета. Вытеснять по неподтверждённому `command.characterUid` было бы
+  // вытеснением не того.
+  //
+  // ★БЕЗ ЭТОГО ПОЧИНКА ВХОДА (R78-1) НЕ ВИДНА ИГРОКУ. Старое соединение сервер
+  // держит вечно (#235), клиент возвращается вторым — и обе записи оказались бы
+  // привязаны к одному персонажу. Разбор — в `MessengerSessionEviction.hpp`.
+  // #235 этим НЕ закрывается: течь чат-сокетов как класс остаётся.
+  EvictOtherSessionsOfCharacter(clientId, clientContext.characterUid);
 
   // Check if inbox contains any unread mails, count and populate response
   for (const data::Uid mailUid : inbox)

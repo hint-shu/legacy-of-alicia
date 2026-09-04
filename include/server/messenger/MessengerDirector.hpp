@@ -138,6 +138,15 @@ private:
     network::ClientId clientId,
     const protocol::ChatCmdGuildLogin& command);
 
+  //! LOA (R78, round78, backlog #255): вход персонажа оставляет ровно одну
+  //! привязанную к нему мессенджер-сессию. Правило вытеснения вынесено в
+  //! `MessengerSessionEviction.hpp` ИМЕННО затем, чтобы его можно было
+  //! проверить юнит-тестом, не поднимая сервер; здесь остаётся вторая фаза —
+  //! закрытие отвязанных соединений ВНЕ обхода карты.
+  void EvictOtherSessionsOfCharacter(
+    network::ClientId keepClientId,
+    data::Uid characterUid);
+
   ChatterServer _chatterServer;
   ServerInstance& _serverInstance;
 
