@@ -1928,7 +1928,7 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
       util::QuietLogWarn(
         "login frame over budget for user '{}': shed mask 0x{:x}"
         " (macros={} gamepad={} keyboard={} introduction={} still-too-large={});"
-        " the stored profile is untouched (suppressed {} more, {} in total)",
+        " the stored profile is untouched by this frame (suppressed {} more, {} in total)",
         clientContext.userName,
         shed,
         (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Macros)) != 0,
@@ -1939,6 +1939,38 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
         suppressed,
         total);
     }
+
+    // ★R74-fix-3 (subreview #2, NIT 1): `StillTooLarge` ОБЯЗАН ОТКАЗЫВАТЬ, А НЕ
+    // СТАВИТЬ В ОЧЕРЕДЬ КАДР, КОТОРЫЙ ЗАВЕДОМО БРОСИТ.
+    //
+    // Раньше эта ветка только печатала строку и всё равно шла дальше: кадр
+    // уходил в очередь, поставщик записи бросал, `Client::WriteLoop` звал
+    // `End()` — то есть доревизионный клин ПЛЮС одна строка в журнале. Теперь
+    // клиент получает штатный отказ входа: он видит причину, а не молчаливый
+    // разрыв, и повторить попытку может сам.
+    if ((shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0)
+    {
+      util::QuietLogError(
+        "refusing the login of user '{}': the login frame does not fit {} bytes"
+        " even with every client-authored profile block shed; the cause is"
+        " outside those blocks (an oversized server notice, or a failing"
+        " conversion) and the account cannot be let in until it is found",
+        clientContext.userName,
+        protocol::MaxClientPacketDataBytes);
+      SendLoginCancel(clientId, protocol::AcCmdCLLoginCancel::Reason::Generic);
+      return;
+    }
+
+    // ★R74-fix-3 (subreview #2, WARN 3): СЕССИЯ ЗАПОМИНАЕТ, ЧТО СНЯЛА.
+    // Клиент этих блоков не получит, значит на его стороне они пусты — и его
+    // первое же сохранение настроек затёрло бы хранимое. Запоминаем маску;
+    // `HandleUpdateUserSettings` её читает.
+    MutateClientContext(
+      clientId,
+      [shed](ClientContext& context)
+      {
+        context.shedSettingsBlocks = shed;
+      });
   }
 
   _commandServer.SetCode(clientId, {});
@@ -2782,12 +2814,25 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
   std::size_t macroBlockWireSize = 0;
   std::size_t macroSlotsAccepted = 0;
 
+  // ★R74-fix-3 (subreview #2, WARN 3): БЛОКИ, КОТОРЫХ КЛИЕНТ НЕ ПОЛУЧАЛ, ОН НЕ
+  // ВПРАВЕ И СТИРАТЬ. Маску проставил `SendLoginOK` этой же сессии; она
+  // означает «сервер снял этот блок со СВОЕГО кадра, у клиента он пуст не
+  // потому, что игрок его очистил». Первое сохранение настроек в сессии такие
+  // блоки пропускает, а дальше флаг снимается — игрок, который действительно
+  // хочет очистить блок, сделает это вторым сохранением.
+  const auto shedBlocks = clientContext.shedSettingsBlocks;
+  const auto blockWasShed = [shedBlocks](const protocol::LoginFrameShed block)
+  {
+    return (shedBlocks & static_cast<uint32_t>(block)) != 0;
+  };
+
   settingsRecord.Mutable([&settingsUid, &command, &macroBlockRefused, &macroBlockWireSize,
-                          &macroSlotsAccepted](
+                          &macroSlotsAccepted, &blockWasShed](
     data::Settings& settings)
   {
     // Copy the keyboard bindings if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Keyboard))
+    if (command.settings.typeBitset.test(protocol::Settings::Keyboard)
+        && not blockWasShed(protocol::LoginFrameShed::KeyboardBindings))
     {
       settings.keyboardBindings().emplace();
 
@@ -2802,7 +2847,8 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     }
 
     // Copy the gamepad bindings if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Gamepad))
+    if (command.settings.typeBitset.test(protocol::Settings::Gamepad)
+        && not blockWasShed(protocol::LoginFrameShed::GamepadBindings))
     {
       settings.gamepadBindings().emplace();
 
@@ -2823,7 +2869,8 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     }
 
     // Copy the macros if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Macros))
+    if (command.settings.typeBitset.test(protocol::Settings::Macros)
+        && not blockWasShed(protocol::LoginFrameShed::Macros))
     {
       // ★R74 (backlog #170). МАКРОСЫ — ЕДИНСТВЕННОЕ ПОЛЕ ПРОФИЛЯ, ЧЬЮ ДЛИНУ
       // ЗАДАЁТ КЛИЕНТ, КОТОРОЕ ПЕРСИСТИТСЯ НАВСЕГДА И УЕЗЖАЕТ НА ПРОВОД ПРИ
@@ -2837,8 +2884,12 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
       // уже лежала на диске. Что клин случался, видно по апстриму: там есть
       // GM-команда, единственное действие которой — обнулить все 8 макросов.
       //
-      // ОТКАЗ ШТАТНЫЙ: остальные блоки настроек применяются, СТАРЫЕ макросы
-      // остаются, соединение живо. Мы не рвём соединение из-за настроек.
+      // ОТКАЗ ШТАТНЫЙ: остальные блоки настроек применяются, соединение живо,
+      // мы не рвём его из-за настроек. ★R74-fix-3 (subreview #2, WARN 1):
+      // прежняя формулировка «СТАРЫЕ макросы остаются» после fix-2 стала
+      // НЕВЕРНОЙ — ветка else записывает отобранный префикс. Правда теперь
+      // такая: принимаются те слоты, что влезли; если не влез НИ ОДИН,
+      // хранимый блок остаётся нетронутым.
       macroBlockWireSize = protocol::MeasureMacroBlockWireSize(
         command.settings.macroOptions);
 
@@ -2859,19 +2910,14 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
         // будет. Поэтому берём то, что влезает, по одному слоту, в порядке
         // слотов: игрок теряет ровно хвост, а не всё.
         protocol::MacroOptions accepted{};
-        std::size_t slotsAccepted = 0;
-        for (std::size_t slot = 0; slot < accepted.macros.size(); ++slot)
-        {
-          protocol::MacroOptions probe = accepted;
-          probe.macros[slot] = command.settings.macroOptions.macros[slot];
-          if (protocol::MeasureMacroBlockWireSize(probe)
-                > protocol::MaxMacroBlockWireBytes)
-            break;
-          accepted = probe;
-          ++slotsAccepted;
-        }
+        const auto slotsAccepted = protocol::SelectMacroSlotsWithinBudget(
+          command.settings.macroOptions, accepted);
 
-        settings.macros() = accepted.macros;
+        // ★НИ ОДИН СЛОТ НЕ ВЛЕЗ — ХРАНИМОЕ НЕ ТРОГАЕМ. Записать здесь восемь
+        // пустых строк значило бы стереть чужой (свой прежний) блок за
+        // успешным ACK, то есть ровно та потеря, против которой правка.
+        if (slotsAccepted > 0)
+          settings.macros() = accepted.macros;
         macroBlockRefused = true;
         macroSlotsAccepted = slotsAccepted;
       }
@@ -2879,6 +2925,47 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
 
     settingsUid = settings.uid();
   });
+
+  // ★ФЛАГ СНИМАЕТСЯ ПОСЛЕ ПЕРВОГО ЖЕ СОХРАНЕНИЯ — по тем блокам, которые
+  // клиент прислал. Держать защиту всю сессию значило бы запретить игроку
+  // очистить блок вообще; одного круга «сервер снял -> клиент прислал пустое»
+  // достаточно, чтобы отличить потерю от намерения.
+  if (shedBlocks != 0)
+  {
+    uint32_t appliedBlocks = 0;
+    if (command.settings.typeBitset.test(protocol::Settings::Keyboard))
+      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::KeyboardBindings);
+    if (command.settings.typeBitset.test(protocol::Settings::Gamepad))
+      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::GamepadBindings);
+    if (command.settings.typeBitset.test(protocol::Settings::Macros))
+      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::Macros);
+
+    if (appliedBlocks != 0)
+    {
+      MutateClientContext(
+        clientId,
+        [appliedBlocks](ClientContext& context)
+        {
+          context.shedSettingsBlocks &= ~appliedBlocks;
+        });
+
+      static util::LogThrottle shedProtectionThrottle{std::chrono::minutes{5}};
+      uint64_t suppressed = 0;
+      uint64_t total = 0;
+      if ((shedBlocks & appliedBlocks) != 0
+          && shedProtectionThrottle.Allow(suppressed, total))
+      {
+        util::QuietLogWarn(
+          "kept the stored settings blocks 0x{:x} of user '{}': they were shed from"
+          " this session's login frame, so the client never had them to send back"
+          " (suppressed {} more, {} in total)",
+          shedBlocks & appliedBlocks,
+          clientContext.userName,
+          suppressed,
+          total);
+      }
+    }
+  }
 
   if (macroBlockRefused)
   {
