@@ -59,6 +59,22 @@ public:
     bool requireAuthentication = true);
 
   [[nodiscard]] std::optional<Client> GetClientByCharacterUid(const data::Uid characterUid) const;
+
+  //! LOA (R78-fix4, round78, backlog #255, находка ревю W1): ЗАКРЫТЬ ВСЕ
+  //! мессенджер-сессии персонажа. Зовёт лобби, когда снимает долгоживущий ключ
+  //! на выходе игрока из игры.
+  //!
+  //! ★ЗАЧЕМ. Снятие ключа (`OtpSystem::RevokeLtk`) трогает только карту ключей,
+  //! а право обслуживать мессенджер живёт в `clientContext.isAuthenticated`, и
+  //! после входа `OtpSystem` не опрашивается больше НИКОГДА. Значит уже
+  //! ОТКРЫТАЯ сессия снятие ключа переживала: держатель подсмотренного ключа
+  //! продолжал читать и слать письма от имени игрока, который уже вышел.
+  //! Ключ и сессия обязаны умирать вместе.
+  //!
+  //! ★ЗВАТЬ ТОЛЬКО ВНЕ ЗАМКОВ вызывающего: метод берёт СВОЙ замок карты
+  //! клиентов, а закрытие соединений синхронно возвращается в
+  //! `HandleClientDisconnected` (класс R59 — нерекурсивный `shared_mutex`).
+  void CloseSessionsOfCharacter(data::Uid characterUid);
   [[nodiscard]] bool IsCharacterOnline(const data::Uid characterUid) const;
   void SendStallionReward(
     data::Uid characterUid,
@@ -147,6 +163,13 @@ private:
   //! закрытие отвязанных соединений ВНЕ обхода карты.
   void EvictOtherSessionsOfCharacter(
     network::ClientId keepClientId,
+    data::Uid characterUid);
+
+  //! Фаза 2, общая для входа и для выхода: закрыть отвязанные соединения.
+  //! ★ВСЕГДА вне замка карты — см. разбор у `_clientsMutex`.
+  void DisconnectUnboundSessions(
+    const std::vector<network::ClientId>& unbound,
+    const char* reason,
     data::Uid characterUid);
 
   ChatterServer _chatterServer;

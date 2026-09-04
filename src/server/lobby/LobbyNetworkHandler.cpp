@@ -1336,8 +1336,32 @@ void LobbyNetworkHandler::HandleClientDisconnected(ClientId clientId)
     {
       size_t messengerKey = std::hash<uint32_t>()(clientContext.characterUid);
       boost::hash_combine(messengerKey, MessengerOtpConstant);
-      _serverInstance.GetOtpSystem().RevokeLtk(
+      const bool revoked = _serverInstance.GetOtpSystem().RevokeLtk(
         messengerKey, clientContext.messengerLtk.value());
+
+      // LOA-fix (R78-fix4, round78, backlog #255, находка ревю W1): КЛЮЧ И
+      // СЕССИЯ УМИРАЮТ ВМЕСТЕ.
+      //
+      // ★СНЯТИЕ КЛЮЧА САМО ПО СЕБЕ НИКОГО НЕ ВЫГОНЯЕТ. Право обслуживать
+      // мессенджер живёт в `clientContext.isAuthenticated`, и после входа
+      // `OtpSystem` не опрашивается больше НИКОГДА. Держатель подсмотренного
+      // ключа, вошедший до выхода игрока, продолжал бы читать входящие,
+      // удалять их и слать письма ОТ ИМЕНИ игрока, который уже вышел из игры.
+      //
+      // ★ТОЛЬКО ПРИ `revoked == true`, И ЭТО НЕСУЩЕЕ. `false` означает, что
+      // ключ в карте — УЖЕ НЕ НАШ: игрок успел перезайти и держит новый.
+      // Закрыть сессии в этом случае значило бы выбить его же свежую личку —
+      // ровно тот дефект, который раунд чинит.
+      //
+      // ★СТОИТ ВНЕ ЗАМКА карты клиентов лобби (он отпущен выше вместе с
+      // копией контекста) и вне мьютекса `OtpSystem` (`RevokeLtk` уже
+      // вернулась): директор мессенджера возьмёт СВОИ замки, а закрытие
+      // соединений синхронно уйдёт в его обработчик разрыва — класс R59.
+      if (revoked)
+      {
+        _serverInstance.GetMessengerDirector().CloseSessionsOfCharacter(
+          clientContext.characterUid);
+      }
     }
 
     // LOA-fix (R38-4, round38, backlog #90a-B4): СНИМАЕМ ПЕРСОНАЖА С ОЧЕРЕДИ

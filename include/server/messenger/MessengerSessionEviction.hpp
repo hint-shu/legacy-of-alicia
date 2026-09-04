@@ -8,6 +8,7 @@
 #include <libserver/data/DataDefinitions.hpp>
 #include <libserver/network/NetworkDefinitions.hpp>
 
+#include <optional>
 #include <vector>
 
 namespace server::messenger
@@ -50,10 +51,10 @@ namespace server::messenger
 //!         синхронно возвращается в `HandleClientDisconnected`, который
 //!         стирает запись, а стирание посреди цикла — инвалидация итератора.
 template <typename ContextMap>
-std::vector<network::ClientId> UnbindOtherSessionsOfCharacter(
+std::vector<network::ClientId> UnbindSessionsOfCharacter(
   ContextMap& clients,
-  const network::ClientId keepClientId,
-  const data::Uid characterUid)
+  const data::Uid characterUid,
+  const std::optional<network::ClientId> keepClientId)
 {
   std::vector<network::ClientId> unbound;
 
@@ -62,7 +63,7 @@ std::vector<network::ClientId> UnbindOtherSessionsOfCharacter(
 
   for (auto& [clientId, clientContext] : clients)
   {
-    if (clientId == keepClientId)
+    if (keepClientId.has_value() && clientId == keepClientId.value())
       continue;
     if (clientContext.characterUid != characterUid)
       continue;
@@ -75,6 +76,32 @@ std::vector<network::ClientId> UnbindOtherSessionsOfCharacter(
   }
 
   return unbound;
+}
+
+//! Вход персонажа: отвязать ВСЕ его сессии, кроме вошедшей.
+template <typename ContextMap>
+std::vector<network::ClientId> UnbindOtherSessionsOfCharacter(
+  ContextMap& clients,
+  const network::ClientId keepClientId,
+  const data::Uid characterUid)
+{
+  return UnbindSessionsOfCharacter(clients, characterUid, keepClientId);
+}
+
+//! LOA (R78-fix4, round78, backlog #255, находка ревю W1): выход персонажа из
+//! игры — отвязать ВСЕ его сессии, не щадя ни одной.
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНЫЙ ВХОД, А НЕ «keepClientId = что-нибудь несуществующее».
+//! `network::ClientId` — это `size_t`, и НИ ОДНО его значение не запрещено:
+//! часового, который заведомо ни с чем не совпадёт, не существует. Поэтому
+//! «щадить некого» выражено ТИПОМ (`std::nullopt`), а не магическим числом,
+//! которое однажды совпадёт с настоящим соединением.
+template <typename ContextMap>
+std::vector<network::ClientId> UnbindAllSessionsOfCharacter(
+  ContextMap& clients,
+  const data::Uid characterUid)
+{
+  return UnbindSessionsOfCharacter(clients, characterUid, std::nullopt);
 }
 
 } // namespace server::messenger

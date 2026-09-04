@@ -216,6 +216,74 @@ void TestUnauthenticatedButBoundIsUnbound()
     "личность обязана быть стёрта и у неаутентифицированной записи");
 }
 
+//! LOA (R78-fix4, находка ревю W1): ВЫХОД ИЗ ИГРЫ ГАСИТ ВСЕ СЕССИИ ПЕРСОНАЖА.
+//!
+//! ★ЗАЧЕМ ОТДЕЛЬНЫЙ ВХОД. При входе одну сессию щадят — вошедшую. При выходе
+//! щадить некого, и «щадить некого» обязано быть выражено ТИПОМ: `ClientId` —
+//! это `size_t`, у него нет запрещённого значения, поэтому часовой вроде
+//! `(ClientId)-1` однажды совпал бы с настоящим соединением.
+void TestLogoutUnbindsEverySession()
+{
+  Map clients{
+    {0, Bound(4)},
+    {1, Bound(4)},
+    {2, Bound(4)},
+    {3, Bound(9)},
+  };
+
+  const auto unbound = server::messenger::UnbindAllSessionsOfCharacter(clients, 4);
+
+  Check(unbound.size() == 3,
+    "★выход обязан отвязать ВСЕ три сессии персонажа, не щадя ни одной — "
+    "иначе держатель подсмотренного ключа продолжит читать чужую почту");
+  for (const server::network::ClientId id : {0u, 1u, 2u})
+  {
+    Check(not clients[id].isAuthenticated,
+      "у каждой сессии вышедшего обязан быть снят флаг обслуживания");
+    Check(clients[id].characterUid == server::data::InvalidUid,
+      "у каждой сессии вышедшего обязана быть стёрта личность");
+    Check(not clients[id].otpCode.has_value(),
+      "у каждой сессии вышедшего обязан быть стёрт запомненный код");
+  }
+  Check(clients[3].isAuthenticated && clients[3].characterUid == 9,
+    "чужой персонаж не должен пострадать от чужого выхода");
+}
+
+//! Тот же несущий гард, что и у входа: без личности не гасим никого.
+void TestLogoutWithInvalidUidUnbindsNothing()
+{
+  Map clients{
+    {0, Binding{}},
+    {1, Binding{}},
+    {2, Bound(4)},
+  };
+
+  const auto unbound = server::messenger::UnbindAllSessionsOfCharacter(
+    clients, server::data::InvalidUid);
+
+  Check(unbound.empty(),
+    "выход без выясненной личности обязан не тронуть НИ ОДНОЙ записи — "
+    "подключающиеся клиенты лежат в карте ровно с этим значением");
+  Check(clients[2].isAuthenticated, "чужая живая сессия обязана уцелеть");
+}
+
+//! ★ВХОД И ВЫХОД РАЗЛИЧАЮТСЯ ИМЕННО ЭТИМ, и разница проверена, а не заявлена.
+void TestLoginSparesOneAndLogoutSparesNone()
+{
+  Map loginCase{{0, Bound(4)}, {1, Bound(4)}};
+  Map logoutCase{{0, Bound(4)}, {1, Bound(4)}};
+
+  const auto onLogin = server::messenger::UnbindOtherSessionsOfCharacter(
+    loginCase, 1, 4);
+  const auto onLogout = server::messenger::UnbindAllSessionsOfCharacter(
+    logoutCase, 4);
+
+  Check(onLogin.size() == 1, "вход щадит вошедшую сессию");
+  Check(onLogout.size() == 2, "выход не щадит ни одной");
+  Check(loginCase[1].isAuthenticated, "после входа вошедшая сессия жива");
+  Check(not logoutCase[1].isAuthenticated, "после выхода не жива ни одна");
+}
+
 } // namespace
 
 int main()
@@ -228,6 +296,9 @@ int main()
   TestInvalidUidEvictsNothing();
   TestSingleSessionIsNoOp();
   TestUnauthenticatedButBoundIsUnbound();
+  TestLogoutUnbindsEverySession();
+  TestLogoutWithInvalidUidUnbindsNothing();
+  TestLoginSparesOneAndLogoutSparesNone();
 
   if (g_failures != 0)
   {
