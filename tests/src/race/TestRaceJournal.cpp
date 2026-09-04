@@ -41,8 +41,8 @@
 
 #include "server/tracker/RaceTracker.hpp"
 
-#include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -51,6 +51,26 @@
 
 namespace
 {
+
+//! ★НЕ `assert` (R76-fix-1, находка Codex 1 WARN-2). И образ, и юнит-прогон
+//! раунда собираются `RelWithDebInfo`, а он несёт `-DNDEBUG` — то есть `assert`
+//! выкидывается препроцессором и тест, написанный на нём, ПРОХОДИТ ВСЕГДА.
+//! Первая редакция этого файла была написана именно так: три её рантайм-теста
+//! не проверяли РОВНО НИЧЕГО, и ctest давал зелёный на пустом месте. Ровно та
+//! же ловушка описана в шапке `tests/src/data/TestCourseRecords.cpp` (R75) —
+//! я прошёл мимо предупреждения, оставленного соседним раундом.
+//! Своя проверка живёт вне зависимости от NDEBUG и возвращает ненулевой код.
+int g_failures = 0;
+
+void Check(const bool condition, const char* const what, const int line)
+{
+  if (condition)
+    return;
+  std::fprintf(stderr, "TestRaceJournal.cpp:%d: ПРОВАЛ — %s\n", line, what);
+  ++g_failures;
+}
+
+#define CHECK(cond, what) Check((cond), (what), __LINE__)
 
 using Racer = server::tracker::RaceTracker::Racer;
 
@@ -70,15 +90,17 @@ void TestJournalFieldsAreSelfInitialised()
 
   Racer* racer = new (storage) Racer;
 
-  assert(racer->splitsReached == 0);
-  assert(racer->posSampleCount == 0);
-  assert(racer->positionJumps == 0);
-  assert(racer->discardedMetres == 0.0);
-  assert(racer->maxDiscardedStepMetres == 0.0f);
-  assert(racer->progressClipped == 0);
-  assert(racer->maxDeclaredProgress == 0.0f);
+  CHECK(racer->splitsReached == 0, "splitsReached инициализируется сам");
+  CHECK(racer->posSampleCount == 0, "posSampleCount инициализируется сам");
+  CHECK(racer->positionJumps == 0, "positionJumps инициализируется сам");
+  CHECK(racer->discardedMetres == 0.0, "discardedMetres инициализируется сам");
+  CHECK(racer->maxDiscardedStepMetres == 0.0f,
+    "maxDiscardedStepMetres инициализируется сам");
+  CHECK(racer->progressClipped == 0, "progressClipped инициализируется сам");
+  CHECK(racer->maxDeclaredProgress == 0.0f,
+    "maxDeclaredProgress инициализируется сам");
   for (const uint32_t split : racer->progressSplits)
-    assert(split == 0);
+    CHECK(split == 0, "элемент progressSplits инициализируется сам");
 
   racer->~Racer();
 }
@@ -105,31 +127,44 @@ void TestInvalidSplitSentinelIsUnreachable()
     "пороги трассы десятипроцентные — и печать, и WARN считают именно так");
 }
 
-//! (3) Знаменатель плотности считается в 64 битах.
+//! (3) Плотность пакетов считается в 64 битах — проверяется ПРОДАКШН-КОД.
 //!
-//! Условие WARN «жидкий заезд» умножает число принятых пакетов на верхнюю
-//! границу среднего интервала. В 32 битах это произведение переполняется
-//! задолго до предела счётчика, и заезд, в котором пакетов пришло СЛИШКОМ
-//! МНОГО, получил бы маленькое произведение — то есть флуд читался бы как
-//! «никто не ехал». Тест не повторяет условие, он показывает, что две
-//! арифметики РАСХОДЯТСЯ и почему выбрана 64-битная.
-void TestDensityArithmeticDoesNotOverflow()
+//! ★ПЕРЕПИСАНО ПО НАХОДКЕ Codex 1 WARN-3. Первая редакция считала у себя
+//! «широкое» и «узкое» выражения и сравнивала их между собой. Это была КОПИЯ
+//! кода, проверяющая КОПИЮ кода: снятие `static_cast<uint64_t>` в
+//! `RaceInstance.cpp` оставляло такой тест зелёным. Теперь условие живёт в
+//! `Racer::HasPlausiblePacketDensity()` — той самой функции, которую зовёт WARN
+//! «жидкий заезд», — и тест зовёт ЕЁ.
+//!
+//! Что доказывается: при `posSampleCount`, близком к пределу `uint32_t`,
+//! произведение обязано перекрыть ЛЮБОЙ `courseTime`. В 32-битной арифметике
+//! оно переполнилось бы и функция сказала бы «пакетов не хватило» — то есть
+//! флуд читался бы как «никто не ехал».
+void TestDensityIsComputedInSixtyFourBits()
 {
-  constexpr uint32_t manySamples = std::numeric_limits<uint32_t>::max();
+  alignas(Racer) unsigned char storage[sizeof(Racer)];
+  std::memset(storage, 0, sizeof(storage));
+  Racer* racer = new (storage) Racer;
 
-  const uint64_t wide = static_cast<uint64_t>(manySamples)
-    * server::tracker::MaxPlausibleMeanPosIntervalMs;
-  const uint32_t narrow = manySamples
-    * server::tracker::MaxPlausibleMeanPosIntervalMs;
+  // Честный заезд: 585 пакетов за 154 с — плотность достаточна.
+  racer->posSampleCount = 585;
+  CHECK(racer->HasPlausiblePacketDensity(154164),
+    "585 пакетов за 154 с — плотность достаточна");
 
-  // Две арифметики обязаны РАЗОЙТИСЬ — иначе тест ничего не стерёг бы.
-  assert(wide != static_cast<uint64_t>(narrow));
+  // «Заезд в два пакета» за 42 с — плотности НЕТ (это и есть арка one-packet).
+  racer->posSampleCount = 2;
+  CHECK(not racer->HasPlausiblePacketDensity(42002),
+    "2 пакета за 42 с — плотности нет");
 
-  // И только широкая честно говорит «пакетов хватило на любой заезд»:
-  // courseTime — uint32, значит его максимум заведомо меньше произведения.
-  assert(wide > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()));
-  assert(static_cast<uint64_t>(narrow)
-    < static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()));
+  // ★ЯДРО ПРОВЕРКИ. При максимуме счётчика произведение обязано перекрыть
+  // максимальный возможный courseTime. Со снятым 64-битным кастом произведение
+  // переполнится, и эта строка покраснеет.
+  racer->posSampleCount = std::numeric_limits<uint32_t>::max();
+  CHECK(racer->HasPlausiblePacketDensity(std::numeric_limits<uint32_t>::max()),
+    "при пределе счётчика пакетов плотность обязана быть достаточной "
+    "(иначе знаменатель переполнился в 32 битах)");
+
+  racer->~Racer();
 }
 
 //! (4) Пороги раунда 0 остаются достижимыми.
@@ -141,6 +176,12 @@ void TestDensityArithmeticDoesNotOverflow()
 //! честный финишный «часовой» карты до 2.0.
 void TestRoundZeroThresholdsStayReachable()
 {
+  // ★ПОРОГ ОБЯЗАН УМЕТЬ СРАБОТАТЬ (R76-fix-1, находка Codex 1 WARN-4).
+  // Первая редакция проверяла только ВЕРХНИЕ границы, и `MinPlausibleSplits = 0`
+  // проходил их обе — то есть порог, который не срабатывает НИКОГДА, считался
+  // настроенным. Нижняя граница столь же обязательна, сколь верхняя.
+  static_assert(server::tracker::MinPlausibleSplits >= 1,
+    "порог 0 не срабатывает никогда — это не порог");
   // Порог «жидкого заезда» обязан лежать НИЖЕ полного числа порогов, иначе
   // WARN получил бы даже тот, кто взял все десять.
   static_assert(server::tracker::MinPlausibleSplits < Racer::ProgressSplitCount,
@@ -149,6 +190,13 @@ void TestRoundZeroThresholdsStayReachable()
   // на карте 7 (ri_fore01 финиширует при progress 0.811).
   static_assert(server::tracker::MinPlausibleSplits <= 8,
     "порог выше честного минимума 8/10 — ложная тревога на карте 7");
+  // ★И ЗАКРЕПЛЁН ПОИМЁННО. Ни одна арка стенда не даёт финиша с 4-5 сплитами
+  // (честный доходит до 10, читерский — до 1), поэтому ИМЕННО ЭТО ЧИСЛО не
+  // проверяется поведением нигде. Пусть его меняют осознанно: снижать по
+  // живому логу МОЖНО, повышать — только с новым замером (раунд 0 дал
+  // честный минимум 8/10 по 86 заездам, 6 оставляет два сплита запаса).
+  static_assert(server::tracker::MinPlausibleSplits == 6,
+    "измеренное значение порога изменено — нужен новый замер, а не правка теста");
 
   // Телепорт меряется ВЕЛИЧИНОЙ шага. Порог обязан стоять выше честного
   // максимума 63.25 м, иначе склейка пакетов честного игрока читается как
@@ -175,6 +223,9 @@ int main()
 {
   TestJournalFieldsAreSelfInitialised();
   TestInvalidSplitSentinelIsUnreachable();
-  TestDensityArithmeticDoesNotOverflow();
+  TestDensityIsComputedInSixtyFourBits();
   TestRoundZeroThresholdsStayReachable();
+  // ★НЕНУЛЕВОЙ КОД ВОЗВРАТА — единственное, что видит ctest. Тест, который
+  // печатает провал и выходит нулём, зелен для всех, кроме читателя лога.
+  return g_failures == 0 ? 0 : 1;
 }

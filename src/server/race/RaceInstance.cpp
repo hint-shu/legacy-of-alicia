@@ -61,6 +61,25 @@ constexpr uint16_t RaceAchievementEvent = 2;
 //! `-Wswitch` на новом значении перечисления, то есть будущее пополнение
 //! `FinishOutcome` придёт сюда предупреждением сборки, а не молчаливым
 //! «unknown» в проде. Возврат в конце нужен формально — все значения покрыты.
+//! LOA-fix (R76-fix-1, находка Codex 1 BLOCK-1): ИМЯ СОСТОЯНИЯ СОЕДИНЕНИЯ.
+//! Нужно ровно затем, что журнал перестал пропускать отключившихся: без этого
+//! поля «гонщик доехал и вышел» и «гонщик доехал и остался» дают в логе
+//! одинаковые строки, а разбирать их будет раунд 2.
+//! `default` не ставится по той же причине, что у исхода ниже.
+[[nodiscard]] constexpr std::string_view RacerStateName(
+  const tracker::RaceTracker::Racer::State state)
+{
+  using State = tracker::RaceTracker::Racer::State;
+  switch (state)
+  {
+    case State::Disconnected: return "disconnected";
+    case State::Loading: return "loading";
+    case State::Racing: return "racing";
+    case State::Finishing: return "finishing";
+  }
+  return "disconnected";
+}
+
 [[nodiscard]] constexpr std::string_view FinishOutcomeName(
   const tracker::RaceTracker::Racer::FinishOutcome outcome)
 {
@@ -1746,11 +1765,20 @@ void RaceInstance::LogRaceAudit()
 
   for (const auto& [characterUid, racer] : _tracker.GetRacers())
   {
-    // Отключившихся пропускаем — тот же гейт, что у персиста R24: их запись
-    // может рушиться в teardown, а журнал не стоит ни одной такой гонки.
-    if (racer.state == State::Disconnected)
-      continue;
-
+    // ★ОТКЛЮЧИВШИЕСЯ ТОЖЕ ПОПАДАЮТ В ЖУРНАЛ (R76-fix-1, находка Codex 1
+    // BLOCK-1). Первая редакция их ПРОПУСКАЛА «по образцу персиста R24», и это
+    // было неверно дважды:
+    //  (1) довод не применим. Гейт R24 защищает ЗАПИСЬ персонажа, которая в
+    //      teardown может рушиться. Здесь не трогается ни одна запись — только
+    //      поля `Racer` и печать;
+    //  (2) пропуск давал МОДКЛИЕНТУ ОТКАЗ ОТ ЖУРНАЛА. `HandleLeaveRoom`
+    //      (`RaceNetworkHandler.cpp:1983`) ставит `state = Disconnected`, но
+    //      НЕ УДАЛЯЕТ гонщика из трекера; финишировавший, который вышел из
+    //      комнаты раньше, чем доехали остальные, терял единственную свою
+    //      аудит-строку. Наблюдение, от которого можно отписаться выходом, —
+    //      не наблюдение, а тем более не улика античита.
+    // Состояние соединения печатается полем `state`: оно отвечает «где игрок
+    // СЕЙЧАС», а не «ехал ли он» ([[R70]]), и раунд 2 обязан их различать.
     // ★ДВЕ РАЗНЫЕ ПРАВДЫ, И ОБЕ ИДУТ В СТРОКУ (решение лида #2, R76).
     //
     // `finished` — это «клиент объявил финиш, и сервер принял время»
@@ -1770,6 +1798,7 @@ void RaceInstance::LogRaceAudit()
     // величин значило бы отдать раунду 2 таблицу, в которой «объявил финиш» и
     // «доказал заезд» слиты в один столбец.
     const bool finished = racer.courseTime != tracker::InvalidCourseTime;
+    const std::string_view stateName = RacerStateName(racer.state);
     const std::string_view outcomeName = FinishOutcomeName(racer.finishOutcome);
     const bool provenTraversal = racer.HasProvenTraversal();
 
@@ -1791,7 +1820,7 @@ void RaceInstance::LogRaceAudit()
     // журнале ни одного следа (слепое пятно B1 спеки), и понадобился бы
     // третий раунд «дописать в ту же строку».
     server::util::QuietLogInfo(
-      "race audit: room {} map {} mode {} char {} finished {} "
+      "race audit: room {} map {} mode {} char {} state {} finished {} "
       "outcome {} proven {} time {} "
       "splits {}/{} [{}] samples {} trusted {:.4f} declared {:.4f} "
       "clipped {} jumps {} discarded {:.1f}m maxJump {:.1f}m "
@@ -1800,6 +1829,7 @@ void RaceInstance::LogRaceAudit()
       static_cast<uint32_t>(GetMapBlockId()),
       static_cast<uint32_t>(GetGameModeId()),
       characterUid,
+      stateName,
       finished ? 1 : 0,
       outcomeName,
       provenTraversal ? 1 : 0,
@@ -1825,10 +1855,13 @@ void RaceInstance::LogRaceAudit()
     // паузы ОДИН пакет с progress = 1.0 штампует все десять сплитов (бюджет
     // храповика elapsedMs/30000 вырастает до 4.4). «Сплитов 10» без проверки
     // ПЛОТНОСТИ пакетов не доказывает, что кто-то ехал.
+    // ★ПЛОТНОСТЬ СЧИТАЕТ `Racer::HasPlausiblePacketDensity` (R76-fix-1,
+    // находка Codex 1 WARN-3): пока выражение стояло здесь по месту, юнит-тест
+    // мог лишь ПОВТОРИТЬ его у себя и оставался зелёным даже со снятым
+    // 64-битным кастом. Теперь бой и тест зовут ОДИН И ТОТ ЖЕ код.
     if (finished
       && (racer.splitsReached < tracker::MinPlausibleSplits
-        || static_cast<uint64_t>(racer.posSampleCount)
-             * tracker::MaxPlausibleMeanPosIntervalMs < racer.courseTime))
+        || not racer.HasPlausiblePacketDensity(racer.courseTime)))
     {
       server::util::QuietLogWarn(
         "race audit WARN thin ride: map {} char {} time {} splits {}/{} samples {}",
