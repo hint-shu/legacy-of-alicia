@@ -12,6 +12,7 @@
 
 #include "server/Config.hpp"
 
+#include <mutex>
 #include <shared_mutex>
 
 namespace server
@@ -74,6 +75,10 @@ public:
   //! ★ЗВАТЬ ТОЛЬКО ВНЕ ЗАМКОВ вызывающего: метод берёт СВОЙ замок карты
   //! клиентов, а закрытие соединений синхронно возвращается в
   //! `HandleClientDisconnected` (класс R59 — нерекурсивный `shared_mutex`).
+  //! ★ЗВАТЬ МОЖНО С ЛЮБОГО ПОТОКА, И ЭТО ГЛАВНОЕ СВОЙСТВО МЕТОДА (R78-fix7).
+  //! Сам он ничего не рвёт: правит значения под замком карты и КЛАДЁТ
+  //! соединения в очередь. Настоящее закрытие делает `Tick()` на потоке
+  //! мессенджера — см. разбор у `_pendingDisconnects`.
   void CloseSessionsOfCharacter(data::Uid characterUid);
   [[nodiscard]] bool IsCharacterOnline(const data::Uid characterUid) const;
   void SendStallionReward(
@@ -165,12 +170,22 @@ private:
     network::ClientId keepClientId,
     data::Uid characterUid);
 
-  //! Фаза 2, общая для входа и для выхода: закрыть отвязанные соединения.
+  //! Фаза 2 ДЛЯ ПУТИ ВХОДА: закрыть отвязанные соединения прямо здесь.
+  //! ★ЗВАТЬ ТОЛЬКО С ПОТОКА МЕССЕНДЖЕРА. Путь входа (`HandleChatterLogin`)
+  //! исполняется на нём по построению, поэтому синхронное закрытие тут
+  //! законно — это ровно тот приём, что стоял в базе в ветке отказа
+  //! авторизации. Для ЧУЖИХ потоков есть очередь, см. `_pendingDisconnects`.
   //! ★ВСЕГДА вне замка карты — см. разбор у `_clientsMutex`.
   void DisconnectUnboundSessions(
     const std::vector<network::ClientId>& unbound,
     const char* reason,
     data::Uid characterUid);
+
+  //! Сетевой тик чат-сервера. Приходит на потоке мессенджера.
+  void HandleNetworkTick() override;
+
+  //! Слить очередь отложенных разрывов. Только с потока мессенджера.
+  void DrainPendingDisconnects();
 
   ChatterServer _chatterServer;
   ServerInstance& _serverInstance;
@@ -201,6 +216,36 @@ private:
   //! (класс R59). Поэтому отключение вытесненных вынесено во ВТОРУЮ фазу,
   //! за пределы замка.
   mutable std::shared_mutex _clientsMutex;
+
+  //! LOA (R78-fix7, round78, backlog #255, находка ревю #2 BLOCK):
+  //! ОТЛОЖЕННЫЕ РАЗРЫВЫ. Соединения, которые попросили закрыть с ЧУЖОГО потока.
+  //!
+  //! ★ЗАЧЕМ ОЧЕРЕДЬ, А НЕ ПРЯМОЙ РАЗРЫВ. `CloseSessionsOfCharacter` зовёт лобби
+  //! (выход игрока) и поток чат-команд (GM-бан). Прямой `DisconnectClient`
+  //! оттуда синхронно уходит в `Client::End()` → `OnClientDisconnected` →
+  //! `HandleClientDisconnected`, то есть ЧУЖОЙ поток стирал бы записи из
+  //! `_clients` мессенджера и из `Server::_clients`/`Server::_addressStates`
+  //! (последняя вообще без замка), пока поток чата законно их читает. Это
+  //! гонка по неатомарным картам и use-after-free по ссылке, которую
+  //! `HandleChatterLogin` держит через всё тяжёлое тело, — а не «редкий сбой».
+  //!
+  //! ★ПОЧЕМУ НЕ «ПРОСТО МЬЮТЕКС». Тот же довод, по которому очередью написан
+  //! `RanchDirector::Disconnect` (R34-4, #96): `GetClientContext` отдаёт
+  //! `ClientContext&` НАРУЖУ, и ссылка живёт дольше любого замка внутри
+  //! аксессора. Замок в аксессоре дал бы ЛОЖНУЮ безопасность.
+  //!
+  //! ★ШТАМП ПОКОЛЕНИЯ НЕ НУЖЕН, и это ПРОВЕРЕНО, а не предположено. Ранчу он
+  //! нужен потому, что там в очередь кладут `characterUid` и разрыв ищет
+  //! соединение по нему уже во время слива. Здесь в очередь кладутся УЖЕ
+  //! ОТОБРАННЫЕ `clientId`, а `ClientId` — монотонный `size_t` без
+  //! переиспользования (`Server::_clientIdCounter`), поэтому реконнект того же
+  //! персонажа внутри окна слива получает ДРУГОЙ идентификатор и под слив
+  //! попасть не может по построению.
+  //!
+  //! Замок — ЛИСТОВОЙ: под ним ровно одна операция с контейнером и ни одного
+  //! вызова наружу.
+  std::mutex _pendingDisconnectsMutex;
+  std::vector<network::ClientId> _pendingDisconnects;
 };
 
 } // namespace server

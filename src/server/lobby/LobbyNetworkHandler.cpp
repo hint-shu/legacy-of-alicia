@@ -1331,6 +1331,16 @@ void LobbyNetworkHandler::HandleClientDisconnected(ClientId clientId)
     //
     // ★СТОИТ ПОСЛЕ КОПИИ И ВНЕ ЗАМКА: `RevokeLtk` берёт СВОЙ мьютекс, а держать
     // через чужой вызов замок карты клиентов запрещено (класс R59).
+    // LOA-fix (R78-fix7, NIT ревю #2 N1): шаг обёрнут в `RunCleanupStep`, как и
+    // его соседи. Правило сформулировано двумя строками ниже и в шапке
+    // функции: уборка лобби обязана ДОХОДИТЬ ДО КОНЦА при любом исходе
+    // каждого шага. Единственный независимый шаг без пояса — это шаг, который
+    // однажды унесёт с собой снятие с очереди подбора и планирование логаута.
+    util::RunCleanupStep(
+      "messenger key revoke",
+      clientId,
+      [&]()
+    {
     if (clientContext.messengerLtk.has_value()
       && clientContext.characterUid != data::InvalidUid)
     {
@@ -1363,6 +1373,7 @@ void LobbyNetworkHandler::HandleClientDisconnected(ClientId clientId)
           clientContext.characterUid);
       }
     }
+    });
 
     // LOA-fix (R38-4, round38, backlog #90a-B4): СНИМАЕМ ПЕРСОНАЖА С ОЧЕРЕДИ
     // БЫСТРОГО СТАРТА. Выход из игры «в поиске комнаты» запись в

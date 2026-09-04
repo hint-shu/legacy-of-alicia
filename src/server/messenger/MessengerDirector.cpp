@@ -267,7 +267,59 @@ void MessengerDirector::CloseSessionsOfCharacter(const data::Uid characterUid)
   if (unbound.empty())
     return;
 
-  DisconnectUnboundSessions(unbound, "logout", characterUid);
+  // ★ФАЗА 2 НЕ ЗДЕСЬ. Этот метод зовут ЧУЖИЕ потоки — лобби на выходе игрока и
+  // поток чат-команд на GM-бане. Закрыть соединение отсюда значит синхронно
+  // уйти в `Client::End()` → `HandleClientDisconnected` и стирать записи из
+  // трёх карт (наша `_clients`, `Server::_clients`, `Server::_addressStates`
+  // вовсе без замка), пока поток мессенджера их читает. Кладём в очередь и
+  // уходим; закроет `Tick()` на своём потоке, не позже следующего тика (1 с).
+  {
+    const std::lock_guard lock(_pendingDisconnectsMutex);
+    _pendingDisconnects.insert(
+      _pendingDisconnects.end(), unbound.begin(), unbound.end());
+  }
+
+  server::util::QuietLogInfo(
+    "Evicted {} stale messenger session(s) of character {} on {}",
+    unbound.size(),
+    characterUid,
+    "logout");
+}
+
+void MessengerDirector::HandleNetworkTick()
+{
+  Tick();
+}
+
+void MessengerDirector::DrainPendingDisconnects()
+{
+  // ★ИСПОЛНЯЕТСЯ НА ПОТОКЕ МЕССЕНДЖЕРА. `Server::TickLoop` армирован на
+  // `io_context` этого же сервера, поэтому тик приходит с того же потока, что
+  // accept, чтение пакетов и разрывы. Только здесь законно звать
+  // `DisconnectClient` и позволять уборке стирать записи.
+  std::vector<network::ClientId> pending;
+  {
+    const std::lock_guard lock(_pendingDisconnectsMutex);
+    if (_pendingDisconnects.empty())
+      return;
+    pending.swap(_pendingDisconnects);
+  }
+
+  for (const network::ClientId staleClientId : pending)
+  {
+    try
+    {
+      _chatterServer.DisconnectClient(staleClientId);
+    }
+    catch (const std::exception&)
+    {
+      // Соединения уже нет — ровно та цель, которой добивались.
+    }
+  }
+
+  server::util::QuietLogInfo(
+    "Closed {} deferred messenger session(s) on the messenger thread",
+    pending.size());
 }
 
 void MessengerDirector::DisconnectUnboundSessions(
@@ -445,6 +497,9 @@ void MessengerDirector::SendStallionReward(
 
 void MessengerDirector::Tick()
 {
+  // LOA-fix (R78-fix7, round78, backlog #255, находка ревю #2 BLOCK): здесь
+  // и только здесь закрываются соединения, о которых попросили чужие потоки.
+  DrainPendingDisconnects();
 }
 
 Config::Messenger& MessengerDirector::GetConfig()
@@ -560,8 +615,20 @@ void MessengerDirector::HandleChatterLogin(
   // ★СВЕРЯЕМ И ЛИЧНОСТЬ: вход под ДРУГИМ персонажем обязан идти полным путём
   // через `AuthorizeLtk`, иначе гард стал бы дырой «вошёл как свой — обслужен
   // как чужой».
-  if (clientContext.isAuthenticated
-    && clientContext.characterUid == command.characterUid)
+  // ★ЧТЕНИЕ — ПОД ЗАМКОМ (NIT ревю #2 N2). Оба поля вправе переписать фазой 1
+  // гашения чужой поток (выход игрока, GM-бан), поэтому читать их голыми
+  // руками — та же гонка, что и писать. Снимаем ОБА под одним разделяемым
+  // замком: решение принимается по согласованной паре, а не по двум значениям
+  // из разных мгновений.
+  bool alreadyLoggedInAsSameCharacter = false;
+  {
+    const std::shared_lock lock(_clientsMutex);
+    alreadyLoggedInAsSameCharacter =
+      clientContext.isAuthenticated
+      && clientContext.characterUid == command.characterUid;
+  }
+
+  if (alreadyLoggedInAsSameCharacter)
   {
     server::util::QuietLogDebug(
       "[{}] ChatCmdLogin: already logged in as character {}, replay ignored",
@@ -640,6 +707,16 @@ void MessengerDirector::HandleChatterLogin(
 
   // Store this otp code for reauthentication with the guild login command (if at all)
   protocol::ChatCmdLoginAckOK response{};
+
+  // LOA (R78-fix7, NIT ревю #2 N4): МАРКЕР САМОГО ТЕЛА, а не ветки гарда.
+  // Предикат «тело исполнено один раз» считался по строкам гарда, то есть
+  // мерил соседнюю ветку, а не ту, что защищают. Строка стоит ВНУТРИ тяжёлой
+  // части, ПОСЛЕ раннего выхода: если гард снять, она напечатается на каждый
+  // пакет, и стенд это увидит.
+  server::util::QuietLogDebug(
+    "[{}] ChatCmdLogin body: building the roster for character {}",
+    clientId,
+    command.characterUid);
 
   // Client request could be logging in as another character
   //
@@ -810,7 +887,11 @@ void MessengerDirector::HandleChatterLogin(
     .presence = protocol::Presence{
       .status = protocol::Status::Online,
       .scene = protocol::Presence::Scene::Ranch,
-      .sceneUid = clientContext.characterUid // Scene uid is default to character uid by design
+      // ★ЛОКАЛЬНАЯ ВЕЛИЧИНА, А НЕ ЧТЕНИЕ ЧЕРЕЗ ССЫЛКУ (R78-fix7, ревю #2).
+      // Ссылка на запись карты живёт здесь через всё тяжёлое тело входа, и
+      // читать её в конце значило бы читать поле, которое чужой поток вправе
+      // переписать фазой 1 гашения. Значение уже снято и неизменно.
+      .sceneUid = boundCharacterUid
     }});
 }
 

@@ -86,6 +86,11 @@ ACCESS_RE = re.compile(r"(?<!_)_clients\b(?!Mutex)")
 #: то же обращение к карте, просто написанное иначе.
 CONTEXT_WRITE_RE = re.compile(
     r"\bclientContext\.\w+\s*(?:=[^=]|\.emplace\(|\.reset\(\))")
+#: ЧТЕНИЕ через ту же ссылку. ★Добавлено по NIT ревю #2 N2: гейт видел записи,
+#! но не чтения, и новый гард повтора входа читал `isAuthenticated` и
+#: `characterUid` без замка совершенно незаметно для него. Чтение поля, которое
+#: чужой поток вправе переписать фазой 1 гашения, — та же гонка, что и запись.
+CONTEXT_READ_RE = re.compile(r"\bclientContext\.\w+")
 
 
 class Invalid(Exception):
@@ -161,9 +166,12 @@ def analyse(text: str):
             lock_depths.append(depth)
 
         is_access = bool(ACCESS_RE.search(code))
-        is_context_write = (func in MUST_LOCK_EXCLUSIVELY
-                            and bool(CONTEXT_WRITE_RE.search(code)))
-        if (is_access or is_context_write) and func is not None:
+        # Запись и чтение через ссылку считаются одинаково: и то и другое —
+        # обращение к элементу карты, просто записанное не через `_clients`.
+        is_context_touch = (func in MUST_LOCK_EXCLUSIVELY
+                            and (bool(CONTEXT_WRITE_RE.search(code))
+                                 or bool(CONTEXT_READ_RE.search(code))))
+        if (is_access or is_context_touch) and func is not None:
             protected = bool(lock_depths)
             accesses.append((number, func, protected))
             if func in MUST_LOCK and not protected:
