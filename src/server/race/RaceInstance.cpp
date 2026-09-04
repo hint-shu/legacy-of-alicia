@@ -1760,7 +1760,9 @@ void RaceInstance::Stop()
 
 void RaceInstance::LogRaceAudit()
 {
-  using State = tracker::RaceTracker::Racer::State;
+  // `State` здесь больше не нужен: пропуск отключившихся снят (находка Codex 1
+  // BLOCK-1), а имя состояния печатает `RacerStateName`. Оставленный алиас
+  // давал `-Wunused-local-typedefs` на пиннованном gcc 15 (находка Codex 2).
   using Racer = tracker::RaceTracker::Racer;
 
   for (const auto& [characterUid, racer] : _tracker.GetRacers())
