@@ -30,6 +30,30 @@
 namespace server::protocol
 {
 
+namespace
+{
+
+//! Влезает ли кадр входа в буфер команды. Мерит НАСТОЯЩИМ писателем — «длина
+//! в полях» к байтам провода отношения не имеет (строки уезжают в EUC-KR).
+[[nodiscard]] bool LoginFrameFits(const LobbyCommandLoginOK& command)
+{
+  static thread_local std::vector<std::byte> scratch(util::MaxCommandDataSizeBytes);
+  SinkStream sink{std::span{scratch}};
+  try
+  {
+    LobbyCommandLoginOK::Write(command, sink);
+  }
+  catch (...)
+  {
+    // Не смог записать — значит не влезает. Любая другая причина отказа
+    // писателя тоже обязана вести к сбросу, а не к потере входа.
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
 void AcCmdCLLogin::Write(
   const AcCmdCLLogin&,
   SinkStream&)
@@ -223,6 +247,62 @@ void LobbyCommandLoginOK::Write(
 
   // Pet
   stream.Write(command.pet);
+}
+
+uint32_t BudgetLoginFrame(LobbyCommandLoginOK& command)
+{
+  uint32_t shed = static_cast<uint32_t>(LoginFrameShed::Nothing);
+  if (LoginFrameFits(command))
+    return shed;
+
+  // 1. Макросы. У них уже есть штатный путь «не публиковать», и клиент без них
+  //    работает — теряются только заготовки фраз.
+  if (command.settings.typeBitset.test(Settings::Macros))
+  {
+    command.settings.typeBitset.reset(Settings::Macros);
+    command.settings.macroOptions = MacroOptions{};
+    shed |= static_cast<uint32_t>(LoginFrameShed::Macros);
+    if (LoginFrameFits(command))
+      return shed;
+  }
+
+  // 2-3. Привязки. Геймпад раньше клавиатуры: геймпад есть далеко не у всех.
+  if (command.settings.typeBitset.test(Settings::Gamepad))
+  {
+    command.settings.typeBitset.reset(Settings::Gamepad);
+    command.settings.gamepadOptions.bindings.clear();
+    shed |= static_cast<uint32_t>(LoginFrameShed::GamepadBindings);
+    if (LoginFrameFits(command))
+      return shed;
+  }
+  if (command.settings.typeBitset.test(Settings::Keyboard))
+  {
+    command.settings.typeBitset.reset(Settings::Keyboard);
+    command.settings.keyboardOptions.bindings.clear();
+    shed |= static_cast<uint32_t>(LoginFrameShed::KeyboardBindings);
+    if (LoginFrameFits(command))
+      return shed;
+  }
+
+  // 4. Представление — самое заметное игроку, поэтому последнее. Режем
+  //    ПОПОЛАМ, пока не влезет: длина в байтах провода не равна длине в
+  //    символах, поэтому «отрезать N символов» ничего не гарантирует, а
+  //    деление пополам сходится за считанные шаги при любой кодировке.
+  if (not command.introduction.empty())
+  {
+    while (not command.introduction.empty() && not LoginFrameFits(command))
+    {
+      command.introduction.resize(command.introduction.size() / 2);
+      shed |= static_cast<uint32_t>(LoginFrameShed::Introduction);
+    }
+    if (LoginFrameFits(command))
+      return shed;
+  }
+
+  // Кадр не влез даже без всего клиентского. Причина лежит вне полей, длину
+  // которых задаёт клиент, — вызывающий обязан это назвать, а не промолчать.
+  shed |= static_cast<uint32_t>(LoginFrameShed::StillTooLarge);
+  return shed;
 }
 
 void LobbyCommandLoginOK::Read(

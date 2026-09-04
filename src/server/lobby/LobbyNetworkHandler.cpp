@@ -1905,6 +1905,42 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
   response.trainingProgression.mapProggressInfos = {
     mapProgressInfo};
 
+  // ★R74-fix-2 (subreview #1, WARN 1): ПОСЛЕДНЯЯ ЛИНИЯ ПЕРЕД ОТПРАВКОЙ.
+  //
+  // Кадр входа собран целиком; здесь и только здесь известно, влезает ли он.
+  // Три поля профиля, чью длину задаёт клиент (представление, привязки
+  // клавиатуры и геймпада, макросы), персистятся и уезжают в КАЖДОМ входе, а
+  // их собственные потолки в сумме кадр не вмещают. Перелив убивает не их, а
+  // ХВОСТ кадра — бросок из поставщика записи закрывает соединение, и так на
+  // каждой попытке входа: восстановление только правкой JSON руками.
+  //
+  // Сбрасываем копию, уезжающую на провод; данные на диске не трогаем.
+  const auto shed = protocol::BudgetLoginFrame(response);
+  if (shed != static_cast<uint32_t>(protocol::LoginFrameShed::Nothing))
+  {
+    // Жалоба задросселирована: содержимое профиля задаёт клиент, значит и
+    // частоту этой строки задавал бы он.
+    static util::LogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (loginFrameShedThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "login frame over budget for user '{}': shed mask 0x{:x}"
+        " (macros={} gamepad={} keyboard={} introduction={} still-too-large={});"
+        " the stored profile is untouched (suppressed {} more, {} in total)",
+        clientContext.userName,
+        shed,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Macros)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::GamepadBindings)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::KeyboardBindings)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Introduction)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0,
+        suppressed,
+        total);
+    }
+  }
+
   _commandServer.SetCode(clientId, {});
 
   _commandServer.QueueCommand<decltype(response)>(
@@ -2744,8 +2780,10 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
   // ПОСЛЕ выхода из него: держать логгер под замком записи не за чем.
   bool macroBlockRefused = false;
   std::size_t macroBlockWireSize = 0;
+  std::size_t macroSlotsAccepted = 0;
 
-  settingsRecord.Mutable([&settingsUid, &command, &macroBlockRefused, &macroBlockWireSize](
+  settingsRecord.Mutable([&settingsUid, &command, &macroBlockRefused, &macroBlockWireSize,
+                          &macroSlotsAccepted](
     data::Settings& settings)
   {
     // Copy the keyboard bindings if present in the command.
@@ -2810,7 +2848,32 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
       }
       else
       {
+        // ★R74-fix-2 (subreview #1, WARN 3): ЧАСТИЧНЫЙ ПРИЁМ ВМЕСТО «ВСЁ ИЛИ
+        // НИЧЕГО». Прежний отказ выбрасывал ВЕСЬ блок, включая те семь слотов,
+        // что влезали по отдельности, — а `AcCmdCLUpdateUserSettingsOK`
+        // отправляется в любом случае и тела не несёт, то есть клиент показывал
+        // «сохранено». Игрок узнавал о потере при следующем входе и без
+        // причины. Отдельного отказного кадра протокол не предлагает: опкод
+        // `AcCmdCLUpdateUserSettingsCancel` (0x92) в перечислении есть, но
+        // структуры у него нет и никто его не шлёт — выдумывать её раунд не
+        // будет. Поэтому берём то, что влезает, по одному слоту, в порядке
+        // слотов: игрок теряет ровно хвост, а не всё.
+        protocol::MacroOptions accepted{};
+        std::size_t slotsAccepted = 0;
+        for (std::size_t slot = 0; slot < accepted.macros.size(); ++slot)
+        {
+          protocol::MacroOptions probe = accepted;
+          probe.macros[slot] = command.settings.macroOptions.macros[slot];
+          if (protocol::MeasureMacroBlockWireSize(probe)
+                > protocol::MaxMacroBlockWireBytes)
+            break;
+          accepted = probe;
+          ++slotsAccepted;
+        }
+
+        settings.macros() = accepted.macros;
         macroBlockRefused = true;
+        macroSlotsAccepted = slotsAccepted;
       }
     }
 
@@ -2828,11 +2891,12 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     if (macroRefusalThrottle.Allow(suppressed, total))
     {
       util::QuietLogWarn(
-        "refused an oversized macro block from user '{}': {} wire bytes over the {} byte budget;"
-        " the stored macros were left unchanged (suppressed {} more, {} in total)",
+        "refused an oversized macro block from user '{}': {} over the {} byte budget;"
+        " kept the first {} slot(s) that fit (suppressed {} more, {} in total)",
         clientContext.userName,
-        macroBlockWireSize,
+        protocol::DescribeMacroBlockWireSize(macroBlockWireSize),
         protocol::MaxMacroBlockWireBytes,
+        macroSlotsAccepted,
         suppressed,
         total);
     }
@@ -2902,6 +2966,19 @@ void LobbyNetworkHandler::HandleGoodsShopList(
   auto now = util::Clock::now() + std::chrono::days(1);
 
   //! Chunk size as defined in command handler.
+  // ★R74 (subreview #1, NIT 3): ЭТО ЧИСЛО ДЕРЖИТ ОТКАЗ БУЛК-ХЕЛПЕРА
+  // НЕДОСТИЖИМЫМ, И ЭТО НЕ СЛУЧАЙНОСТЬ, А ИНВАРИАНТ.
+  //
+  // `AcCmdLCGoodsShopListData::Write` пишет свой кусок через
+  // `util::WriteBoundedBytes`, а тот при нехватке места НЕ БРОСАЕТ — он
+  // укорачивает блок и оставляет счётчик согласованным с телом. Для zlib это
+  // хуже броска: клиент получит формально корректный кадр и неразжимаемый
+  // поток. Единственный производитель этих кусков — вот этот `chunk`, и
+  // 7168 против ~8174 доступных байт кадра оставляют запас 1006 Б, то есть
+  // резать нечего.
+  //
+  // Поднимешь ChunkSize выше ~8100 — хелпер начнёт молча резать сжатый поток.
+  // Расти этому числу можно только вместе с `MaxCommandDataSize`.
   constexpr auto ChunkSize = 7168;
 
   // Fragment shop data and send it in parts for the client to reconstruct and store.
