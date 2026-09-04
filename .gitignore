@@ -36,3 +36,4 @@ resources/config/server/config.local.yaml
 # Python bytecode from tools/*.py
 __pycache__/
 *.pyc
+Dockerfile.tests

@@ -19,6 +19,7 @@
 
 #include "server/ServerInstance.hpp"
 #include "libserver/util/QuietLog.hpp"
+#include "libserver/util/RecordAccess.hpp"
 
 #include "server/race/RaceInstance.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
@@ -27,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -224,6 +227,11 @@ bool RaceInstance::Start(
   // такого исхода — джоб прошлого заезда всё ещё считается своим; это ровно
   // пред-существующее поведение «заезд кончился, а джоб ещё летит», и первый
   // же удавшийся `Start()` его отсекает.
+  // LOA-fix (R75, #14/#233): новый заезд — новые итоги. Стоит на том же пути,
+  // что ++_raceEpoch: после успешных PrepareGameMode/PrepareMap, то есть только
+  // там, где заезд ДЕЙСТВИТЕЛЬНО начался.
+  _resultsCredited = false;
+
   ++_raceEpoch;
 
   return true;
@@ -250,6 +258,18 @@ void RaceInstance::ArmLoadingDeadline()
 
 void RaceInstance::Stop()
 {
+  // LOA-fix (R75, #14/#233): см. `_resultsCredited` в заголовке. Ранний выход
+  // стоит ПЕРВЫМ действием функции — до единого чтения трекера, чтобы «не более
+  // одного раза» относилось ко ВСЕМУ телу, а не к тому куску, до которого дошли.
+  if (_resultsCredited)
+  {
+    server::util::QuietLogWarn(
+      "Room {}: the race results were already credited, skipping the repeated Stop()",
+      this->GetRoomUid());
+    return;
+  }
+  _resultsCredited = true;
+
   protocol::AcCmdRCRaceResultNotify raceResult{};
 
   using Team = tracker::RaceTracker::Racer::Team;
@@ -578,6 +598,320 @@ void RaceInstance::Stop()
             ? 0xFFFFFFFFu
             : static_cast<uint32_t>(newTotalDistance);
         });
+    }
+  }
+
+  // === LOA-fix (R75, #14 Ф2): ВЕЧНЫЕ РЕКОРДЫ ЛОШАДИ — ОТДЕЛЬНЫМ ПРОХОДОМ ====
+  //
+  // ★ПОЧЕМУ ОТДЕЛЬНЫЙ ПРОХОД, А НЕ ДОПИСКА В ЦИКЛ Ф1 ВЫШЕ (R75 ит.3, Codex #1).
+  // Первая редакция раунда дописала эти две величины в цикл фазы 1 — и тем самым
+  // поставила их ПОД ЧУЖОЙ ГЕЙТ `state == Disconnected`. Гонщик, который доехал
+  // (сервер сам замерил и время, и путь) и закрыл игру, не дождавшись последнего
+  // соперника, терял свой рекорд планирования и цепочку. Отключение — не отмена
+  // уже ДОКАЗАННОГО исхода; тот же довод записан у блока достижений R70
+  // («состояние соединения — не история заезда»).
+  // ★ГЕЙТ Ф1 ПРИ ЭТОМ НЕ ТРОГАЕМ, И ЭТО НАМЕРЕННО. Он пред-существующий (R24),
+  // у него своя причина — прямой `Record::Mutable` на записи, которая может
+  // рушиться в teardown, — и расширять радиус чужого античита раунд не вправе.
+  // Блок фазы 1 выше остался ПОБАЙТНО таким же, как на `origin/main`.
+  // ★ЦЕНА ОТДЕЛЬНОГО ПРОХОДА — ВТОРАЯ ЗАПИСЬ В ТУ ЖЕ ЛОШАДЬ, и она оплачена:
+  // здесь доступ идёт ЧЕРЕЗ ПОЯС (`util::TryImmutable`/`util::TryMutate`), то
+  // есть непрогруженная запись даёт отказ со строкой в логе, а не бросок,
+  // уносящий весь хвост `Stop()`. Именно поэтому проход и может позволить себе
+  // не спрашивать соединение.
+  //
+  // ★ДВЕ УЛИКИ, И ОНИ ОТВЕЧАЮТ НА РАЗНЫЕ ВОПРОСЫ.
+  //  (1) «ЭТОТ ЗАЕЗД ВООБЩЕ ЕХАЛИ?» — `FinishOutcome::Finished` (финиш пережил
+  //      зелёный свет, пол `MinPlausibleCourseTime` и улику пути) плюс
+  //      `HasProvenTraversal()` (>= 200 м, посчитанных СЕРВЕРОМ из разниц
+  //      позиций, и прогресс >= 0.1 под храповиком). Обе построены R70 (#58),
+  //      обе серверные, объявить их нельзя — можно только проехать.
+  //  (2) «А ЭТО ЧИСЛО ПРАВДОПОДОБНО?» — два потолка. Они ограничивают РАЗМЕР
+  //      лжи, пережившей первую улику.
+  // Ни одна не заменяет другую.
+  // ★ОТБРАСЫВАЕМ, А НЕ КЛАМПИМ. Кламп позволил бы модифицированному клиенту
+  // ПРИКОЛОТИТЬ вечный рекорд ровно к потолку; отброс означает, что
+  // неправдоподобная величина не даёт НИЧЕГО. Та же дисциплина, что у бюджета
+  // шага R24 (`if (step <= budget)` — отбросить, не обрезать).
+  {
+    for (const auto& [characterUid, racer] : _tracker.GetRacers())
+    {
+      const bool outcomeProven =
+        racer.finishOutcome
+          == tracker::RaceTracker::Racer::FinishOutcome::Finished
+        && racer.HasProvenTraversal();
+      if (not outcomeProven)
+      {
+        // Молчим у того, кому и писать было нечего: иначе строка пойдёт на
+        // КАЖДОГО сошедшего в каждом заезде и утопит собой диагностику.
+        if (racer.longestGlideMetres > 0.0f || racer.boostComboMax > 0)
+          server::util::QuietLogWarn(
+            "Room {}: character {} has no server-proven finish, the per-race "
+            "record is not persisted",
+            this->GetRoomUid(),
+            characterUid);
+        continue;
+      }
+      // Санитарная проверка самого времени оставлена вторым сомножителем
+      // нарочно — тот же довод, что у `isProvenFinish` в блоке достижений:
+      // читать время без неё было бы приглашением к регрессии, если исход
+      // когда-нибудь начнут ставить в другом месте.
+      if (racer.courseTime == tracker::InvalidCourseTime
+        || racer.courseTime < tracker::MinPlausibleCourseTime)
+        continue;
+
+      const bool glidePlausible =
+        racer.longestGlideMetres <= tracker::MaxPlausibleGlideMetres;
+      const bool chainPlausible =
+        racer.boostComboMax <= tracker::MaxPlausibleBoostChain;
+      if (not glidePlausible || not chainPlausible)
+        server::util::QuietLogWarn(
+          "Room {}: character {} reported an implausible per-race record "
+          "(glide {} m, boost chain {}); the implausible value is discarded",
+          this->GetRoomUid(),
+          characterUid,
+          racer.longestGlideMetres,
+          racer.boostComboMax);
+
+      const float glideMetres = glidePlausible ? racer.longestGlideMetres : 0.0f;
+      // ★ЕДИНИЦЫ ЗДЕСЬ ДРУГИЕ, ЧЕМ У totalDistance, И ЭТО ЛОВУШКА.
+      // У totalDistance — «store in metres»; у longestGlideDistance — «whole
+      // number, divided by 10», ровно тот же комментарий, что у topSpeed, чьи
+      // десятые доказаны pcap'ом R24. Поэтому здесь ДЕСЯТЫЕ ДОЛИ МЕТРА.
+      const uint64_t glideTenthsRaw = static_cast<uint64_t>(
+        static_cast<double>(glideMetres) * 10.0 + 0.5);
+      const uint32_t glideTenths = glideTenthsRaw > 0xFFFFFFFFull
+        ? 0xFFFFFFFFu
+        : static_cast<uint32_t>(glideTenthsRaw);
+      // Wire-поле boostsInARow — uint16, и read-back режет его кастом. Клампим
+      // на ЗАПИСИ, иначе хранимое и показанное разойдутся. Потолок
+      // правдоподобия (50) и так ниже 65535 — кламп остаётся страховкой формы,
+      // а не логикой.
+      const uint32_t boostsInARow = chainPlausible
+        ? std::min<uint32_t>(racer.boostComboMax, 65535u)
+        : 0u;
+      if (glideTenths == 0 && boostsInARow == 0)
+        continue;
+
+      data::Uid mountUid = data::InvalidUid;
+      if (not server::util::TryImmutable(
+            _raceNetworkHandler.GetServerInstance().GetDataDirector()
+              .GetCharacter(characterUid),
+            "read the mount of the per-race record holder",
+            [&mountUid](const data::Character& character) noexcept
+            {
+              mountUid = character.mountUid();
+            }))
+        continue;
+      if (mountUid == data::InvalidUid)
+        continue;
+
+      const auto outcome = server::util::TryMutate(
+        _raceNetworkHandler.GetServerInstance().GetDataDirector().GetHorse(
+          mountUid),
+        "credit the per-race horse record",
+        [glideTenths, boostsInARow](data::Horse& horse) noexcept
+        {
+          // ★ОБА ПОЛЯ — ВЕЧНЫЕ РЕКОРДЫ, ПОЭТОМУ ТОЛЬКО МАКСИМУМ И ТОЛЬКО ВВЕРХ.
+          // Безусловное присваивание стирало бы чужой рекорд КАЖДЫМ медленным
+          // заездом, а снять последствие можно только правкой файлов при
+          // остановленном сервере.
+          if (glideTenths > horse.mountInfo.longestGlideDistance())
+            horse.mountInfo.longestGlideDistance() = glideTenths;
+          if (boostsInARow > horse.mountInfo.boostsInARow())
+            horse.mountInfo.boostsInARow() = boostsInARow;
+        });
+
+      if (outcome == server::util::MutateOutcome::NotApplied)
+        server::util::QuietLogWarn(
+          "Room {}: the per-race horse record of character {} was not credited",
+          this->GetRoomUid(),
+          characterUid);
+      // ★ТРЕТИЙ ИСХОД ПОЯСА — НЕ «ПОЧТИ УСПЕХ» (R75 ит.4, Codex #1).
+      // `AppliedNotPersisted` означает: рекорд в памяти УЖЕ обновлён, а просьба
+      // сохранить запись не поставлена (`_patchListener` умеет бросить УЖЕ
+      // ПОСЛЕ применения — ровно поэтому у пояса три ответа, а не два).
+      // Молча проехать мимо — значит потерять ВЕЧНОЕ поле честного игрока при
+      // ближайшем перезапуске. Договор пояса на этот случай один и уже
+      // используется в дереве (`BreedingMarket`): досылаем просьбу сохранить
+      // через `util::TrySave` по кэшу той же записи.
+      else if (outcome == server::util::MutateOutcome::AppliedNotPersisted)
+        (void)server::util::TrySave(
+          _raceNetworkHandler.GetServerInstance().GetDataDirector()
+            .GetHorseCache(),
+          mountUid,
+          "a horse with a new per-race record");
+    }
+  }
+
+  // === LOA-fix (R75, #14): ПЕР-КУРСОВЫЕ РЕКОРДЫ ПЕРСОНАЖА ==================
+  // Окно «Мои данные -> Трассы» (AcCmdLCPersonalInfo type 7) отвечало пустотой:
+  // хендлер стоял на `// TODO: implement`, а хранить было НЕЧЕГО — у
+  // data::Character не было ни счётчика заездов, ни рекордов по трассам. Это и
+  // есть исходная формулировка #14 «число заездов не пишется» (провод был готов
+  // всегда).
+  //
+  // ★СЧИТАЕМ ПО `_tracker.GetRacers()` (R75 ит.2, Codex #1/#2 — было по
+  // `raceResult.scores`). ДВЕ ПРИЧИНЫ, И ОБЕ — ПРО ПРАВИЛЬНОСТЬ, НЕ ПРО ВКУС.
+  //  (1) `raceResult.scores` ЗАТИРАЕТ ВРЕМЯ ОТКЛЮЧИВШЕГОСЯ: построение табло
+  //      выше кладёт `InvalidCourseTime` всякому, чей `state == Disconnected`.
+  //      Гонщик, который ДОЕХАЛ и закрыл игру, не дождавшись последнего
+  //      соперника, терял из-за этого свой пер-курсовой рекорд. Отключение — не
+  //      отмена уже доказанного исхода; тот же довод записан у блока достижений
+  //      R70 («состояние соединения — не история заезда»), и он читает трекер
+  //      ровно поэтому.
+  //  (2) В ТРЕКЕРЕ ЛЕЖИТ УЛИКА, КОТОРОЙ В ТАБЛО НЕТ, — `finishOutcome` и
+  //      `HasProvenTraversal()` (см. гейт ниже).
+  // ★БОТОВ В ТРЕКЕРЕ НЕТ, и это свойство построения, а не памятливости:
+  // `AddRacer` зовётся ровно в одном месте (`HandleStartRace`, по игрокам
+  // комнаты), а AI-ростер живёт отдельным `_aiRacers` на инстансе и в табло
+  // попадает только через КОПИЮ `broadcastResult`. Соседние блоки — Ф1 (R24) и
+  // достижения (R70) — перебирают трекер по той же причине.
+  //
+  // ★ГЕЙТ — «СЕРВЕР САМ ВИДЕЛ, ЧТО ЕХАЛИ», А НЕ «ВРЕМЯ ВЫГЛЯДИТ ПРАВДОПОДОБНО»
+  // (R75 ит.2, Codex #2). Прежний гейт (валидный courseTime + пол
+  // `MinPlausibleCourseTime`) — тот же, что у Ф0/Ф1/S8, и он ОДИН пропускал
+  // модифицированного клиента, который вошёл в заезд, простоял тридцать секунд
+  // и прислал `AcCmdUserRaceFinal`: серверный замер времени к тому моменту
+  // честно превышает пол, и вечный пер-курсовой рекорд чеканился без единого
+  // метра пути. R70 (#58) уже собрал ту улику, которой здесь не хватало:
+  // `FinishOutcome::Finished` ставится только пережившему ВСЕ серверные
+  // проверки финишу, а `HasProvenTraversal()` — это 200 м пути, посчитанные
+  // САМИМ сервером из разниц позиций, плюс зажатый храповиком прогресс 0.1.
+  // Объявить их нельзя — их можно только проехать.
+  // ★ПОЛ ВРЕМЕНИ ОСТАЁТСЯ ВТОРЫМ СОМНОЖИТЕЛЕМ: `recordTime` уходит в вечное
+  // поле, и читать время без санитарной проверки в том же предикате было бы
+  // приглашением к регрессии (тот же довод у `isProvenFinish` в блоке R70).
+  //
+  // ★ЗАПИСЬ ЧЕРЕЗ `util::TryMutate`, А НЕ ПРЯМЫМ `Mutable`. Это НОВЫЙ доступ к
+  // записи на участке между начислениями и рассылкой табло: прямой `Mutable` на
+  // непрогруженной записи бросил бы, и вся комната осталась бы без результата
+  // заезда.
+  //
+  // ★ЧЕСТНО О ГРАНИЦЕ ПОЯСА. `static_assert` в RecordAccess.hpp проверяет
+  // `std::is_nothrow_invocable_v`, то есть НАЛИЧИЕ СПЕЦИФИКАТОРА `noexcept`, а
+  // НЕ отсутствие броска. Единственная операция тела, которая теоретически
+  // бросает, — рост вектора (`push_back` -> bad_alloc); невыловленный bad_alloc
+  // из noexcept-функции это std::terminate, то есть гибель всего процесса.
+  // Поэтому аллоцирующая операция стоит под СОБСТВЕННЫМ try/catch, и стоит она
+  // ПЕРВОЙ: при отказе тело выходит ДО единой мутации, и `NotApplied`/
+  // `credited == false` остаются честными.
+  {
+    const bool isSpeed = _parameters.gameMode == protocol::GameMode::Speed;
+    const bool isMagic = _parameters.gameMode == protocol::GameMode::Magic;
+    // Tutorial и Unk4 в статистику трасс НЕ идут: окно клиента считает ровно
+    // скоростные и магические заезды, третьего счётчика там нет.
+    const uint64_t rawCourseId = static_cast<uint64_t>(_mapBlockId);
+    if ((isSpeed || isMagic)
+      && rawCourseId != 0
+      && rawCourseId <= std::numeric_limits<uint16_t>::max())
+    {
+      // Та же величина, что S8 зовёт `finishedMapBlockId` — карта, на которой
+      // РЕАЛЬНО проехали, уже после PickRandomMapFromCourse.
+      const auto courseId = static_cast<uint16_t>(rawCourseId);
+
+      for (const auto& [characterUid, racer] : _tracker.GetRacers())
+      {
+        if (racer.finishOutcome
+              != tracker::RaceTracker::Racer::FinishOutcome::Finished
+          || not racer.HasProvenTraversal())
+          continue;
+        if (racer.courseTime == tracker::InvalidCourseTime
+          || racer.courseTime < tracker::MinPlausibleCourseTime)
+          continue;
+
+        const auto characterRecord =
+          _raceNetworkHandler.GetServerInstance().GetDataDirector().GetCharacter(
+            characterUid);
+        bool credited = false;
+        const auto outcome = server::util::TryMutate(
+          characterRecord,
+          "credit the per-course race record",
+          [courseId, isSpeed, courseTime = racer.courseTime, &credited](
+            data::Character& character) noexcept
+          {
+            // ★ТРЕТЬЕГО СЧЁТЧИКА НЕТ НАМЕРЕННО. `totalGames` выводится сложением
+            // двух и потому не умеет разойтись со слагаемыми.
+            const auto countTheRace = [isSpeed, &character]() noexcept
+            {
+              auto& games = isSpeed
+                ? character.totalSpeedGames()
+                : character.totalMagicGames();
+              if (games < std::numeric_limits<uint32_t>::max())
+                games += 1;
+            };
+
+            auto& records = character.courseRecords();
+            auto found = std::ranges::find(
+              records, courseId, &data::Character::CourseRecord::courseId);
+            if (found == records.end())
+            {
+              // Кап тот же, что несёт провод (счётчик списка пишется uint8), и
+              // он же — предел файла на чтении.
+              if (records.size() >= data::MaxCourseRecords)
+              {
+                // ★ЗАЕЗД ВСЁ РАВНО СОСТОЯЛСЯ (R75 ит.2, Codex #6). Счётчик
+                // заездов по режиму — величина, НЕЗАВИСИМАЯ от того, влез ли
+                // рекорд трассы в список: раньше упор в кап тихо переставал
+                // считать и заезды тоже. Ветка не аллоцирует, поэтому
+                // «мутация после возможного броска» здесь недостижима.
+                countTheRace();
+                return;
+              }
+              // ★ЕДИНСТВЕННАЯ АЛЛОЦИРУЮЩАЯ ОПЕРАЦИЯ ТЕЛА — под своим try/catch
+              // и ПЕРВОЙ, до любой мутации.
+              try
+              {
+                records.push_back(
+                  data::Character::CourseRecord{.courseId = courseId});
+              }
+              catch (...)
+              {
+                return;
+              }
+              found = std::prev(records.end());
+            }
+
+            countTheRace();
+
+            if (found->timesRaced < std::numeric_limits<uint32_t>::max())
+              found->timesRaced += 1;
+            // Рекорд — МИНИМАЛЬНОЕ время. Ноль означает «рекорда ещё нет»,
+            // поэтому первый финиш всегда записывается.
+            if (found->recordTime == 0 || courseTime < found->recordTime)
+              found->recordTime = courseTime;
+            credited = true;
+          });
+
+        if (outcome == server::util::MutateOutcome::NotApplied || not credited)
+          server::util::QuietLogWarn(
+            "Room {}: the per-course record of character {} was not credited",
+            this->GetRoomUid(),
+            characterUid);
+        // ★ТОТ ЖЕ ТРЕТИЙ ИСХОД, ТОТ ЖЕ ДОГОВОР. Условие разделено с
+        // предупреждением выше нарочно: «не применено» и «применено, но не
+        // сохранено» — разные состояния записи, и лечатся они разным.
+        //
+        // ★БЕЗ ДОПОЛНИТЕЛЬНОГО КОНЪЮНКТА — И ЭТО ИСПРАВЛЕНИЕ ПРЕДЫДУЩЕЙ
+        // РЕДАКЦИИ (R75 ит.5, Codex #1). Сперва здесь стояло `&& credited`, «не
+        // просить сохранить нетронутую запись». Проверка оказалась ЛОЖНО-УЗКОЙ:
+        // ветка упора в кап (`records.size() >= MaxCourseRecords`) вызывает
+        // `countTheRace()` — то есть УЖЕ меняет запись — и выходит, не поставив
+        // `credited`. Досылка сохранения подавлялась ровно там, где изменение
+        // было, и заезд терялся при перезапуске.
+        // Заводить второй флаг «а тут я тоже поменял» — это перечень мест: он
+        // разъедется на первой же будущей правке тела, молча и в ту же сторону.
+        // Берём ТОТАЛЬНУЮ форму: тело отработало -> досылаем просьбу сохранить.
+        // Цена ошибки в эту сторону — лишний запрос на сохранение неизменённой
+        // записи (сохранение идемпотентно); цена ошибки в другую — потерянные
+        // данные честного игрока.
+        if (outcome == server::util::MutateOutcome::AppliedNotPersisted)
+          (void)server::util::TrySave(
+            _raceNetworkHandler.GetServerInstance().GetDataDirector()
+              .GetCharacterCache(),
+            characterUid,
+            "a character with a new per-course record");
+      }
     }
   }
 
@@ -1012,19 +1346,29 @@ void RaceInstance::Stop()
   //     character-рекорда, а `Record` использует НЕрекурсивный `shared_mutex`.
   //     Значит врезка обязана стоять ВНЕ любого `characterRecord.Mutable`;
   //     здесь закрыты все (последний — лямбда `GetRoom` прямо выше).
-  // (2) ПОВТОРНЫЙ `Stop()`: `RaceInstance::Tick` глотает исключения,
-  //     а `_stage = Stage::Waiting` стоит ПОСЛЕ `Stop()` в `TickFinishing` —
-  //     бросок в середине `Stop()` заставляет `TickFinishing` позвать её ещё раз.
-  //     Блок, стоящий ПОСЛЕДНИМ, при таком повторе исполнится РОВНО ОДИН раз:
-  //     при первом заходе до него не дошли, при втором он отработает впервые.
-  //     ★ЭТО УТВЕРЖДЕНИЕ ДЕРЖИТСЯ НА ДВУХ ФАКТАХ, И ОБА ПРОВЕРЯЕМЫ:
+  // (2) ПОВТОРНЫЙ `Stop()` — ★ДОВОД ПЕРЕПИСАН РАУНДОМ R75 (#233): ПОВТОРА
+  //     БОЛЬШЕ НЕТ, И СТАРАЯ ФОРМУЛИРОВКА СТАЛА БЫ ЛОЖЬЮ.
+  //     КАК БЫЛО: `RaceInstance::Tick` глотает исключения, `_stage =
+  //     Stage::Waiting` стояло ПОСЛЕ `Stop()` в `TickFinishing`, и бросок в
+  //     середине `Stop()` заставлял `TickFinishing` позвать её ещё раз — а блок,
+  //     стоящий ПОСЛЕДНИМ, при таком повторе исполнялся РОВНО ОДИН раз: при
+  //     первом заходе до него не дошли, при втором он отрабатывал впервые.
+  //     Ценой этого «ровно одного раза» было ВТОРОЕ начисление всего, что стоит
+  //     ВЫШЕ (победы, пробег, морковки мести, дейлики), — то есть ровно дефект
+  //     #233, ради которого R75 и завёл латч `_resultsCredited`.
+  //     КАК СТАЛО: повторный `Stop()` выходит первой же строкой, а стадию и
+  //     комнату `TickFinishing` освобождает при любом исходе. Значит блок
+  //     исполняется РОВНО ОДИН РАЗ на небросающем пути и НИ РАЗУ, если что-то
+  //     выше по `Stop()` бросило: достижения такого заезда не начислятся вовсе.
+  //     Это записанная цена латча, и она дешевле двойного начисления.
+  //     ★ЧТО ОТ ПРЕЖНЕГО ДОВОДА В СИЛЕ И ПОЧЕМУ ГЕЙТ ЖИВ:
   //       (а) блок сам не может бросить — весь он обёрнут в `catch (...)` ниже;
   //       (б) после блока в `Stop()` НЕТ НИ ОДНОГО оператора — это машинно
   //           проверяет гейт раунда `tools/round/check_stop_tail.py`.
-  //     ЛЮБОЙ будущий раунд, дописывающий что-то в конец `Stop()` (в очереди
-  //     такие есть: R75 и R76 планируют врезки в `Stop()`, R76 — явно «самым
-  //     последним шагом»), обязан либо встать ПЕРЕД этим блоком, либо доказать,
-  //     что его код не бросает, либо завести здесь эпоху-гард по `_raceEpoch`.
+  //     ЛЮБОЙ будущий раунд, дописывающий что-то в конец `Stop()` (R76 планирует
+  //     врезку «самым последним шагом»), обязан либо встать ПЕРЕД этим блоком,
+  //     либо доказать, что его код не бросает: бросок из хвоста теперь не
+  //     «переигрывается» повтором — он молча теряет всё, что стоит после него.
   //     Гейт упадёт и заставит принять решение явно.
   try
   {
@@ -1933,8 +2277,64 @@ void RaceInstance::TickFinishing()
       this->GetRoomUid());
   }
 
-  Stop();
- _stage = Stage::Waiting;
+  // LOA-fix (R75, #14/#233): СТАДИЯ И КОМНАТА ОСВОБОЖДАЮТСЯ, ЧТО БЫ НИ СДЕЛАЛ
+  // Stop(). Раньше эти две строки шли линейно: бросок внутри Stop() улетал в
+  // catch в Tick(), комната оставалась в Finishing, и каждый следующий тик звал
+  // Stop() заново. Латч `_resultsCredited` делает повтор БЕЗВРЕДНЫМ; здесь мы
+  // делаем его НЕНУЖНЫМ — и заодно закрываем второй, более дорогой хвост того же
+  // дефекта: `room.SetRoomPlaying(false)` стоит в предпоследнем блоке Stop(),
+  // то есть сорвавшееся подведение итогов оставляло комнату «играющей»
+  // НАВСЕГДА — ни нового старта, ни входа.
+  try
+  {
+    Stop();
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Room {}: the race results failed to complete: {}",
+      this->GetRoomUid(),
+      x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Room {}: the race results failed to complete: {}",
+      this->GetRoomUid(),
+      "unknown exception");
+  }
+
+  // Присваивание бросить не может — поэтому стоит ПЕРВЫМ после Stop().
+  _stage = Stage::Waiting;
+
+  // Возврат комнаты — тот же способ, что на таймаут-ветке TickRacing.
+  // Идемпотентно: удавшийся Stop() уже сделал ровно это, повтор — no-op.
+  try
+  {
+    this->GetRoom(
+      [](Room& room)
+      {
+        room.SetRoomPlaying(false);
+        for (const auto& characterUid : room.GetPlayers() | std::views::keys)
+        {
+          room.GetPlayer(characterUid).SetReady(false);
+        }
+      });
+  }
+  catch (const std::exception& x)
+  {
+    server::util::QuietLogError(
+      "Room {}: failed to return the room to the waiting state: {}",
+      this->GetRoomUid(),
+      x.what());
+  }
+  catch (...)
+  {
+    server::util::QuietLogError(
+      "Room {}: failed to return the room to the waiting state: {}",
+      this->GetRoomUid(),
+      "unknown exception");
+  }
 }
 
 void RaceInstance::TickActiveRaceContent()

@@ -104,6 +104,15 @@ target_include_directories(server_test_config_strict
 target_link_libraries(server_test_config_strict
         PRIVATE project-properties)
 
+# R75. Пер-курсовые рекорды — новые поля ЗАПИСИ на диске, и круг
+# «записали -> прочитали» на стенде не проверяется: стенд пишет и читает одним
+# сервером, где потеря при сохранении и потеря при чтении сокращаются.
+add_executable(data_test_course_records)
+target_sources(data_test_course_records PRIVATE
+        src/data/TestCourseRecords.cpp)
+target_link_libraries(data_test_course_records
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
@@ -117,6 +126,7 @@ add_test(NAME RanchTestGenetics COMMAND ranch_test_genetics)
 add_test(NAME RegistryTestAchievementTiers COMMAND registry_test_achievement_tiers)
 add_test(NAME RanchTestAchievementNotifyHold COMMAND ranch_test_achievement_notify_hold)
 add_test(NAME ServerTestConfigStrict COMMAND server_test_config_strict)
+add_test(NAME DataTestCourseRecords COMMAND data_test_course_records)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -154,6 +164,19 @@ if (NOT WIN32)
     # property durably; it proves itself on two fixtures before judging the tree.
     add_test(NAME ToolPotentialRollGate
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_potential_roll.sh)
+    # R75. Both are DELTA gates: they judge the lines this round ADDED, not the
+    # file's contents, because the properties ("no record access added inside
+    # Stop()", "the position handler acquired no logging") do not exist as
+    # properties of a file -- Stop() already holds twelve direct accesses the
+    # round keeps, and the position handler already holds one pre-existing debug
+    # line. Each proves it can fail on three fixtures before judging anything,
+    # and each stops with code 2 rather than reporting clean when it is blind.
+    # The self-tests run here; the delta run needs a BASE and lives in the round
+    # builder, since "what this branch added" is a property of the BRANCH.
+    add_test(NAME ToolR75RecordAccessSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_record_access_gate.sh --self-test)
+    add_test(NAME ToolR75UserPosLoggingSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/r75_userpos_logging_gate.sh --self-test)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

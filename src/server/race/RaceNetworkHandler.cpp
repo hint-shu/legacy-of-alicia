@@ -32,8 +32,10 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/fmt/bin_to_hex.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <limits>
 #include <ranges>
 
 namespace server
@@ -604,6 +606,27 @@ constexpr const char* AiRacerNames[]{
   "Karim", "Eden", "Warren", "Tien", "Dains", "Glen", "Meirin"};
 
 constexpr size_t AiRacerCount = sizeof(AiRacerNames) / sizeof(AiRacerNames[0]);
+
+//! LOA-fix (R75, #14): ЕДИНОЕ определение «идёт сам заезд» для ВСЕХ
+//! пер-заездных счётчиков раунда.
+//!
+//! ★ЗАЧЕМ ФУНКЦИЯ, А НЕ ПОВТОРЁННОЕ УСЛОВИЕ. `racer.state == Racing` НЕ
+//! является признаком зелёного света: state выставляется по завершении
+//! ЗАГРУЗКИ, а `GetRaceStartTimePoint()` лежит на waitTime карты в БУДУЩЕМ
+//! (mapBlockId 1 -> 10 с обратного отсчёта). Именно поэтому телеметрия R24 уже
+//! стоит под этим гейтом. Раунд заводит ДВА новых счётчика, которые уезжают в
+//! ВЕЧНЫЕ поля лошади; повтори условие дважды — и завтра третий счётчик заведут
+//! с третьим смыслом «во время заезда». Одна функция = одно определение, и
+//! негативная арка снимает его РАЗОМ у всех потребителей.
+[[nodiscard]] bool IsRaceUnderway(
+  const RaceInstance& raceInstance,
+  const tracker::RaceTracker::Racer& racer,
+  const std::chrono::steady_clock::time_point now) noexcept
+{
+  return racer.state == tracker::RaceTracker::Racer::State::Racing
+    && not racer.finishCounted
+    && now >= raceInstance.GetRaceStartTimePoint();
+}
 
 } // namespace
 
@@ -2319,6 +2342,18 @@ void RaceNetworkHandler::HandleStartRace(
         racer.hasPositionSample = false;
         racer.lastPositionTimePoint =
           std::chrono::steady_clock::time_point::max();
+        // LOA-fix (R75, #14 Ф2): планирование и цепочка рывков — пер-заездные,
+        // обнуляем там же, где телеметрию R24 (причина та же).
+        racer.previousAirborne = false;
+        racer.currentAirborneMetres = 0.0f;
+        racer.currentStretchIsGlide = false;
+        racer.lastStretchMetres = 0.0f;
+        racer.lastLandingTimePoint = std::chrono::steady_clock::time_point::max();
+        racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
+        racer.longestGlideMetres = 0.0f;
+        racer.boostCombo = 0;
+        racer.boostComboMax = 0;
+        racer.lastSpurTimePoint = std::chrono::steady_clock::time_point::max();
         // LOA-fix (R-revenge, #13): состояние мести — пер-заездное, обнуляем
         // ровно там же, где остальное состояние заезда (та же причина, что у
         // finishCounted: переиспользование трекера без Clear() иначе перенесло
@@ -3768,6 +3803,32 @@ bool RaceNetworkHandler::HandleRequestSpur(
 
   racer.starPointValue -= gameModeTemplate.spurConsumeStarPoints;
 
+  // === LOA-fix (R75, #14 Ф2): ЦЕПОЧКА ПЛАТНЫХ РЫВКОВ =======================
+  // Стоим ПОСЛЕ списания звёздных очков и ПОСЛЕ AI-гарда R57 — значит считаем
+  // только рывки, за которые списано, и которые прислал сам отправитель.
+  // ★ГЕЙТ — ТОТ ЖЕ IsRaceUnderway, а не `state == Racing`: рывки в обратном
+  // отсчёте цепочку не начинают, рывки в финиш-окне её не удлиняют.
+  // ★ОБА ПРИЗНАКА ОБРЫВА УМЕЮТ ТОЛЬКО УМЕНЬШАТЬ ЧИСЛО (см. BoostComboWindow):
+  // клиентский comboBreak и серверное окно устаревания. Ни один не даёт
+  // модифицированному клиенту НАКРУТИТЬ значение — накрутку ограничивает
+  // потолок MaxPlausibleBoostChain на записи в лошадь, потому что «оплата»
+  // рывка объявляется самим клиентом (HandleStarPointGet).
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (IsRaceUnderway(raceInstance, racer, now))
+    {
+      const bool chainStale =
+        racer.lastSpurTimePoint == std::chrono::steady_clock::time_point::max()
+        || (now - racer.lastSpurTimePoint) > tracker::BoostComboWindow;
+      if (command.comboBreak != 0 || chainStale)
+        racer.boostCombo = 1;
+      else if (racer.boostCombo < std::numeric_limits<uint32_t>::max())
+        racer.boostCombo += 1;
+      racer.lastSpurTimePoint = now;
+      racer.boostComboMax = std::max(racer.boostComboMax, racer.boostCombo);
+    }
+  }
+
   protocol::AcCmdCRRequestSpurOK response{
     .characterOid = command.characterOid,
     .activeBoosters = command.activeBoosters,
@@ -4008,6 +4069,59 @@ void RaceNetworkHandler::HandleHurdleClearResult(
     case protocol::AcCmdCRHurdleClearResult::HurdleClearType::Good:
     case protocol::AcCmdCRHurdleClearResult::HurdleClearType::DoubleJumpOrGlide:
     {
+      // LOA-fix (R75, #14 Ф2): ОТМЕТКА ПЛАНИРОВАНИЯ. `Good` и `DoubleJumpOrGlide`
+      // делят ветку, поэтому разбираем тип явно — планирование это ТОЛЬКО тип 2.
+      // ★ГЕЙТ — ТОТ ЖЕ IsRaceUnderway, ЧТО У ПОЗИЦИИ И У ЦЕПОЧКИ: отметка в
+      // обратном отсчёте не должна пометить первый пост-стартовый отрезок, а
+      // отметка в финиш-окне — вообще ничего.
+      // Гонщик в момент отметки может быть в трёх состояниях:
+      //   * в воздухе        -> помечаем ТЕКУЩИЙ отрезок;
+      //   * только что сел   -> засчитываем ТОЛЬКО ЧТО закончившийся;
+      //   * на земле давно   -> отметка ждёт взлёта (допуск проверит его).
+      //
+      // ★ОДНА ОТМЕТКА ПОМЕЧАЕТ РОВНО ОДИН ОТРЕЗОК (R75 ит.2, Codex #5).
+      // ЧТО БЫЛО НЕ ТАК: `glideMarkTimePoint = now` стояло БЕЗУСЛОВНО, в том
+      // числе на двух ветках, где отметка уже ИЗРАСХОДОВАНА — помечен текущий
+      // полёт или засчитан только что закончившийся. Отметка оставалась
+      // «свежей» ещё GlideMarkTolerance (500 мс), а каденция позиции 3.83 Гц
+      // (0.26 с) вполне позволяет за это время сесть и снова взлететь. Тогда
+      // взлёт СЛЕДУЮЩЕГО, ОБЫЧНОГО барьера видел ту же отметку и помечался
+      // планированием — путь обычного прыжка уезжал в ВЕЧНЫЙ рекорд лошади.
+      // ТЕПЕРЬ отметка ЛИБО израсходована здесь (гасим её), ЛИБО остаётся
+      // ждать взлёта; взлёт, воспользовавшись ею, гасит её сам. Ждать нового
+      // отрезка может только НЕизрасходованная отметка.
+      if (command.hurdleClearType
+            == protocol::AcCmdCRHurdleClearResult::HurdleClearType::DoubleJumpOrGlide)
+      {
+        const auto now = std::chrono::steady_clock::now();
+        if (IsRaceUnderway(raceInstance, racer, now))
+        {
+          if (racer.previousAirborne)
+          {
+            racer.currentStretchIsGlide = true;
+            // Израсходована: пометила ТЕКУЩИЙ отрезок.
+            racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
+          }
+          else if (racer.lastLandingTimePoint
+                     != std::chrono::steady_clock::time_point::max()
+                   && (now - racer.lastLandingTimePoint) <= tracker::GlideMarkTolerance)
+          {
+            racer.longestGlideMetres =
+              std::max(racer.longestGlideMetres, racer.lastStretchMetres);
+            // Один отрезок не может быть засчитан дважды.
+            racer.lastStretchMetres = 0.0f;
+            // Израсходована: засчитала ПРЕДЫДУЩИЙ отрезок.
+            racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
+          }
+          else
+          {
+            // Не израсходована — ждёт взлёта, который случится в пределах
+            // допуска. Это единственная ветка, оставляющая отметку живой.
+            racer.glideMarkTimePoint = now;
+          }
+        }
+      }
+
       // Not a perfect jump over the hurdle, reset the jump combo.
       racer.jumpComboValue = 0;
       response.jumpCombo = racer.jumpComboValue;
@@ -4186,6 +4300,10 @@ void RaceNetworkHandler::HandleRaceUserPos(
         racer.topSpeedKph = command.member4;
       }
 
+      // LOA-fix (R75): принятый шаг нужен и планированию — объявляем ДО ветки,
+      // чтобы отброшенный телепорт не мог стать «полётом» (тот же кламп, что у
+      // R24: одна величина, один фильтр, два потребителя).
+      float acceptedStep = 0.0f;
       if (racer.hasPositionSample)
       {
         // Бюджет перемещения за прошедшее время: телепорт/респавн/лаг-скачок
@@ -4201,11 +4319,64 @@ void RaceNetworkHandler::HandleRaceUserPos(
 
         const float step = (command.position - racer.worldPosition).Length();
         if (step <= budget)
+        {
           racer.distanceMetres += static_cast<double>(step);
+          acceptedStep = step;
+        }
       }
 
       racer.hasPositionSample = true;
       racer.lastPositionTimePoint = now;
+
+      // === LOA-fix (R75, #14 Ф2): ПЛАНИРОВАНИЕ ==============================
+      // Считаем ТОЛЬКО отрезки полёта, помеченные 0xe7 DoubleJumpOrGlide.
+      // `member5 == 1` = «в воздухе» и для ОБЫЧНОГО прыжка через барьер тоже,
+      // поэтому «любой airtime» превратил бы рекорд планирования в счётчик
+      // барьеров — и откатить это было бы нечем: поле вечное.
+      //
+      // ★В РЕКОРД ИДЁТ ТОЛЬКО ОТРЕЗОК, ЗАКРЫВШИЙСЯ ПРИЗЕМЛЕНИЕМ.
+      // Клиент, держащий member5 = 1 до конца заезда, не приземляется никогда,
+      // и весь остаток пути свернулся бы в ВЕЧНЫЙ рекорд. Теперь величина
+      // ограничена сверху самим фактом приземления (плюс потолком в Stop()).
+      // Цена — гонщик, пересёкший черту в воздухе, свой последний полёт не
+      // досчитает. НЕДОСЧЁТ ДЛЯ ВЕЧНОГО ПОЛЯ ДЕШЕВЛЕ, ЧЕМ НЕОГРАНИЧЕННЫЙ ПЕРЕБОР.
+      const bool airborne = command.member5 == 1;
+      if (airborne)
+      {
+        if (not racer.previousAirborne)
+        {
+          // ВЗЛЁТ: начинается новый отрезок. Он планирующий, если отметка пришла
+          // только что (случай «0xe7 на пакет раньше первого воздушного кадра»).
+          racer.currentAirborneMetres = 0.0f;
+          racer.currentStretchIsGlide =
+            racer.glideMarkTimePoint != std::chrono::steady_clock::time_point::max()
+            && (now - racer.glideMarkTimePoint) <= tracker::GlideMarkTolerance;
+          // ★ОТМЕТКА ОДНОРАЗОВАЯ (R75 ит.2, Codex #5). Гасим её ВСЕГДА, а не
+          // только когда она сработала: просроченная отметка тоже не должна
+          // дожить до следующего взлёта, а сработавшая — тем более. Иначе
+          // обычный барьер, взлетевший вторым внутри допуска, унаследовал бы
+          // чужую пометку и его путь ушёл бы в ВЕЧНЫЙ рекорд лошади.
+          racer.glideMarkTimePoint = std::chrono::steady_clock::time_point::max();
+        }
+        else
+        {
+          racer.currentAirborneMetres += acceptedStep;
+        }
+      }
+      else if (racer.previousAirborne)
+      {
+        // ПРИЗЕМЛЕНИЕ: отрезок закончился. Помеченный — сворачиваем в рекорд
+        // заезда; непомеченный — запоминаем на случай, если 0xe7 придёт
+        // следующим пакетом (случай «отметка уже на земле»).
+        if (racer.currentStretchIsGlide)
+          racer.longestGlideMetres =
+            std::max(racer.longestGlideMetres, racer.currentAirborneMetres);
+        racer.lastStretchMetres = racer.currentAirborneMetres;
+        racer.lastLandingTimePoint = now;
+        racer.currentAirborneMetres = 0.0f;
+        racer.currentStretchIsGlide = false;
+      }
+      racer.previousAirborne = airborne;
     }
   }
 
