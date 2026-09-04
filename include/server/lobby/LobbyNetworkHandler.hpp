@@ -27,6 +27,7 @@
 #include <libserver/network/command/proto/LobbyMessageDefinitions.hpp>
 #include <libserver/util/LogThrottle.hpp>
 
+#include <optional>
 #include <string>
 
 namespace server
@@ -128,6 +129,15 @@ private:
     std::chrono::steady_clock::time_point ranchGraceSince{};
 
     std::string userName{};
+
+    //! LOA (R78-fix1, round78, backlog #255, находка Codex 1): долгоживущий
+    //! ключ мессенджера, ВЫДАННЫЙ ЭТОМУ СОЕДИНЕНИЮ.
+    //!
+    //! ★ЗАЧЕМ ПОМНИТЬ ЗНАЧЕНИЕ, А НЕ ФАКТ. Ключ снимается уборкой разорванного
+    //! соединения, то есть ПОСЛЕ события. Игрок, успевший перезайти, к этому
+    //! моменту уже держит новый ключ, и снятие «по ключу карты» стёрло бы
+    //! именно его. Помним выданное значение и снимаем только совпадающее.
+    std::optional<uint32_t> messengerLtk{};
 
     //! LOA-fix (R72-fix2-1, round72, backlog #129-S1, находка Codex 1):
     //! ★«ПРОСЬБА О ВХОДЕ УЖЕ СТОИТ В ПЛАНИРОВЩИКЕ И ЕЩЁ НЕ ИСПОЛНЕНА».
