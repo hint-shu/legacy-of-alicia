@@ -27,6 +27,7 @@
 
 #include <boost/container_hash/hash.hpp>
 #include <locale>
+#include <shared_mutex>
 
 namespace server
 {
@@ -197,8 +198,16 @@ std::optional<MessengerDirector::Client> MessengerDirector::GetClientByCharacter
 {
   std::optional<Client> client{};
 
-  // Get snapshot of current clients
-  const auto clientsSnapshot = _clients;
+  // LOA-fix (R78-fix2, round78, backlog #255, находка Codex 2): КОПИЯ — ПОД
+  // РАЗДЕЛЯЕМЫМ ЗАМКОМ. Этот метод зовут потоки ранча и заезда, а вытеснение
+  // пишет чужие записи с потока чата; без замка это гонка данных и UB.
+  // Замок держится РОВНО НА КОПИРОВАНИИ: перебор идёт уже по снимку, и ни
+  // одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   // Find client iterator by character uid
   const auto& iter = std::ranges::find_if(
     clientsSnapshot,
@@ -227,9 +236,17 @@ void MessengerDirector::EvictOtherSessionsOfCharacter(
   const network::ClientId keepClientId,
   const data::Uid characterUid)
 {
-  // Фаза 1 — только правка значений на месте, без вставок и удалений.
-  const auto unbound = messenger::UnbindOtherSessionsOfCharacter(
-    _clients, keepClientId, characterUid);
+  // Фаза 1 — правка значений на месте под ИСКЛЮЧИТЕЛЬНЫМ замком, без вставок
+  // и удалений. Замок обязателен: `GetClientByCharacterUid` снимает копию этой
+  // карты с потоков ранча и заезда (находка Codex 2). Он снимается ДО фазы 2 —
+  // отключение синхронно возвращается в `HandleClientDisconnected`, и держать
+  // через это нерекурсивный замок значило бы самозахват (класс R59).
+  std::vector<network::ClientId> unbound;
+  {
+    const std::unique_lock lock(_clientsMutex);
+    unbound = messenger::UnbindOtherSessionsOfCharacter(
+      _clients, keepClientId, characterUid);
+  }
 
   if (unbound.empty())
     return;
