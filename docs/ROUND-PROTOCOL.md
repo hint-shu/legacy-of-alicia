@@ -256,6 +256,18 @@ no-op that prints reassuring output, so the id is the only proof the bytes arriv
 
 1. **Check the window is empty.** Established connections on the game ports, and the
    login log, decide this — not the wall clock.
+
+   **Never cut a live race.** A rider mid-course loses the run and its result, so an
+   active race socket holds the deploy. A session parked on the ranch or in the lobby
+   loses nothing on a restart and is not a reason to wait.
+
+   **When the window is the only red gate, take one control measurement before you
+   report BLOCKED.** The time a round may wait is a budget, not evidence. In R71 the
+   45-minute cap ran out and the blocked report was already being written when one more
+   measurement found the window empty — the player had simply logged off in the
+   meantime. The cap expiring says the budget is spent; it does not say the gate is
+   still closed. Measure once more, then decide.
+
 2. **Back up what you are about to replace**, and prove the backup by count, not by the
    absence of an error: a data snapshot has a known file count and fingerprint; take it
    with enough privilege to read every file, then verify the number.

@@ -20,6 +20,7 @@ Plain-language summary of the gameplay and reliability work we built on top of t
 - **Horse racing that actually works** — fixes to race start, the countdown, in-race item pickups, and matchmaking so races run correctly for multiple players.
 - **Race statistics** — every course you ride keeps your best time and how many times you raced it, and each horse remembers its own records: longest glide and the longest run of boosts. A win is credited exactly once, even if something goes wrong after you cross the finish line.
 - **Race journal** — the server keeps its own record of every racer's run (splits, packet density, trusted progress) so results can be verified server-side instead of trusting the client.
+- **Race anti-cheat guards** — the server refuses forged spell casts, effects aimed at other riders, faked relay packets and item pickups claimed for someone else, and caps how many effects one rider can issue; diagnostics are rate-limited so a cheater cannot flood the log.
 - **Horse care skills** — the grooming/feeding care activities and their progression.
 - **Breeding and horse market fixes** — breeding, the stallion market, and horse handling behave correctly.
 - **Breeding fairness fixes** — coat/mane/tail tables are read by the right key, the rarest coat is kept out of breeding, the emblem chance is driven by data instead of always firing, and foal potential is weighted by coat tier.
