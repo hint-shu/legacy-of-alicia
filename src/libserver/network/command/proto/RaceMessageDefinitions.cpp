@@ -20,23 +20,34 @@
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/chatter/ChatterServer.hpp"
 
+#include "libserver/util/BoundedList.hpp"
 #include "libserver/util/Stream.hpp"
 
 #include <cassert>
+#include <cstddef>
 #include <format>
 #include <stdexcept>
 
 namespace server::protocol
 {
 
+namespace
+{
+
+//! LOA-fix (R74, round74, backlog #170): потолки, которые код уже объявлял
+//! (`throw` на входе в комнату и `assert` на кругах). Новых чисел раунд не
+//! вводит.
+constexpr std::size_t MaxRoomRacerCount = 10;
+constexpr std::size_t MaxLapRecordCount = 10;
+
+} // namespace
+
 void WritePlayerRacer(SinkStream& stream, const Avatar& playerRacer)
 {
-  stream.Write(static_cast<uint8_t>(playerRacer.equipment.size()));
-
-  for (const Item& item : playerRacer.equipment)
-  {
-    stream.Write(item);
-  }
+  // ★R74. Площадка в СВОБОДНОЙ функции: перепись, ключившаяся на `::Write(`,
+  // её не видела вовсе, хотя счётчик отсюда уезжает КАЖДОМУ входящему в комнату.
+  util::WriteBoundedList<uint8_t>(
+    stream, playerRacer.equipment, {.name = "WritePlayerRacer.equipment"});
 
   stream.Write(playerRacer.character)
     .Write(playerRacer.mount)
@@ -118,16 +129,25 @@ void AcCmdCREnterRoomOK::Write(
   const AcCmdCREnterRoomOK& command,
   SinkStream& stream)
 {
-  if (command.racers.size() > 10)
+  // ★R74 MUST-NOT-TOUCH. Этот `throw` — ВХОД УЖЕ ВЫКАЧЕННОГО ГАРДА: обработчик
+  // входа в комнату прогоняет ответ через скретч-`SinkStream` и превращает
+  // бросок отсюда в ШТАТНЫЙ отказ входа. Сноси мы его «ради единообразия» —
+  // вход разрешался бы с ТИХО ОБРЕЗАННЫМ ростером, то есть гард остался бы
+  // стоять и перестал бы работать. По той же причине площадка получает
+  // `rethrowOnCapacity`: переполнение ВМЕСТИМОСТИ обязано продолжать выходить
+  // наружу, иначе замер на скретче 16384 «успешно влезал» бы всегда.
+  if (command.racers.size() > MaxRoomRacerCount)
   {
     throw std::logic_error("Racers size is greater than 10.");
   }
 
-  stream.Write(static_cast<uint32_t>(command.racers.size()));
-  for (const auto& racer : command.racers)
-  {
-    WriteRacer(stream, racer);
-  }
+  util::WriteBoundedList<uint32_t>(
+    stream,
+    command.racers,
+    {.maxCount = MaxRoomRacerCount,
+     .name = "AcCmdCREnterRoomOK.racers",
+     .rethrowOnCapacity = true},
+    [](SinkStream& sink, const auto& racer) { WriteRacer(sink, racer); });
 
   stream.Write(command.isRoomWaiting)
     .Write(command.uid);
@@ -144,12 +164,9 @@ void AcCmdCREnterRoomOK::Write(
     .Write(command.unk8);
 
   stream.Write(command.unk9.unk0)
-    .Write(command.unk9.unk1)
-    .Write(static_cast<uint8_t>(command.unk9.unk2.size()));
-  for (const auto& unk2Element : command.unk9.unk2)
-  {
-    stream.Write(unk2Element);
-  }
+    .Write(command.unk9.unk1);
+  util::WriteBoundedList<uint8_t>(
+    stream, command.unk9.unk2, {.name = "AcCmdCREnterRoomOK.unk9.unk2"});
 
   stream.Write(command.unk10)
     .Write(command.unk11)
@@ -384,18 +401,28 @@ void AcCmdCRStartRaceNotify::RaceRecord::Write(
    .Write(command.finalRecordMs);
 
   // Max 10 laps (3 sectors per lap * 10 laps)
-  assert(command.lapRecords.size() <= 10);
+  assert(command.lapRecords.size() <= MaxLapRecordCount);
   // Max (underlying protocol) count is 32 (0x20).
-  constexpr auto SectorsPerLap = 3u;
+  constexpr std::size_t SectorsPerLap = 3;
   assert(command.lapRecords.size() * 3 <= 32);
 
-  stream.Write(static_cast<uint8_t>(command.lapRecords.size() * SectorsPerLap));
-  for (const auto& lapRecord : command.lapRecords)
-  {
-    stream.Write(lapRecord.sector1Ms)
-      .Write(lapRecord.sector2Ms)
-      .Write(lapRecord.sector3Ms);
-  }
+  // ★R74. ЕДИНСТВЕННАЯ ПЛОЩАДКА, ГДЕ СЧЁТЧИК СЧИТАЕТ НЕ ЭЛЕМЕНТЫ: контейнер
+  // хранит КРУГИ, а на провод уезжает число СЕКТОРОВ, по три на круг. Отсюда
+  // `countScale`; потолок счётчика хелпер делит на масштаб, а не умножает —
+  // иначе сама проверка переполнилась бы раньше, чем что-либо защитила.
+  // 10 × 3 = 30 удовлетворяет и протокольному потолку 32.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.lapRecords,
+    {.maxCount = MaxLapRecordCount,
+     .countScale = SectorsPerLap,
+     .name = "AcCmdCRStartRaceNotify.RaceRecord.lapRecords"},
+    [](SinkStream& sink, const auto& lapRecord)
+    {
+      sink.Write(lapRecord.sector1Ms)
+        .Write(lapRecord.sector2Ms)
+        .Write(lapRecord.sector3Ms);
+    });
 
   if (command.teamMode == protocol::TeamMode::Single)
   {
@@ -441,12 +468,16 @@ void AcCmdCRStartRaceNotify::ActiveSkillSet::Write(
   stream.Write(command.setId)
     .Write(command.unk1);
 
-  stream.Write(static_cast<uint8_t>(
-    command.skills.size()));
-  for (const auto& element : command.skills)
-  {
-    stream.Write(element);
-  }
+  // ★R74. Площадку не видела построчная перепись раунда: `static_cast` и
+  // `.size()` стоят на РАЗНЫХ СТРОКАХ, а перепись делалась `grep`'ом, то есть
+  // построчно. Кламп здесь тождествен (`std::array<uint32_t, 3>`), но счётчик
+  // всё равно обязан ехать через хелпер — иначе гейт по СВОЙСТВУ красный, и
+  // правильно красный: свойство «ни одной сырой узкой длины» либо тотально,
+  // либо его нет.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.skills,
+    {.maxCount = 3, .name = "AcCmdCRStartRaceNotify.ActiveSkillSet.skills"});
 }
 
 void AcCmdCRStartRaceNotify::ActiveSkillSet::Read(
@@ -466,18 +497,21 @@ void AcCmdCRStartRaceNotify::Write(
     .Write(command.member4)
     .Write(command.raceMapBlockId);
 
-  stream.Write(static_cast<uint8_t>(command.racers.size()));
-  for (const auto& element : command.racers)
-  {
-    stream.Write(element.oid)
-      .Write(element.name)
-      .Write(element.unk2)
-      .Write(element.unk3)
-      .Write(element.p2dId)
-      .Write(element.teamColor)
-      .Write(element.unk6)
-      .Write(element.unk7);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.racers,
+    {.name = "AcCmdCRStartRaceNotify.racers"},
+    [](SinkStream& sink, const auto& element)
+    {
+      sink.Write(element.oid)
+        .Write(element.name)
+        .Write(element.unk2)
+        .Write(element.unk3)
+        .Write(element.p2dId)
+        .Write(element.teamColor)
+        .Write(element.unk6)
+        .Write(element.unk7);
+    });
 
   stream.Write(
     boost::asio::detail::socket_ops::host_to_network_long(
@@ -496,16 +530,16 @@ void AcCmdCRStartRaceNotify::Write(
     .Write(command.weatherType)
     .Write(command.unk17);
 
-  stream.Write(static_cast<uint8_t>(command.unk18.size()));
-  for (const auto& element : command.unk18)
-  {
-    stream.Write(element.unk0)
-      .Write(static_cast<uint8_t>(element.unk1.size()));
-    for (const auto& subElement : element.unk1)
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.unk18,
+    {.name = "AcCmdCRStartRaceNotify.unk18"},
+    [](SinkStream& sink, const auto& element)
     {
-      stream.Write(subElement);
-    }
-  }
+      sink.Write(element.unk0);
+      util::WriteBoundedList<uint8_t>(
+        sink, element.unk1, {.name = "AcCmdCRStartRaceNotify.unk18.unk1"});
+    });
 }
 
 void AcCmdCRStartRaceNotify::Read(
@@ -764,37 +798,40 @@ void AcCmdRCRaceResultNotify::Write(
   const AcCmdRCRaceResultNotify& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint16_t>(command.scores.size()));
-  for (const auto& score : command.scores)
-  {
-    stream.Write(score.uid)
-      .Write(score.name)
-      .Write(score.courseTime)
-      .Write(score.member4)
-      .Write(score.experience)
-      .Write(score.member6)
-      .Write(score.carrots)
-      .Write(score.level)
-      .Write(score.teamColor)
-      .Write(score.member10)
-      .Write(score.member11)
-      .Write(score.member12)
-      .Write(score.recordTimeDifference)
-      .Write(score.levelProgress)
-      .Write(score.horseClassProgress)
-      .Write(score.achievements)
-      .Write(score.bitset)
-      .Write(score.mountName)
-      .Write(score.growthPoints)
-      .Write(score.horseClass)
-      .Write(score.bonusCarrots)
-      .Write(score.member22)
-      .Write(score.raceRecord)
-      .Write(score.trainingCarrotReward)
-      .Write(score.member25)
-      .Write(score.member26)
-      .Write(score.member27);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream,
+    command.scores,
+    {.name = "AcCmdRCRaceResultNotify.scores"},
+    [](SinkStream& sink, const auto& score)
+    {
+      sink.Write(score.uid)
+        .Write(score.name)
+        .Write(score.courseTime)
+        .Write(score.member4)
+        .Write(score.experience)
+        .Write(score.member6)
+        .Write(score.carrots)
+        .Write(score.level)
+        .Write(score.teamColor)
+        .Write(score.member10)
+        .Write(score.member11)
+        .Write(score.member12)
+        .Write(score.recordTimeDifference)
+        .Write(score.levelProgress)
+        .Write(score.horseClassProgress)
+        .Write(score.achievements)
+        .Write(score.bitset)
+        .Write(score.mountName)
+        .Write(score.growthPoints)
+        .Write(score.horseClass)
+        .Write(score.bonusCarrots)
+        .Write(score.member22)
+        .Write(score.raceRecord)
+        .Write(score.trainingCarrotReward)
+        .Write(score.member25)
+        .Write(score.member26)
+        .Write(score.member27);
+    });
 
   stream.Write(command.racerActiveSkillSet);
 
@@ -854,14 +891,18 @@ void AcCmdGameRaceP2PResult::Write(
   const AcCmdGameRaceP2PResult& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(
-    command.member1.size()));
-
-  for (auto& value : command.member1)
-  {
-    stream.Write(value.oid)
-      .Write(value.member2);
-  }
+  // ★R74. Вторая площадка, пропущенная построчной переписью, и в отличие от
+  // соседней — НАСТОЯЩАЯ: `member1` это `std::vector`, потолка не объявлял
+  // никто, и счётчик `uint8_t` лгал бы ровно так же, как везде.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.member1,
+    {.name = "AcCmdGameRaceP2PResult.member1"},
+    [](SinkStream& sink, const auto& value)
+    {
+      sink.Write(value.oid)
+        .Write(value.member2);
+    });
 }
 
 void AcCmdGameRaceP2PResult::Read(
@@ -1380,11 +1421,8 @@ void AcCmdCRRelayNotify::Write(
     .Write(command.toOid)
     .Write(command.payloadType);
 
-  stream.Write(static_cast<uint16_t>(command.data.size()));
-  for (const uint8_t datum : command.data)
-  {
-    stream.Write(datum);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.data, {.name = "AcCmdCRRelayNotify.data"});
 }
 
 void AcCmdCRRelayNotify::Read(
@@ -1616,11 +1654,8 @@ void AcCmdCRUseMagicItemOK::Write(
     case 0x13:
     {
       // Expects vector size followed by uint16_t vector itself
-      stream.Write(static_cast<uint8_t>(command.targetList.size()));
-      for (auto& element : command.targetList)
-      {
-        stream.Write(element);
-      }
+      util::WriteBoundedList<uint8_t>(
+        stream, command.targetList, {.name = "AcCmdCRUseMagicItemOK.targetList"});
       break;
     }
     default:
@@ -1843,11 +1878,8 @@ void AcCmdCRUseMagicItemNotify::Write(
     case 0x13:
     {
       // Expects vector size followed by uint16_t vector itself
-      stream.Write(static_cast<uint8_t>(command.targetList.size()));
-      for (auto& element : command.targetList)
-      {
-        stream.Write(element);
-      }
+      util::WriteBoundedList<uint8_t>(
+        stream, command.targetList, {.name = "AcCmdCRUseMagicItemNotify.targetList"});
       break;
     }
     default:
