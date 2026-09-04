@@ -185,6 +185,29 @@ target_include_directories(race_test_race_journal
         PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(race_test_race_journal
         PRIVATE project-properties alicia-libserver)
+# LOA (R78, round78, backlog #255): правило вытеснения устаревшей
+# мессенджер-сессии. ★Заголовочное, поэтому линковать нечего, кроме
+# include-пути: правило вынесено из MessengerDirector.cpp ИМЕННО затем, чтобы
+# его можно было проверить без поднятия сервера.
+add_executable(messenger_test_session_eviction)
+target_sources(messenger_test_session_eviction PRIVATE
+        src/messenger/TestSessionEviction.cpp)
+target_include_directories(messenger_test_session_eviction
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(messenger_test_session_eviction
+        PRIVATE project-properties)
+
+# LOA (R78, round78, backlog #255): два вида ключей выдачи. Раунд не меняет
+# OtpSystem, но целиком стоит на его свойствах — в том числе на том, что
+# ОДНОРАЗОВЫЙ код остался одноразовым для ранча и заезда.
+add_executable(server_test_otp_system)
+target_sources(server_test_otp_system PRIVATE
+        src/server/TestOtpSystem.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/system/OtpSystem.cpp)
+target_include_directories(server_test_otp_system
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(server_test_otp_system
+        PRIVATE project-properties)
 
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
@@ -209,6 +232,8 @@ add_test(NAME RaceTestEffectInstances COMMAND race_test_effect_instances)
 add_test(NAME RaceTestMagicApplication COMMAND race_test_magic_application)
 add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
 add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
+add_test(NAME MessengerTestSessionEviction COMMAND messenger_test_session_eviction)
+add_test(NAME ServerTestOtpSystem COMMAND server_test_otp_system)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
