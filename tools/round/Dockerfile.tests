@@ -8,6 +8,11 @@
 # 0 means ctest passed; anything else means it did not. When the log is wanted as
 # evidence, take it out of the image: `docker create` the tag, `docker cp <cid>:/ctest.log`.
 #
+# BASE_REF — the commit the DELTA gates measure against. Default `origin/main`; override
+# when the round branched off something else:
+#
+#   docker build --build-arg BASE_REF=<ref> -f tools/round/Dockerfile.tests …
+#
 # WHY THIS FILE LIVES IN THE REPOSITORY
 #   Every round used to write its own throwaway Dockerfile.tests next to its clone, and
 #   the copies drifted. Measured 2026-09-04 (R78): the copies R75, R76 and R78 used all
@@ -31,6 +36,40 @@
 #     * `--no-tests=error` — a run that found no tests is the loudest false green there
 #       is (broken BUILD_TESTS wiring, a renamed target), and plain `ctest` reports that
 #       case with a warning and exit 0.
+#
+# WHY THE RECIPE HANDS THE GATES A BASE REF
+#   Some of the checks in this suite are DELTA gates: they judge the lines a branch
+#   ADDED, not the contents of a file, and their documented default base is the ref
+#   `main` (`BASE="${BASE:-main}"` in tools/r75_*_gate.sh). A round clone has no such
+#   ref. `tools/round/build_from_branch.sh` clones and then `checkout --detach`, so the
+#   only local head is whatever branch the clone happened to create — measured
+#   2026-09-04 in ~/rounds/r74cand2 and ~/rounds/r78cand5: `refs/heads/<round branch>`
+#   and no `main` at all. `git diff main` then fails, the gates correctly refuse to
+#   report clean when blind (exit 2), and their SELF-tests — which expect the violation
+#   fixture to come back as exit 1 — go red. Measured on a plain clone of origin/main:
+#   ctest 32/34, the two red being ToolR75RecordAccessSelftest and
+#   ToolR75UserPosLoggingSelftest. Two rounds (R74, R75) hit exactly that and each
+#   patched it locally, which is how the drift this file exists to stop starts again.
+#
+#   So the base is an INPUT of the recipe now, not a hope about what the context
+#   contains: `ARG BASE_REF` (default `origin/main`) is resolved to a commit and
+#   written to `refs/heads/main` inside the image.
+#
+#   Why materialise the ref instead of simply exporting `BASE=origin/main`:
+#     * `origin/main` is a remote-tracking ref of WHATEVER repository the clone came
+#       from, and that is not always the canonical base — ~/rounds/r74cand2 has
+#       `origin` = ~/rounds/r74 and `origin/main` = 5e5befcf, a stale main. Exporting
+#       it would keep comparing against an unnamed, unprinted commit. Here the ref is
+#       resolved once, printed with its SHA, and overridable by the round.
+#     * it repairs the gates' own default, so a hand run inside the image
+#       (`docker run … bash tools/r75_record_access_gate.sh`) measures the same delta
+#       the ctest run did, instead of needing an env var nobody documents.
+#     * an unresolvable BASE_REF stops the BUILD, loudly and by name, instead of
+#       surfacing minutes later as two self-tests failing for a reason that reads like
+#       a code defect.
+#   The step does NOT refuse when the base equals HEAD: building the tests image for
+#   `main` itself is the legitimate control run. It says so instead — with an empty
+#   delta the gates stop with code 2, and only their self-tests take part in ctest.
 #
 # pinned: the same base digest as ./Dockerfile, deliberately — the tests must run on the
 # toolchain that builds the shipped binary. Bump the two together, in one commit.
@@ -57,5 +96,30 @@ RUN git submodule update --init --recursive
 
 RUN cmake -DCMAKE_BUILD_TYPE=${SERVER_BUILD_TYPE} -DBUILD_TESTS=True . -B ./build
 RUN cmake --build ./build --parallel 8
+
+# The base for the delta gates. Declared HERE, after the compile, on purpose: an ARG
+# invalidates the cache of everything below it, and rebuilding the whole server because
+# the base moved would make the honest thing the expensive one. POSIX sh only — the
+# self-test's control arm runs this same file with the `SHELL` line cut out.
+ARG BASE_REF=origin/main
+RUN base="$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null)"; \
+    if [ -z "$base" ]; then \
+      echo "ОСТАНОВ: BASE_REF='${BASE_REF}' не разрешается в коммит в этом контексте." >&2; \
+      echo "  Дельта-гейты сравнивают ветку с базой; без базы они слепы, а их самопрогоны" >&2; \
+      echo "  краснеют так, будто сломан код. Передайте --build-arg BASE_REF=<ref>," >&2; \
+      echo "  который есть в клоне (обычно origin/main), или соберите контекст с ним." >&2; \
+      echo "  Локальные головы в контексте:" >&2; \
+      git for-each-ref --format='    %(refname)' refs/heads refs/remotes >&2; \
+      exit 1; \
+    fi; \
+    git update-ref refs/heads/main "$base"; \
+    head="$(git rev-parse --verify HEAD)"; \
+    echo "  BASE_REF=${BASE_REF} -> $base  (записан в refs/heads/main)"; \
+    echo "  HEAD                 -> $head"; \
+    if [ "$base" = "$head" ]; then \
+      echo "  ВНИМАНИЕ: база СОВПАДАЕТ с HEAD — дельта пуста, и дельта-гейты остановятся"; \
+      echo "  кодом 2 (слепота), а не отчитаются 'чисто'. Для сборки самого main это норма:"; \
+      echo "  в ctest участвуют их самопрогоны, а не дельта-прогон."; \
+    fi
 
 RUN cd ./build && ctest --output-on-failure --no-tests=error 2>&1 | tee /ctest.log

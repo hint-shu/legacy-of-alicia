@@ -9,6 +9,8 @@
 #   (no marker)   one passing test          -> `docker build` must exit 0
 #   ARM_FAIL      one passing, one failing  -> `docker build` must exit non-zero
 #   ARM_NOTESTS   no tests registered       -> `docker build` must exit non-zero
+#   ARM_DELTA     one passing + delta_gate  -> exit 0 with a real BASE_REF,
+#                                              non-zero when the base is the branch itself
 #
 # `LANGUAGES NONE` on purpose. The claim being tested is the shell's pipeline semantics
 # and ctest's exit code, not a compiler, so the fixture compiles nothing and an arm costs
@@ -26,5 +28,13 @@ else()
   add_test(NAME recipe_fixture_passes COMMAND "${CMAKE_COMMAND}" -E true)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ARM_FAIL")
     add_test(NAME recipe_fixture_fails COMMAND "${CMAKE_COMMAND}" -E false)
+  endif()
+  # The stand-in for the repository's DELTA gates: it reads `git diff main` and, like
+  # them, treats a base it cannot resolve or an empty delta as blindness rather than as
+  # "clean". It is what makes the recipe's BASE_REF step provable — the arm is green
+  # only when the recipe actually wrote a base ref that differs from the branch.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ARM_DELTA")
+    add_test(NAME recipe_fixture_delta
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/delta_gate.sh")
   endif()
 endif()

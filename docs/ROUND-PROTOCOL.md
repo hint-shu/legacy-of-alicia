@@ -100,10 +100,47 @@ arm that exists to show "the tests catch this" reported success without checking
 anything; the lesson is filed as `pipe-swallows-exit-code`. The canonical recipe runs
 under `bash -o pipefail` and passes `--no-tests=error`, so a failing test and an empty
 test set both fail the build, and the `tee` stays because the log is the evidence.
+
+The recipe also hands the tests a **base ref**. Some checks in the suite are *delta*
+gates — they judge the lines a branch ADDED rather than the contents of a file — and
+their documented default base is the ref `main` (`BASE="${BASE:-main}"` in
+`tools/r75_*_gate.sh`). A round clone has no such ref: `build_from_branch.sh` clones and
+then `checkout --detach`, so the only local head is the round's own branch (measured
+2026-09-04: `~/rounds/r74cand2` and `~/rounds/r78cand5` carry `refs/heads/<round branch>`
+and no `main`). `git diff main` then fails, the gates correctly refuse to call themselves
+clean while blind (exit 2), and their self-tests go red — on a plain clone of
+`origin/main`, ctest read **32/34**, the two red being `ToolR75RecordAccessSelftest` and
+`ToolR75UserPosLoggingSelftest`. R74 and R75 each hit that and each patched it in their
+own copy, which is how the drift this file exists to stop starts again.
+
+So the base is an input of the recipe, not a hope about the context:
+
+```
+docker build -f tools/round/Dockerfile.tests -t alicia-tests:r<N>cand ~/rounds/r<N>cand
+docker build --build-arg BASE_REF=<ref> -f tools/round/Dockerfile.tests …   # branched elsewhere
+```
+
+`BASE_REF` defaults to `origin/main`; the recipe resolves it to a commit, prints the SHA
+and writes it to `refs/heads/main` inside the image, so `main` there means *the base*.
+A `BASE_REF` that resolves to nothing **stops the build by name**, instead of surfacing
+minutes later as two self-tests failing for what looks like a code defect. A base that
+equals HEAD does not stop it — building the tests image for `main` itself is the
+legitimate control run — but it is announced, because with an empty delta the gates stop
+with code 2 and only their self-tests take part in ctest. Exporting `BASE=origin/main`
+instead was rejected: `origin/main` is a remote-tracking ref of whatever repository the
+clone came from and is not always the canonical base (`~/rounds/r74cand2` has `origin` =
+`~/rounds/r74` and `origin/main` = `5e5befcf`, a stale main), and an env var would fix
+only the ctest path while a hand run of a gate inside the image still found no `main`.
+
 `bash tools/round/check_tests_recipe.sh` builds that file against a fixture in the same
-base image and shows it going red on a failing test, red on no tests, and — with only
-the pipefail line removed — green on that same failing test; run it whenever the recipe
-or the base digest changes.
+base image, in eight arms, and refuses to pass unless each behaves as stated: red on a
+failing test, red on no tests, green on that same failing test once only the pipefail
+line is removed, green when the default `BASE_REF` supplies a real base, red when
+`--build-arg BASE_REF=HEAD` makes the branch its own base and the delta collapses, red
+when `BASE_REF` resolves to nothing, and red when the base-ref step itself is cut out of
+the recipe. Each arm's fixture context is a git repository in the shape of a round clone
+— detached HEAD, `origin/main` on the base commit, no local `main` — because that shape
+is half of what is being tested. Run it whenever the recipe or the base digest changes.
 
 ---
 
