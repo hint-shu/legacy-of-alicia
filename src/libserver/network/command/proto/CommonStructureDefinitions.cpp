@@ -130,6 +130,25 @@ std::string DescribeMacroBlockWireSize(const std::size_t measured)
   return std::format("{} bytes", measured);
 }
 
+std::size_t SelectMacroSlotsWithinBudget(
+  const MacroOptions& requested,
+  MacroOptions& accepted)
+{
+  accepted = MacroOptions{};
+  std::size_t slotsAccepted = 0;
+  for (std::size_t slot = 0; slot < accepted.macros.size(); ++slot)
+  {
+    MacroOptions probe = accepted;
+    probe.macros[slot] = requested.macros[slot];
+    // ★ПРОПУСКАЕМ невлезающий слот и идём дальше — см. шапку объявления.
+    if (MeasureMacroBlockWireSize(probe) > MaxMacroBlockWireBytes)
+      continue;
+    accepted = probe;
+    ++slotsAccepted;
+  }
+  return slotsAccepted;
+}
+
 std::size_t MeasureMacroBlockWireSize(const MacroOptions& value)
 {
   // Скретч вдвое больше бюджета: замер обязан УЗНАТЬ размер перебора, а не
