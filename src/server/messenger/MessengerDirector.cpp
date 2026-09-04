@@ -288,7 +288,11 @@ void MessengerDirector::CloseSessionsOfCharacter(const data::Uid characterUid)
 
 void MessengerDirector::HandleNetworkTick()
 {
-  Tick();
+  // ★ЕДИНСТВЕННАЯ ТОЧКА, ПРИХОДЯЩАЯ С ПОТОКА ЧАТ-СЕРВЕРА. `Server::TickLoop`
+  // армируется на `_io_ctx` того же сервера, поэтому тик приходит с того же
+  // потока, что accept, чтение пакетов и разрывы — то есть с того, которому
+  // карта клиентов принадлежит.
+  DrainPendingDisconnects();
 }
 
 void MessengerDirector::DrainPendingDisconnects()
@@ -497,9 +501,18 @@ void MessengerDirector::SendStallionReward(
 
 void MessengerDirector::Tick()
 {
-  // LOA-fix (R78-fix7, round78, backlog #255, находка ревю #2 BLOCK): здесь
-  // и только здесь закрываются соединения, о которых попросили чужие потоки.
-  DrainPendingDisconnects();
+  // ★ЗДЕСЬ ДРЕНАЖА НЕТ, И ЭТО ИЗМЕРЕНО, А НЕ ВЫВЕДЕНО (R78-fix7).
+  //
+  // `Tick()` зовёт `RunDirectorTaskLoop` со СВОЕГО потока директора
+  // (`ServerInstance.cpp:246-252`), а пакеты мессенджера разбирает ДРУГОЙ поток
+  // — тот, на котором крутится `_io_ctx` чат-сервера. Первая редакция фикса
+  // дренажила отсюда, и предикат идентичности потока поймал это на стенде:
+  // закрытие печаталось потоком директора (Thread 10), а `ChatCmdLogin`,
+  // `HandleClientConnected` и чтения карты — потоком чата (Thread 14).
+  // То есть работа лишь ПЕРЕЕХАЛА с чужого потока на другой чужой.
+  //
+  // Дренаж живёт в `HandleNetworkTick()` — единственной точке, приходящей
+  // с того же потока, что и разбор пакетов.
 }
 
 Config::Messenger& MessengerDirector::GetConfig()
