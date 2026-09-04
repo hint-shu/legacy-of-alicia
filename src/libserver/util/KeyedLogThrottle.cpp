@@ -50,7 +50,8 @@ bool KeyedLogThrottle::Allow(uint64_t key, uint64_t& suppressed) noexcept
   {
     // Захват замка умеет бросить (`std::system_error`), а `noexcept` превратил бы
     // это в `std::terminate`. Ответ «сейчас не жалуемся» безопасен: теряется только
-    // строка лога. (Тот же довод, что в `LogThrottle::Allow`.)
+    // строка лога. ★`LogThrottle::Allow` этой ветки не имеет и иметь не может:
+    // с R72 он атомарный и замка не берёт — бросать там нечему.
     suppressed = 0;
     return false;
   }
