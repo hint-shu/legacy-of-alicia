@@ -19,6 +19,14 @@
 
 #include "libserver/network/command/proto/LobbyMessageDefinitions.hpp"
 
+#include "libserver/util/BoundedList.hpp"
+
+#include <algorithm>
+#include <cassert>
+#include <span>
+#include <utility>
+#include <vector>
+
 namespace server::protocol
 {
 
@@ -43,12 +51,26 @@ void AcCmdCLLogin::Read(
 
 void LobbyCommandLoginOK::SystemContent::Write(const SystemContent& command, SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.values.size()));
-  for (const auto& [key, value] : command.values)
-  {
-    stream.Write(key)
-      .Write(value);
-  }
+  // ★R74. ЯВНЫЙ ПИСАТЕЛЬ ОБЯЗАТЕЛЕН: элемент здесь — `std::pair`, а для пары у
+  // `SinkStream` перегрузки `Write` нет вовсе. Заодно снимается вторая беда:
+  // обход `std::unordered_map` НЕ ОПРЕДЕЛЁН, то есть порядок этих записей на
+  // проводе уже сегодня недетерминирован. Сортировка по ключу превращает
+  // неопределённый порядок в определённый — это не смена поведения, а его
+  // фиксация. Кламп недостижим: каталог системного контента даёт 69 записей
+  // при потолке 255.
+  std::vector<std::pair<uint32_t, uint32_t>> orderedValues{
+    command.values.begin(), command.values.end()};
+  std::sort(orderedValues.begin(), orderedValues.end());
+
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    orderedValues,
+    {.name = "LobbyCommandLoginOK.SystemContent.values"},
+    [](SinkStream& sink, const auto& entry)
+    {
+      sink.Write(entry.first)
+        .Write(entry.second);
+    });
 }
 
 void LobbyCommandLoginOK::SystemContent::Read(
@@ -73,30 +95,30 @@ void LobbyCommandLoginOK::Write(
     .Write(static_cast<uint8_t>(command.gender))
     .Write(command.introduction);
 
-  constexpr size_t MaxEquipmentItemCount = 16;
-
-  if (command.equipmentItems.size() > MaxEquipmentItemCount)
-    throw std::runtime_error("Equipment item count is over the limit");
-
-  stream.Write(static_cast<uint8_t>(command.equipmentItems.size()));
-  for (size_t idx = 0; idx < command.equipmentItems.size(); ++idx)
-  {
-    const auto& item = command.equipmentItems[idx];
-    stream.Write(item);
-  }
-
+  // ★R74. ЭТИ ДВА `throw` И БЫЛИ МЕХАНИЗМОМ ВЕЧНОЙ БЛОКИРОВКИ ВХОДА.
+  //
+  // `LobbyCommandLoginOK::Write` исполняется в поставщике записи, то есть на
+  // потоке `Client::WriteLoop`; бросок оттуда ловит `Server.cpp` и зовёт
+  // `End()`. Семнадцатый предмет экипировки означал «этот персонаж не входит в
+  // игру НИКОГДА» — и путь этот самоинфлицируемый: `characterEquipment` хранит
+  // и одежду, и сбрую одним списком, а замена по слоту происходит ТОЛЬКО для
+  // предметов, чей tid знает реестр; выпавший из реестра tid остаётся в списке
+  // навсегда, а реестр мы правим каждой волной локализации.
+  //
+  // Потолки переехали в `maxCount` теми же числами и теперь КЛАМПЯТ: игрок
+  // входит и видит 16 предметов вместо «не входит вовсе».
   constexpr size_t MaxExpiredItemCount = 250;
 
-  // Mount equipment
-  if (command.expiredItems.size() > MaxExpiredItemCount)
-    throw std::runtime_error("Expired item count is over the limit");
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.equipmentItems,
+    {.maxCount = MaxCharacterEquipmentCount, .name = "LobbyCommandLoginOK.equipmentItems"});
 
-  stream.Write(static_cast<uint8_t>(command.expiredItems.size()));
-  for (size_t idx = 0; idx < command.expiredItems.size(); ++idx)
-  {
-    const auto& item = command.expiredItems[idx];
-    stream.Write(item);
-  }
+  // Mount equipment
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.expiredItems,
+    {.maxCount = MaxExpiredItemCount, .name = "LobbyCommandLoginOK.expiredItems"});
 
   //
   stream.Write(command.level)
@@ -109,18 +131,24 @@ void LobbyCommandLoginOK::Write(
   stream.Write(command.settings);
 
   //
-  stream.Write(static_cast<uint8_t>(command.missions.size()));
-  for (const auto& val : command.missions)
-  {
-    stream.Write(val.id);
-
-    stream.Write(static_cast<uint8_t>(val.progress.size()));
-    for (const auto& nestedVal : val.progress)
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.missions,
+    {.name = "LobbyCommandLoginOK.missions"},
+    [](SinkStream& sink, const auto& mission)
     {
-      stream.Write(nestedVal.id)
-        .Write(nestedVal.value);
-    }
-  }
+      sink.Write(mission.id);
+
+      util::WriteBoundedList<uint8_t>(
+        sink,
+        mission.progress,
+        {.name = "LobbyCommandLoginOK.missions.progress"},
+        [](SinkStream& nested, const auto& entry)
+        {
+          nested.Write(entry.id)
+            .Write(entry.value);
+        });
+    });
 
   stream.Write(command.val6);
 
@@ -148,22 +176,26 @@ void LobbyCommandLoginOK::Write(
     .Write(managementSkills.points);
 
   const auto& skillRanks = command.skillRanks;
-  stream.Write(
-    static_cast<uint8_t>(skillRanks.values.size()));
-  for (const auto& value : skillRanks.values)
-  {
-    stream.Write(value.id)
-      .Write(value.rank);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    skillRanks.values,
+    {.name = "LobbyCommandLoginOK.skillRanks.values"},
+    [](SinkStream& sink, const auto& value)
+    {
+      sink.Write(value.id)
+        .Write(value.rank);
+    });
 
-  stream.Write(
-    static_cast<uint8_t>(command.trainingProgression.mapProggressInfos.size()));
-  for (const auto& value : command.trainingProgression.mapProggressInfos)
-  {
-    stream.Write(value.mapBlockId)
-      .Write(value.gameMode)
-      .Write(value.clearStage);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.trainingProgression.mapProggressInfos,
+    {.name = "LobbyCommandLoginOK.trainingProgression.mapProggressInfos"},
+    [](SinkStream& sink, const auto& value)
+    {
+      sink.Write(value.mapBlockId)
+        .Write(value.gameMode)
+        .Write(value.clearStage);
+    });
 
   stream.Write(command.characterCreationDate);
 
@@ -232,22 +264,27 @@ void LobbyCommandShowInventoryOK::Write(
   const LobbyCommandShowInventoryOK& command,
   SinkStream& stream)
 {
-  if (command.items.size() > 250)
-    throw std::runtime_error("Item count greater than protocol max (250)");
-  if (command.horses.size() > 10)
-    throw std::runtime_error("Horse count greater than protocol max (10)");
+  // ★R74. Два `throw` УДАЛЕНЫ, а их числа переехали в потолки хелпера.
+  //
+  // Бросок отсюда исполнялся В ПОСТАВЩИКЕ ЗАПИСИ, то есть на потоке
+  // `Client::WriteLoop`, где `Server.cpp` ловит его и зовёт `End()` — то есть
+  // «список длиннее протокольного предела» означало «выкинуть игрока», и так
+  // на каждой попытке. Наблюдаемого поведения замена не меняет вовсе:
+  // `HandleShowInventory` уже нарезает ответ ровно по 250 предметов и 10
+  // лошадей (`std::views::chunk`), поэтому кламп здесь недостижим — он стоит
+  // как последняя, не убивающая соединение линия.
+  constexpr std::size_t MaxInventoryItemCount = 250;
+  constexpr std::size_t MaxInventoryHorseCount = 10;
 
-  stream.Write(static_cast<uint8_t>(command.items.size()));
-  for (const auto& item : command.items)
-  {
-    stream.Write(item);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.items,
+    {.maxCount = MaxInventoryItemCount, .name = "LobbyCommandShowInventoryOK.items"});
 
-  stream.Write(static_cast<uint8_t>(command.horses.size()));
-  for (const auto& horse : command.horses)
-  {
-    stream.Write(horse);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.horses,
+    {.maxCount = MaxInventoryHorseCount, .name = "LobbyCommandShowInventoryOK.horses"});
 }
 
 void LobbyCommandShowInventoryOK::Read(
@@ -384,11 +421,8 @@ void AcCmdCLAchievementCompleteListOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.unk0);
-  stream.Write(static_cast<uint16_t>(command.achievements.size()));
-  for (const auto& achievement : command.achievements)
-  {
-    stream.Write(achievement);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.achievements, {.name = "AcCmdCLAchievementCompleteListOK.achievements"});
 }
 
 void AcCmdCLAchievementCompleteListOK::Read(
@@ -517,12 +551,9 @@ void LobbyCommandRoomListOK::Write(
 {
   stream.Write(command.page)
     .Write(command.gameMode)
-    .Write(command.teamMode)
-    .Write(static_cast<uint8_t>(command.rooms.size()));
-  for (const auto& room : command.rooms)
-  {
-    stream.Write(room);
-  }
+    .Write(command.teamMode);
+  util::WriteBoundedList<uint8_t>(
+    stream, command.rooms, {.name = "LobbyCommandRoomListOK.rooms"});
   stream.Write(command.unk3.unk0)
     .Write(command.unk3.unk1)
     .Write(command.unk3.unk2);
@@ -684,11 +715,8 @@ void AcCmdCLRequestQuestListOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.unk0);
-  stream.Write(static_cast<uint16_t>(command.quests.size()));
-  for (const auto& quest : command.quests)
-  {
-    stream.Write(quest);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.quests, {.name = "AcCmdCLRequestQuestListOK.quests"});
 }
 
 void AcCmdCLRequestQuestListOK::Read(
@@ -717,19 +745,11 @@ void AcCmdCLRequestDailyQuestListOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.characterUid);
-  stream.Write(static_cast<uint16_t>(command.unk.size()));
- 
-  for (auto& member : command.unk)
-  {
-    stream.Write(member);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.unk, {.name = "AcCmdCLRequestDailyQuestListOK.unk"});
 
-  stream.Write(static_cast<uint16_t>(command.dailyQuests.size()));
-
-  for (auto& quest : command.dailyQuests)
-  {
-    stream.Write(quest);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.dailyQuests, {.name = "AcCmdCLRequestDailyQuestListOK.dailyQuests"});
 }
 
 void AcCmdCLRequestDailyQuestListOK::Read(
@@ -879,18 +899,18 @@ void AcCmdCLRequestSpecialEventListOK::Write(
 {
   stream.Write(command.unk0);
 
-  stream.Write(static_cast<uint16_t>(command.quests.size()));
-  for (const auto& quest : command.quests)
-  {
-    stream.Write(quest);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.quests, {.name = "AcCmdCLRequestSpecialEventListOK.quests"});
 
-  stream.Write(static_cast<uint16_t>(command.events.size()));
-  for (const auto& event : command.events)
-  {
-    stream.Write(event.unk0)
-      .Write(event.unk1);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream,
+    command.events,
+    {.name = "AcCmdCLRequestSpecialEventListOK.events"},
+    [](SinkStream& sink, const auto& event)
+    {
+      sink.Write(event.unk0)
+        .Write(event.unk1);
+    });
 }
 
 void AcCmdCLRequestSpecialEventListOK::Read(
@@ -970,8 +990,8 @@ void AcCmdLCGoodsShopListData::Write(
   stream.Write(command.index)
     .Write(command.count);
 
-  stream.Write(static_cast<uint32_t>(command.data.size()));
-  stream.Write(command.data.data(), command.data.size());
+  util::WriteBoundedBytes<uint32_t>(
+    stream, std::span{command.data}, {.name = "AcCmdLCGoodsShopListData.data"});
 }
 
 void AcCmdLCGoodsShopListData::Read(
@@ -1054,9 +1074,15 @@ void LobbyCommandGuildPartyListOK::Write(
   const LobbyCommandGuildPartyListOK& command,
   SinkStream& stream)
 {
+  // `assert` ОСТАЁТСЯ: сообщение не реализовано для непустого списка, и кламп
+  // это не заменяет — он объявит меньше, но тела всё равно не будет.
   assert(command.members.empty());
   // todo: Write members
-  stream.Write(static_cast<uint8_t>(command.members.size()));
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.members,
+    {.maxCount = 0, .name = "LobbyCommandGuildPartyListOK.members"},
+    [](SinkStream&, const auto&) {});
 }
 
 void LobbyCommandGuildPartyListOK::Read(
@@ -1185,18 +1211,22 @@ void AcCmdLCPersonalInfo::CourseInformation::Write(const CourseInformation& comm
     .Write(command.totalSpeedGames)
     .Write(command.totalMagicGames);
 
-  stream.Write(static_cast<uint8_t>(command.courses.size()));
-  for (const auto& entry : command.courses)
-  {
-    stream.Write(entry.courseId)
-      .Write(entry.timesRaced)
-      .Write(entry.recordTime);
-
-    for (const auto& byte : entry.member4)
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.courses,
+    {.name = "AcCmdLCPersonalInfo.CourseInformation.courses"},
+    [](SinkStream& sink, const auto& entry)
     {
-      stream.Write(byte);
-    }
-  }
+      sink.Write(entry.courseId)
+        .Write(entry.timesRaced)
+        .Write(entry.recordTime);
+
+      // Фиксированный std::array без счётчика на проводе — не список.
+      for (const auto& byte : entry.member4)
+      {
+        sink.Write(byte);
+      }
+    });
 }
 
 void AcCmdLCPersonalInfo::CourseInformation::Read(
@@ -1210,12 +1240,15 @@ void AcCmdLCPersonalInfo::Eight::Write(
   const Eight& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.member1.size()));
-  for (const auto& entry : command.member1)
-  {
-    stream.Write(entry.member1)
-      .Write(entry.member2);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.member1,
+    {.name = "AcCmdLCPersonalInfo.Eight.member1"},
+    [](SinkStream& sink, const auto& entry)
+    {
+      sink.Write(entry.member1)
+        .Write(entry.member2);
+    });
 }
 
 void AcCmdLCPersonalInfo::Eight::Read(
@@ -1554,22 +1587,25 @@ void AcCmdCLRequestMountInfoOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.characterUid);
-  stream.Write(static_cast<uint8_t>(command.mountInfos.size()));
-  for (const auto& mountInfo : command.mountInfos)
-  {
-    stream.Write(mountInfo.horseUid)
-      .Write(mountInfo.boostsInARow)
-      .Write(mountInfo.winsSpeedSingle)
-      .Write(mountInfo.winsSpeedTeam)
-      .Write(mountInfo.winsMagicSingle)
-      .Write(mountInfo.winsMagicTeam)
-      .Write(mountInfo.totalDistance)
-      .Write(mountInfo.topSpeed)
-      .Write(mountInfo.longestGlideDistance)
-      .Write(mountInfo.participated)
-      .Write(mountInfo.cumulativePrize)
-      .Write(mountInfo.biggestPrize);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.mountInfos,
+    {.name = "AcCmdCLRequestMountInfoOK.mountInfos"},
+    [](SinkStream& sink, const auto& mountInfo)
+    {
+      sink.Write(mountInfo.horseUid)
+        .Write(mountInfo.boostsInARow)
+        .Write(mountInfo.winsSpeedSingle)
+        .Write(mountInfo.winsSpeedTeam)
+        .Write(mountInfo.winsMagicSingle)
+        .Write(mountInfo.winsMagicTeam)
+        .Write(mountInfo.totalDistance)
+        .Write(mountInfo.topSpeed)
+        .Write(mountInfo.longestGlideDistance)
+        .Write(mountInfo.participated)
+        .Write(mountInfo.cumulativePrize)
+        .Write(mountInfo.biggestPrize);
+    });
 }
 
 void AcCmdLCSkillCardPresetList::Read(
@@ -1586,11 +1622,8 @@ void AcCmdLCSkillCardPresetList::Write(
   stream.Write(command.speedActiveSetId)
     .Write(command.magicActiveSetId);
 
-  stream.Write(static_cast<uint8_t>(command.skillSets.size()));
-  for (const auto& skillSet : command.skillSets)
-  {
-    stream.Write(skillSet);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.skillSets, {.name = "AcCmdLCSkillCardPresetList.skillSets"});
 }
 
 void AcCmdLCInviteGuildJoin::Read(
