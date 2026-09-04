@@ -1253,7 +1253,10 @@ void RaceNetworkHandler::HandleEnterRoom(
         // байт без строк. Размер EnterRoomOK держат имена (EUC-KR, два байта на
         // символ) и число гонщиков, а реальную экономию дал снятый двойной
         // аппенд (п.2), а не этот потолок.
-        constexpr std::size_t MaxRacerEquipmentItems = 16;
+        // ★R74-fix-3 (subreview #2, NIT 3): та же константа, что у писателя —
+        // `protocol::MaxRacerEquipmentItems`. Локальный литерал убран, чтобы
+        // кламп здесь и потолок на проводе не могли разъехаться.
+        constexpr std::size_t MaxRacerEquipmentItems = protocol::MaxRacerEquipmentItems;
 
         const auto equipmentItems = _serverInstance.GetDataDirector().GetItemCache().Get(
           character.characterEquipment());

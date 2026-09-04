@@ -47,7 +47,9 @@ void WritePlayerRacer(SinkStream& stream, const Avatar& playerRacer)
   // ★R74. Площадка в СВОБОДНОЙ функции: перепись, ключившаяся на `::Write(`,
   // её не видела вовсе, хотя счётчик отсюда уезжает КАЖДОМУ входящему в комнату.
   util::WriteBoundedList<uint8_t>(
-    stream, playerRacer.equipment, {.name = "WritePlayerRacer.equipment"});
+    stream,
+    playerRacer.equipment,
+    {.maxCount = MaxRacerEquipmentItems, .name = "WritePlayerRacer.equipment"});
 
   stream.Write(playerRacer.character)
     .Write(playerRacer.mount)
