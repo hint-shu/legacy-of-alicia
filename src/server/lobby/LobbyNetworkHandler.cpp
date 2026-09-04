@@ -21,6 +21,7 @@
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
+#include "libserver/util/KeyedLogThrottle.hpp"
 #include "libserver/util/LogThrottle.hpp"
 #include "server/ServerInstance.hpp"
 
@@ -1920,10 +1921,18 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
   {
     // Жалоба задросселирована: содержимое профиля задаёт клиент, значит и
     // частоту этой строки задавал бы он.
-    static util::LogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
+    //
+    // ★R74-fix-3 (subreview #2, NIT 7 — тот же дефект, что у соседней строки):
+    // ДРОССЕЛЬ КЛЮЧИТСЯ ПО ПЕРСОНАЖУ, А НЕ ОДИН НА ПРОЦЕСС. С одним статиком
+    // второй игрок, чей кадр порезали в том же пятиминутном окне, не давал
+    // строки ВООБЩЕ — и это не теория: на негативном образе так пропала
+    // единственная улика решения о сбросе для `loatest-5`, потому что окно уже
+    // занял `loatest-4`. Строка несёт МАСКУ, то есть решение; терять её по
+    // соседству значит терять наблюдаемость самого механизма.
+    static util::KeyedLogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
     uint64_t suppressed = 0;
-    uint64_t total = 0;
-    if (loginFrameShedThrottle.Allow(suppressed, total))
+    const uint64_t total = 0;
+    if (loginFrameShedThrottle.Allow(clientContext.characterUid, suppressed))
     {
       util::QuietLogWarn(
         "login frame over budget for user '{}': shed mask 0x{:x}"
