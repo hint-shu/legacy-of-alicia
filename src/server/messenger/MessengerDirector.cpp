@@ -275,8 +275,14 @@ void MessengerDirector::CloseSessionsOfCharacter(const data::Uid characterUid)
   // уходим; закроет `Tick()` на своём потоке, не позже следующего тика (1 с).
   {
     const std::lock_guard lock(_pendingDisconnectsMutex);
-    _pendingDisconnects.insert(
-      _pendingDisconnects.end(), unbound.begin(), unbound.end());
+    for (const network::ClientId staleClientId : unbound)
+    {
+      // ★ЛИЧНОСТЬ КЛАДЁТСЯ В ОЧЕРЕДЬ ВМЕСТЕ С СОЕДИНЕНИЕМ (ревю #3 WARN-1):
+      // фаза 1 её уже стёрла из контекста, а сливу она нужна, чтобы разослать
+      // друзьям и гильдии «офлайн».
+      _pendingDisconnects.emplace_back(
+        PendingDisconnect{.clientId = staleClientId, .characterUid = characterUid});
+    }
   }
 
   server::util::QuietLogInfo(
@@ -301,7 +307,7 @@ void MessengerDirector::DrainPendingDisconnects()
   // `io_context` этого же сервера, поэтому тик приходит с того же потока, что
   // accept, чтение пакетов и разрывы. Только здесь законно звать
   // `DisconnectClient` и позволять уборке стирать записи.
-  std::vector<network::ClientId> pending;
+  std::vector<PendingDisconnect> pending;
   {
     const std::lock_guard lock(_pendingDisconnectsMutex);
     if (_pendingDisconnects.empty())
@@ -309,11 +315,43 @@ void MessengerDirector::DrainPendingDisconnects()
     pending.swap(_pendingDisconnects);
   }
 
-  for (const network::ClientId staleClientId : pending)
+  size_t closed = 0;
+  size_t rebound = 0;
+  for (const PendingDisconnect& entry : pending)
   {
+    // ★ПЕРЕПРОВЕРКА ПЕРЕД РАЗРЫВОМ (NIT ревю #3 №3). Пока запись лежала в
+    // очереди, сокет мог пройти повторный вход и СНОВА стать законной сессией
+    // персонажа: гард повтора его не остановит, потому что фаза 1 сняла оба
+    // поля. Рвать такую сессию значило бы бить по живому входу, которого
+    // просьба о гашении не касалась. Монотонность `ClientId` спасает только от
+    // НОВЫХ соединений, а это — то же самое.
+    bool stillUnbound = false;
+    {
+      const std::shared_lock lock(_clientsMutex);
+      const auto clientIter = _clients.find(entry.clientId);
+      stillUnbound = clientIter != _clients.cend()
+        && clientIter->second.characterUid == data::InvalidUid;
+    }
+    if (not stillUnbound)
+    {
+      ++rebound;
+      continue;
+    }
+
+    // ★РАССЫЛКА «ОФЛАЙН» ИДЁТ ДО РАЗРЫВА И ПО СОХРАНЁННОЙ ЛИЧНОСТИ
+    // (ревю #3 WARN-1). После разрыва уборка синтезирует Offline сама, но
+    // упирается в снятый фазой 1 флаг и молчит. Здесь флаг не спрашивается.
+    const protocol::Presence offlinePresence{
+      .status = protocol::Status::Offline,
+      .scene = protocol::Presence::Scene::Ranch,
+      .sceneUid = 0};
+    BroadcastPresenceOfCharacter(
+      entry.characterUid, offlinePresence, entry.clientId);
+
     try
     {
-      _chatterServer.DisconnectClient(staleClientId);
+      _chatterServer.DisconnectClient(entry.clientId);
+      ++closed;
     }
     catch (const std::exception&)
     {
@@ -322,8 +360,10 @@ void MessengerDirector::DrainPendingDisconnects()
   }
 
   server::util::QuietLogInfo(
-    "Closed {} deferred messenger session(s) on the messenger thread",
-    pending.size());
+    "Closed {} deferred messenger session(s) on the messenger thread"
+    " ({} rebound and spared)",
+    closed,
+    rebound);
 }
 
 void MessengerDirector::DisconnectUnboundSessions(
@@ -600,11 +640,19 @@ void MessengerDirector::HandleChatterLogin(
   const network::ClientId clientId,
   const protocol::ChatCmdLogin& command)
 {
-  server::util::QuietLogDebug("[{}] ChatCmdLogin: {} {} {} {}",
+  // LOA-fix (R78-fix8, round78, backlog #255, находка ревю #3 WARN-2):
+  // КЛЮЧ В ЛОГ НЕ ПОПАДАЕТ.
+  //
+  // ★ЧТО ИЗМЕНИЛ РАУНД. Строка стоит с базы, но раньше печаталось ОДНОРАЗОВОЕ
+  // значение, потраченное первым же входом и протухавшее за 30 секунд. После
+  // перехода на LTK то же поле — живой credential на весь лобби-сеанс, а
+  // `logs/log.txt` пишется на уровне debug безусловно (`main.cpp:174`). Одной
+  // строки лога хватало, чтобы собрать `uid` + `code` и войти как жертва.
+  // Убираем аргумент — ровно так же, как строка ниже уже поступает с
+  // `command.name`. `guildUid` оставляем: он не credential.
+  server::util::QuietLogDebug("[{}] ChatCmdLogin: {} {}",
     clientId,
     command.characterUid,
-    command.name,
-    command.code,
     command.guildUid);
 
   auto& clientContext = GetClientContext(clientId, false);
@@ -703,10 +751,12 @@ void MessengerDirector::HandleChatterLogin(
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    server::util::QuietLogWarn("Client {} tried to login as character {} but failed authentication with auth code {}",
+    // ★УРОВЕНЬ WARN ВКЛЮЧЁН ВСЕГДА, а в принятом §10 регрессе (multi-WAN)
+    // игрок валит авторизацию КАЖДОЙ попыткой — и каждая печатала бы его всё
+    // ещё живой ключ. Код убран (ревю #3 WARN-2).
+    server::util::QuietLogWarn("Client {} tried to login as character {} but failed authentication",
       clientId,
-      command.characterUid,
-      command.code);
+      command.characterUid);
 
     protocol::ChatCmdLoginAckCancel cancel{
       .errorCode = protocol::ChatterErrorCode::LoginFailed};
@@ -752,6 +802,39 @@ void MessengerDirector::HandleChatterLogin(
   // выхода в чужой код под ним.
   {
     const std::unique_lock lock(_clientsMutex);
+
+    // LOA-fix (R78-fix8, round78, backlog #255, NIT ревю #3 №2): ПЕРЕПРОВЕРКА
+    // КЛЮЧА В ТОЧКЕ ПРИВЯЗКИ.
+    //
+    // ★ОКНО, КОТОРОЕ ЭТИМ ЗАКРЫВАЕТСЯ. Между сверкой ключа и публикацией
+    // личности лежит всё тяжёлое тело входа (чтение ящика, групп, друзей —
+    // десятки миллисекунд, длина задаётся клиентом). Игрок мог за это время
+    // выйти из игры: лобби сняло бы ключ и попросило погасить сессии — но
+    // фаза 1 ищет по `characterUid`, которого этот вход ЕЩЁ НЕ опубликовал,
+    // никого не находит и молча уходит. Вход довязывался бы к персонажу,
+    // чей ключ уже отозван.
+    //
+    // ★СТОИТ ПОД ТЕМ ЖЕ ЗАМКОМ, ЧТО И ПУБЛИКАЦИЯ: между проверкой и записью
+    // не остаётся ни одного оператора. Своего мьютекса `OtpSystem` не роняет
+    // на наш — он никого не зовёт наружу, цикла блокировок нет.
+    if (not _serverInstance.GetOtpSystem().AuthorizeLtk(
+          identityHash,
+          command.code,
+          _chatterServer.GetClientAddress(clientId).to_uint()))
+    {
+      server::util::QuietLogWarn(
+        "Client {} lost its messenger key while logging in as character {}"
+        " — the session is not bound",
+        clientId,
+        command.characterUid);
+
+      protocol::ChatCmdLoginAckCancel cancel{
+        .errorCode = protocol::ChatterErrorCode::LoginFailed};
+      _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+      _chatterServer.DisconnectClient(clientId);
+      return;
+    }
+
     clientContext.otpCode.emplace(command.code);
     clientContext.characterUid = boundCharacterUid;
     clientContext.presence = protocol::Presence{
@@ -2081,9 +2164,26 @@ void MessengerDirector::HandleChatterUpdateState(
   // Update state for client context
   clientContext.presence = command.presence;
 
-  // Get guild uid of the invoking character
+  BroadcastPresenceOfCharacter(
+    clientContext.characterUid, command.presence, clientId);
+}
+
+void MessengerDirector::BroadcastPresenceOfCharacter(
+  const data::Uid characterUid,
+  const protocol::Presence& presence,
+  const network::ClientId selfClientId)
+{
+  // LOA-fix (R78-fix8, round78, backlog #255, находка ревю #3 WARN-1):
+  // РАССЫЛКА ПРИСУТСТВИЯ, НЕ ЗАВИСЯЩАЯ ОТ ФЛАГА КОНТЕКСТА.
+  //
+  // ★ЗАЧЕМ ВЫНЕСЕНО. Гашение сессии (фаза 1) снимает `isAuthenticated` и
+  // обнуляет `characterUid`, а `HandleChatterUpdateState` выходит первой же
+  // строкой именно по этому флагу. Значит синтезированный на разрыве Offline
+  // никуда не уходил: друзья видели ушедшего игрока в сети до его следующего
+  // входа, гильдия — тоже, а приглашение призраку не получало даже ack.
+  // Личность передаётся ПАРАМЕТРОМ: её сохраняет фаза 1 до обнуления.
   data::Uid guildUid{data::InvalidUid};
-  _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
+  _serverInstance.GetDataDirector().GetCharacter(characterUid).Immutable(
     [&guildUid](const data::Character& character)
     {
       guildUid = character.guildUid();
@@ -2094,7 +2194,11 @@ void MessengerDirector::HandleChatterUpdateState(
   // This mechanism goes through all the online clients and checks if the invoker is in their stored friends list.
   std::vector<network::ClientId> friendsToNotify{};
 
-  const auto clientsSnapshot = _clients;
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   for (const auto& [onlineClientId, onlineClientContext] : clientsSnapshot)
   {
     // Skip unauthenticated clients
@@ -2103,7 +2207,7 @@ void MessengerDirector::HandleChatterUpdateState(
       continue;
 
     // Self broadcast is needed only for guild notification
-    bool isSelf = onlineClientId == clientId;
+    bool isSelf = onlineClientId == selfClientId;
     if (isSelf and guildUid != data::InvalidUid)
     {
       guildMembersToNotify.emplace_back(onlineClientId);
@@ -2113,13 +2217,13 @@ void MessengerDirector::HandleChatterUpdateState(
     // Check if invoker is in the online client's stored friends list
     bool isFriend = false;
     _serverInstance.GetDataDirector().GetCharacter(onlineClientContext.characterUid).Immutable(
-      [&isFriend, &clientContext](const data::Character& character)
+      [&isFriend, characterUid](const data::Character& character)
       {
         isFriend = std::ranges::any_of(
           character.contacts.groups() | std::views::values,
-          [&clientContext](const data::Character::Contacts::Group& group)
+          [characterUid](const data::Character::Contacts::Group& group)
           {
-            return std::ranges::contains(group.members, clientContext.characterUid);
+            return std::ranges::contains(group.members, characterUid);
           });
       });
 
@@ -2151,8 +2255,8 @@ void MessengerDirector::HandleChatterUpdateState(
   {
     protocol::ChatCmdUpdateStateTrs notify{
       protocol::ChatCmdUpdateState{
-        command.presence,},
-      clientContext.characterUid};
+        presence,},
+      characterUid};
 
     for (const auto& targetClientId : friendsToNotify)
     {
@@ -2163,8 +2267,8 @@ void MessengerDirector::HandleChatterUpdateState(
   if (not guildMembersToNotify.empty())
   {
     protocol::ChatCmdUpdateGuildMemberStateTrs notify{};
-    notify.affectedCharacterUid = clientContext.characterUid;
-    notify.presence = command.presence;
+    notify.affectedCharacterUid = characterUid;
+    notify.presence = presence;
 
     for (const auto& targetClientId : guildMembersToNotify)
     {
@@ -2368,11 +2472,9 @@ void MessengerDirector::HandleChatterGuildLogin(
 {
   // ChatCmdGuildLogin is sent after ChatCmdLogin
 
-  server::util::QuietLogDebug("[{}] ChatCmdGuildLogin: {} {} {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdGuildLogin: {} {}",
     clientId,
     command.characterUid,
-    command.name,
-    command.code,
     command.guildUid);
 
   auto& clientContext = GetClientContext(clientId);
@@ -2386,11 +2488,10 @@ void MessengerDirector::HandleChatterGuildLogin(
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    server::util::QuietLogWarn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication with auth code '{}'",
+    server::util::QuietLogWarn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication",
       clientId,
       command.guildUid,
-      command.characterUid,
-      command.code);
+      command.characterUid);
 
     protocol::ChatCmdGuildLoginAckCancel cancel{
       .errorCode = protocol::ChatterErrorCode::LoginFailed};
