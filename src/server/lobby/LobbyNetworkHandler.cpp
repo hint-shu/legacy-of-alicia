@@ -1929,9 +1929,12 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
     // единственная улика решения о сбросе для `loatest-5`, потому что окно уже
     // занял `loatest-4`. Строка несёт МАСКУ, то есть решение; терять её по
     // соседству значит терять наблюдаемость самого механизма.
+    // ★R74-fix-4 (subreview #3, NIT 2): у `KeyedLogThrottle` нет пожизненного
+    // счётчика, и поле «{} in total» подпиралось литералом — то есть печатало
+    // ложь. Поле убрано, а не подперто: соседние строки на `LogThrottle` несут
+    // НАСТОЯЩИЙ total, и одинаковая форма при разном смысле хуже разной формы.
     static util::KeyedLogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
     uint64_t suppressed = 0;
-    const uint64_t total = 0;
     // ★КЛЮЧ — `response.uid`, А НЕ `clientContext.characterUid`. Снимок
     // контекста берётся в начале этой функции, ДО того как uid персонажа в нём
     // проставляется отдельной мутацией под замком, — то есть здесь он ещё
@@ -1944,7 +1947,7 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
       util::QuietLogWarn(
         "login frame over budget for user '{}': shed mask 0x{:x}"
         " (macros={} gamepad={} keyboard={} introduction={} still-too-large={});"
-        " the stored profile is untouched by this frame (suppressed {} more, {} in total)",
+        " the stored profile is untouched by this frame (suppressed {} more for this character)",
         clientContext.userName,
         shed,
         (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Macros)) != 0,
@@ -1952,8 +1955,7 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
         (shed & static_cast<uint32_t>(protocol::LoginFrameShed::KeyboardBindings)) != 0,
         (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Introduction)) != 0,
         (shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0,
-        suppressed,
-        total);
+        suppressed);
     }
 
     // ★R74-fix-3 (subreview #2, NIT 1): `StillTooLarge` ОБЯЗАН ОТКАЗЫВАТЬ, А НЕ
@@ -1966,28 +1968,66 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
     // разрыв, и повторить попытку может сам.
     if ((shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0)
     {
-      util::QuietLogError(
-        "refusing the login of user '{}': the login frame does not fit {} bytes"
-        " even with every client-authored profile block shed; the cause is"
-        " outside those blocks (an oversized server notice, or a failing"
-        " conversion) and the account cannot be let in until it is found",
-        clientContext.userName,
-        protocol::MaxClientPacketDataBytes);
+      // ★R74-fix-4 (subreview #3, WARN 1 и NIT 3): ОТКАЗ РАЗМАТЫВАЕТ СЕССИЮ.
+      //
+      // Прежняя редакция только печатала строку и слала отказ, оставляя обе
+      // защёлки взведёнными: `isAuthenticated` и `characterUid` в контексте и
+      // запись в `_userInstances`. `AcCmdCLLogin` — pre-auth обработчик, а его
+      // гейт дубликатов идёт по всем контекстам БЕЗ исключения самого себя, —
+      // значит повтор на том же сокете получал `Duplicated`, а не свежую
+      // попытку. Комментарий «повторить попытку может сам» был неверен, и это
+      // НОВЫЙ режим отказа: до раунда бросок из поставщика звал `End()`, и
+      // `HandleClientDisconnected` чистил обе защёлки сразу.
+      //
+      // Разматываем ровно те две вещи, что взвёл вход: отметку «в игре» у
+      // директора и признаки аутентификации в контексте. Сокет не рвём — клиент
+      // получает названную причину и волен попробовать снова.
+      static util::KeyedLogThrottle refusalThrottle{std::chrono::minutes{5}};
+      uint64_t refusalsSuppressed = 0;
+      if (refusalThrottle.Allow(response.uid, refusalsSuppressed))
+      {
+        util::QuietLogError(
+          "refusing the login of user '{}': the login frame does not fit {} bytes"
+          " even with every client-authored profile block shed; the cause is"
+          " outside those blocks (an oversized server notice, or a failing"
+          " conversion) and the account cannot be let in until it is found"
+          " (suppressed {} more for this character)",
+          clientContext.userName,
+          protocol::MaxClientPacketDataBytes,
+          refusalsSuppressed);
+      }
+
+      _serverInstance.GetLobbyDirector().QueueClientLogout(
+        clientId, clientContext.userName);
+      MutateClientContext(
+        clientId,
+        [](ClientContext& context)
+        {
+          context.isAuthenticated = false;
+          context.characterUid = data::InvalidUid;
+          context.shedSettingsBlocks = 0;
+        });
+
       SendLoginCancel(clientId, protocol::AcCmdCLLoginCancel::Reason::Generic);
       return;
     }
-
-    // ★R74-fix-3 (subreview #2, WARN 3): СЕССИЯ ЗАПОМИНАЕТ, ЧТО СНЯЛА.
-    // Клиент этих блоков не получит, значит на его стороне они пусты — и его
-    // первое же сохранение настроек затёрло бы хранимое. Запоминаем маску;
-    // `HandleUpdateUserSettings` её читает.
-    MutateClientContext(
-      clientId,
-      [shed](ClientContext& context)
-      {
-        context.shedSettingsBlocks = shed;
-      });
   }
+
+  // ★R74-fix-3 (subreview #2, WARN 3) + R74-fix-4 (subreview #3, NIT 4):
+  // СЕССИЯ ЗАПОМИНАЕТ, ЧТО СНЯЛА, И ДЕЛАЕТ ЭТО НА КАЖДОМ КАДРЕ ВХОДА.
+  //
+  // Клиент сброшенных блоков не получит, значит на его стороне они пусты — и
+  // его сохранение настроек затёрло бы хранимое. Присваивание стоит ВНЕ ветки
+  // «что-то сброшено» намеренно: второй `SendLoginOK` на том же соединении
+  // достижим (повтор `AcCmdCLCreateNickname`), и если его кадр помещается,
+  // СТАРАЯ маска обязана быть снята — иначе одно законное сохранение молча
+  // игнорируется. Присваиваем всегда, в том числе нулём.
+  MutateClientContext(
+    clientId,
+    [shed](ClientContext& context)
+    {
+      context.shedSettingsBlocks = shed;
+    });
 
   _commandServer.SetCode(clientId, {});
 
@@ -2942,44 +2982,34 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     settingsUid = settings.uid();
   });
 
-  // ★ФЛАГ СНИМАЕТСЯ ПОСЛЕ ПЕРВОГО ЖЕ СОХРАНЕНИЯ — по тем блокам, которые
-  // клиент прислал. Держать защиту всю сессию значило бы запретить игроку
-  // очистить блок вообще; одного круга «сервер снял -> клиент прислал пустое»
-  // достаточно, чтобы отличить потерю от намерения.
+  // ★R74-fix-4 (subreview #3, WARN 2): ЗАЩИТА ДЕРЖИТСЯ ВСЮ СЕССИЮ, А НЕ ОДНО
+  // СОХРАНЕНИЕ.
+  //
+  // Прежняя редакция снимала маску по битам, которые клиент ПРИСЛАЛ, — то есть
+  // тот же самый пакет, от которого защита сработала, её и снимал. Второе
+  // сохранение в той же сессии находило пустую маску и стирало все восемь
+  // слотов необратимо, без единой строки в журнале. Обоснование «одного круга
+  // достаточно, чтобы отличить потерю от намерения» было ложным:
+  // `AcCmdCLUpdateUserSettingsOK` — ПУСТАЯ структура, между сохранениями клиент
+  // блок не получает, и его состояние бит в бит то же самое.
+  //
+  // Снять маску вправе только ФАКТ ПОЛУЧЕНИЯ блока клиентом, а он бывает ровно
+  // в кадре входа: `BuildProtocolSettings` зовётся из одного места —
+  // `SendLoginOK`, и там же маска переписывается заново. Внутри сессии этого не
+  // случается никогда, поэтому здесь маска не трогается вовсе.
   if (shedBlocks != 0)
   {
-    uint32_t appliedBlocks = 0;
-    if (command.settings.typeBitset.test(protocol::Settings::Keyboard))
-      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::KeyboardBindings);
-    if (command.settings.typeBitset.test(protocol::Settings::Gamepad))
-      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::GamepadBindings);
-    if (command.settings.typeBitset.test(protocol::Settings::Macros))
-      appliedBlocks |= static_cast<uint32_t>(protocol::LoginFrameShed::Macros);
-
-    if (appliedBlocks != 0)
+    static util::KeyedLogThrottle shedProtectionThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    if (shedProtectionThrottle.Allow(clientContext.characterUid, suppressed))
     {
-      MutateClientContext(
-        clientId,
-        [appliedBlocks](ClientContext& context)
-        {
-          context.shedSettingsBlocks &= ~appliedBlocks;
-        });
-
-      static util::LogThrottle shedProtectionThrottle{std::chrono::minutes{5}};
-      uint64_t suppressed = 0;
-      uint64_t total = 0;
-      if ((shedBlocks & appliedBlocks) != 0
-          && shedProtectionThrottle.Allow(suppressed, total))
-      {
-        util::QuietLogWarn(
-          "kept the stored settings blocks 0x{:x} of user '{}': they were shed from"
-          " this session's login frame, so the client never had them to send back"
-          " (suppressed {} more, {} in total)",
-          shedBlocks & appliedBlocks,
-          clientContext.userName,
-          suppressed,
-          total);
-      }
+      util::QuietLogWarn(
+        "kept the stored settings blocks 0x{:x} of user '{}': they were shed from"
+        " this session's login frame, so the client never had them to send back"
+        " (suppressed {} more for this character)",
+        shedBlocks,
+        clientContext.userName,
+        suppressed);
     }
   }
 
