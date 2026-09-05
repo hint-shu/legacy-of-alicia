@@ -32,6 +32,7 @@
 #include <libserver/network/command/proto/RanchMessageDefinitions.hpp>
 #include <libserver/network/chatter/proto/ChatterMessageDefinitions.hpp>
 #include <libserver/util/BoundedList.hpp>
+#include <libserver/util/Locale.hpp>
 #include <libserver/util/Stream.hpp>
 
 #include <spdlog/sinks/ostream_sink.h>
@@ -39,6 +40,7 @@
 
 #include <array>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <cstdint>
 #include <cstdio>
@@ -982,25 +984,34 @@ void TestDryRunLeavesNoTrace()
   spdlog::set_default_logger(probe);
 
   const auto data = Fill<Quad>(40);
+
+  // ★R74-fix-4 (subreview #3, NIT 1): ОБЕ ЗАПИСИ — С ОДНОЙ И ТОЙ ЖЕ СТРОКИ
+  // ВЫЗОВА. Дроссель ключится по `(file, line)` из `source_location`, взятого
+  // аргументом по умолчанию, — а прежняя редакция ставила сухой прогон и
+  // «настоящую» запись на РАЗНЫЕ строки, то есть на разные площадки. Второе
+  // утверждение тогда не могло упасть по названной причине: мутант, который
+  // держит строку подавленной, но ЖЖЁТ окно, проходил обе проверки. Один
+  // вызов в цикле снимает вопрос — площадка буквально одна.
+  const auto writeSite = [&data](bool dryRun)
   {
-    // Измерение: жалоб быть не должно ВООБЩЕ.
-    const server::util::ScopedBoundedListSilence silence;
     std::array<std::byte, 4096> storage{};
-    SinkStream measured{std::span{storage}};
+    SinkStream sink{std::span{storage}};
+    // Глушитель — необязательный, а ВЫЗОВ РОВНО ОДИН: только так обе записи
+    // приходят с одной строки, то есть с одной площадки дросселя.
+    std::optional<server::util::ScopedBoundedListSilence> silence;
+    if (dryRun)
+      silence.emplace();
     server::util::WriteBoundedList<uint8_t>(
-      measured, data, {.maxCount = 4, .name = "t17"});
-  }
+      sink, data, {.maxCount = 4, .name = "t17"});
+  };
+
+  writeSite(true);
   probe->flush();
   const auto afterDryRun = captured->str();
 
-  // Настоящая запись с ТОЙ ЖЕ площадки обязана дать строку — то есть окно
+  // Настоящая запись С ТОЙ ЖЕ ПЛОЩАДКИ обязана дать строку — то есть окно
   // подавления сухим прогоном НЕ взведено.
-  {
-    std::array<std::byte, 4096> storage{};
-    SinkStream real{std::span{storage}};
-    server::util::WriteBoundedList<uint8_t>(
-      real, data, {.maxCount = 4, .name = "t17"});
-  }
+  writeSite(false);
   probe->flush();
   spdlog::set_default_logger(previous);
   const auto afterReal = captured->str();
@@ -1058,6 +1069,143 @@ void TestOversizedElementIsSkipped()
   Check(declared >= 9,
     "t18: девять коротких писем доезжают, несмотря на переросшее письмо 0",
     declared, 9);
+}
+
+// ------------------------------------------------------------------ тест 20
+
+//! 20: ПОТОЛОК ТЕЛА ПИСЬМА ДЕРЖИТ ВСЕ ТРИ КАДРА ПРИ САМОМ ШИРОКОМ ИМЕНИ
+//!     (★subreview #3, BLOCK 1 и BLOCK 2).
+//!
+//! ★ЮНИТ 18 ЭТОГО НЕ ВИДЕЛ ПО ПОСТРОЕНИЮ: он брал отправителя `attacker`
+//! (8 байт) и тело 4040, которое гейт и так отклоняет, — то есть проверял
+//! МЕХАНИЗМ пропуска и ни разу саму константу. Здесь имя берётся максимально
+//! широким из тех, что пропускает `locale::IsNameValid(name, 18)`: 18
+//! кириллических букв, которые счётчик считает узкими, а EUC-KR тратит по два
+//! байта — 36 байт на проводе.
+void TestMailCeilingWithWidestSender()
+{
+  // 18 кириллических букв: столько пропускает гейт имени, и ровно они дают
+  // худшую ширину на проводе.
+  const std::string wideSender = "Александрапетрович";
+  const std::string asciiSender(18, 'A');
+  const auto wideWireWidth = server::locale::FromUtf8(wideSender).size();
+  const auto asciiWireWidth = server::locale::FromUtf8(asciiSender).size();
+  std::printf("t20: имя 18 кириллических букв = %zu Б провода, 18 ASCII = %zu Б\n",
+    wideWireWidth, asciiWireWidth);
+  Check(wideWireWidth == 36,
+    "t20: 18 кириллических букв стоят 36 байт EUC-KR",
+    static_cast<long long>(wideWireWidth), 36);
+
+  //! Потолок раунда. Число живёт в `MessengerDirector`, недоступном тесту, —
+  //! поэтому здесь оно повторено ЯВНО и тут же проверено арифметикой кадров.
+  constexpr std::size_t MailBodyCeiling = 4006;
+  constexpr std::size_t ChatterPayload = 4088;
+
+  const auto buildPage = [](const std::string& sender, std::size_t bodyBytes)
+  {
+    server::protocol::ChatCmdLetterListAckOk page{};
+    page.mailboxFolder = server::protocol::MailboxFolder::Inbox;
+    page.mailboxInfo.hasMoreMail = 0;
+    auto& mail = page.inboxMails.emplace_back();
+    mail.uid = 1;
+    mail.sender = sender;
+    mail.date = "00:00:00 01/01/2026 UTC";
+    mail.struct0.unk0 = "\x0F";
+    mail.struct0.body = std::string(bodyBytes, 'X');
+    return page;
+  };
+
+  // (1) СТРАНИЦА ЯЩИКА: письмо РОВНО на потолке от самого широкого отправителя
+  //     обязано доехать. До правки константа была 4026 и счётчик уходил в 0.
+  {
+    const auto page = buildPage(wideSender, MailBodyCeiling);
+    std::array<std::byte, ChatterPayload> storage{};
+    SinkStream sink{std::span{storage}};
+    bool threw = false;
+    try { server::protocol::ChatCmdLetterListAckOk::Write(page, sink); }
+    catch (const std::exception&) { threw = true; }
+    const auto declared = ReadCount<uint32_t>(storage, 1);
+    std::printf("t20: страница с телом %zu Б и именем %zu Б -> %zu Б кадра, "
+                "объявлено %u\n",
+      MailBodyCeiling, wideWireWidth, sink.GetCursor(), declared);
+    Check(not threw, "t20: страница на потолке пишется без броска");
+    Check(declared == 1,
+      "t20: письмо НА ПОТОЛКЕ доезжает на проводе (было 0 при константе 4026)",
+      declared, 1);
+  }
+
+  // (2) ПОТОЛОК + 1 обязан НЕ влезать — иначе константа выбрана с запасом и
+  //     ничего не доказывает.
+  {
+    const auto page = buildPage(wideSender, MailBodyCeiling + 1);
+    std::array<std::byte, ChatterPayload> storage{};
+    SinkStream sink{std::span{storage}};
+    server::protocol::ChatCmdLetterListAckOk::Write(page, sink);
+    const auto declared = ReadCount<uint32_t>(storage, 1);
+    Check(declared == 0,
+      "t20: потолок+1 в страницу уже НЕ влезает — константа стоит на границе",
+      declared, 0);
+  }
+
+  // (3) ДОСТАВКА ЖЕРТВЕ (`ChatCmdLetterArriveTrs`) — плоский писатель без
+  //     бюджета: бросок отсюда уходит в поставщик записи ЖЕРТВЫ и рвёт ей
+  //     соединение. Проверяем на том же худшем имени и теле на потолке.
+  {
+    server::protocol::ChatCmdLetterArriveTrs arrive{};
+    arrive.mailUid = 1;
+    arrive.sender = wideSender;
+    arrive.date = "00:00:00 01/01/2026 UTC";
+    arrive.body = std::string(MailBodyCeiling, 'X');
+    std::array<std::byte, ChatterPayload> storage{};
+    SinkStream sink{std::span{storage}};
+    bool threw = false;
+    try { server::protocol::ChatCmdLetterArriveTrs::Write(arrive, sink); }
+    catch (const std::exception&) { threw = true; }
+    std::printf("t20: ArriveTrs = %zu Б из %zu\n", sink.GetCursor(), ChatterPayload);
+    Check(not threw,
+      "t20: доставка на потолке НЕ бросает — иначе жертву выкидывает из мессенджера");
+  }
+
+  // (4) КВИТАНЦИЯ ОТПРАВИТЕЛЮ (`ChatCmdLetterSendAckOk`) — зеркальный случай,
+  //     роняющий уже отправителя, причём ПОСЛЕ того как письмо сохранено.
+  {
+    server::protocol::ChatCmdLetterSendAckOk ack{};
+    ack.mailUid = 1;
+    ack.recipient = wideSender;
+    ack.date = "00:00:00 01/01/2026 UTC";
+    ack.body = std::string(MailBodyCeiling, 'X');
+    std::array<std::byte, ChatterPayload> storage{};
+    SinkStream sink{std::span{storage}};
+    bool threw = false;
+    try { server::protocol::ChatCmdLetterSendAckOk::Write(ack, sink); }
+    catch (const std::exception&) { threw = true; }
+    std::printf("t20: SendAckOk = %zu Б из %zu\n", sink.GetCursor(), ChatterPayload);
+    Check(not threw, "t20: квитанция на потолке НЕ бросает");
+  }
+
+  // (5) ДЕСЯТЬ писем на потолке от широкого отправителя: страница обязана
+  //     показать хотя бы одно. Это и есть сценарий BLOCK 1 целиком.
+  {
+    server::protocol::ChatCmdLetterListAckOk page{};
+    page.mailboxFolder = server::protocol::MailboxFolder::Inbox;
+    for (uint32_t index = 0; index < 10; ++index)
+    {
+      auto& mail = page.inboxMails.emplace_back();
+      mail.uid = 100 + index;
+      mail.sender = wideSender;
+      mail.date = "00:00:00 01/01/2026 UTC";
+      mail.struct0.unk0 = "\x0F";
+      mail.struct0.body = std::string(MailBodyCeiling, 'X');
+    }
+    std::array<std::byte, ChatterPayload> storage{};
+    SinkStream sink{std::span{storage}};
+    server::protocol::ChatCmdLetterListAckOk::Write(page, sink);
+    const auto declared = ReadCount<uint32_t>(storage, 1);
+    std::printf("t20: десять писем на потолке -> объявлено %u\n", declared);
+    Check(declared >= 1,
+      "t20: ящик НЕ пуст — жертва видит письмо и может его удалить",
+      declared, 1);
+  }
 }
 
 // ------------------------------------------------------------------ тест 19
@@ -1136,6 +1284,7 @@ int main()
   TestMacroPartialAcceptance();
   TestDryRunLeavesNoTrace();
   TestOversizedElementIsSkipped();
+  TestMailCeilingWithWidestSender();
   TestIntroductionTruncationKeepsCharacters();
 
   if (failures != 0)
