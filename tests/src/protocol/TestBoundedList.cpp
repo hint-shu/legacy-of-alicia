@@ -1096,10 +1096,13 @@ void TestMailCeilingWithWidestSender()
     "t20: 18 кириллических букв стоят 36 байт EUC-KR",
     static_cast<long long>(wideWireWidth), 36);
 
-  //! Потолок раунда. Число живёт в `MessengerDirector`, недоступном тесту, —
-  //! поэтому здесь оно повторено ЯВНО и тут же проверено арифметикой кадров.
-  constexpr std::size_t MailBodyCeiling = 4006;
-  constexpr std::size_t ChatterPayload = 4088;
+  //! ★R74-fix-4: БЕРЁМ КОНСТАНТУ СЕРВЕРА, А НЕ ПОВТОРЯЕМ ЕЁ. Первая редакция
+  //! этого теста объявляла 4006 у себя — и подмена настоящей константы не
+  //! красила ни одной проверки, ровно тот класс, что ревью уже ловило у отбора
+  //! слотов макросов. Числа переехали в заголовок протокола чаттера, который
+  //! линкуется и в сервер, и в тест.
+  constexpr auto MailBodyCeiling = server::protocol::MaxMailBodyLength;
+  constexpr auto ChatterPayload = server::protocol::ChatterFramePayloadBytes;
 
   const auto buildPage = [](const std::string& sender, std::size_t bodyBytes)
   {

@@ -50,6 +50,60 @@ enum class MailboxFolder : uint8_t
 //! Corresponds with `MessengerErrorStrings`.
 //! Error codes can be custom server defined error codes.
 //! The client displays these custom codes as "Server Error (code: x)"
+//! LOA-fix (R74-fix-4, subreview #3, BLOCK 1 и 2): ПОТОЛОК ТЕЛА ПИСЬМА, В БАЙТАХ
+//! ПРОВОДА.
+//!
+//! ★ЧТО БЫЛО ОТКРЫТО ПОСЛЕ ИТЕРАЦИИ 3. Прежнее число 4026 выводилось из строки
+//! «отправитель — имя персонажа, ≤16 + NUL», которой сервер НИГДЕ НЕ ОБЕСПЕЧИВАЕТ.
+//! Единственный гейт имени — `locale::IsNameValid(name, 18)`, и его счётчик
+//! заряжает кириллицу ОДНИМ байтом (она попадает в `LatinLettersPattern`,
+//! `Locale.cpp:38`, и считается узкой, `Locale.cpp:32`), тогда как на проводе
+//! EUC-KR тратит ДВА. Измерено, а не выведено: `'Александрапетрович'` — 18 букв,
+//! `IsNameValid` пропускает, `encode('euc_kr')` даёт **36 байт**. То же выводит
+//! и собственный `NameGuard.hpp:34-43`. Поэтому легальное имя стоит на проводе
+//! 18 (латиница) … 36 (кириллица) байт, и десять писем ровно по 4026 байт от
+//! 18-буквенного отправителя снова опустошали страницу ящика жертвы.
+//!
+//! ★АРИФМЕТИКА ЦЕЛИКОМ, КАЖДОЕ СЛАГАЕМОЕ НАЗВАНО.
+//!
+//!   кадр чаттера, потолок длины                      4092   (ChatterServer, header.length)
+//!   − заголовок ChatterCommandHeader                    4   (u16 length + u16 commandId)
+//!   = бюджет полезной нагрузки                       4088
+//!
+//!   (1) СТРАНИЦА ЯЩИКА ChatCmdLetterListAckOk — САМЫЙ УЗКИЙ ИЗ ТРЁХ КАДРОВ:
+//!       − mailboxFolder (u8)                            1
+//!       − слот счётчика (u32)                           4
+//!       − hasMoreMail (u8)                              1
+//!       = на записи                                  4082
+//!       одна запись InboxMail:
+//!         uid(4) + type(4) + claimUid(4)               12
+//!         sender  S + NUL                             S+1
+//!         date "HH:MM:SS DD/MM/YYYY UTC" + NUL          24
+//!         struct0.unk0 "\x0F" + NUL                      2
+//!         body    B + NUL                             B+1
+//!       итого 40 + S + B <= 4082  ->  B <= 4042 - S
+//!
+//!   (2) ДОСТАВКА ChatCmdLetterArriveTrs (кадр ЖЕРТВЫ):
+//!       uid(4)+type(4)+claimUid(4)+sender(S+1)+date(24)+body(B+1)
+//!       = 38 + S + B <= 4088  ->  B <= 4050 - S
+//!
+//!   (3) КВИТАНЦИЯ ChatCmdLetterSendAckOk (кадр ОТПРАВИТЕЛЯ):
+//!       uid(4)+recipient(R+1)+date(24)+body(B+1)
+//!       = 30 + R + B <= 4088  ->  B <= 4058 - R
+//!
+//!   Худшее имя на проводе — 36 байт (18 кириллических букв). Связывает (1):
+//!       B <= 4042 - 36 = 4006     ((2) даёт 4014, (3) даёт 4022 — оба шире)
+constexpr std::size_t MaxMailBodyLength = 4006;
+
+//! Постоянные части трёх кадров, куда попадает тело письма. Числа те же, что в
+//! выводе выше; отдельными константами они нужны потому, что фактическая
+//! проверка считает по РЕАЛЬНОЙ ширине имён, а не по худшему случаю.
+constexpr std::size_t ChatterFramePayloadBytes = 4088;
+constexpr std::size_t MailboxPageEntryBudget = ChatterFramePayloadBytes - 6;
+constexpr std::size_t MailboxEntryFixedBytes = 40;
+constexpr std::size_t MailArriveFixedBytes = 38;
+constexpr std::size_t MailSendAckFixedBytes = 30;
+
 enum class ChatterErrorCode : uint32_t
 {
   LoginFailed = 1,
