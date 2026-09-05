@@ -312,6 +312,16 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py --selftest)
     add_test(NAME ToolMessengerClientMapLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py)
+    # LOA (R78-fix9, round78, backlog #255, находка ревю #4 BLOCK): под замком
+    # карты клиентов не должно быть НИ ОДНОГО выхода, который сам берёт этот же
+    # замок или синхронно рвёт соединение. ★ДЕТЕРМИНИРОВАННЫЙ фальсификатор
+    # BLOCK'а: стендовая ячейка `mid-login-revoke` ловит то же окно ГОНКОЙ, то
+    # есть вероятностно, а этот гейт краснеет всегда — проверено на дереве
+    # ДО фикса (нарушение на той самой строке, которую назвало ревю).
+    add_test(NAME ToolMessengerDisconnectOutsideLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
+    add_test(NAME ToolMessengerDisconnectOutsideLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()
