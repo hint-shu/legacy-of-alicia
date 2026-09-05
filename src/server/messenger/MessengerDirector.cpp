@@ -19,8 +19,11 @@
 
 #include "server/messenger/MessengerDirector.hpp"
 #include "server/messenger/MessengerSessionEviction.hpp"
+#include "libserver/util/Locale.hpp"
 #include "libserver/util/LogThrottle.hpp"
 #include "libserver/util/QuietLog.hpp"
+
+#include <algorithm>
 
 #include "libserver/util/Cleanup.hpp"
 
@@ -38,43 +41,59 @@ constexpr auto FriendsCategoryUid = 0;
 constexpr auto OnlinePlayersCategoryUid = std::numeric_limits<uint32_t>::max() - 2;
 constexpr std::string_view DateTimeFormat = "{:%H:%M:%S %d/%m/%Y} UTC";
 
-//! LOA-fix (R74-fix-3, subreview #2, WARN 4): ПОТОЛОК ТЕЛА ПИСЬМА, В БАЙТАХ.
+//! LOA-fix (R74-fix-4, subreview #3, BLOCK 1 и 2): ПОТОЛОК ТЕЛА ПИСЬМА, В БАЙТАХ
+//! ПРОВОДА.
 //!
-//! ★ЧТО БЫЛО ОТКРЫТО. Тело письма не ограничивалось ничем (здесь же стоял
-//! собственный `// TODO: enforce any character limit?`). Письмо кладётся в
-//! НАЧАЛО инбокса получателя, то есть всегда становится элементом 0 первой
-//! страницы. Одно письмо на ~4 КБ делало страницу почты жертвы пустой: список
-//! обрывался на первом невлезающем элементе, жертва не видела ни одного
-//! письма, не узнавала uid отравленного и не могла его удалить. Лечилось
-//! только оператором.
+//! ★ЧТО БЫЛО ОТКРЫТО ПОСЛЕ ИТЕРАЦИИ 3. Прежнее число 4026 выводилось из строки
+//! «отправитель — имя персонажа, ≤16 + NUL», которой сервер НИГДЕ НЕ ОБЕСПЕЧИВАЕТ.
+//! Единственный гейт имени — `locale::IsNameValid(name, 18)`, и его счётчик
+//! заряжает кириллицу ОДНИМ байтом (она попадает в `LatinLettersPattern`,
+//! `Locale.cpp:38`, и считается узкой, `Locale.cpp:32`), тогда как на проводе
+//! EUC-KR тратит ДВА. Измерено, а не выведено: `'Александрапетрович'` — 18 букв,
+//! `IsNameValid` пропускает, `encode('euc_kr')` даёт **36 байт**. То же выводит
+//! и собственный `NameGuard.hpp:34-43`. Поэтому легальное имя стоит на проводе
+//! 18 (латиница) … 36 (кириллица) байт, и десять писем ровно по 4026 байт от
+//! 18-буквенного отправителя снова опустошали страницу ящика жертвы.
 //!
-//! ★ЧИСЛО ВЫВЕДЕНО ИЗ КАДРА, А НЕ ВЫБРАНО. Арифметика целиком:
+//! ★АРИФМЕТИКА ЦЕЛИКОМ, КАЖДОЕ СЛАГАЕМОЕ НАЗВАНО.
 //!
-//!   кадр чаттера, потолок длины              4092   (`ChatterServer.cpp`, проверка header.length)
-//!   − заголовок `ChatterCommandHeader`          4   (u16 length + u16 commandId)
-//!   = бюджет полезной нагрузки               4088
+//!   кадр чаттера, потолок длины                      4092   (ChatterServer, header.length)
+//!   − заголовок ChatterCommandHeader                    4   (u16 length + u16 commandId)
+//!   = бюджет полезной нагрузки                       4088
 //!
-//!   `ChatCmdLetterListAckOk`, постоянная часть:
-//!   − `mailboxFolder` (u8)                      1
-//!   − слот счётчика (u32)                       4
-//!   − `hasMoreMail` (u8)                        1
+//!   (1) СТРАНИЦА ЯЩИКА ChatCmdLetterListAckOk — САМЫЙ УЗКИЙ ИЗ ТРЁХ КАДРОВ:
+//!       − mailboxFolder (u8)                            1
+//!       − слот счётчика (u32)                           4
+//!       − hasMoreMail (u8)                              1
+//!       = на записи                                  4082
+//!       одна запись InboxMail:
+//!         uid(4) + type(4) + claimUid(4)               12
+//!         sender  S + NUL                             S+1
+//!         date "HH:MM:SS DD/MM/YYYY UTC" + NUL          24
+//!         struct0.unk0 "\x0F" + NUL                      2
+//!         body    B + NUL                             B+1
+//!       итого 40 + S + B <= 4082  ->  B <= 4042 - S
 //!
-//!   одна запись `InboxMail`, всё кроме тела:
-//!   − `uid` (u32)                               4
-//!   − `type` (`MailType : uint32_t`)            4
-//!   − `claimUid` (u32)                          4
-//!   − `sender` — имя персонажа, ≤16 + NUL      17
-//!   − `date` — "HH:MM:SS DD/MM/YYYY UTC" + NUL 24
-//!   − `struct0.unk0` — "\x0F" + NUL             2
-//!   − NUL самого тела                           1
-//!   ---------------------------------------------
-//!   = потолок тела                           4026
+//!   (2) ДОСТАВКА ChatCmdLetterArriveTrs (кадр ЖЕРТВЫ):
+//!       uid(4)+type(4)+claimUid(4)+sender(S+1)+date(24)+body(B+1)
+//!       = 38 + S + B <= 4088  ->  B <= 4050 - S
 //!
-//! ★ПОЧЕМУ ПРОВЕРКА ПО UTF-8 ДАЁТ ПОТОЛОК НА ПРОВОДЕ. Тело хранится в UTF-8, а
-//! уезжает через `locale::FromUtf8` в EUC-KR, где ASCII 1→1, а хангыль 3→2:
-//! длина на проводе НИКОГДА не больше длины в UTF-8. Тот же довод уже принят
-//! для представления (`MaxIntroductionLength`, R72).
-constexpr std::size_t MaxMailBodyLength = 4026;
+//!   (3) КВИТАНЦИЯ ChatCmdLetterSendAckOk (кадр ОТПРАВИТЕЛЯ):
+//!       uid(4)+recipient(R+1)+date(24)+body(B+1)
+//!       = 30 + R + B <= 4088  ->  B <= 4058 - R
+//!
+//!   Худшее имя на проводе — 36 байт (18 кириллических букв). Связывает (1):
+//!       B <= 4042 - 36 = 4006     ((2) даёт 4014, (3) даёт 4022 — оба шире)
+constexpr std::size_t MaxMailBodyLength = 4006;
+
+//! Постоянные части трёх кадров, куда попадает тело письма. Числа те же, что в
+//! выводе выше; отдельными константами они нужны потому, что фактическая
+//! проверка считает по РЕАЛЬНОЙ ширине имён, а не по худшему случаю.
+constexpr std::size_t ChatterFramePayloadBytes = 4088;
+constexpr std::size_t MailboxPageEntryBudget = ChatterFramePayloadBytes - 6;
+constexpr std::size_t MailboxEntryFixedBytes = 40;
+constexpr std::size_t MailArriveFixedBytes = 38;
+constexpr std::size_t MailSendAckFixedBytes = 30;
 
 const std::string GetSystemNameFromType(data::Mail::MailType type)
 {
@@ -1951,35 +1970,6 @@ void MessengerDirector::HandleChatterLetterSend(
     return;
   }
 
-  // ★R74-fix-3 (subreview #2, WARN 4): ОТБРАСЫВАЕМ ДО ЗАПИСИ, А НЕ ПОСЛЕ.
-  // Письмо, которое не влезает в страницу почты, нельзя ни сохранить, ни
-  // показать: сохранённое, оно навсегда занимает первую позицию инбокса
-  // жертвы. Отказ штатный — у команды есть форма отказа, и отправитель
-  // узнаёт причину, а не молча теряет письмо.
-  if (command.body.size() > MaxMailBodyLength)
-  {
-    static util::LogThrottle oversizedMailThrottle{std::chrono::minutes{5}};
-    uint64_t suppressed = 0;
-    uint64_t total = 0;
-    if (oversizedMailThrottle.Allow(suppressed, total))
-    {
-      util::QuietLogWarn(
-        "refused an oversized mail body from client {}: {} bytes exceed the {}-byte"
-        " limit derived from the chatter frame; the recipient's mailbox page would"
-        " not have fit it (suppressed {} more, {} in total)",
-        clientId,
-        command.body.size(),
-        MaxMailBodyLength,
-        suppressed,
-        total);
-    }
-
-    protocol::ChatCmdLetterSendAckCancel cancel{
-      .errorCode = protocol::ChatterErrorCode::LetterSendBodyTooLong};
-    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
-    return;
-  }
-
   // TODO: bad word checks and/or deny sending the letter as a result?
 
   const auto& clientContext = GetClientContext(clientId);
@@ -1992,6 +1982,62 @@ void MessengerDirector::HandleChatterLetterSend(
       senderUid = character.uid();
       senderName = character.name();
     });
+
+  // ★R74-fix-4 (subreview #3, BLOCK 1 и 2): ОТБРАСЫВАЕМ ДО ЗАПИСИ, ПО ФАКТИЧЕСКОЙ
+  // ШИРИНЕ ИМЁН НА ПРОВОДЕ.
+  //
+  // Проверка стоит ЗДЕСЬ, а не выше по функции, именно потому, что раньше имени
+  // отправителя ещё не знали — и прежняя редакция подставляла вместо него
+  // выдуманные «не больше 16 байт». Теперь считаются РЕАЛЬНЫЕ ширины:
+  // `locale::FromUtf8` — тот самый конвертер, которым строки уезжают на провод
+  // (`SinkStream::Write`), так что это не оценка, а тот же байтовый счёт.
+  //
+  // Проверяются ВСЕ ТРИ кадра, куда попадает тело: страница ящика жертвы,
+  // доставка жертве и квитанция отправителю. Письмо, не влезающее хотя бы в
+  // один, нельзя ни показать, ни доставить, а сохранённое — оно навсегда встаёт
+  // в голову инбокса и уже оттуда не убирается.
+  const auto senderWireWidth = locale::FromUtf8(senderName).size();
+  const auto recipientWireWidth = locale::FromUtf8(command.recipient).size();
+  const auto bodyWireWidth = locale::FromUtf8(command.body).size();
+
+  const auto pageAllowance = MailboxPageEntryBudget > MailboxEntryFixedBytes + senderWireWidth
+    ? MailboxPageEntryBudget - MailboxEntryFixedBytes - senderWireWidth
+    : std::size_t{0};
+  const auto arriveAllowance = ChatterFramePayloadBytes > MailArriveFixedBytes + senderWireWidth
+    ? ChatterFramePayloadBytes - MailArriveFixedBytes - senderWireWidth
+    : std::size_t{0};
+  const auto ackAllowance = ChatterFramePayloadBytes > MailSendAckFixedBytes + recipientWireWidth
+    ? ChatterFramePayloadBytes - MailSendAckFixedBytes - recipientWireWidth
+    : std::size_t{0};
+
+  const auto allowance = std::min(
+    {MaxMailBodyLength, pageAllowance, arriveAllowance, ackAllowance});
+
+  if (bodyWireWidth > allowance)
+  {
+    static util::LogThrottle oversizedMailThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (oversizedMailThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "refused an oversized mail body from client {}: {} wire bytes over the {} these"
+        " frames allow for this pair (sender {} B, recipient {} B); the recipient's"
+        " mailbox page could not have shown it (suppressed {} more, {} in total)",
+        clientId,
+        bodyWireWidth,
+        allowance,
+        senderWireWidth,
+        recipientWireWidth,
+        suppressed,
+        total);
+    }
+
+    protocol::ChatCmdLetterSendAckCancel cancel{
+      .errorCode = protocol::ChatterErrorCode::LetterSendBodyTooLong};
+    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+    return;
+  }
 
   // UTC now in seconds
   const auto& utcNow = std::chrono::floor<std::chrono::seconds>(util::Clock::now());
