@@ -348,6 +348,17 @@ void MessengerDirector::DrainPendingDisconnects()
     BroadcastPresenceOfCharacter(
       entry.characterUid, offlinePresence, entry.clientId);
 
+    // ★СЛЕД В ЛОГЕ, БЕЗ КОТОРОГО РАССЫЛКУ НЕЧЕМ ИЗМЕРИТЬ. Сама рассылка строк
+    // не печатает: логирует только обработчик `ChatCmdUpdateState`, а этот
+    // путь идёт мимо него. Форма строки повторяет обработчик (стенд ищет
+    // `ChatCmdUpdateState: [Offline]`), но несёт пометку `(teardown)` —
+    // иначе ячейку удовлетворил бы обычный Offline от самого клиента, и
+    // предикат стал бы вакуумным. Событие редкое: одно на погашенную сессию.
+    server::util::QuietLogDebug(
+      "[{}] ChatCmdUpdateState: [Offline] [Ranch] {} (teardown)",
+      entry.clientId,
+      entry.characterUid);
+
     try
     {
       _chatterServer.DisconnectClient(entry.clientId);
