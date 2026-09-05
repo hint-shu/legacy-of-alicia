@@ -2008,6 +2008,17 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
           context.shedSettingsBlocks = 0;
         });
 
+      // ★СТРОКА СУЩЕСТВУЕТ РАДИ ПРОВЕРЯЕМОСТИ. Размотка не оставляет никакого
+      // другого следа: `isAuthenticated` и `characterUid` — поля в памяти, а
+      // «logged out» пишет и обычный разрыв соединения. Без этой строки стенд
+      // не мог отличить образ с размоткой от образа без неё, то есть фикс
+      // WARN 1 держался бы на чтении кода, а не на измерении.
+      util::QuietLogWarn(
+        "unwound the refused login session of user '{}': the authentication"
+        " latch and the in-game marker are released, so a retry is answered"
+        " afresh instead of Duplicated",
+        clientContext.userName);
+
       SendLoginCancel(clientId, protocol::AcCmdCLLoginCancel::Reason::Generic);
       return;
     }
