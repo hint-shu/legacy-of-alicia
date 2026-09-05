@@ -272,7 +272,9 @@ void MessengerDirector::CloseSessionsOfCharacter(const data::Uid characterUid)
   // уйти в `Client::End()` → `HandleClientDisconnected` и стирать записи из
   // трёх карт (наша `_clients`, `Server::_clients`, `Server::_addressStates`
   // вовсе без замка), пока поток мессенджера их читает. Кладём в очередь и
-  // уходим; закроет `Tick()` на своём потоке, не позже следующего тика (1 с).
+  // уходим; закроет `DrainPendingDisconnects()` с тика ЧАТ-СЕРВЕРА
+  // (`HandleNetworkTick`), не позже следующего тика (1 с). `Tick()`
+  // директора к дренажу отношения не имеет и пуст (ревю #4, R1).
   {
     const std::lock_guard lock(_pendingDisconnectsMutex);
     for (const network::ClientId staleClientId : unbound)
@@ -599,7 +601,21 @@ void MessengerDirector::HandleClientDisconnected(const network::ClientId clientI
   // `LobbyNetworkHandler::HandleClientDisconnected` (R64-3).
   //
   // ★САМОЗАХВАТА НЕТ: замок берётся ТОЛЬКО в деструкторе, то есть после
-  // `RunCleanupStep`, а фаза 2 вытеснения освобождает замок до `DisconnectClient`.
+  // `RunCleanupStep`, а ВСЕ разрывы (обе фазы вытеснения, слив и отказ входа)
+  // зовутся с отпущенным замком — см. R78-fix9 в `HandleChatterLogin`.
+  //
+  // LOA-fix (R78-fix10, round78, backlog #255, ревю #4 BLOCK, наблюдаемость):
+  // СНЯТИЕ ЗАПИСИ ОТЧИТЫВАЕТСЯ О СЕБЕ.
+  //
+  // ★ЗАЧЕМ СТРОКА В ЛОГ. Снятие живёт в деструкторе с `catch(...)`, то есть
+  // МОЛЧА переживает любой сбой — именно так самозахват замка (ревю #4) и
+  // оставлял вечного зомби, не оставляя следа. Проверить «зомби не осталось»
+  // по проводу нельзя: карта клиентов наружу не видна. Поэтому снятие само
+  // печатает, ЧТО оно сняло и сколько сессий осталось, — и стенд судит по
+  // состоянию сервера, а не по выводу «раз соединение закрылось, значит
+  // запись снята».
+  // ★СТРОКА ПЕЧАТАЕТСЯ УЖЕ БЕЗ ЗАМКА: под ним не остаётся ни одного выхода
+  // в чужой код, включая логгер.
   struct LockedContextEraser final
   {
     MessengerDirector& director;
@@ -609,8 +625,19 @@ void MessengerDirector::HandleClientDisconnected(const network::ClientId clientI
     {
       try
       {
-        const std::unique_lock lock(director._clientsMutex);
-        director._clients.erase(clientId);
+        size_t erased = 0;
+        size_t remaining = 0;
+        {
+          const std::unique_lock lock(director._clientsMutex);
+          erased = director._clients.erase(clientId);
+          remaining = director._clients.size();
+        }
+
+        server::util::QuietLogDebug(
+          "Messenger registry: erased {} entry for client {}, {} session(s) left",
+          erased,
+          clientId,
+          remaining);
       }
       catch (...)
       {
@@ -800,6 +827,33 @@ void MessengerDirector::HandleChatterLogin(
 
   // Три оставшиеся записи входа — одним исключительным замком, без единого
   // выхода в чужой код под ним.
+  //
+  // LOA-fix (R78-fix9, round78, backlog #255, находка ревю #4 BLOCK):
+  // РЕШЕНИЕ ПРИНИМАЕТСЯ ПОД ЗАМКОМ, ДЕЙСТВИЕ ВЫПОЛНЯЕТСЯ ВНЕ ЕГО.
+  //
+  // ★ЧТО БЫЛО НЕВЕРНО. Предыдущая редакция на провале перепроверки звала
+  // `DisconnectClient` НЕ ВЫХОДЯ из этого замка — то есть ровно то, что
+  // запрещает строка над ним. Разрыв синхронный: `ChatterServer::
+  // DisconnectClient` → `Client::End()` → `OnClientDisconnected` →
+  // `HandleClientDisconnected`, и всё это НА ЭТОМ ЖЕ ПОТОКЕ. Уборка снова
+  // берёт `_clientsMutex` (страж записи), а он `std::shared_mutex` и
+  // рекурсию не поддерживает.
+  //
+  // ★ЦЕНА БЫЛА НЕ «ПОДВИСНЕТ», А «СЛОМАЕТСЯ НАВСЕГДА». На нашем gcc-15/glibc
+  // самозахват не висит: реализация возвращает EDEADLK, `std::unique_lock`
+  // бросает `system_error`, а страж — деструктор с `catch(...)`, поэтому
+  // бросок глотается и `_clients.erase` НЕ ВЫПОЛНЯЕТСЯ. В карте остаётся
+  // запись мёртвого соединения с поднятым флагом и НЕВЫЯСНЕННОЙ личностью,
+  // а `ClientId` монотонный и не переиспользуется — то есть зомби вечный.
+  // Дальше каждая рассылка присутствия (любой вход, выход, смена статуса
+  // ЛЮБОГО игрока) шла бы по нему в `GetCharacter(InvalidUid).Immutable`,
+  // а тот бросает — и рассылка обрывалась бы ДО отправки уведомлений
+  // друзьям и гильдии, на весь сервер, до перезапуска процесса.
+  //
+  // ★ФОРМА ФИКСА — ТА ЖЕ, ЧТО У СОСЕДЕЙ: фаза 2 вытеснения
+  // (`DisconnectUnboundSessions`) и слив (`DrainPendingDisconnects`) тоже
+  // сперва решают под замком, а рвут соединение уже без него.
+  bool keyLostDuringLogin = false;
   {
     const std::unique_lock lock(_clientsMutex);
 
@@ -822,26 +876,44 @@ void MessengerDirector::HandleChatterLogin(
           command.code,
           _chatterServer.GetClientAddress(clientId).to_uint()))
     {
-      server::util::QuietLogWarn(
-        "Client {} lost its messenger key while logging in as character {}"
-        " — the session is not bound",
-        clientId,
-        command.characterUid);
-
-      protocol::ChatCmdLoginAckCancel cancel{
-        .errorCode = protocol::ChatterErrorCode::LoginFailed};
-      _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
-      _chatterServer.DisconnectClient(clientId);
-      return;
+      // ★ФЛАГ СНИМАЕТСЯ ЗДЕСЬ, И ЭТО НЕСУЩЕЕ, А НЕ ГИГИЕНА. Вход отвергнут,
+      // значит к моменту разрыва сессия обязана выглядеть НЕаутентифицированной:
+      // иначе уборка соединения пойдёт в `HandleChatterUpdateState` с поднятым
+      // флагом и невыясненной личностью и станет рассылать присутствие за
+      // `characterUid == InvalidUid`. Ровно так же устроена ветка
+      // `not authorized` выше: там флаг к моменту разрыва уже `false`.
+      clientContext.isAuthenticated = false;
+      keyLostDuringLogin = true;
     }
+    else
+    {
+      clientContext.otpCode.emplace(command.code);
+      clientContext.characterUid = boundCharacterUid;
+      clientContext.presence = protocol::Presence{
+        .status = protocol::Status::Online,
+        .scene = protocol::Presence::Scene::Ranch,
+        .sceneUid = boundCharacterUid
+      };
+    }
+  }
 
-    clientContext.otpCode.emplace(command.code);
-    clientContext.characterUid = boundCharacterUid;
-    clientContext.presence = protocol::Presence{
-      .status = protocol::Status::Online,
-      .scene = protocol::Presence::Scene::Ranch,
-      .sceneUid = boundCharacterUid
-    };
+  if (keyLostDuringLogin)
+  {
+    server::util::QuietLogWarn(
+      "Client {} lost its messenger key while logging in as character {}"
+      " — the session is not bound",
+      clientId,
+      command.characterUid);
+
+    protocol::ChatCmdLoginAckCancel cancel{
+      .errorCode = protocol::ChatterErrorCode::LoginFailed};
+    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+
+    // ★С ЭТОЙ СТРОКИ `clientContext` — ВИСЯЧАЯ ССЫЛКА: разрыв синхронно уводит
+    // в уборку, а та стирает запись из `_clients`. Ниже к ней не обращаемся —
+    // как и ветка `not authorized`, которая устроена так же.
+    _chatterServer.DisconnectClient(clientId);
+    return;
   }
 
   // LOA-fix (R78-2, round78, backlog #255): ВХОД ОСТАВЛЯЕТ РОВНО ОДНУ ПРИВЯЗКУ.
@@ -2220,8 +2292,12 @@ void MessengerDirector::BroadcastPresenceOfCharacter(
   for (const auto& [onlineClientId, onlineClientContext] : clientsSnapshot)
   {
     // Skip unauthenticated clients
-    bool isAuthenticated = onlineClientContext.isAuthenticated;
-    if (not isAuthenticated)
+    // LOA-fix (R78-fix11, round78, backlog #255, ревю #4 BLOCK): и записи БЕЗ
+    // ЛИЧНОСТИ тоже. Пропуск по одному флагу оставлял бы полусвязанной записи
+    // право утащить в `GetCharacter(InvalidUid).Immutable` весь обход, а с ним
+    // и уведомления друзьям и гильдии. Правило и его разбор —
+    // `MessengerSessionEviction.hpp`, проверка — `MessengerTestSessionEviction`.
+    if (not messenger::IsPresenceBroadcastable(onlineClientContext))
       continue;
 
     // Self broadcast is needed only for guild notification

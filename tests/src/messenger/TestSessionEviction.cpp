@@ -284,6 +284,39 @@ void TestLoginSparesOneAndLogoutSparesNone()
   Check(not logoutCase[1].isAuthenticated, "после выхода не жива ни одна");
 }
 
+//! LOA (R78-fix11, ревю #4 BLOCK — вторая половина): ПОЯС РАССЫЛКИ.
+//!
+//! ★ЗАЧЕМ ЮНИТ-ТЕСТ, А НЕ СТЕНД. Пока первичный фикс на месте, полусвязанная
+//! запись в карте не появляется — то есть стенд пояс покраснить НЕ МОЖЕТ, и
+//! негатива, который его фальсифицирует на проводе, не существует. Значит
+//! фальсификатор обязан быть здесь: снимите из предиката проверку личности —
+//! и `MessengerTestSessionEviction` покраснеет.
+void TestPresenceBroadcastSkipsHalfBoundEntries()
+{
+  const Binding fresh{};
+  const Binding zombie{.isAuthenticated = true,
+                       .characterUid = server::data::InvalidUid};
+  const Binding live = Bound(4);
+
+  Check(not server::messenger::IsPresenceBroadcastable(fresh),
+    "свежее соединение до входа рассылке не подлежит");
+  Check(not server::messenger::IsPresenceBroadcastable(zombie),
+    "запись с поднятым флагом и БЕЗ личности рассылке не подлежит: "
+    "`GetCharacter(InvalidUid).Immutable` бросает и уносит с собой весь обход");
+  Check(server::messenger::IsPresenceBroadcastable(live),
+    "живая связанная сессия рассылке подлежит — иначе пояс съел бы работу");
+}
+
+//! Отвязанная фазой 1 сессия обязана выпасть из рассылки ОБОИМИ признаками.
+void TestUnboundSessionIsNotBroadcastable()
+{
+  Map clients{{0, Bound(4)}};
+  server::messenger::UnbindAllSessionsOfCharacter(clients, 4);
+
+  Check(not server::messenger::IsPresenceBroadcastable(clients[0]),
+    "после отвязки запись рассылке не подлежит");
+}
+
 } // namespace
 
 int main()
@@ -299,6 +332,8 @@ int main()
   TestLogoutUnbindsEverySession();
   TestLogoutWithInvalidUidUnbindsNothing();
   TestLoginSparesOneAndLogoutSparesNone();
+  TestPresenceBroadcastSkipsHalfBoundEntries();
+  TestUnboundSessionIsNotBroadcastable();
 
   if (g_failures != 0)
   {
