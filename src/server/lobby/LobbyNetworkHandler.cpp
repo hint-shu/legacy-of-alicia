@@ -1321,6 +1321,60 @@ void LobbyNetworkHandler::HandleClientDisconnected(ClientId clientId)
       clientContext = GetClientContextLocked(clientId, false);
     }
 
+    // LOA-fix (R78-fix1, round78, backlog #255, находка Codex 1): СНИМАЕМ
+    // ДОЛГОЖИВУЩИЙ КЛЮЧ МЕССЕНДЖЕРА ВМЕСТЕ С СЕАНСОМ.
+    //
+    // ★СНЯТИЕ ОГРАНИЧЕНО ТЕМ КЛЮЧОМ, КОТОРЫЙ ВЫДАЛИ ЭТОМУ СОЕДИНЕНИЮ. Уборка
+    // приходит позже события, и игрок, успевший перезайти, уже держит НОВЫЙ
+    // ключ; снятие «по ключу карты» стёрло бы именно его и вернуло бы #255.
+    // Сверку делает `OtpSystem::RevokeLtk`.
+    //
+    // ★СТОИТ ПОСЛЕ КОПИИ И ВНЕ ЗАМКА: `RevokeLtk` берёт СВОЙ мьютекс, а держать
+    // через чужой вызов замок карты клиентов запрещено (класс R59).
+    // LOA-fix (R78-fix7, NIT ревю #2 N1): шаг обёрнут в `RunCleanupStep`, как и
+    // его соседи. Правило сформулировано двумя строками ниже и в шапке
+    // функции: уборка лобби обязана ДОХОДИТЬ ДО КОНЦА при любом исходе
+    // каждого шага. Единственный независимый шаг без пояса — это шаг, который
+    // однажды унесёт с собой снятие с очереди подбора и планирование логаута.
+    util::RunCleanupStep(
+      "messenger key revoke",
+      clientId,
+      [&]()
+    {
+    if (clientContext.messengerLtk.has_value()
+      && clientContext.characterUid != data::InvalidUid)
+    {
+      size_t messengerKey = std::hash<uint32_t>()(clientContext.characterUid);
+      boost::hash_combine(messengerKey, MessengerOtpConstant);
+      const bool revoked = _serverInstance.GetOtpSystem().RevokeLtk(
+        messengerKey, clientContext.messengerLtk.value());
+
+      // LOA-fix (R78-fix4, round78, backlog #255, находка ревю W1): КЛЮЧ И
+      // СЕССИЯ УМИРАЮТ ВМЕСТЕ.
+      //
+      // ★СНЯТИЕ КЛЮЧА САМО ПО СЕБЕ НИКОГО НЕ ВЫГОНЯЕТ. Право обслуживать
+      // мессенджер живёт в `clientContext.isAuthenticated`, и после входа
+      // `OtpSystem` не опрашивается больше НИКОГДА. Держатель подсмотренного
+      // ключа, вошедший до выхода игрока, продолжал бы читать входящие,
+      // удалять их и слать письма ОТ ИМЕНИ игрока, который уже вышел из игры.
+      //
+      // ★ТОЛЬКО ПРИ `revoked == true`, И ЭТО НЕСУЩЕЕ. `false` означает, что
+      // ключ в карте — УЖЕ НЕ НАШ: игрок успел перезайти и держит новый.
+      // Закрыть сессии в этом случае значило бы выбить его же свежую личку —
+      // ровно тот дефект, который раунд чинит.
+      //
+      // ★СТОИТ ВНЕ ЗАМКА карты клиентов лобби (он отпущен выше вместе с
+      // копией контекста) и вне мьютекса `OtpSystem` (`RevokeLtk` уже
+      // вернулась): директор мессенджера возьмёт СВОИ замки, а закрытие
+      // соединений синхронно уйдёт в его обработчик разрыва — класс R59.
+      if (revoked)
+      {
+        _serverInstance.GetMessengerDirector().CloseSessionsOfCharacter(
+          clientContext.characterUid);
+      }
+    }
+    });
+
     // LOA-fix (R38-4, round38, backlog #90a-B4): СНИМАЕМ ПЕРСОНАЖА С ОЧЕРЕДИ
     // БЫСТРОГО СТАРТА. Выход из игры «в поиске комнаты» запись в
     // MatchmakingSystem::_matchmakingQueue НЕ убирал: её подбирал только
@@ -3321,8 +3375,51 @@ void LobbyNetworkHandler::HandleGetMessengerInfo(
   size_t identityHash = std::hash<uint32_t>()(clientContext.characterUid);
   boost::hash_combine(identityHash, MessengerOtpConstant);
 
-  // Grant otp code to character
-  const uint32_t code = _serverInstance.GetOtpSystem().GrantCode(identityHash);
+  // LOA-fix (R78-3, round78, backlog #255): ВЫДАЁМ LTK, А НЕ ОДНОРАЗОВЫЙ КОД.
+  //
+  // Парная правка к `MessengerDirector::HandleChatterLogin`. Клиент помнит этот
+  // код всю сессию и присылает его при КАЖДОМ переподключении мессенджера, а
+  // `GrantCode` выдавал код, который живёт 30 секунд и тратится первым же
+  // входом. Разбор — там же, у места сверки.
+  //
+  // ★АДРЕС БЕРЁТСЯ У ЖИВОГО СОКЕТА, И ЭТО МОЖЕТ БРОСИТЬ.
+  // `CommandServer::GetClientAddress` уходит в `Server::GetClient`, который
+  // бросает «Invalid client», если запись клиента уже снята (`Server.cpp:471`).
+  // Внутри обработчика пакета этого же клиента такого быть не должно, но
+  // необработанный бросок здесь стоил бы соединения; а отвечать ушедшему
+  // клиенту всё равно некому — молча выходим.
+  uint32_t endpointAddress{};
+  try
+  {
+    endpointAddress = _commandServer.GetClientAddress(clientId).to_uint();
+  }
+  catch (const std::exception&)
+  {
+    return;
+  }
+
+  // Grant long-term key to character
+  const uint32_t code = _serverInstance.GetOtpSystem().GrantLtk(
+    identityHash,
+    endpointAddress);
+
+  // LOA-fix (R78-fix1, round78, backlog #255, находка Codex 1): КЛЮЧ ЖИВЁТ НЕ
+  // ДОЛЬШЕ СЕАНСА. Запоминаем выданное значение на СОБСТВЕННОМ соединении —
+  // уборка разрыва (`HandleClientDisconnected`) снимет по нему ключ.
+  // Без этого ключ оставался бы годным до перезапуска сервера, и подсмотревший
+  // его сосед по NAT мог бы входить в мессенджер жертвы уже ПОСЛЕ того, как та
+  // вышла из игры. Пишем под ИСКЛЮЧИТЕЛЬНЫМ замком через внутренний путь:
+  // публичный `GetClientContext` берёт замок сам и отдаёт КОПИЮ.
+  try
+  {
+    const std::unique_lock lock(_clientsMutex);
+    GetClientContextLocked(clientId).messengerLtk = code;
+  }
+  catch (const std::exception&)
+  {
+    // Клиента уже нет. Ключ останется висеть до перезапуска — ровно то
+    // поведение, что было до этой правки, и хуже оно не делает.
+  }
 
   protocol::AcCmdCLGetMessengerInfoOK response{
     .code = code,

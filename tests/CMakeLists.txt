@@ -185,6 +185,29 @@ target_include_directories(race_test_race_journal
         PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(race_test_race_journal
         PRIVATE project-properties alicia-libserver)
+# LOA (R78, round78, backlog #255): правило вытеснения устаревшей
+# мессенджер-сессии. ★Заголовочное, поэтому линковать нечего, кроме
+# include-пути: правило вынесено из MessengerDirector.cpp ИМЕННО затем, чтобы
+# его можно было проверить без поднятия сервера.
+add_executable(messenger_test_session_eviction)
+target_sources(messenger_test_session_eviction PRIVATE
+        src/messenger/TestSessionEviction.cpp)
+target_include_directories(messenger_test_session_eviction
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(messenger_test_session_eviction
+        PRIVATE project-properties)
+
+# LOA (R78, round78, backlog #255): два вида ключей выдачи. Раунд не меняет
+# OtpSystem, но целиком стоит на его свойствах — в том числе на том, что
+# ОДНОРАЗОВЫЙ код остался одноразовым для ранча и заезда.
+add_executable(server_test_otp_system)
+target_sources(server_test_otp_system PRIVATE
+        src/server/TestOtpSystem.cpp
+        ${CMAKE_SOURCE_DIR}/src/server/system/OtpSystem.cpp)
+target_include_directories(server_test_otp_system
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(server_test_otp_system
+        PRIVATE project-properties)
 
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
@@ -209,6 +232,8 @@ add_test(NAME RaceTestEffectInstances COMMAND race_test_effect_instances)
 add_test(NAME RaceTestMagicApplication COMMAND race_test_magic_application)
 add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
 add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
+add_test(NAME MessengerTestSessionEviction COMMAND messenger_test_session_eviction)
+add_test(NAME ServerTestOtpSystem COMMAND server_test_otp_system)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -276,6 +301,27 @@ if (NOT WIN32)
     add_test(NAME ToolTrackJournalGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/round/check_track_journal.py
                     ${CMAKE_SOURCE_DIR})
+    # LOA (R78-fix3, round78, backlog #255, находка Codex 2 итерации 2): гейт
+    # замка над картой клиентов мессенджера. ★ЕДИНСТВЕННАЯ проверка раунда,
+    # которая умеет покраснеть на пропущенной синхронизации: гонку данных стенд
+    # детерминированно не воспроизводит, поэтому проверка структурная — перепись
+    # обращений к карте и требование замка там, где он обязан быть. Гейт сперва
+    # доказывает себя: снимает каждый из пяти замков по очереди и требует, чтобы
+    # покраснел ровно тот.
+    add_test(NAME ToolMessengerClientMapLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py --selftest)
+    add_test(NAME ToolMessengerClientMapLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_client_map_lock.py)
+    # LOA (R78-fix9, round78, backlog #255, находка ревю #4 BLOCK): под замком
+    # карты клиентов не должно быть НИ ОДНОГО выхода, который сам берёт этот же
+    # замок или синхронно рвёт соединение. ★ДЕТЕРМИНИРОВАННЫЙ фальсификатор
+    # BLOCK'а: стендовая ячейка `mid-login-revoke` ловит то же окно ГОНКОЙ, то
+    # есть вероятностно, а этот гейт краснеет всегда — проверено на дереве
+    # ДО фикса (нарушение на той самой строке, которую назвало ревю).
+    add_test(NAME ToolMessengerDisconnectOutsideLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
+    add_test(NAME ToolMessengerDisconnectOutsideLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

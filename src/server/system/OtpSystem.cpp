@@ -65,4 +65,20 @@ bool OtpSystem::AuthorizeLtk(size_t key, uint32_t code, uint32_t endpointAddress
   return authorized;
 }
 
+bool OtpSystem::RevokeLtk(const size_t key, const uint32_t code)
+{
+  std::scoped_lock lock(_ltksMutex);
+
+  const auto ltkIter = _ltks.find(key);
+  if (ltkIter == _ltks.cend())
+    return false;
+
+  // Снимаем ТОЛЬКО свой ключ: чужой (перевыданный после перезахода) не трогаем.
+  if (ltkIter->second.code != code)
+    return false;
+
+  _ltks.erase(ltkIter);
+  return true;
+}
+
 } // namespace server

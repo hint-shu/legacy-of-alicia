@@ -44,6 +44,20 @@ public:
 
   virtual void HandleClientConnected(network::ClientId clientId) = 0;
   virtual void HandleClientDisconnected(network::ClientId clientId) = 0;
+
+  //! LOA (R78-fix7, round78, backlog #255, находка ревю #2 BLOCK): сетевой тик
+  //! чат-сервера, доведённый до директора.
+  //!
+  //! ★ЗАЧЕМ. Директору нужна точка, исполняемая ГАРАНТИРОВАННО НА СВОЁМ потоке:
+  //! `Server::TickLoop` армируется на `io_context` того же сервера, поэтому
+  //! `HandleNetworkTick` приходит ровно с того потока, что и accept, чтение
+  //! пакетов и разрывы. Всё, что трогает реестр клиентов директора, обязано
+  //! исполняться там и только там.
+  //!
+  //! ★НЕ ЧИСТО ВИРТУАЛЬНЫЙ СОЗНАТЕЛЬНО: у all-chat и приватного чата
+  //! отложенной работы нет, и заставлять их писать пустое тело значило бы
+  //! трогать директоров, которых раунд не касается.
+  virtual void HandleNetworkTick() {}
 };
 
 //! A raw command handler.

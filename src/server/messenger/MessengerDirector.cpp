@@ -18,6 +18,7 @@
  **/
 
 #include "server/messenger/MessengerDirector.hpp"
+#include "server/messenger/MessengerSessionEviction.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
@@ -26,6 +27,7 @@
 
 #include <boost/container_hash/hash.hpp>
 #include <locale>
+#include <shared_mutex>
 
 namespace server
 {
@@ -196,8 +198,16 @@ std::optional<MessengerDirector::Client> MessengerDirector::GetClientByCharacter
 {
   std::optional<Client> client{};
 
-  // Get snapshot of current clients
-  const auto clientsSnapshot = _clients;
+  // LOA-fix (R78-fix2, round78, backlog #255, находка Codex 2): КОПИЯ — ПОД
+  // РАЗДЕЛЯЕМЫМ ЗАМКОМ. Этот метод зовут потоки ранча и заезда, а вытеснение
+  // пишет чужие записи с потока чата; без замка это гонка данных и UB.
+  // Замок держится РОВНО НА КОПИРОВАНИИ: перебор идёт уже по снимку, и ни
+  // одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   // Find client iterator by character uid
   const auto& iter = std::ranges::find_if(
     clientsSnapshot,
@@ -220,6 +230,184 @@ std::optional<MessengerDirector::Client> MessengerDirector::GetClientByCharacter
 bool MessengerDirector::IsCharacterOnline(const data::Uid characterUid) const
 {
   return GetClientByCharacterUid(characterUid).has_value();
+}
+
+void MessengerDirector::EvictOtherSessionsOfCharacter(
+  const network::ClientId keepClientId,
+  const data::Uid characterUid)
+{
+  // Фаза 1 — правка значений на месте под ИСКЛЮЧИТЕЛЬНЫМ замком, без вставок
+  // и удалений. Замок обязателен: `GetClientByCharacterUid` снимает копию этой
+  // карты с потоков ранча и заезда (находка Codex 2). Он снимается ДО фазы 2 —
+  // отключение синхронно возвращается в `HandleClientDisconnected`, и держать
+  // через это нерекурсивный замок значило бы самозахват (класс R59).
+  std::vector<network::ClientId> unbound;
+  {
+    const std::unique_lock lock(_clientsMutex);
+    unbound = messenger::UnbindOtherSessionsOfCharacter(
+      _clients, keepClientId, characterUid);
+  }
+
+  if (unbound.empty())
+    return;
+
+  DisconnectUnboundSessions(unbound, "re-login", characterUid);
+}
+
+void MessengerDirector::CloseSessionsOfCharacter(const data::Uid characterUid)
+{
+  // Фаза 1 — отвязать ВСЕ сессии персонажа, не щадя ни одной: игрок вышел,
+  // держать нечего.
+  std::vector<network::ClientId> unbound;
+  {
+    const std::unique_lock lock(_clientsMutex);
+    unbound = messenger::UnbindAllSessionsOfCharacter(_clients, characterUid);
+  }
+
+  if (unbound.empty())
+    return;
+
+  // ★ФАЗА 2 НЕ ЗДЕСЬ. Этот метод зовут ЧУЖИЕ потоки — лобби на выходе игрока и
+  // поток чат-команд на GM-бане. Закрыть соединение отсюда значит синхронно
+  // уйти в `Client::End()` → `HandleClientDisconnected` и стирать записи из
+  // трёх карт (наша `_clients`, `Server::_clients`, `Server::_addressStates`
+  // вовсе без замка), пока поток мессенджера их читает. Кладём в очередь и
+  // уходим; закроет `DrainPendingDisconnects()` с тика ЧАТ-СЕРВЕРА
+  // (`HandleNetworkTick`), не позже следующего тика (1 с). `Tick()`
+  // директора к дренажу отношения не имеет и пуст (ревю #4, R1).
+  {
+    const std::lock_guard lock(_pendingDisconnectsMutex);
+    for (const network::ClientId staleClientId : unbound)
+    {
+      // ★ЛИЧНОСТЬ КЛАДЁТСЯ В ОЧЕРЕДЬ ВМЕСТЕ С СОЕДИНЕНИЕМ (ревю #3 WARN-1):
+      // фаза 1 её уже стёрла из контекста, а сливу она нужна, чтобы разослать
+      // друзьям и гильдии «офлайн».
+      _pendingDisconnects.emplace_back(
+        PendingDisconnect{.clientId = staleClientId, .characterUid = characterUid});
+    }
+  }
+
+  server::util::QuietLogInfo(
+    "Evicted {} stale messenger session(s) of character {} on {}",
+    unbound.size(),
+    characterUid,
+    "logout");
+}
+
+void MessengerDirector::HandleNetworkTick()
+{
+  // ★ЕДИНСТВЕННАЯ ТОЧКА, ПРИХОДЯЩАЯ С ПОТОКА ЧАТ-СЕРВЕРА. `Server::TickLoop`
+  // армируется на `_io_ctx` того же сервера, поэтому тик приходит с того же
+  // потока, что accept, чтение пакетов и разрывы — то есть с того, которому
+  // карта клиентов принадлежит.
+  DrainPendingDisconnects();
+}
+
+void MessengerDirector::DrainPendingDisconnects()
+{
+  // ★ИСПОЛНЯЕТСЯ НА ПОТОКЕ МЕССЕНДЖЕРА. `Server::TickLoop` армирован на
+  // `io_context` этого же сервера, поэтому тик приходит с того же потока, что
+  // accept, чтение пакетов и разрывы. Только здесь законно звать
+  // `DisconnectClient` и позволять уборке стирать записи.
+  std::vector<PendingDisconnect> pending;
+  {
+    const std::lock_guard lock(_pendingDisconnectsMutex);
+    if (_pendingDisconnects.empty())
+      return;
+    pending.swap(_pendingDisconnects);
+  }
+
+  size_t closed = 0;
+  size_t rebound = 0;
+  for (const PendingDisconnect& entry : pending)
+  {
+    // ★ПЕРЕПРОВЕРКА ПЕРЕД РАЗРЫВОМ (NIT ревю #3 №3). Пока запись лежала в
+    // очереди, сокет мог пройти повторный вход и СНОВА стать законной сессией
+    // персонажа: гард повтора его не остановит, потому что фаза 1 сняла оба
+    // поля. Рвать такую сессию значило бы бить по живому входу, которого
+    // просьба о гашении не касалась. Монотонность `ClientId` спасает только от
+    // НОВЫХ соединений, а это — то же самое.
+    bool stillUnbound = false;
+    {
+      const std::shared_lock lock(_clientsMutex);
+      const auto clientIter = _clients.find(entry.clientId);
+      stillUnbound = clientIter != _clients.cend()
+        && clientIter->second.characterUid == data::InvalidUid;
+    }
+    if (not stillUnbound)
+    {
+      ++rebound;
+      continue;
+    }
+
+    // ★РАССЫЛКА «ОФЛАЙН» ИДЁТ ДО РАЗРЫВА И ПО СОХРАНЁННОЙ ЛИЧНОСТИ
+    // (ревю #3 WARN-1). После разрыва уборка синтезирует Offline сама, но
+    // упирается в снятый фазой 1 флаг и молчит. Здесь флаг не спрашивается.
+    const protocol::Presence offlinePresence{
+      .status = protocol::Status::Offline,
+      .scene = protocol::Presence::Scene::Ranch,
+      .sceneUid = 0};
+    BroadcastPresenceOfCharacter(
+      entry.characterUid, offlinePresence, entry.clientId, "teardown");
+
+    try
+    {
+      _chatterServer.DisconnectClient(entry.clientId);
+      ++closed;
+    }
+    catch (const std::exception&)
+    {
+      // Соединения уже нет — ровно та цель, которой добивались.
+    }
+  }
+
+  server::util::QuietLogInfo(
+    "Closed {} deferred messenger session(s) on the messenger thread"
+    " ({} rebound and spared)",
+    closed,
+    rebound);
+}
+
+void MessengerDirector::DisconnectUnboundSessions(
+  const std::vector<network::ClientId>& unbound,
+  const char* const reason,
+  const data::Uid characterUid)
+{
+  // Фаза 2 — закрытие, СТРОГО ВНЕ обхода карты.
+  //
+  // ★ПОЧЕМУ ДВЕ ФАЗЫ, А НЕ ОДИН ЦИКЛ. `Client::End()` СИНХРОННО зовёт
+  // `OnClientDisconnected` (`Server.cpp:85`), тот приходит в наш же
+  // `HandleClientDisconnected`, а он снимает запись из `_clients` стражем
+  // `RegistryEraser`. Отключение внутри обхода стирало бы элемент карты,
+  // по которой мы идём, — инвалидация итератора посреди цикла.
+  //
+  // ★ОТКЛЮЧЕНИЕ БЕЗОПАСНО ТОЛЬКО ПОТОМУ, ЧТО ФЛАГ УЖЕ СНЯТ ФАЗОЙ 1: уборка
+  // соединения рассылает присутствие Offline, а `HandleChatterUpdateState`
+  // выходит на `not isAuthenticated`. Иначе закрытие мёртвого сокета сообщило
+  // бы друзьям, что игрок вышел, — сразу после того, как он вошёл.
+  for (const network::ClientId staleClientId : unbound)
+  {
+    try
+    {
+      _chatterServer.DisconnectClient(staleClientId);
+    }
+    catch (const std::exception&)
+    {
+      // Соединения уже нет — `Server::GetClient` бросает «Invalid client».
+      // Это ровно та цель, которой мы добивались; ронять вход из-за неё нельзя.
+    }
+  }
+
+  // Одна строка на СОБЫТИЕ, а не на пакет: и вход, и выход — события редкие.
+  // ★ЧИСЛО — ЭТО ОТВЯЗАННЫЕ ЗАПИСИ, А НЕ ЗАКРЫТЫЕ СОКЕТЫ (NIT ревью 1):
+  // отвязка фазы 1 безусловна, а закрытие фазы 2 может не состояться, если
+  // соединения уже нет. Именно отвязка и решает, куда пойдёт адресная доставка,
+  // поэтому считаем её.
+  server::util::QuietLogInfo(
+    "Evicted {} stale messenger session(s) of character {} on {}",
+    unbound.size(),
+    characterUid,
+    reason);
 }
 
 void MessengerDirector::SendStallionReward(
@@ -312,14 +500,31 @@ void MessengerDirector::SendStallionReward(
     });
 
   // Check if recipient is online for live mail delivery
+  //
+  // LOA-fix (R78-fix3, round78, backlog #255, находка Codex 2 итерации 2):
+  // ЧИТАЕМ ПО СНИМКУ ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ, а не по живой карте.
+  //
+  // ★ЭТО ВТОРОЙ ЧУЖОЙ ПОТОК, И Я ЕГО ПРОПУСТИЛА. Путь измерен ревьюером и
+  // проверен мной: `RanchDirector::HandleUnregisterStallion` ->
+  // `BreedingMarket::UnregisterStallion` -> `SendBreedingPayoutMail` ->
+  // `SendStallionReward`. То есть перебор идёт с потока РАНЧА и может совпасть
+  // с фазой 1 вытеснения, которая пишет элементы этой же карты с потока чата.
+  // Первая редакция замка закрыла только `GetClientByCharacterUid` — «сколько
+  // ещё читателей у карты» надо было СЧИТАТЬ, а не осматривать.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
+
   auto client = std::ranges::find_if(
-    _clients,
+    clientsSnapshot,
     [characterUid](const std::pair<network::ClientId, ClientContext>& client)
     {
       return client.second.characterUid == characterUid;
     });
 
-  if (client == _clients.cend())
+  if (client == clientsSnapshot.cend())
     // Character is not online, all good and handled
     return;
 
@@ -338,6 +543,18 @@ void MessengerDirector::SendStallionReward(
 
 void MessengerDirector::Tick()
 {
+  // ★ЗДЕСЬ ДРЕНАЖА НЕТ, И ЭТО ИЗМЕРЕНО, А НЕ ВЫВЕДЕНО (R78-fix7).
+  //
+  // `Tick()` зовёт `RunDirectorTaskLoop` со СВОЕГО потока директора
+  // (`ServerInstance.cpp:246-252`), а пакеты мессенджера разбирает ДРУГОЙ поток
+  // — тот, на котором крутится `_io_ctx` чат-сервера. Первая редакция фикса
+  // дренажила отсюда, и предикат идентичности потока поймал это на стенде:
+  // закрытие печаталось потоком директора (Thread 10), а `ChatCmdLogin`,
+  // `HandleClientConnected` и чтения карты — потоком чата (Thread 14).
+  // То есть работа лишь ПЕРЕЕХАЛА с чужого потока на другой чужой.
+  //
+  // Дренаж живёт в `HandleNetworkTick()` — единственной точке, приходящей
+  // с того же потока, что и разбор пакетов.
 }
 
 Config::Messenger& MessengerDirector::GetConfig()
@@ -350,7 +567,14 @@ void MessengerDirector::HandleClientConnected(const network::ClientId clientId)
   server::util::QuietLogDebug("Client {} connected to the messenger server from {}",
     clientId,
     _chatterServer.GetClientAddress(clientId).to_string());
-  _clients.try_emplace(clientId);
+  // LOA-fix (R78-fix3, round78, backlog #255): ВСТАВКА — ПОД ИСКЛЮЧИТЕЛЬНЫМ
+  // ЗАМКОМ. Найдено ПЕРЕПИСЬЮ всех 18 обращений к карте, а не осмотром: ревью
+  // указало, что «сколько ещё читателей» надо считать. Вставка способна вызвать
+  // РЕХЭШ, то есть для копирующего с чужого потока она опаснее правки значений.
+  {
+    const std::unique_lock lock(_clientsMutex);
+    _clients.try_emplace(clientId);
+  }
 }
 
 void MessengerDirector::HandleClientDisconnected(const network::ClientId clientId)
@@ -361,7 +585,66 @@ void MessengerDirector::HandleClientDisconnected(const network::ClientId clientI
   // бросающая работа, а запись реестра снималась после неё. Осиротевшая запись
   // держит присутствие живым: друзья видят игрока в сети, пока сервер не
   // перезапустят.
-  const util::RegistryEraser eraser{_clients, clientId};
+  // LOA-fix (R78-fix3, round78, backlog #255, находка Codex 1 итерации 2):
+  // СНЯТИЕ ЗАПИСИ — ПОД ИСКЛЮЧИТЕЛЬНЫМ ЗАМКОМ.
+  //
+  // ★ПОЧЕМУ ЭТО ДЕЛО ИМЕННО R78. Прежний `util::RegistryEraser` о замке ничего не
+  // знает и стирает запись голыми руками — ровно тогда, когда карту может
+  // копировать `GetClientByCharacterUid` с потока ранча или заезда. Удаление к
+  // тому же способно вызвать рехэш, то есть это ХУЖЕ правки значений. До раунда
+  // сюда приходили только настоящие разрывы; ВЫТЕСНЕНИЕ (R78) зовёт этот путь
+  // САМО, синхронно из `DisconnectClient`, — значит гонку приводит сюда раунд,
+  // и закрыть её обязан он же.
+  //
+  // ★ГАРАНТИЯ R50 СОХРАНЕНА: страж остаётся RAII и снимает запись на выходе при
+  // любом исходе, просто теперь под замком. Форма — та же, что у
+  // `LobbyNetworkHandler::HandleClientDisconnected` (R64-3).
+  //
+  // ★САМОЗАХВАТА НЕТ: замок берётся ТОЛЬКО в деструкторе, то есть после
+  // `RunCleanupStep`, а ВСЕ разрывы (обе фазы вытеснения, слив и отказ входа)
+  // зовутся с отпущенным замком — см. R78-fix9 в `HandleChatterLogin`.
+  //
+  // LOA-fix (R78-fix10, round78, backlog #255, ревю #4 BLOCK, наблюдаемость):
+  // СНЯТИЕ ЗАПИСИ ОТЧИТЫВАЕТСЯ О СЕБЕ.
+  //
+  // ★ЗАЧЕМ СТРОКА В ЛОГ. Снятие живёт в деструкторе с `catch(...)`, то есть
+  // МОЛЧА переживает любой сбой — именно так самозахват замка (ревю #4) и
+  // оставлял вечного зомби, не оставляя следа. Проверить «зомби не осталось»
+  // по проводу нельзя: карта клиентов наружу не видна. Поэтому снятие само
+  // печатает, ЧТО оно сняло и сколько сессий осталось, — и стенд судит по
+  // состоянию сервера, а не по выводу «раз соединение закрылось, значит
+  // запись снята».
+  // ★СТРОКА ПЕЧАТАЕТСЯ УЖЕ БЕЗ ЗАМКА: под ним не остаётся ни одного выхода
+  // в чужой код, включая логгер.
+  struct LockedContextEraser final
+  {
+    MessengerDirector& director;
+    network::ClientId clientId;
+
+    ~LockedContextEraser() noexcept
+    {
+      try
+      {
+        size_t erased = 0;
+        size_t remaining = 0;
+        {
+          const std::unique_lock lock(director._clientsMutex);
+          erased = director._clients.erase(clientId);
+          remaining = director._clients.size();
+        }
+
+        server::util::QuietLogDebug(
+          "Messenger registry: erased {} entry for client {}, {} session(s) left",
+          erased,
+          clientId,
+          remaining);
+      }
+      catch (...)
+      {
+        // Бросок из деструктора — это `std::terminate` (урок round49).
+      }
+    }
+  } const eraser{*this, clientId};
 
   // Call update state like a client would do before disconnect
   util::RunCleanupStep(
@@ -384,33 +667,123 @@ void MessengerDirector::HandleChatterLogin(
   const network::ClientId clientId,
   const protocol::ChatCmdLogin& command)
 {
-  server::util::QuietLogDebug("[{}] ChatCmdLogin: {} {} {} {}",
+  // LOA-fix (R78-fix8, round78, backlog #255, находка ревю #3 WARN-2):
+  // КЛЮЧ В ЛОГ НЕ ПОПАДАЕТ.
+  //
+  // ★ЧТО ИЗМЕНИЛ РАУНД. Строка стоит с базы, но раньше печаталось ОДНОРАЗОВОЕ
+  // значение, потраченное первым же входом и протухавшее за 30 секунд. После
+  // перехода на LTK то же поле — живой credential на весь лобби-сеанс, а
+  // `logs/log.txt` пишется на уровне debug безусловно (`main.cpp:174`). Одной
+  // строки лога хватало, чтобы собрать `uid` + `code` и войти как жертва.
+  // Убираем аргумент — ровно так же, как строка ниже уже поступает с
+  // `command.name`. `guildUid` оставляем: он не credential.
+  server::util::QuietLogDebug("[{}] ChatCmdLogin: {} {}",
     clientId,
     command.characterUid,
-    command.name,
-    command.code,
     command.guildUid);
 
   auto& clientContext = GetClientContext(clientId, false);
+
+  // LOA-fix (R78-fix5, round78, backlog #255, находка ревю W3): ПОВТОРНЫЙ ВХОД
+  // НА ТОМ ЖЕ СОЕДИНЕНИИ НЕ ПЕРЕИГРЫВАЕТ ТЕЛО.
+  //
+  // ★ЧТО СЛОМАЛОСЬ ИМЕННО ЭТИМ РАУНДОМ. Прежний `AuthorizeCode` СТИРАЛ код при
+  // успехе, поэтому на один выданный код приходился ровно ОДИН успешный вход.
+  // `AuthorizeLtk` ключ не тратит — и без этого гарда один вошедший клиент мог
+  // гнать `ChatCmdLogin` потоком, каждый раз заставляя сервер перечитывать
+  // почтовый ящик, обходить все группы контактов и всех друзей и собирать
+  // ответ, на ЕДИНСТВЕННОМ потоке чат-сервера. Раунд обязан не отдавать
+  // усилитель, которого до него не было.
+  //
+  // ★СЦЕНАРИЙ РАУНДА НЕ ЗАДЕТ: честное переподключение приходит НОВЫМ
+  // соединением с чистым контекстом (`isAuthenticated == false`), поэтому
+  // гард его не видит. Срабатывает он только на повторе в ОДНОМ соединении,
+  // чего настоящий клиент не делает.
+  //
+  // ★СВЕРЯЕМ И ЛИЧНОСТЬ: вход под ДРУГИМ персонажем обязан идти полным путём
+  // через `AuthorizeLtk`, иначе гард стал бы дырой «вошёл как свой — обслужен
+  // как чужой».
+  // ★ЧТЕНИЕ — ПОД ЗАМКОМ (NIT ревю #2 N2). Оба поля вправе переписать фазой 1
+  // гашения чужой поток (выход игрока, GM-бан), поэтому читать их голыми
+  // руками — та же гонка, что и писать. Снимаем ОБА под одним разделяемым
+  // замком: решение принимается по согласованной паре, а не по двум значениям
+  // из разных мгновений.
+  bool alreadyLoggedInAsSameCharacter = false;
+  {
+    const std::shared_lock lock(_clientsMutex);
+    alreadyLoggedInAsSameCharacter =
+      clientContext.isAuthenticated
+      && clientContext.characterUid == command.characterUid;
+  }
+
+  if (alreadyLoggedInAsSameCharacter)
+  {
+    server::util::QuietLogDebug(
+      "[{}] ChatCmdLogin: already logged in as character {}, replay ignored",
+      clientId,
+      command.characterUid);
+
+    const protocol::ChatCmdLoginAckOK replayAck{};
+    _chatterServer.QueueCommand<decltype(replayAck)>(
+      clientId, [replayAck](){ return replayAck; });
+    return;
+  }
 
   // Generate identity hash based on the character uid from the command and
   // the messenger otp constant
   size_t identityHash = std::hash<uint32_t>()(command.characterUid);
   boost::hash_combine(identityHash, MessengerOtpConstant);
 
-  // Authorise the code received in the command against the calculated identity hash
-  clientContext.isAuthenticated = _serverInstance.GetOtpSystem().AuthorizeCode(
+  // LOA-fix (R78-1, round78, backlog #255): МЕССЕНДЖЕР ЖИВЁТ НА LTK, КАК ALL-CHAT.
+  //
+  // Здесь стоял `AuthorizeCode`, а он СТИРАЕТ код при успехе и держит его всего
+  // 30 секунд (`OtpSystem.cpp:22-37`). Код же выдаётся ровно один раз — на
+  // `AcCmdCLGetMessengerInfo` при входе в лобби, и клиент помнит его всю сессию.
+  // Поэтому первый вход код тратил, а любое переподключение мессенджера (возврат
+  // из заезда, обрыв связи) присылало тот же код в пустоту: в проде 09:22:15
+  // `failed authentication with auth code 1854698400` — тот самый код, что прошёл
+  // в 09:03:31, — и 39 минут без лички и писем до полного перезахода.
+  //
+  // ★ЭТО НЕ НОВЫЙ ДИЗАЙН, А ДОВЕДЕНИЕ АПСТРИМНОГО. Апстрим ловил ровно этот баг
+  // у all-chat: `fdf0474a` «Fix all chat disconnecting after entering race», затем
+  // `78a3c287` «Implement LTK codes (all chat fix)» с формулировкой «the game
+  // client keeps persistent key codes in memory». LTK не стирается и не протухает,
+  // но привязан к конечной точке. Мессенджеру ту же правку тогда не сделали.
+  //
+  // ★ЧТО МЕНЯЕТСЯ ДЛЯ АТАКУЮЩЕГО. Раньше подсмотренный код работал 30 секунд
+  // с ЛЮБОГО адреса; теперь — только с того IPv4, с которого пришло лобби-
+  // соединение, получившее код. Для удалённого наблюдателя это ослабление его
+  // возможностей, а не усиление. Ключ по-прежнему считается от `characterUid`
+  // ИЗ ПАКЕТА, поэтому вход под чужим uid с подсмотренным кодом не сходится.
+  const bool authorized = _serverInstance.GetOtpSystem().AuthorizeLtk(
     identityHash,
-    command.code);
+    command.code,
+    _chatterServer.GetClientAddress(clientId).to_uint());
 
-  if (not clientContext.isAuthenticated)
+  // LOA-fix (R78-fix6, round78, backlog #255, находка ревю W5): ЗАПИСИ В КАРТУ
+  // — ПОД ИСКЛЮЧИТЕЛЬНЫМ ЗАМКОМ.
+  //
+  // ★ЗАМОК, ВЗЯТЫЙ ТОЛЬКО ЧИТАТЕЛЕМ, СИНХРОНИЗАЦИЕЙ НЕ ЯВЛЯЕТСЯ. Предыдущая
+  // редакция закрыла у пары «читатель ранча/заезда ↔ писатель-входа» ровно
+  // ОДНУ сторону: копии в `GetClientByCharacterUid` и `SendStallionReward`
+  // ходят под `shared_lock`, а вход писал те же записи голыми руками. Это
+  // гонка данных, то есть UB, и живёт она на строке, которую раунд сам и
+  // переписывает. Решение — сперва РЕШИТЬ, потом записать под замком.
+  {
+    const std::unique_lock lock(_clientsMutex);
+    clientContext.isAuthenticated = authorized;
+  }
+
+  if (not authorized)
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    server::util::QuietLogWarn("Client {} tried to login as character {} but failed authentication with auth code {}",
+    // ★УРОВЕНЬ WARN ВКЛЮЧЁН ВСЕГДА, а в принятом §10 регрессе (multi-WAN)
+    // игрок валит авторизацию КАЖДОЙ попыткой — и каждая печатала бы его всё
+    // ещё живой ключ. Код убран (ревю #3 WARN-2).
+    server::util::QuietLogWarn("Client {} tried to login as character {} but failed authentication",
       clientId,
-      command.characterUid,
-      command.code);
+      command.characterUid);
 
     protocol::ChatCmdLoginAckCancel cancel{
       .errorCode = protocol::ChatterErrorCode::LoginFailed};
@@ -423,26 +796,138 @@ void MessengerDirector::HandleChatterLogin(
   }
 
   // Store this otp code for reauthentication with the guild login command (if at all)
-  clientContext.otpCode.emplace(command.code);
-
   protocol::ChatCmdLoginAckOK response{};
 
-  // TODO: remember status from last login?
-  clientContext.presence = protocol::Presence{
-    .status = protocol::Status::Online,
-    .scene = protocol::Presence::Scene::Ranch,
-    .sceneUid = clientContext.characterUid
-  };
+  // LOA (R78-fix7, NIT ревю #2 N4): МАРКЕР САМОГО ТЕЛА, а не ветки гарда.
+  // Предикат «тело исполнено один раз» считался по строкам гарда, то есть
+  // мерил соседнюю ветку, а не ту, что защищают. Строка стоит ВНУТРИ тяжёлой
+  // части, ПОСЛЕ раннего выхода: если гард снять, она напечатается на каждый
+  // пакет, и стенд это увидит.
+  server::util::QuietLogDebug(
+    "[{}] ChatCmdLogin body: building the roster for character {}",
+    clientId,
+    command.characterUid);
 
   // Client request could be logging in as another character
+  //
+  // ★ЛИЧНОСТЬ СНИМАЕТСЯ В ЛОКАЛЬНУЮ ПЕРЕМЕННУЮ, А НЕ ПРЯМО В КАРТУ (R78-fix6).
+  // Запись сюда шла ИЗ ЛЯМБДЫ `Mutable`, то есть под замком записи персонажа у
+  // `DataDirector`. Тянуть наш замок карты клиентов внутрь чужого замка нельзя
+  // — это готовая инверсия порядка блокировок. Поэтому читаем наружу, а в карту
+  // пишем одним движением ниже, уже выйдя из `Mutable`.
+  data::Uid boundCharacterUid{data::InvalidUid};
   std::vector<data::Uid> inbox{};
   _serverInstance.GetDataDirector().GetCharacter(command.characterUid).Mutable(
-    [&clientContext, &inbox](data::Character& character)
+    [&boundCharacterUid, &inbox](data::Character& character)
     {
-      clientContext.characterUid = character.uid();
+      boundCharacterUid = character.uid();
       inbox = character.mailbox.inbox();
       character.mailbox.hasNewMail() = false;
     });
+
+  // Три оставшиеся записи входа — одним исключительным замком, без единого
+  // выхода в чужой код под ним.
+  //
+  // LOA-fix (R78-fix9, round78, backlog #255, находка ревю #4 BLOCK):
+  // РЕШЕНИЕ ПРИНИМАЕТСЯ ПОД ЗАМКОМ, ДЕЙСТВИЕ ВЫПОЛНЯЕТСЯ ВНЕ ЕГО.
+  //
+  // ★ЧТО БЫЛО НЕВЕРНО. Предыдущая редакция на провале перепроверки звала
+  // `DisconnectClient` НЕ ВЫХОДЯ из этого замка — то есть ровно то, что
+  // запрещает строка над ним. Разрыв синхронный: `ChatterServer::
+  // DisconnectClient` → `Client::End()` → `OnClientDisconnected` →
+  // `HandleClientDisconnected`, и всё это НА ЭТОМ ЖЕ ПОТОКЕ. Уборка снова
+  // берёт `_clientsMutex` (страж записи), а он `std::shared_mutex` и
+  // рекурсию не поддерживает.
+  //
+  // ★ЦЕНА БЫЛА НЕ «ПОДВИСНЕТ», А «СЛОМАЕТСЯ НАВСЕГДА». На нашем gcc-15/glibc
+  // самозахват не висит: реализация возвращает EDEADLK, `std::unique_lock`
+  // бросает `system_error`, а страж — деструктор с `catch(...)`, поэтому
+  // бросок глотается и `_clients.erase` НЕ ВЫПОЛНЯЕТСЯ. В карте остаётся
+  // запись мёртвого соединения с поднятым флагом и НЕВЫЯСНЕННОЙ личностью,
+  // а `ClientId` монотонный и не переиспользуется — то есть зомби вечный.
+  // Дальше каждая рассылка присутствия (любой вход, выход, смена статуса
+  // ЛЮБОГО игрока) шла бы по нему в `GetCharacter(InvalidUid).Immutable`,
+  // а тот бросает — и рассылка обрывалась бы ДО отправки уведомлений
+  // друзьям и гильдии, на весь сервер, до перезапуска процесса.
+  //
+  // ★ФОРМА ФИКСА — ТА ЖЕ, ЧТО У СОСЕДЕЙ: фаза 2 вытеснения
+  // (`DisconnectUnboundSessions`) и слив (`DrainPendingDisconnects`) тоже
+  // сперва решают под замком, а рвут соединение уже без него.
+  bool keyLostDuringLogin = false;
+  {
+    const std::unique_lock lock(_clientsMutex);
+
+    // LOA-fix (R78-fix8, round78, backlog #255, NIT ревю #3 №2): ПЕРЕПРОВЕРКА
+    // КЛЮЧА В ТОЧКЕ ПРИВЯЗКИ.
+    //
+    // ★ОКНО, КОТОРОЕ ЭТИМ ЗАКРЫВАЕТСЯ. Между сверкой ключа и публикацией
+    // личности лежит всё тяжёлое тело входа (чтение ящика, групп, друзей —
+    // десятки миллисекунд, длина задаётся клиентом). Игрок мог за это время
+    // выйти из игры: лобби сняло бы ключ и попросило погасить сессии — но
+    // фаза 1 ищет по `characterUid`, которого этот вход ЕЩЁ НЕ опубликовал,
+    // никого не находит и молча уходит. Вход довязывался бы к персонажу,
+    // чей ключ уже отозван.
+    //
+    // ★СТОИТ ПОД ТЕМ ЖЕ ЗАМКОМ, ЧТО И ПУБЛИКАЦИЯ: между проверкой и записью
+    // не остаётся ни одного оператора. Своего мьютекса `OtpSystem` не роняет
+    // на наш — он никого не зовёт наружу, цикла блокировок нет.
+    if (not _serverInstance.GetOtpSystem().AuthorizeLtk(
+          identityHash,
+          command.code,
+          _chatterServer.GetClientAddress(clientId).to_uint()))
+    {
+      // ★ФЛАГ СНИМАЕТСЯ ЗДЕСЬ, И ЭТО НЕСУЩЕЕ, А НЕ ГИГИЕНА. Вход отвергнут,
+      // значит к моменту разрыва сессия обязана выглядеть НЕаутентифицированной:
+      // иначе уборка соединения пойдёт в `HandleChatterUpdateState` с поднятым
+      // флагом и невыясненной личностью и станет рассылать присутствие за
+      // `characterUid == InvalidUid`. Ровно так же устроена ветка
+      // `not authorized` выше: там флаг к моменту разрыва уже `false`.
+      clientContext.isAuthenticated = false;
+      keyLostDuringLogin = true;
+    }
+    else
+    {
+      clientContext.otpCode.emplace(command.code);
+      clientContext.characterUid = boundCharacterUid;
+      clientContext.presence = protocol::Presence{
+        .status = protocol::Status::Online,
+        .scene = protocol::Presence::Scene::Ranch,
+        .sceneUid = boundCharacterUid
+      };
+    }
+  }
+
+  if (keyLostDuringLogin)
+  {
+    server::util::QuietLogWarn(
+      "Client {} lost its messenger key while logging in as character {}"
+      " — the session is not bound",
+      clientId,
+      command.characterUid);
+
+    protocol::ChatCmdLoginAckCancel cancel{
+      .errorCode = protocol::ChatterErrorCode::LoginFailed};
+    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+
+    // ★С ЭТОЙ СТРОКИ `clientContext` — ВИСЯЧАЯ ССЫЛКА: разрыв синхронно уводит
+    // в уборку, а та стирает запись из `_clients`. Ниже к ней не обращаемся —
+    // как и ветка `not authorized`, которая устроена так же.
+    _chatterServer.DisconnectClient(clientId);
+    return;
+  }
+
+  // LOA-fix (R78-2, round78, backlog #255): ВХОД ОСТАВЛЯЕТ РОВНО ОДНУ ПРИВЯЗКУ.
+  //
+  // Стоит ИМЕННО ЗДЕСЬ, а не сразу после авторизации: личность соединения
+  // становится известна только строкой выше — её берут из записи персонажа, а
+  // не из пакета. Вытеснять по неподтверждённому `command.characterUid` было бы
+  // вытеснением не того.
+  //
+  // ★БЕЗ ЭТОГО ПОЧИНКА ВХОДА (R78-1) НЕ ВИДНА ИГРОКУ. Старое соединение сервер
+  // держит вечно (#235), клиент возвращается вторым — и обе записи оказались бы
+  // привязаны к одному персонажу. Разбор — в `MessengerSessionEviction.hpp`.
+  // #235 этим НЕ закрывается: течь чат-сокетов как класс остаётся.
+  EvictOtherSessionsOfCharacter(clientId, boundCharacterUid);
 
   // Check if inbox contains any unread mails, count and populate response
   for (const data::Uid mailUid : inbox)
@@ -475,6 +960,17 @@ void MessengerDirector::HandleChatterLogin(
     });
 
   // Initialise with one group for now (friends)
+  // LOA-fix (R78-fix6, round78, backlog #255, находка ревю W5): СНИМОК ВМЕСТО
+  // ЖИВОЙ КАРТЫ. Оба цикла ниже читают присутствие соседей, а внутри зовут
+  // `DataDirector` — держать замок карты клиентов через чужой вызов нельзя.
+  // Снимаем копию под разделяемым замком и дальше идём по ней; это тот же
+  // приём, что уже стоит в `HandleChatterUpdateState`.
+  const auto onlineSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
+
   response.groups.emplace_back(FriendsCategoryUid, "");
 
   // Loop through every group to prepare response
@@ -500,7 +996,7 @@ void MessengerDirector::HandleChatterLogin(
 
       // Check if friend is online by looking for them in messenger clients
       friendo.status = protocol::Status::Offline;
-      for (const auto& [onlineClientId, onlineClientContext] : _clients)
+      for (const auto& [onlineClientId, onlineClientContext] : onlineSnapshot)
       {
         if (onlineClientContext.isAuthenticated && onlineClientContext.characterUid == friendUid)
         {
@@ -532,7 +1028,7 @@ void MessengerDirector::HandleChatterLogin(
     
     // Check if friend is online by looking for them in messenger clients
     friendo.status = protocol::Status::Offline;
-    for (const auto& [onlineClientId, onlineClientContext] : _clients)
+    for (const auto& [onlineClientId, onlineClientContext] : onlineSnapshot)
     {
       if (onlineClientContext.isAuthenticated && onlineClientContext.characterUid == pendingUid)
       {
@@ -559,7 +1055,11 @@ void MessengerDirector::HandleChatterLogin(
     .presence = protocol::Presence{
       .status = protocol::Status::Online,
       .scene = protocol::Presence::Scene::Ranch,
-      .sceneUid = clientContext.characterUid // Scene uid is default to character uid by design
+      // ★ЛОКАЛЬНАЯ ВЕЛИЧИНА, А НЕ ЧТЕНИЕ ЧЕРЕЗ ССЫЛКУ (R78-fix7, ревю #2).
+      // Ссылка на запись карты живёт здесь через всё тяжёлое тело входа, и
+      // читать её в конце значило бы читать поле, которое чужой поток вправе
+      // переписать фазой 1 гашения. Значение уже снято и неизменно.
+      .sceneUid = boundCharacterUid
     }});
 }
 
@@ -1736,9 +2236,44 @@ void MessengerDirector::HandleChatterUpdateState(
   // Update state for client context
   clientContext.presence = command.presence;
 
-  // Get guild uid of the invoking character
+  BroadcastPresenceOfCharacter(
+    clientContext.characterUid, command.presence, clientId, nullptr);
+}
+
+void MessengerDirector::BroadcastPresenceOfCharacter(
+  const data::Uid characterUid,
+  const protocol::Presence& presence,
+  const network::ClientId selfClientId,
+  const char* const reason)
+{
+  // ★УЛИКУ ПЕЧАТАЕТ САМА РАССЫЛКА, И ЭТО НЕ КОСМЕТИКА. Сначала строка стояла
+  // рядом с вызовом, в сливе, — и негатив, снимавший рассылку, оставлял след
+  // нетронутым: ячейка `negP` оставалась ЗЕЛЁНОЙ на сломанном коде. Проверка
+  // обязана мерить то, что защищает, поэтому след живёт ВНУТРИ измеряемого
+  // действия и исчезает вместе с ним.
+  // ★Печатается только на редких путях (гашение), а не на каждом обновлении
+  // присутствия клиента: у штатного пути `reason == nullptr`. Пометка нужна
+  // ещё и затем, чтобы предикат не удовлетворялся обычным Offline от клиента.
+  if (reason != nullptr)
+  {
+    server::util::QuietLogDebug(
+      "[{}] ChatCmdUpdateState: [Offline] [Ranch] {} ({})",
+      selfClientId,
+      characterUid,
+      reason);
+  }
+
+  // LOA-fix (R78-fix8, round78, backlog #255, находка ревю #3 WARN-1):
+  // РАССЫЛКА ПРИСУТСТВИЯ, НЕ ЗАВИСЯЩАЯ ОТ ФЛАГА КОНТЕКСТА.
+  //
+  // ★ЗАЧЕМ ВЫНЕСЕНО. Гашение сессии (фаза 1) снимает `isAuthenticated` и
+  // обнуляет `characterUid`, а `HandleChatterUpdateState` выходит первой же
+  // строкой именно по этому флагу. Значит синтезированный на разрыве Offline
+  // никуда не уходил: друзья видели ушедшего игрока в сети до его следующего
+  // входа, гильдия — тоже, а приглашение призраку не получало даже ack.
+  // Личность передаётся ПАРАМЕТРОМ: её сохраняет фаза 1 до обнуления.
   data::Uid guildUid{data::InvalidUid};
-  _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
+  _serverInstance.GetDataDirector().GetCharacter(characterUid).Immutable(
     [&guildUid](const data::Character& character)
     {
       guildUid = character.guildUid();
@@ -1749,16 +2284,24 @@ void MessengerDirector::HandleChatterUpdateState(
   // This mechanism goes through all the online clients and checks if the invoker is in their stored friends list.
   std::vector<network::ClientId> friendsToNotify{};
 
-  const auto clientsSnapshot = _clients;
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   for (const auto& [onlineClientId, onlineClientContext] : clientsSnapshot)
   {
     // Skip unauthenticated clients
-    bool isAuthenticated = onlineClientContext.isAuthenticated;
-    if (not isAuthenticated)
+    // LOA-fix (R78-fix11, round78, backlog #255, ревю #4 BLOCK): и записи БЕЗ
+    // ЛИЧНОСТИ тоже. Пропуск по одному флагу оставлял бы полусвязанной записи
+    // право утащить в `GetCharacter(InvalidUid).Immutable` весь обход, а с ним
+    // и уведомления друзьям и гильдии. Правило и его разбор —
+    // `MessengerSessionEviction.hpp`, проверка — `MessengerTestSessionEviction`.
+    if (not messenger::IsPresenceBroadcastable(onlineClientContext))
       continue;
 
     // Self broadcast is needed only for guild notification
-    bool isSelf = onlineClientId == clientId;
+    bool isSelf = onlineClientId == selfClientId;
     if (isSelf and guildUid != data::InvalidUid)
     {
       guildMembersToNotify.emplace_back(onlineClientId);
@@ -1768,13 +2311,13 @@ void MessengerDirector::HandleChatterUpdateState(
     // Check if invoker is in the online client's stored friends list
     bool isFriend = false;
     _serverInstance.GetDataDirector().GetCharacter(onlineClientContext.characterUid).Immutable(
-      [&isFriend, &clientContext](const data::Character& character)
+      [&isFriend, characterUid](const data::Character& character)
       {
         isFriend = std::ranges::any_of(
           character.contacts.groups() | std::views::values,
-          [&clientContext](const data::Character::Contacts::Group& group)
+          [characterUid](const data::Character::Contacts::Group& group)
           {
-            return std::ranges::contains(group.members, clientContext.characterUid);
+            return std::ranges::contains(group.members, characterUid);
           });
       });
 
@@ -1806,8 +2349,8 @@ void MessengerDirector::HandleChatterUpdateState(
   {
     protocol::ChatCmdUpdateStateTrs notify{
       protocol::ChatCmdUpdateState{
-        command.presence,},
-      clientContext.characterUid};
+        presence,},
+      characterUid};
 
     for (const auto& targetClientId : friendsToNotify)
     {
@@ -1818,8 +2361,8 @@ void MessengerDirector::HandleChatterUpdateState(
   if (not guildMembersToNotify.empty())
   {
     protocol::ChatCmdUpdateGuildMemberStateTrs notify{};
-    notify.affectedCharacterUid = clientContext.characterUid;
-    notify.presence = command.presence;
+    notify.affectedCharacterUid = characterUid;
+    notify.presence = presence;
 
     for (const auto& targetClientId : guildMembersToNotify)
     {
@@ -2023,11 +2566,9 @@ void MessengerDirector::HandleChatterGuildLogin(
 {
   // ChatCmdGuildLogin is sent after ChatCmdLogin
 
-  server::util::QuietLogDebug("[{}] ChatCmdGuildLogin: {} {} {} {}",
+  server::util::QuietLogDebug("[{}] ChatCmdGuildLogin: {} {}",
     clientId,
     command.characterUid,
-    command.name,
-    command.code,
     command.guildUid);
 
   auto& clientContext = GetClientContext(clientId);
@@ -2041,11 +2582,10 @@ void MessengerDirector::HandleChatterGuildLogin(
   {
     // Login failed, bad actor, log and return
     // Do not log with `command.name` (character name) to prevent some form of string manipulation in spdlog
-    server::util::QuietLogWarn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication with auth code '{}'",
+    server::util::QuietLogWarn("Client '{}' tried to login to guild '{}' as character '{}' but failed authentication",
       clientId,
       command.guildUid,
-      command.characterUid,
-      command.code);
+      command.characterUid);
 
     protocol::ChatCmdGuildLoginAckCancel cancel{
       .errorCode = protocol::ChatterErrorCode::LoginFailed};

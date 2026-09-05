@@ -21,6 +21,13 @@ public:
 
   uint32_t GrantLtk(size_t key, uint32_t endpointAddress);
   bool AuthorizeLtk(size_t key, uint32_t code, uint32_t endpointAddress);
+  //! LOA (R78-fix1, round78, backlog #255, находка Codex 1): снятие
+  //! долгоживущего ключа, ОГРАНИЧЕННОЕ ТЕМ КЛЮЧОМ, КОТОРЫЙ СНИМАЮЩИЙ ВЫДАВАЛ.
+  //! ★СВЕРКА `code` — НЕСУЩАЯ, А НЕ ГИГИЕНА. Снятие зовёт уборка разорванного
+  //! лобби-соединения, и она приходит ПОЗЖЕ события. Игрок, успевший
+  //! перезайти, к этому моменту уже держит НОВЫЙ ключ; снятие «по ключу»
+  //! стёрло бы именно его и сломало бы ровно то, что чинит раунд.
+  bool RevokeLtk(size_t key, uint32_t code);
 
 private:
   struct Code

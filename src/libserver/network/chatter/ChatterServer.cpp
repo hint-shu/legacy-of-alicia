@@ -136,6 +136,10 @@ void ChatterServer::EndHost()
 
 void ChatterServer::HandleNetworkTick()
 {
+  // LOA-fix (R78-fix7, round78, backlog #255): тик доводится до директора —
+  // это его единственная точка исполнения на СВОЁМ потоке (см. разбор у
+  // `IChatterServerEventsHandler::HandleNetworkTick`).
+  _chatterServerEventsHandler.HandleNetworkTick();
 }
 
 void ChatterServer::OnClientConnected(network::ClientId clientId)
