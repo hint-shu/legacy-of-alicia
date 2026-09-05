@@ -346,18 +346,7 @@ void MessengerDirector::DrainPendingDisconnects()
       .scene = protocol::Presence::Scene::Ranch,
       .sceneUid = 0};
     BroadcastPresenceOfCharacter(
-      entry.characterUid, offlinePresence, entry.clientId);
-
-    // ★СЛЕД В ЛОГЕ, БЕЗ КОТОРОГО РАССЫЛКУ НЕЧЕМ ИЗМЕРИТЬ. Сама рассылка строк
-    // не печатает: логирует только обработчик `ChatCmdUpdateState`, а этот
-    // путь идёт мимо него. Форма строки повторяет обработчик (стенд ищет
-    // `ChatCmdUpdateState: [Offline]`), но несёт пометку `(teardown)` —
-    // иначе ячейку удовлетворил бы обычный Offline от самого клиента, и
-    // предикат стал бы вакуумным. Событие редкое: одно на погашенную сессию.
-    server::util::QuietLogDebug(
-      "[{}] ChatCmdUpdateState: [Offline] [Ranch] {} (teardown)",
-      entry.clientId,
-      entry.characterUid);
+      entry.characterUid, offlinePresence, entry.clientId, "teardown");
 
     try
     {
@@ -2176,14 +2165,32 @@ void MessengerDirector::HandleChatterUpdateState(
   clientContext.presence = command.presence;
 
   BroadcastPresenceOfCharacter(
-    clientContext.characterUid, command.presence, clientId);
+    clientContext.characterUid, command.presence, clientId, nullptr);
 }
 
 void MessengerDirector::BroadcastPresenceOfCharacter(
   const data::Uid characterUid,
   const protocol::Presence& presence,
-  const network::ClientId selfClientId)
+  const network::ClientId selfClientId,
+  const char* const reason)
 {
+  // ★УЛИКУ ПЕЧАТАЕТ САМА РАССЫЛКА, И ЭТО НЕ КОСМЕТИКА. Сначала строка стояла
+  // рядом с вызовом, в сливе, — и негатив, снимавший рассылку, оставлял след
+  // нетронутым: ячейка `negP` оставалась ЗЕЛЁНОЙ на сломанном коде. Проверка
+  // обязана мерить то, что защищает, поэтому след живёт ВНУТРИ измеряемого
+  // действия и исчезает вместе с ним.
+  // ★Печатается только на редких путях (гашение), а не на каждом обновлении
+  // присутствия клиента: у штатного пути `reason == nullptr`. Пометка нужна
+  // ещё и затем, чтобы предикат не удовлетворялся обычным Offline от клиента.
+  if (reason != nullptr)
+  {
+    server::util::QuietLogDebug(
+      "[{}] ChatCmdUpdateState: [Offline] [Ranch] {} ({})",
+      selfClientId,
+      characterUid,
+      reason);
+  }
+
   // LOA-fix (R78-fix8, round78, backlog #255, находка ревю #3 WARN-1):
   // РАССЫЛКА ПРИСУТСТВИЯ, НЕ ЗАВИСЯЩАЯ ОТ ФЛАГА КОНТЕКСТА.
   //

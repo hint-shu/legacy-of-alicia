@@ -189,10 +189,14 @@ private:
   //! присутствия персонажа, НЕ ЗАВИСЯЩАЯ от флага контекста. Личность и
   //! присутствие приходят параметрами, потому что на пути гашения контекст
   //! уже обнулён фазой 1.
+  //! @param reason Ненулевой — путь ГАШЕНИЯ: рассылка оставит след в логе,
+  //!        по которому стенд её и меряет. `nullptr` — штатное обновление
+  //!        присутствия от клиента, его логирует сам обработчик.
   void BroadcastPresenceOfCharacter(
     data::Uid characterUid,
     const protocol::Presence& presence,
-    network::ClientId selfClientId);
+    network::ClientId selfClientId,
+    const char* reason);
 
   //! Слить очередь отложенных разрывов. Только с потока мессенджера.
   void DrainPendingDisconnects();
