@@ -159,6 +159,49 @@ MUST_DECLARE_LOCK = {
 #: прямыми замками).
 LOCKED_CALL_RE = re.compile(r"\bGetClientContextLocked\s*\(")
 
+#: LOA (R82, round82, director-clients-lock-hardening): ВЫХОДЫ, ЗАПРЕЩЁННЫЕ
+#: ВНУТРИ ЛЯМБДЫ `MutateClientContext`.
+#:
+#: ★ЗАЧЕМ ЭТО ЗДЕСЬ, А НЕ В `check_messenger_disconnect_outside_lock.py`.
+#: Тот гейт ищет запретный вызов ПОД ТЕКСТОВЫМ ОБЪЯВЛЕНИЕМ ЗАМКА и до R82 видел
+#: всё, потому что все замки объявлялись прямо в телах обработчиков. Раунд
+#: инкапсулирует исключительный замок ВНУТРЬ `MutateClientContext`, и лямбда,
+#: которая под этим замком исполняется, стоит в тексте вызывающего БЕЗ единого
+#: объявления замка над собой. Проверено вживую на негативе `neg-callout-msgr`
+#: (`BroadcastPresenceOfCharacter` перенесён внутрь лямбды): соседний гейт
+#: остаётся ЗЕЛЁНЫМ — то есть контракт R82 вводит выход, который старая проверка
+#: физически не умеет увидеть ([[gate-by-form-gives-false-completeness]]).
+#: Правило заведено ЗДЕСЬ, потому что `MutateClientContext` — сущность этого
+#: раунда, а соседний гейт раунд обязан оставить зелёным без правок (регрессия).
+#:
+#: ★ЦЕНА ПРОПУСКА — НЕ КОСМЕТИКА. `_clientsMutex` нерекурсивный:
+#: `BroadcastPresenceOfCharacter` изнутри лямбды снова берёт его снимком, glibc
+#: возвращает EDEADLK, `std::shared_lock` бросает `system_error` — и рассылка
+#: присутствия обрывается на каждом обновлении статуса. Это класс R59/R78.
+MUTATION_FORBIDDEN = (
+    "DisconnectClient",
+    "End",
+    "EvictOtherSessionsOfCharacter",
+    "CloseSessionsOfCharacter",
+    "DisconnectUnboundSessions",
+    "DrainPendingDisconnects",
+    "GetClientByCharacterUid",
+    "IsCharacterOnline",
+    "SendStallionReward",
+    "BroadcastPresenceOfCharacter",
+    "HandleChatterUpdateState",
+    "GetClientContext",
+    "MutateClientContext",
+    "QueueCommand",
+    "GetDataDirector",
+    "GetCharacter",
+)
+MUTATION_FORBIDDEN_RE = re.compile(
+    r"\b(" + "|".join(MUTATION_FORBIDDEN) + r")\s*(?:<[^<>;{}]*>)?\s*\(")
+MUTATION_CALL_RE = re.compile(r"\bMutateClientContext\s*\(")
+#: Строка ОПРЕДЕЛЕНИЯ метода — не вызов; её из учёта исключаем.
+MUTATION_DEF_RE = re.compile(r"MessengerDirector::MutateClientContext\s*\(")
+
 #: Ниже этого числа обращений файл заведомо не тот — проверка слепа.
 #: ★ПОДНЯТ ПО ЗАМЕРУ, А НЕ НАУГАД (R80-7): на дереве R78 гейт находил 30
 #: обращений при пороге 12 — то есть разбор мог ослепнуть больше чем вдвое и
@@ -342,6 +385,52 @@ def analyse(text: str):
     return accesses, violations, seen_functions
 
 
+def mutation_lambdas(text: str):
+    """Вернуть (вызовов `MutateClientContext`, нарушений внутри их лямбд).
+
+    ★РАЗБОР ПО БАЛАНСУ КРУГЛЫХ СКОБОК, а не по строкам: аргумент-лямбда занимает
+    несколько строк, и «следующие N строк» было бы догадкой. Область вызова —
+    от строки с `MutateClientContext(` до строки, на которой баланс `(`/`)`
+    вернулся к нулю. Первое вхождение самого имени в счёт не идёт, иначе вызов
+    объявлял бы нарушителем сам себя.
+    """
+    lines = text.splitlines()
+    calls = 0
+    violations = []
+    index = 0
+    while index < len(lines):
+        code = _strip_comment(lines[index])
+        if not MUTATION_CALL_RE.search(code) or MUTATION_DEF_RE.search(code):
+            index += 1
+            continue
+
+        calls += 1
+        start = index
+        depth = 0
+        opened = False
+        region = []
+        while index < len(lines):
+            code = _strip_comment(lines[index])
+            region.append((index + 1, lines[index], code))
+            depth += code.count("(")
+            if depth > 0:
+                opened = True
+            depth -= code.count(")")
+            index += 1
+            if opened and depth <= 0:
+                break
+
+        for number, raw, code in region:
+            for match in MUTATION_FORBIDDEN_RE.finditer(code):
+                # Само имя `MutateClientContext` на открывающей строке — это
+                # разбираемый вызов, а не выход из-под замка.
+                if number == start + 1 and match.group(1) == "MutateClientContext":
+                    continue
+                violations.append((number, match.group(1), raw.strip()))
+
+    return calls, violations
+
+
 def _owning_function(text: str, line_number: int) -> str | None:
     """Имя функции `MessengerDirector::<name>`, чьё ТЕЛО содержит эту строку.
 
@@ -414,6 +503,10 @@ def judge(tree: Path) -> int:
     for name in declare_missing:
         violations.append((0, name, "обязана объявить замок в СВОЁМ теле "
                                     "(контракт R82), а объявления нет"))
+    mutation_calls, mutation_violations = mutation_lambdas(text)
+    for number, name, code in mutation_violations:
+        violations.append((number, "MutateClientContext-лямбда",
+                           f"выход {name} ПОД исключительным замком: {code}"))
     print("=== gate: замок над картой клиентов мессенджера ===")
     print(f"дерево            : {tree}")
     print(f"обращений к карте : {len(accesses)} (минимум {MIN_ACCESSES}) — "
@@ -421,6 +514,8 @@ def judge(tree: Path) -> int:
     print(f"обязаны быть под замком : {len(guarded)} в {len(MUST_LOCK)} функциях")
     print(f"замок в СВОЁМ теле обязан : {len(MUST_DECLARE_LOCK) - len(declare_missing)}"
           f" из {len(MUST_DECLARE_LOCK)} (R82)")
+    print(f"лямбд MutateClientContext  : {mutation_calls}, выходов в них: "
+          f"{len(mutation_violations)} (ожидалось 0)")
     print(f"исключительный замок в теле : "
           f"{len(MUST_LOCK_EXCLUSIVELY) - len(exclusive_missing)} "
           f"из {len(MUST_LOCK_EXCLUSIVELY)}")
@@ -537,6 +632,14 @@ def selftest() -> int:
              "    return _clients;\n"
              "  }();",
              "  const auto clientsSnapshot = _clients;",
+             1)),
+        ("выход в чужой код внутри лямбды MutateClientContext",
+         lambda s: s.replace(
+             "      mutableClientContext.presence = command.presence;",
+             "      mutableClientContext.presence = command.presence;\n"
+             "      BroadcastPresenceOfCharacter(\n"
+             "        mutableClientContext.characterUid, command.presence, "
+             "clientId, nullptr);",
              1)),
         ("GetClientContextLocked вызван вне замка",
          lambda s: s.replace(
