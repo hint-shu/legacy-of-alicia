@@ -65,6 +65,15 @@ MUST_LOCK = {
     # предыдущая редакция гейта его не стерегла. Замок, взятый только
     # читателем, синхронизацией не является.
     "HandleChatterLogin",
+    # LOA (R80-7, round80, backlog #235): раунд заводит в этом файле ДВЕ новые
+    # функции, трогающие карту. Обе — писатели значений, обе обязаны стоять под
+    # исключительным замком, и обе прошли бы мимо СПИСОЧНОГО гейта незамеченными.
+    # `HandleClientActivity` пишет метку на КАЖДЫЙ входящий кадр (значит
+    # совпадает с копированием карты с потоков ранча и заезда чаще всего
+    # остального); `SweepChatSockets` обходит карту целиком и правит поля чужих
+    # записей.
+    "HandleClientActivity",
+    "SweepChatSockets",
 }
 
 #: Функции, которые карту МЕНЯЮТ: им мало «какого-нибудь» замка, нужен
@@ -79,14 +88,27 @@ MUST_LOCK_EXCLUSIVELY = {
     "EvictOtherSessionsOfCharacter",
     "CloseSessionsOfCharacter",
     "HandleChatterLogin",
+    # LOA (R80-7): обе новые функции ПИШУТ значения записей. Разделяемого замка
+    # им мало — «запись под замком для чтения» гейт обязан ловить, и ровно этот
+    # мутант прежняя редакция пропускала.
+    "HandleClientActivity",
+    "SweepChatSockets",
 }
 
 #: Ниже этого числа обращений файл заведомо не тот — проверка слепа.
-MIN_ACCESSES = 12
+#: ★ПОДНЯТ ПО ЗАМЕРУ, А НЕ НАУГАД (R80-7): на дереве R78 гейт находил 30
+#: обращений при пороге 12 — то есть разбор мог ослепнуть больше чем вдвое и
+#: по-прежнему печатать «чисто». Кандидат R80 даёт 39; порог ставится чуть ниже
+#: замера, чтобы ловить именно слепоту, а не мелкую правку.
+MIN_ACCESSES = 34
 
+#: ★ТИП ВОЗВРАТА ПЕРЕЧИСЛЯЕТСЯ, И ЭТО ЦЕНА ФОРМЫ: функция, чей тип здесь не
+#: назван, для разбора НЕВИДИМА — её тело не приписывается никому, обращения из
+#: него не считаются, и «0 нарушений» становится тише, чем должно быть.
+#: R80 добавляет `chat::ReapThresholds MessengerDirector::GetReapThresholds()`.
 FUNC_RE = re.compile(
     r"^(?:void|bool|std::optional<[^>]*>|MessengerDirector::ClientContext&|"
-    r"Config::Messenger&)\s+MessengerDirector::(\w+)")
+    r"Config::Messenger&|chat::ReapThresholds)\s+MessengerDirector::(\w+)")
 LOCK_RE = re.compile(r"std::(?:shared_lock|unique_lock)\s+lock\(\s*"
                      r"(?:director\.)?_clientsMutex\s*\)")
 UNIQUE_LOCK_RE = re.compile(r"std::unique_lock\s+lock\(\s*"
@@ -223,6 +245,37 @@ def analyse(text: str):
     return accesses, violations, seen_functions
 
 
+def _owning_function(text: str, line_number: int) -> str | None:
+    """Имя функции `MessengerDirector::<name>`, чьё ТЕЛО содержит эту строку.
+
+    ★ЗАЧЕМ. Самопроверка печатала «снят замок со строки N» — номер строки не
+    говорит читателю, ЧТО именно доказано. R80 добавляет в поднадзорный файл две
+    функции, и требование к нему сформулировано ПОИМЁННО: канарейка обязана
+    называть `SweepChatSockets` и `HandleClientActivity`, иначе «12 канареек
+    поймано» не отличает их от двенадцати чужих.
+    """
+    lines = text.splitlines()
+    func = None
+    func_depth = 0
+    depth = 0
+    for number, raw in enumerate(lines, 1):
+        code = _strip_comment(raw)
+        match = FUNC_RE.match(raw)
+        if match and func is None:
+            func = match.group(1)
+            func_depth = depth
+        if number == line_number:
+            return func
+        opened = code.count("{")
+        closed = code.count("}")
+        depth += opened
+        if closed:
+            depth -= closed
+            if func is not None and depth <= func_depth:
+                func = None
+    return None
+
+
 def judge(tree: Path) -> int:
     path = tree / SOURCE
     if not path.is_file():
@@ -293,18 +346,28 @@ def selftest() -> int:
               f"{len(lock_lines)}, ожидалось не меньше 4")
         return 2
 
+    named = set()
     for number in lock_lines:
         lines = original.splitlines()
         # Канарейка: замок снят (строка выброшена), всё остальное на месте.
         canary = "\n".join(lines[:number - 1] + lines[number:])
         _, canary_violations, _ = analyse(canary)
+        owner = _owning_function(original, number) or "?"
         if canary_violations:
-            print(f"  ✓ канарейка «снят замок со строки {number}» поймана "
-                  f"({len(canary_violations)} нарушений)")
+            named.add(owner)
+            print(f"  ✓ канарейка «снят замок в {owner} (строка {number})» "
+                  f"поймана ({len(canary_violations)} нарушений)")
         else:
             # Замок в функции, за которой гейт не следит, — это ЗАЯВЛЕННЫЙ предел.
-            print(f"  · строка {number}: замок не в поднадзорной функции — "
-                  "гейт молчит, как и заявлено")
+            print(f"  · строка {number} ({owner}): замок не в поднадзорной "
+                  "функции — гейт молчит, как и заявлено")
+
+    # ★ИМЕННОЕ ТРЕБОВАНИЕ R80: без него «12 канареек» не доказывает, что гейт
+    # видит именно ДВЕ НОВЫЕ функции раунда.
+    required = {"HandleClientActivity", "SweepChatSockets"}
+    if not required.issubset(named):
+        print(f"САМОПРОВЕРКА ПРОВАЛЕНА: не названы поимённо {sorted(required - named)}")
+        failures += 1
 
     caught = 0
     for number in lock_lines:
