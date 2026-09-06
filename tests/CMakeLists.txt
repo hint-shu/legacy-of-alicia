@@ -221,6 +221,18 @@ target_include_directories(server_test_otp_system
 target_link_libraries(server_test_otp_system
         PRIVATE project-properties)
 
+# LOA (R80-1, round80, backlog #235): правило жатвы чат-сокетов. ★Заголовочное,
+# поэтому линковать нечего, кроме include-пути: правило вынесено из обоих
+# чат-директоров ИМЕННО затем, чтобы прод-пороги (60/60/0) можно было проверить
+# без часового ожидания на стенде.
+add_executable(chat_test_socket_reap_rule)
+target_sources(chat_test_socket_reap_rule PRIVATE
+        src/chat/TestChatSocketReapRule.cpp)
+target_include_directories(chat_test_socket_reap_rule
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(chat_test_socket_reap_rule
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME ProtocolTestBoundedList COMMAND protocol_test_bounded_list)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
@@ -247,6 +259,7 @@ add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
 add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 add_test(NAME MessengerTestSessionEviction COMMAND messenger_test_session_eviction)
 add_test(NAME ServerTestOtpSystem COMMAND server_test_otp_system)
+add_test(NAME ChatTestSocketReapRule COMMAND chat_test_socket_reap_rule)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
