@@ -21,6 +21,7 @@
 #include "libserver/util/QuietLog.hpp"
 #include "libserver/util/RecordAccess.hpp"
 
+#include "server/race/MasteryAccrual.hpp"
 #include "server/race/RaceInstance.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
 
@@ -690,7 +691,15 @@ void RaceInstance::Stop()
       {
         // Молчим у того, кому и писать было нечего: иначе строка пойдёт на
         // КАЖДОГО сошедшего в каждом заезде и утопит собой диагностику.
-        if (racer.longestGlideMetres > 0.0f || racer.boostComboMax > 0)
+        // ★УСЛОВИЕ МОЛЧАНИЯ РАСШИРЕНО R81 (#273) ТЕМИ ЖЕ ТРЕМЯ ВЕЛИЧИНАМИ.
+        // Не расширив его, раунд получил бы заезд, где игрок набил 40 прыжков
+        // без доказанного пути и МОЛЧА не получил ничего — то есть ровно тот
+        // случай, ради диагностики которого строка и написана. Это же делает
+        // арку `mastery-thin` наблюдаемой с двух сторон (дельта = 0 И строка в
+        // логе), а не только по нулю.
+        if (racer.longestGlideMetres > 0.0f || racer.boostComboMax > 0
+          || racer.raceSpurMagicCount > 0 || racer.raceJumpCount > 0
+          || racer.slidingMillis > 0)
           server::util::QuietLogWarn(
             "Room {}: character {} has no server-proven finish, the per-race "
             "record is not persisted",
@@ -710,14 +719,71 @@ void RaceInstance::Stop()
         racer.longestGlideMetres <= tracker::MaxPlausibleGlideMetres;
       const bool chainPlausible =
         racer.boostComboMax <= tracker::MaxPlausibleBoostChain;
-      if (not glidePlausible || not chainPlausible)
+
+      // === LOA-fix (R81, backlog #273): МАСТЕРСТВО ЛОШАДИ ==================
+      // Панель «Мастерство» читает НАШИ пороги (progression.yaml =
+      // 600/1200/900/8000 совпадают с экраном побайтно), а числитель берёт из
+      // `Horse::Mastery`, которую НЕ ПИСАЛА НИ ОДНА строка сервера. Поэтому
+      // клиент считал мастерство сам, в памяти сессии, и при перезаходе панель
+      // обнулялась (T76: 43/96/15 -> нули; в файле коня `mastery` = нули).
+      //
+      // ★ЗАЧЕМ ЗДЕСЬ, А НЕ ОТДЕЛЬНЫМ БЛОКОМ. Гейт нужен ТОТ ЖЕ, что у Ф2
+      // (`Finished && HasProvenTraversal()` + пол `MinPlausibleCourseTime`),
+      // запись идёт в ТУ ЖЕ лошадь и через ТОТ ЖЕ пояс. Отдельный проход дал бы
+      // вторую просьбу на сохранение той же записи и окно «мастерство записано,
+      // рекорд нет» — третий исход пояса (`AppliedNotPersisted`) независим у
+      // двух блоков. Один `Mutable`, один `TrySave`, один исход.
+      //
+      // ★ОБНОВЛЕНИЕ НАКОПИТЕЛЬНОЕ И НАСЫЩАЮЩЕЕ (`+=` с насыщением, шаблон
+      // `totalDistance` выше), А НЕ `max`: мастерство — СЧЁТЧИК, а не рекорд.
+      // Это ЕДИНСТВЕННОЕ отличие от соседних двух величин блока, и оно
+      // принципиальное: тот же `if (x > horse.…) horse.… = x` стёр бы историю.
+      // ★ПОТОЛКИ ПРАВДОПОДОБИЯ НА ПЕР-ЗАЕЗДНОЕ ПРИРАЩЕНИЕ; неправдоподобное
+      // ОТБРАСЫВАЕТСЯ, а не клампится — та же дисциплина, что у двух величин
+      // выше.
+      // ★У СКОЛЬЖЕНИЯ ПОТОЛОК ДОЛЕВОЙ, ОТ ВРЕМЕНИ ЗАЕЗДА, и это НЕ то же самое,
+      // что пер-отрезковый потолок в `HandleRelay`: десять закрытых отрезков по
+      // 30 с проходят пер-отрезковый и положили бы ~300 единиц в вечное поле со
+      // знаменателем панели 900.
+      // ★ЕДИНИЦЫ: `spurMagicCount`/`jumpCount` — штуки; `slidingTime` —
+      // СЕКУНДЫ (усечение вниз). Знаменатель панели 900: 900 секунд = 15 минут
+      // суммарного заноса за жизнь коня — правдоподобная «полная полоса»; T76
+      // даёт независимое подтверждение порядка (4 заезда -> 15 единиц).
+      // ★`glidingDistance` ЗДЕСЬ НЕ ПИШЕТСЯ. Его единица не доказана ничем (у
+      // проводного поля стоит комментарий «Divided by 10?»), поле вечное. Раунд
+      // его ИЗМЕРЯЕТ (аудит-строка ниже) и оставляет персистенцию следующему
+      // раунду — по данным.
+      // ★САМА АРИФМЕТИКА — В `race::` (MasteryAccrual.hpp), ради юнит-теста
+      // границ и насыщения: величины уезжают в ВЕЧНЫЕ поля, а стенд проверяет
+      // их только теми значениями, до которых доходит арка.
+      const bool spurMagicPlausible =
+        race::IsPlausibleSpurMagicDelta(racer.raceSpurMagicCount);
+      const bool jumpsPlausible = race::IsPlausibleJumpDelta(racer.raceJumpCount);
+      // Доля времени заезда в ТЕХ ЖЕ миллисекундах, что и `slidingMillis`.
+      const uint64_t slideBudgetMillis = race::SlideBudgetMillis(racer.courseTime);
+      const bool slidePlausible =
+        race::IsPlausibleSlideDelta(racer.slidingMillis, racer.courseTime);
+
+      if (not glidePlausible || not chainPlausible
+        || not spurMagicPlausible || not jumpsPlausible || not slidePlausible)
         server::util::QuietLogWarn(
           "Room {}: character {} reported an implausible per-race record "
-          "(glide {} m, boost chain {}); the implausible value is discarded",
+          "(glide {} m, boost chain {}, spur/magic {}, jumps {}, slide {} ms of "
+          "{} ms allowed); the implausible value is discarded",
           this->GetRoomUid(),
           characterUid,
           racer.longestGlideMetres,
-          racer.boostComboMax);
+          racer.boostComboMax,
+          racer.raceSpurMagicCount,
+          racer.raceJumpCount,
+          racer.slidingMillis,
+          slideBudgetMillis);
+
+      const uint32_t spurMagicDelta = spurMagicPlausible ? racer.raceSpurMagicCount : 0u;
+      const uint32_t jumpDelta = jumpsPlausible ? racer.raceJumpCount : 0u;
+      const uint32_t slidingSecondsDelta = slidePlausible
+        ? race::SlidingMillisToSeconds(racer.slidingMillis)
+        : 0u;
 
       const float glideMetres = glidePlausible ? racer.longestGlideMetres : 0.0f;
       // ★ЕДИНИЦЫ ЗДЕСЬ ДРУГИЕ, ЧЕМ У totalDistance, И ЭТО ЛОВУШКА.
@@ -736,7 +802,11 @@ void RaceInstance::Stop()
       const uint32_t boostsInARow = chainPlausible
         ? std::min<uint32_t>(racer.boostComboMax, 65535u)
         : 0u;
-      if (glideTenths == 0 && boostsInARow == 0)
+      // ★РАННИЙ ВЫХОД РАСШИРЕН R81 (#273): «писать нечего» теперь означает
+      // «нечего ПО ВСЕМ ПЯТИ величинам», иначе заезд с одними прыжками молча
+      // не дошёл бы до записи.
+      if (glideTenths == 0 && boostsInARow == 0
+        && spurMagicDelta == 0 && jumpDelta == 0 && slidingSecondsDelta == 0)
         continue;
 
       data::Uid mountUid = data::InvalidUid;
@@ -756,7 +826,8 @@ void RaceInstance::Stop()
         _raceNetworkHandler.GetServerInstance().GetDataDirector().GetHorse(
           mountUid),
         "credit the per-race horse record",
-        [glideTenths, boostsInARow](data::Horse& horse) noexcept
+        [glideTenths, boostsInARow, spurMagicDelta, jumpDelta,
+         slidingSecondsDelta](data::Horse& horse) noexcept
         {
           // ★ОБА ПОЛЯ — ВЕЧНЫЕ РЕКОРДЫ, ПОЭТОМУ ТОЛЬКО МАКСИМУМ И ТОЛЬКО ВВЕРХ.
           // Безусловное присваивание стирало бы чужой рекорд КАЖДЫМ медленным
@@ -766,6 +837,19 @@ void RaceInstance::Stop()
             horse.mountInfo.longestGlideDistance() = glideTenths;
           if (boostsInARow > horse.mountInfo.boostsInARow())
             horse.mountInfo.boostsInARow() = boostsInARow;
+
+          // ★ЭТИ ТРИ — СЧЁТЧИКИ, А НЕ РЕКОРДЫ: НАКОПИТЕЛЬНОЕ НАСЫЩАЮЩЕЕ `+=`
+          // (шаблон `totalDistance`), а не `max`. `max` стёр бы историю коня
+          // каждым более скромным заездом.
+          if (spurMagicDelta > 0)
+            horse.mastery.spurMagicCount() = race::AccumulateSaturating(
+              horse.mastery.spurMagicCount(), spurMagicDelta);
+          if (jumpDelta > 0)
+            horse.mastery.jumpCount() = race::AccumulateSaturating(
+              horse.mastery.jumpCount(), jumpDelta);
+          if (slidingSecondsDelta > 0)
+            horse.mastery.slidingTime() = race::AccumulateSaturating(
+              horse.mastery.slidingTime(), slidingSecondsDelta);
         });
 
       if (outcome == server::util::MutateOutcome::NotApplied)
@@ -957,6 +1041,68 @@ void RaceInstance::Stop()
               .GetCharacterCache(),
             characterUid,
             "a character with a new per-course record");
+      }
+    }
+  }
+
+  // === LOA-fix (R81, backlog #274): ПЛАШКА «ЛИЧНЫЙ РЕКОРД» В ТАБЛО ==========
+  //
+  // ЧТО БЫЛО. Сервер не заполнял `ScoreInfo::raceRecord` НИКОГДА (grep по `src/`
+  // давал только сериализацию), поэтому поле уезжало клиенту нулевым, и клиент
+  // рисовал в плашку «Личный рекорд» СВОЁ текущее время. Тестер видел это трижды
+  // из трёх: `2:30.81 (2:30.81)` в плашке против `02:29.03` во вкладке «Трассы».
+  //
+  // ★ЗАПОЛНЯЕМ ТОЛЬКО `finalRecordMs`. `mapBlockId`/`gameMode`/`teamMode`
+  // остаются дефолтными НАМЕРЕННО: `RaceRecord::Write` дописывает шесть полей
+  // `trainingRecord` (5×`uint16_t` + `uint8_t` = 11 БАЙТ) ТОЛЬКО при
+  // `teamMode == TeamMode::Single` (RaceMessageDefinitions.cpp, ветка после
+  // списка `lapRecords`), а дефолт члена — 0, то есть ни один из трёх режимов.
+  // Проставить `teamMode` «для полноты» значит УДЛИНИТЬ пакет на 11 байт и
+  // сдвинуть разбор `ScoreInfo` у КАЖДОГО клиента комнаты. Арифметику этих
+  // 11 байт пинует юнит-тест `ProtocolTestRaceRecordLength`.
+  //
+  // ★ЧИТАЕМ ПОСЛЕ ОБНОВЛЕНИЯ РЕКОРДОВ, И ЭТО ОСОЗНАННО: проехал хуже -> плашка
+  // покажет СТАРОЕ лучшее время (ровно то, чего ждёт игрок); проехал лучше ->
+  // покажет это время, и оно и есть новый рекорд. Обе стороны верны.
+  //
+  // ★ЧТЕНИЕ ЧЕРЕЗ ПОЯС, А НЕ ПРЯМЫМ `Immutable`: прямой доступ к непрогруженной
+  // записи бросил бы, и вся комната осталась бы без результата заезда.
+  //
+  // ★МЕСТО. Все `TryMutate` блока рекордов выше закрыты, `scores` отсортированы,
+  // ни один лок не вложен — тот же прецедент, что описывает блок мести
+  // («последняя точка перед отправкой пакета»). Разница одна и она в пользу
+  // этого места: значение берётся из `courseRecords`, которые обновляет блок
+  // НЕПОСРЕДСТВЕННО ВЫШЕ.
+  //
+  // ★`raceResult.scores` здесь ещё НЕ скопирован в `broadcastResult` (копия для
+  // ботов делается ниже), поэтому правка попадает и в живых игроков, и в копию.
+  // ★Запись рекорда в блоке выше идёт по `_tracker.GetRacers()`, а эта — по
+  // `scores`; расхождение штатно.
+  // ★`recordMs == 0` («рекорда ещё нет») пишется как ноль — то же значение, что
+  // сегодня, то есть ПЕРВЫЙ В ЖИЗНИ заезд по трассе поведения не меняет.
+  {
+    const uint64_t rawCourseId = static_cast<uint64_t>(_mapBlockId);
+    if (rawCourseId != 0 && rawCourseId <= std::numeric_limits<uint16_t>::max())
+    {
+      const auto courseId = static_cast<uint16_t>(rawCourseId);
+      for (auto& score : raceResult.scores)
+      {
+        if (score.uid == data::InvalidUid)
+          continue; // ботов в raceResult нет (R56), но контракт явный
+        uint32_t recordMs = 0;
+        (void)server::util::TryImmutable(
+          _raceNetworkHandler.GetServerInstance().GetDataDirector().GetCharacter(
+            score.uid),
+          "read the per-course record for the result board",
+          [courseId, &recordMs](const data::Character& character) noexcept
+          {
+            const auto& records = character.courseRecords();
+            const auto found = std::ranges::find(
+              records, courseId, &data::Character::CourseRecord::courseId);
+            if (found != records.end())
+              recordMs = found->recordTime;
+          });
+        score.raceRecord.finalRecordMs = recordMs;
       }
     }
   }
@@ -1826,7 +1972,7 @@ void RaceInstance::LogRaceAudit()
       "outcome {} proven {} time {} "
       "splits {}/{} [{}] samples {} trusted {:.4f} declared {:.4f} "
       "clipped {} jumps {} discarded {:.1f}m maxJump {:.1f}m "
-      "distance {:.1f}m topSpeed {:.2f}",
+      "distance {:.1f}m topSpeed {:.2f} glide {:.1f}m slide {} ms",
       this->GetRoomUid(),
       static_cast<uint32_t>(GetMapBlockId()),
       static_cast<uint32_t>(GetGameModeId()),
@@ -1847,7 +1993,14 @@ void RaceInstance::LogRaceAudit()
       racer.discardedMetres,
       racer.maxDiscardedStepMetres,
       racer.distanceMetres,
-      racer.topSpeedKph);
+      racer.topSpeedKph,
+      // LOA-fix (R81, #273): ИЗМЕРЕНИЕ планирования и скольжения. `glide`
+      // дополнительно клампится на ПЕЧАТИ: пер-отрезковый фильтр стоит на
+      // накоплении, но сумма отрезков всё равно не должна печататься
+      // произвольным числом — калибровать единицу `glidingDistance` следующему
+      // раунду придётся именно по этим строкам.
+      std::min(racer.raceGlideMetres, 1.0e6),
+      racer.slidingMillis);
 
     // --- WARN 1: «жидкий заезд» --------------------------------------------
     // ТОЛЬКО ДЛЯ ДОЕХАВШИХ. Честный DNF на 30 % трассы имеет 3 сплита — это не

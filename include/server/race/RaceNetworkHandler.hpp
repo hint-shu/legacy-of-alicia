@@ -537,6 +537,15 @@ private:
   //! (подмена гонщика в двух хендлерах, неизвестный тип подобранного предмета).
   util::LogThrottle _racerImpersonationThrottle{std::chrono::seconds(5)};
   util::LogThrottle _pickupItemTypeThrottle{std::chrono::seconds(5)};
+  //! LOA-fix (R81, backlog #270): две ЖАЛОБЫ, ЗАКАЗЫВАЕМЫЕ КЛИЕНТСКИМ ПАКЕТОМ,
+  //! и потому обязательно задросселенные. Дроссели РАЗНЫЕ по классу события:
+  //! «простили» — info о честной игре с расхождением счётчиков, «отказали» —
+  //! warn о невозможной величине. Общий дроссель гасил бы одну строку из-за
+  //! другой (тот же довод — R71-25).
+  //! ★ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (#266): дроссели — поля обработчика, то есть общие
+  //! на все комнаты процесса. Раунд его НЕ чинит и называет вслух.
+  util::LogThrottle _spurShortfallThrottle{std::chrono::seconds(5)};
+  util::LogThrottle _spurRefusalThrottle{std::chrono::seconds(5)};
 };
 
 } // namespace server

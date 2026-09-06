@@ -1814,13 +1814,25 @@ void RanchDirector::QueueAchievementNotifies(
   if (notifies.empty())
     return;
 
+  // === LOA-fix (R81, backlog #261): ДВА СЧЁТЧИКА ВЫТЕСНЕНИЯ, А НЕ ОДИН =====
+  // `Push` теперь возвращает ДВА числа. Приплюсовать «вытеснен чужой персонаж»
+  // к «выброшено потолком этого персонажа» значило бы сделать строку R70 ниже
+  // ложной по ОБОИМ числам: она называет ИМЕННО ЭТОГО персонажа и ИМЕННО
+  // `CharacterCap`, а вытеснение — событие другого потолка с другим виновником.
   std::size_t droppedByCap = 0;
+  std::size_t evictedCharacters = 0;
+  std::size_t heldCharacterCount = 0; // снимок ПОД тем же локом, чтобы строка не врала
   try
   {
     const auto now = AchievementNotifyHold::Clock::now();
     std::lock_guard lock(_pendingAchievementNotifiesMutex);
     for (const auto& notify : notifies)
-      droppedByCap += _pendingAchievementNotifies.Push(characterUid, notify, now);
+    {
+      const auto pushed = _pendingAchievementNotifies.Push(characterUid, notify, now);
+      droppedByCap += pushed.droppedByCharacterCap;
+      evictedCharacters += pushed.evictedCharacters;
+    }
+    heldCharacterCount = _pendingAchievementNotifies.CharacterCount();
   }
   catch (...)
   {
@@ -1832,21 +1844,44 @@ void RanchDirector::QueueAchievementNotifies(
   // ★ЖАЛОБА — ВНЕ ЛОКА. Под листовым мьютексом не должно быть ни одного вызова
   // наружу, а spdlog — это вызов наружу (форматирование, приёмники, свои
   // замки). Дисциплина раундов 21/34/72.
-  if (droppedByCap == 0)
-    return;
-
-  uint64_t suppressed = 0;
-  uint64_t total = 0;
-  if (_achievementHoldOverflowThrottle.Allow(suppressed, total))
+  if (droppedByCap > 0)
   {
-    server::util::QuietLogWarn(
-      "Held race achievement popups overflowed for character {}: {} dropped "
-      "(cap {} per character); suppressed {} similar, {} total",
-      characterUid,
-      droppedByCap,
-      AchievementNotifyHold::CharacterCap,
-      suppressed,
-      total);
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_achievementHoldOverflowThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Held race achievement popups overflowed for character {}: {} dropped "
+        "(cap {} per character); suppressed {} similar, {} total",
+        characterUid,
+        droppedByCap,
+        AchievementNotifyHold::CharacterCap,
+        suppressed,
+        total);
+    }
+  }
+
+  // ★ВТОРАЯ СТРОКА ПОД ВТОРЫМ ДРОССЕЛЕМ (R81, #261). Она существует ради ПРОДА,
+  // а не ради стенда: положить 300 придержанных очередей стендом нечем (`Push`
+  // достижим только из `RaceInstance::Stop()`), и без этой строки прод был бы
+  // СЛЕП к тому, что кому-то выбросили весь набор значков целиком.
+  if (evictedCharacters > 0)
+  {
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_achievementHoldCharacterEvictionThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Held race achievement popups evicted {} whole character queue(s) to "
+        "make room for character {} (cap {} characters, {} characters held "
+        "now); suppressed {} similar, {} total",
+        evictedCharacters,
+        characterUid,
+        AchievementNotifyHold::CharacterCountCap,
+        heldCharacterCount,
+        suppressed,
+        total);
+    }
   }
 }
 
@@ -1933,7 +1968,7 @@ void RanchDirector::DrainPendingAchievementNotifies()
       // ★ЗАБИРАЕМ ТОЛЬКО ТОГДА, КОГДА ЕСТЬ КОМУ ОТДАТЬ. Снять записи раньше
       // поиска — значит потерять их у персонажа, который отключился между
       // снимком списка и поиском.
-      std::vector<protocol::AcCmdRCAchievementUpdateNotify> notifies;
+      std::vector<AchievementNotifyHold::Entry> notifies;
       {
         std::lock_guard lock(_pendingAchievementNotifiesMutex);
         notifies = _pendingAchievementNotifies.Take(characterUid);
@@ -1941,8 +1976,47 @@ void RanchDirector::DrainPendingAchievementNotifies()
       if (notifies.empty())
         continue;
 
-      for (const auto& notify : notifies)
+      // === LOA-fix (R81, backlog #261): БАЛАНС МОРКОВОК ОСВЕЖАЕТСЯ НА ДОСТАВКЕ
+      // `carrotBalance` — НЕ справка, а КОМАНДА: собственный комментарий
+      // структуры (RaceMessageDefinitions.hpp, объявление
+      // `AcCmdRCAchievementUpdateNotify`) говорит «set carrots to 555555», то
+      // есть попап ПЕРЕПИСЫВАЕТ клиенту показанный баланс. При сроке 15 минут
+      // ложь была узкой; при суточном сроке попап откатил бы игроку счётчик
+      // морковок на экране на сутки назад.
+      // ★ЧТЕНИЕ ЧЕРЕЗ ПОЯС и ОДНО НА ВСЮ ПАЧКУ.
+      // ★ОТКАЗ ЧТЕНИЯ = НЕ ОТПРАВЛЯЕМ ВООБЩЕ, а пачку ВОЗВРАЩАЕМ в удержание
+      // С ИСХОДНЫМ `queuedAt`: `Take` выше уже стёр очередь, и простой
+      // `continue` потерял бы попапы, а возврат «текущим временем» продлевал бы
+      // срок бесконечно. Следствия возврата названы в контракте потоков класса.
+      int32_t currentCarrots = 0;
+      if (not server::util::TryImmutable(
+            _serverInstance.GetDataDirector().GetCharacter(characterUid),
+            "read the carrot balance for a held achievement popup",
+            [&currentCarrots](const data::Character& character) noexcept
+            {
+              currentCarrots = character.carrots();
+            }))
       {
+        try
+        {
+          std::lock_guard lock(_pendingAchievementNotifiesMutex);
+          for (const auto& entry : notifies)
+            (void)_pendingAchievementNotifies.Push(
+              characterUid, entry.notify, entry.queuedAt);
+        }
+        catch (...)
+        {
+          // Возврат не принят (bad_alloc) — теряется только попап.
+        }
+        continue;
+      }
+
+      for (auto& entry : notifies)
+        entry.notify.carrotBalance = currentCarrots;
+
+      for (const auto& entry : notifies)
+      {
+        const auto notify = entry.notify;
         _commandServer.QueueCommand<protocol::AcCmdRCAchievementUpdateNotify>(
           clientId, [notify]() { return notify; });
       }

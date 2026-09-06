@@ -19,7 +19,9 @@
 
 #include "server/race/MagicApplication.hpp"
 #include "server/race/MagicSystem.hpp"
+#include "server/race/SpurTolerance.hpp"
 #include "libserver/util/QuietLog.hpp"
+#include "libserver/util/RecordAccess.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
 
 #include "libserver/util/Cleanup.hpp"
@@ -2423,6 +2425,17 @@ void RaceNetworkHandler::HandleStartRace(
         racer.maxDiscardedStepMetres = 0.0f;
         racer.progressClipped = 0;
         racer.maxDeclaredProgress = 0.0f;
+        // LOA-fix (R81, #270/#273): пер-заездные счётчики рывков и мастерства —
+        // в ТОТ ЖЕ список, по той же причине. Инвариант раунда: НОВОЕ ПОЛЕ
+        // БЛОКА ОБЯЗАНО ПОЯВИТЬСЯ ЗДЕСЬ, и это стережёт check_track_journal.py.
+        racer.paidSpurCount = 0;
+        racer.toleratedSpurShortfalls = 0;
+        racer.raceSpurMagicCount = 0;
+        racer.raceJumpCount = 0;
+        racer.slidingMillis = 0;
+        racer.isSliding = false;
+        racer.slidingSince = std::chrono::steady_clock::time_point::max();
+        racer.raceGlideMetres = 0.0;
         switch (roomPlayer.GetTeam())
         {
           case Room::Player::Team::Solo:
@@ -2580,6 +2593,45 @@ void RaceNetworkHandler::HandleStartRace(
 
             auto& racer = raceInstance.GetTracker().GetRacer(characterUid);
             notify.hostOid = racer.oid;
+            // === LOA-fix (R81, backlog #274, площадка B): «РЕКОРД, КОТОРЫЙ
+            // НАДО ПОБИТЬ» В СТАРТОВОМ КАДРЕ ============================
+            // Комментарий самого поля (RaceMessageDefinitions.hpp, объявление
+            // `RaceRecord`) говорит про стартовый кадр «indicates the lap
+            // sector times TO BEAT». Здесь рекорд читается ДО заезда, то есть
+            // это честно «что бить».
+            // ★ТЕ ЖЕ ДВА ПРАВИЛА, ЧТО У ПЛОЩАДКИ A: только `finalRecordMs` и
+            // только через пояс. `teamMode` НЕ трогаем — он и есть длина кадра
+            // (ветка `trainingRecord`, +11 байт).
+            // ★ЗАЧЕМ ОБЕ ПЛОЩАДКИ. Какой из двух кадров кормит плашку — не
+            // измерено ничем, и различающий замер стоит окна живого тестера.
+            // Обе правки безопасны одинаково (длина пакета не меняется), обе
+            // берут значение из одного источника — `Character::courseRecords`.
+            // ★ЦЕНА, НАЗВАННАЯ ВСЛУХ: на заезде, ставшем НОВЫМ рекордом, две
+            // площадки дают разные числа (A — новое время, B — старый рекорд).
+            // Это ИЗМЕРЕНИЕ, а не расхождение: стенд снимает оба предиката.
+            notify.raceRecord.finalRecordMs = 0;
+            {
+              const uint64_t rawCourseId =
+                static_cast<uint64_t>(raceInstance.GetMapBlockId());
+              if (rawCourseId != 0
+                && rawCourseId <= std::numeric_limits<uint16_t>::max())
+              {
+                const auto courseId = static_cast<uint16_t>(rawCourseId);
+                uint32_t recordMs = 0;
+                (void)server::util::TryImmutable(
+                  GetServerInstance().GetDataDirector().GetCharacter(characterUid),
+                  "read the per-course record to beat",
+                  [courseId, &recordMs](const data::Character& character) noexcept
+                  {
+                    const auto& records = character.courseRecords();
+                    const auto found = std::ranges::find(
+                      records, courseId, &data::Character::CourseRecord::courseId);
+                    if (found != records.end())
+                      recordMs = found->recordTime;
+                  });
+                notify.raceRecord.finalRecordMs = recordMs;
+              }
+            }
 
             // Skills only apply for speed single or magic single
             if (isEligibleForSkills)
@@ -3858,10 +3910,89 @@ bool RaceNetworkHandler::HandleRequestSpur(
   const auto& gameModeTemplate = GetServerInstance().GetCourseRegistry().GetCourseGameModeInfo(
     static_cast<uint8_t>(parameters.gameMode));
 
-  if (racer.starPointValue < gameModeTemplate.spurConsumeStarPoints)
-    throw std::runtime_error("Client is dead ass cheating (or is really desynced)");
+  // === LOA-fix (R81, backlog #270): ТОЛЕРАНТНЫЙ РЫВОК ВМЕСТО БРОСКА ========
+  //
+  // ЧТО БЫЛО. `throw std::runtime_error("Client is dead ass cheating …")` —
+  // апстримная строка. Она вылетала в диспетчер, где R71-31 печатал одну
+  // (задросселенную) строку [error], и заодно уносила ВЕСЬ хвост: списание,
+  // цепочку R75, квест 11036, оба ответа и `HandleTeamGauge` (контракт bool
+  // R57-3c). То есть честный игрок ТЕРЯЛ рывок. Наблюдалось дважды за два дня,
+  // на двух персонажах, всегда у финиша, всегда на заезде, который сервер сам
+  // признал доказанным (`outcome finished proven 1`).
+  //
+  // ПОЧЕМУ СЧЁТЧИКИ РАСХОДЯТСЯ — НЕ ЗНАЕМ, И ЭТО ЗАПИСАНО ЧЕСТНО. Серверная
+  // шкала не является авторитетной копией клиентской: главный её источник
+  // (`HandleStarPointGet`) начисляет ОБЪЯВЛЕННОЕ КЛИЕНТОМ значение. Это
+  // принятый остаток #241, и раунд его НЕ чинит — он ставит ИЗМЕРЕНИЕ.
+  //
+  // ★`now` СЧИТАЕТСЯ ЗДЕСЬ ЯВНО. Тот `now`, что есть ниже, объявлен ВНУТРИ
+  // фигурных скобок блока цепочки R75 и сюда не виден. Один
+  // `steady_clock::now()` на всю правку — и его же берут оба счётчика ниже.
+  //
+  // ТРИ УРОВНЯ ВМЕСТО ОДНОГО БРОСКА:
+  //   1) хватает очков                      -> как раньше;
+  //   2) не хватает, но рывок правдоподобен -> шкала в 0, рывок ЗАСЧИТАН;
+  //   3) иначе                              -> return false, ничего не меняем.
+  // Само правило правдоподобия вынесено в `race::SpurShortfallDecision`
+  // (SpurTolerance.hpp) — ради юнит-теста обеих границ.
+  const auto spurNow = std::chrono::steady_clock::now();
+  const bool spurUnderway = IsRaceUnderway(raceInstance, racer, spurNow);
+  const uint32_t spurCost = gameModeTemplate.spurConsumeStarPoints;
+  if (racer.starPointValue < spurCost)
+  {
+    const uint32_t shortfall = spurCost - racer.starPointValue;
+    const bool plausible = race::SpurShortfallDecision(
+      spurUnderway, racer.paidSpurCount, racer.toleratedSpurShortfalls);
 
-  racer.starPointValue -= gameModeTemplate.spurConsumeStarPoints;
+    if (not plausible)
+    {
+      uint64_t suppressed = 0, total = 0;
+      if (_spurRefusalThrottle.Allow(suppressed, total))
+        server::util::QuietLogWarn(
+          "Spur refused for character {}: gauge {} < cost {} (short {}), "
+          "spur {} of {} this race, {} of {} shortfalls forgiven, underway {} "
+          "(suppressed {}, total {})",
+          clientContext.characterUid, racer.starPointValue, spurCost, shortfall,
+          racer.paidSpurCount, tracker::MaxPlausibleSpursPerRace,
+          racer.toleratedSpurShortfalls, tracker::SpurShortfallGrace,
+          spurUnderway ? 1 : 0, suppressed, total);
+      // ★return false, А НЕ throw: хвост лямбды (`HandleTeamGauge`) не зовём,
+      // ответов не шлём, состояние гонщика не трогаем.
+      return false;
+    }
+
+    racer.toleratedSpurShortfalls += 1;
+    // ★ПРИРАВНИВАЕМ К ЦЕНЕ, А НЕ ПИШЕМ `= 0` В ВЕТКЕ. Одна точка списания
+    // вместо двух: два места, каждое из которых «обнуляет шкалу», разъедутся на
+    // первой же будущей правке цены рывка. Итог тождественный (0).
+    racer.starPointValue = spurCost;
+    uint64_t suppressed = 0, total = 0;
+    if (_spurShortfallThrottle.Allow(suppressed, total))
+      server::util::QuietLogInfo(
+        "Spur gauge shortfall forgiven for character {}: short {} of cost {}, "
+        "spur {} this race, forgiveness {} of {} (suppressed {}, total {})",
+        clientContext.characterUid, shortfall, spurCost,
+        racer.paidSpurCount + 1,
+        racer.toleratedSpurShortfalls, tracker::SpurShortfallGrace,
+        suppressed, total);
+  }
+
+  racer.starPointValue -= spurCost;
+
+  // ★ОБА ПЕР-ЗАЕЗДНЫХ СЧЁТЧИКА ГЕЙТЯТСЯ ЯВНО. `paidSpurCount` кормит
+  // АНТИЧИТОВЫЙ БЮДЖЕТ, `raceSpurMagicCount` — ВЕЧНОЕ поле лошади. Ни то, ни
+  // другое не должно расти от рывков в обратном отсчёте и после финиша: шкалу
+  // туда клиент способен насыпать сам (`HandleStarPointGet`), то есть без гейта
+  // он получил бы и «бесплатное» расширение бюджета, и внезаездные единицы
+  // мастерства. Условие — то же самое `IsRaceUnderway`, что и у цепочки R75
+  // ниже: одно определение «заезд идёт» на весь раунд.
+  if (spurUnderway)
+  {
+    if (racer.paidSpurCount < std::numeric_limits<uint32_t>::max())
+      racer.paidSpurCount += 1;
+    if (racer.raceSpurMagicCount < std::numeric_limits<uint32_t>::max())
+      racer.raceSpurMagicCount += 1; // #273
+  }
 
   // === LOA-fix (R75, #14 Ф2): ЦЕПОЧКА ПЛАТНЫХ РЫВКОВ =======================
   // Стоим ПОСЛЕ списания звёздных очков и ПОСЛЕ AI-гарда R57 — значит считаем
@@ -4069,6 +4200,19 @@ void RaceNetworkHandler::HandleHurdleClearResult(
   {
     case protocol::AcCmdCRHurdleClearResult::HurdleClearType::Perfect:
     {
+      // === LOA-fix (R81, backlog #273): УДАЧНЫЙ ПРЫЖОК (Perfect) ==========
+      // Первый из двух сигналов `Horse::Mastery::jumpCount`.
+      // ★`now` И `IsRaceUnderway` ПИШУТСЯ ЯВНО: у ветки `Perfect` своего `now`
+      // нет вовсе, а гейт нужен тот же самый — прыжки в обратном отсчёте и
+      // после финиша в ВЕЧНОЕ поле уезжать не должны.
+      // ★СТОИМ НИЖЕ ГАРДА R57 (подмена гонщика отбита выше по функции).
+      {
+        const auto now = std::chrono::steady_clock::now();
+        if (IsRaceUnderway(raceInstance, racer, now)
+          && racer.raceJumpCount < std::numeric_limits<uint32_t>::max())
+          racer.raceJumpCount += 1;
+      }
+
       // Perfect jump over the hurdle.
       racer.jumpComboValue = std::min(
         static_cast<uint32_t>(99),
@@ -4150,6 +4294,23 @@ void RaceNetworkHandler::HandleHurdleClearResult(
       // ТЕПЕРЬ отметка ЛИБО израсходована здесь (гасим её), ЛИБО остаётся
       // ждать взлёта; взлёт, воспользовавшись ею, гасит её сам. Ждать нового
       // отрезка может только НЕизрасходованная отметка.
+      // === LOA-fix (R81, backlog #273): УДАЧНЫЙ ПРЫЖОК (Good) ============
+      // Второй сигнал `jumpCount`. ★ТОЛЬКО `Good`: этот `case` ДЕЛИТСЯ с
+      // `DoubleJumpOrGlide`, поэтому тип различается ЯВНО — планирование
+      // прыжком не считается. `Collision` не считается тем более (у него свой
+      // `case` ниже, и он в счётчик не заходит).
+      // ★СВОЙ `now` И СВОЙ `IsRaceUnderway`: тот `now`, что объявлен ниже,
+      // живёт ВНУТРИ `if (hurdleClearType == DoubleJumpOrGlide)`, куда `Good`
+      // не заходит.
+      if (command.hurdleClearType
+            == protocol::AcCmdCRHurdleClearResult::HurdleClearType::Good)
+      {
+        const auto now = std::chrono::steady_clock::now();
+        if (IsRaceUnderway(raceInstance, racer, now)
+          && racer.raceJumpCount < std::numeric_limits<uint32_t>::max())
+          racer.raceJumpCount += 1;
+      }
+
       if (command.hurdleClearType
             == protocol::AcCmdCRHurdleClearResult::HurdleClearType::DoubleJumpOrGlide)
       {
@@ -4168,6 +4329,16 @@ void RaceNetworkHandler::HandleHurdleClearResult(
           {
             racer.longestGlideMetres =
               std::max(racer.longestGlideMetres, racer.lastStretchMetres);
+            // LOA-fix (R81, #273): ИЗМЕРЕНИЕ планирования за заезд (в лошадь НЕ
+            // пишется). ★СТРОГО ПЕРЕД обнулением строкой ниже: «после» дало бы
+            // тихий ноль, и ошибка не была бы видна ничем.
+            // ★ПЕР-ОТРЕЗКОВЫЙ ПОТОЛОК ОБЯЗАТЕЛЕН: клиент, держащий member5 = 1,
+            // напечатал бы в аудит-строку произвольное число, и следующий
+            // раунд, калибрующий единицу `glidingDistance` по этим числам,
+            // откалибровался бы ПО МУСОРУ. Считаются только отрезки, прошедшие
+            // тот же `MaxPlausibleGlideMetres`, которым R75 судит рекорд.
+            if (racer.lastStretchMetres <= tracker::MaxPlausibleGlideMetres)
+              racer.raceGlideMetres += racer.lastStretchMetres;
             // Один отрезок не может быть засчитан дважды.
             racer.lastStretchMetres = 0.0f;
             // Израсходована: засчитала ПРЕДЫДУЩИЙ отрезок.
@@ -4447,8 +4618,16 @@ void RaceNetworkHandler::HandleRaceUserPos(
         // заезда; непомеченный — запоминаем на случай, если 0xe7 придёт
         // следующим пакетом (случай «отметка уже на земле»).
         if (racer.currentStretchIsGlide)
+        {
           racer.longestGlideMetres =
             std::max(racer.longestGlideMetres, racer.currentAirborneMetres);
+          // LOA-fix (R81, #273): то же ИЗМЕРЕНИЕ, тот же пер-отрезковый потолок.
+          // ★НИ ОДНОЙ НОВОЙ СТРОКИ ЛОГА В `HandleRaceUserPos` — инвариант
+          // R75/R76, его стерегут `r75_userpos_logging_gate.sh` и
+          // `check_track_journal.py` (I4).
+          if (racer.currentAirborneMetres <= tracker::MaxPlausibleGlideMetres)
+            racer.raceGlideMetres += racer.currentAirborneMetres;
+        }
         racer.lastStretchMetres = racer.currentAirborneMetres;
         racer.lastLandingTimePoint = now;
         racer.currentAirborneMetres = 0.0f;
@@ -4893,8 +5072,15 @@ void RaceNetworkHandler::HandleRelay(
 
   // LOA-fix (R71-6a, backlog #31 пререквизит): РЕТРАНСЛЯЦИЯ НЕСЁТ ТОЛЬКО СВОЙ oid.
   //
-  // Конверт `AcCmdCRRelayNotify` уходит всем в комнате с `fromOid` ИЗ ПАКЕТА (:4405,
-  // :4637; запись — RaceMessageDefinitions.cpp:1375-1388).
+  // Конверт `AcCmdCRRelayNotify` уходит всем в комнате с `fromOid` ИЗ ПАКЕТА
+  // (сборка — ЕДИНСТВЕННАЯ, в начале этого же обработчика; запись —
+  // `AcCmdCRRelayNotify::Write` в RaceMessageDefinitions.cpp).
+  // ★ССЫЛКИ СНЯТЫ СО СТРОК И ПЕРЕВЕДЕНЫ НА ИМЕНА (LOA-fix R81, backlog #262).
+  // Прежняя редакция называла «:4405, :4637» и «RaceMessageDefinitions.cpp:
+  // 1375-1388». К R81 ни одно из четырёх чисел не указывало на своё место:
+  // сборок конверта осталась ОДНА, а писатель уехал вместе с переписью
+  // сериализаторов R74. Номер строки в комментарии — это утверждение, которое
+  // никто не проверяет; имя функции проверяется грепом.
   //
   // ★ЭТОГО ОДНОГО ГАРДА МАЛО, И ЭТО ГЛАВНАЯ ПОПРАВКА РЕДАКЦИИ 2 СПЕКИ. Настоящее
   // авторство лежит ВНУТРИ нагрузки (см. R71-6b) — конверт закрывается здесь только
@@ -4988,6 +5174,57 @@ void RaceNetworkHandler::HandleRelay(
         relayClaim.referencedId,
         suppressed);
     return;
+  }
+
+  // === LOA-fix (R81, backlog #273): УЧЁТ СКОЛЬЖЕНИЯ ========================
+  // ★МЕСТО ВЫБРАНО ПРОТИВ ОЧЕВИДНОГО. Приёмник `SlidingMotion` стоит в первом
+  // `switch (command.payloadType)` — ДО `std::scoped_lock`, ДО разрешения
+  // `senderRacer` и ДО ОБОИХ гардов R71. Считать там значило бы считать
+  // НЕАВТОРИЗОВАННЫЕ кадры и трогать трекер без мьютекса. Здесь оба гарда уже
+  // отработали: `racerOid` внутри нагрузки ДОКАЗАННО принадлежит отправителю.
+  // ★СВОЯ МУТАБЕЛЬНАЯ ССЫЛКА, А НЕ ПРАВКА СТРОКИ R71-6a. `senderRacer` объявлен
+  // `const auto&`; переписывать чужую строку ради одного поля значило бы
+  // тронуть комментарий R71-6a.
+  // ★ЗАКРЫТЫЙ ОТРЕЗОК ИЛИ НИЧЕГО. Ровно то же правило, что у планирования R75:
+  // «вечно скользящий» не должен конвертироваться в вечное время.
+  // ★ПОТОЛОК ОДНОГО ОТРЕЗКА. Скольжение дольше `MaxPlausibleSlideDuration` —
+  // это не занос, это удержание флага; ОТБРАСЫВАЕМ отрезок, а не клампим.
+  // ★ПЕР-ЗАЕЗДНАЯ СУММА ИМЕЕТ СВОЙ, ОТДЕЛЬНЫЙ ПОТОЛОК — он применяется НЕ здесь,
+  // а на записи в лошадь: десять закрытых отрезков по 30 с проходят
+  // пер-отрезковый потолок и дали бы 300 «единиц» в ВЕЧНОЕ поле.
+  if (command.payloadType == protocol::relay::RelayCommandId::SlidingMotion)
+  {
+    auto& slidingRacer = raceInstance.GetTracker().GetRacer(
+      clientContext.characterUid);
+    const auto now = std::chrono::steady_clock::now();
+    if (not IsRaceUnderway(raceInstance, slidingRacer, now))
+    {
+      slidingRacer.isSliding = false;
+      slidingRacer.slidingSince = std::chrono::steady_clock::time_point::max();
+    }
+    else if (command.slidingMotion.isSliding)
+    {
+      if (not slidingRacer.isSliding) // повторное «начал» отрезок не переоткрывает
+      {
+        slidingRacer.isSliding = true;
+        slidingRacer.slidingSince = now;
+      }
+    }
+    else if (slidingRacer.isSliding)
+    {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - slidingRacer.slidingSince);
+      if (elapsed.count() > 0 && elapsed <= tracker::MaxPlausibleSlideDuration)
+      {
+        const uint64_t sum = static_cast<uint64_t>(slidingRacer.slidingMillis)
+          + static_cast<uint64_t>(elapsed.count());
+        slidingRacer.slidingMillis = sum > 0xFFFFFFFFull
+          ? 0xFFFFFFFFu
+          : static_cast<uint32_t>(sum);
+      }
+      slidingRacer.isSliding = false;
+      slidingRacer.slidingSince = std::chrono::steady_clock::time_point::max();
+    }
   }
 
   // Relay the command to all other clients in the room
@@ -5124,6 +5361,24 @@ void RaceNetworkHandler::HandleRequestMagicItem(
     clientContext.characterUid);
   racer.magicItem.emplace(magicItemSlotInfo.type);
   racer.starPointValue = 0;
+
+  // === LOA-fix (R81, backlog #273): «РЫВОК ИЛИ ВЫДАННЫЙ МАГИЧЕСКИЙ ПРЕДМЕТ» =
+  // Второй из двух сигналов `Horse::Mastery::spurMagicCount`; первый — платный
+  // рывок в `HandleRequestSpur`. ★ПРАВИЛО ТОТАЛЬНОЕ И ПРОСТОЕ: «рывок ИЛИ
+  // выданный предмет, в любом режиме». Имя поля («spur **magic** count»)
+  // допускает и разделение по режимам, но разделение — это перечень мест,
+  // который разъедется; тотальное правило проверяемо живым замером: в
+  // СКОРОСТНОМ заезде магических предметов не выдают вовсе, значит прирост
+  // панели там обязан совпасть с числом рывков.
+  // ★`now` И `IsRaceUnderway` СЧИТАЮТСЯ ЗДЕСЬ ЯВНО: в этой функции их нет.
+  // ★СТОИМ НИЖЕ ГАРДА R57 и ниже гейта полной шкалы — считаем только предмет,
+  // который РЕАЛЬНО выдан отправителю.
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (IsRaceUnderway(raceInstance, racer, now)
+      && racer.raceSpurMagicCount < std::numeric_limits<uint32_t>::max())
+      racer.raceSpurMagicCount += 1;
+  }
 
   protocol::AcCmdCRStarPointGetOK starPointResponse{
     .characterOid = command.characterOid,

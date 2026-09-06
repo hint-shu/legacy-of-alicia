@@ -96,14 +96,25 @@ server:
       # The port the server listens on.
       # Additionally configurable through environment variable RANCH_SERVER_PORT.
       port: 10031
-    # LOA (R70-fix-7): how long a race-earned achievement popup is held for a
-    # character who is not on the ranch right now. The real client closes its
-    # ranch connection for the duration of a race, so the popup earned at the
-    # finish line has nowhere to go until the player is back on the ranch.
+    # LOA (R70-fix-7; number raised by R81, backlog #261): how long a
+    # race-earned achievement popup is held for a character who is not on the
+    # ranch right now. The real client closes its ranch connection for the
+    # duration of a race, so the popup earned at the finish line has nowhere to
+    # go until the player is back on the ranch.
     # Progress itself is persisted regardless and shows up in the 0xe6 list.
+    #
+    # R81: 900 s threw the badge away from anyone who did not come back within
+    # a quarter of an hour (measured on production 2026-09-04: five popups
+    # expired, the deadline matched to the second). A day means "came back the
+    # next evening". The upper bound on memory is now set by the CHARACTER
+    # COUNT CAP (AchievementNotifyHold::CharacterCountCap), not by the deadline.
+    # The queue does NOT survive a server restart - a deliberate boundary.
+    # The C++ default of the director field (RanchDirector.hpp) is deliberately
+    # left at 900: it is a canary for "SetTtl was never called", not a copy of
+    # this line.
     # Additionally configurable through environment variable
     # RANCH_ACHIEVEMENT_NOTIFY_HOLD_SECONDS.
-    achievement_notify_hold_seconds: 900
+    achievement_notify_hold_seconds: 86400
   # Configuration section of the race server.
   race:
     # Whether the race server is enabled.
