@@ -172,6 +172,58 @@ void Config::LoadFromEnvironment()
     std::format("UDP_RACE_RELAY_SERVER_PORT"),
     udpRaceRelay.listen.address,
     udpRaceRelay.listen.port);
+
+  // LOA (R80-2, round80, backlog #235): ПОРОГИ ЖАТВЫ ЧАТ-СОКЕТОВ.
+  //
+  // ★ТОЛЬКО СРЕДА, НИ ОДНОГО КЛЮЧА В config.yaml, И ЭТО РЕШЕНИЕ, А НЕ ЛЕНЬ.
+  // `tools/config_drift.sh` требует ПОБАЙТОВОГО совпадения `resources/config/**`
+  // с конфигом прод-хоста (единственный waiver — ЗНАЧЕНИЯ шести
+  // advertisement-адресов); добавленный ключ — это дрейф, то есть красный гейт
+  // до выкладки конфига и обязательный шаг 8.4 протокола. Стенду достаточно
+  // среды, прод остаётся на умолчаниях 30/60/60/0.
+  //
+  // ★getenv НАПРЯМУЮ, А НЕ getEnvValue: тот возвращает пустую строку И на
+  // отсутствующей переменной, И на явно пустой — то есть СКЛЕИВАЕТ «не задано»
+  // с «задано мусором», и на этой склейке опечатка становится умолчанием
+  // (R70-fix-8).
+  //
+  // ★ТРИ ПЕРВЫХ КЛЮЧА — `ParseStrictPositiveSeconds`: ноль у любого из них
+  // означал бы «порог истёк мгновенно», то есть жатву всего подряд на первой
+  // же развёртке. Отказ старта здесь дешевле, чем выкошенный сервер.
+  // ★ЧЕТВЁРТЫЙ — `ParseStrictNonNegativeSeconds`: ноль у него ОСМЫСЛЕН и
+  // означает «механизм выключен», и это умолчание прода.
+  {
+    const char* const value = getenv("CHAT_REAP_SWEEP_INTERVAL_SECONDS");
+    if (value != nullptr)
+    {
+      chatReap.sweepIntervalSeconds = ParseStrictPositiveSeconds(
+        "CHAT_REAP_SWEEP_INTERVAL_SECONDS", value);
+    }
+  }
+  {
+    const char* const value = getenv("CHAT_REAP_HANDSHAKE_TIMEOUT_SECONDS");
+    if (value != nullptr)
+    {
+      chatReap.handshakeTimeoutSeconds = ParseStrictPositiveSeconds(
+        "CHAT_REAP_HANDSHAKE_TIMEOUT_SECONDS", value);
+    }
+  }
+  {
+    const char* const value = getenv("CHAT_REAP_ORPHAN_GRACE_SECONDS");
+    if (value != nullptr)
+    {
+      chatReap.orphanGraceSeconds = ParseStrictPositiveSeconds(
+        "CHAT_REAP_ORPHAN_GRACE_SECONDS", value);
+    }
+  }
+  {
+    const char* const value = getenv("CHAT_REAP_ABSOLUTE_IDLE_SECONDS");
+    if (value != nullptr)
+    {
+      chatReap.absoluteIdleSeconds = ParseStrictNonNegativeSeconds(
+        "CHAT_REAP_ABSOLUTE_IDLE_SECONDS", value);
+    }
+  }
 }
 
 void Config::LoadFromFile(const std::filesystem::path& filePath)
