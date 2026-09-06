@@ -386,6 +386,18 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
     add_test(NAME ToolMessengerDisconnectOutsideLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
+    # LOA (R82, round82, backlog: director-clients-lock-hardening): ТОТАЛЬНЫЙ
+    # ИНВАРИАНТ контракта R64-3 в мессенджере. `GetClientContext` отдаёт КОПИЮ,
+    # и ни один вызывающий не связывает её ссылкой. Это единственная форма
+    # проверки, которая не умеет разъехаться: список «в каждом из шестнадцати
+    # мест возьми короткий замок» отстаёт от кода, а запрет брать ссылку —
+    # нет. Ключуется на `GetClientContext(` с негативным lookahead, чтобы не
+    # краснеть на внутреннем `GetClientContextLocked`, который ссылку отдаёт
+    # намеренно.
+    add_test(NAME ToolMessengerContextCopySelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_context_copy.py --selftest)
+    add_test(NAME ToolMessengerContextCopyGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_context_copy.py)
     # LOA (R80-6, round80, backlog #235): развёртка чат-сокетов обязана
     # исполняться СВОИМ сетевым потоком. Самая дешёвая текстовая форма того же
     # свойства — «Tick() обоих чат-директоров пуст»: Tick() приходит с потока

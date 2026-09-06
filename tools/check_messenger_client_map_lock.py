@@ -26,15 +26,28 @@
 мутации остались на потоке чата, поля тривиальны, — но «безопасно» надо
 обосновывать иначе, чем однопоточностью.
 
-Гейт видит только семь функций из `MUST_LOCK`. Вне их поля зрения остаются, в
-частности: гейт авторизации `GetClientContext`, читатели в обработчиках
-buddy/letter/invite, и ДВЕ незалоченные ЗАПИСИ на потоке чата —
-`clientContext.presence` в `HandleChatterUpdateState` (многополевая структура:
-снимок чужого читателя может застать её полуобновлённой) и
-`clientContext.isAuthenticated = true` в `HandleChatterGuildLogin`.
-Закрыть класс целиком — работа размера отдельного раунда (для лобби ею был
-R64-3). Гейт стережёт ровно ту границу, которую провёл этот раунд, и не выдаёт
-себя за доказательство отсутствия гонок.
+★ЧТО ИЗМЕНИЛ R82 (round82, director-clients-lock-hardening). До него гейт видел
+только девять функций и ПРЯМО выводил из области видимости `GetClientContext`,
+читателей buddy/letter/invite и две незалоченные ЗАПИСИ на потоке чата
+(`clientContext.presence` в `HandleChatterUpdateState`, `isAuthenticated` в
+`HandleChatterGuildLogin`) — закрытие класса целиком было работой размера
+отдельного раунда, как для лобби им был R64-3/#215. R82 её сделал, и граница
+гейта сдвинута вслед за кодом:
+  * `GetClientContext` отдаёт КОПИЮ под `shared_lock` — он в `MUST_LOCK` и
+    обязан объявить замок В СВОЁМ ТЕЛЕ (`MUST_DECLARE_LOCK`);
+  * `MutateClientContext` — единственный путь записи значения, ему нужен
+    ИСКЛЮЧИТЕЛЬНЫЙ замок в теле;
+  * `GetClientContextLocked` — внутренний путь «вызывающий держит замок»: он
+    НАМЕРЕННО вне `MUST_LOCK` (см. `GATE_EXCLUDED`), зато КАЖДЫЙ ЕГО ВЫЗОВ
+    обязан стоять под замком;
+  * шесть снимко-держателей (buddy add/add-reply/delete, letter send, chat
+    invite, guild login) копировали/перебирали ВСЮ карту без замка — теперь они
+    в `MUST_LOCK`;
+  * запись `isAuthenticated` гильд-входа не «взята под замок», а УДАЛЕНА как
+    избыточная: `GetClientContext(requireAuthentication=true)` бросил бы раньше,
+    то есть она ставила true поверх гарантированного true.
+Гейт по-прежнему не выдаёт себя за доказательство отсутствия гонок: он
+структурный и стережёт форму, а не поток управления.
 
 КОДЫ ВОЗВРАТА
   0 — чисто
@@ -74,7 +87,30 @@ MUST_LOCK = {
     # записей.
     "HandleClientActivity",
     "SweepChatSockets",
+    # LOA (R82, round82, director-clients-lock-hardening): контракт R64-3 принят
+    # целиком, и вместе с ним под надзор въезжают ДВА новых входа в карту и
+    # ШЕСТЬ снимко-держателей, которые до раунда копировали/перебирали ВСЮ карту
+    # без замка на потоке-владельце (`clientsSnapshot = _clients`,
+    # незалоченный `find`, незалоченный `for`). Гейт R78 их прямо выводил из
+    # области видимости (см. врезку выше) — R82 их туда вводит.
+    "GetClientContext",
+    "MutateClientContext",
+    "HandleChatterBuddyAdd",
+    "HandleChatterBuddyAddReply",
+    "HandleChatterBuddyDelete",
+    "HandleChatterLetterSend",
+    "HandleChatterChatInvite",
+    "HandleChatterGuildLogin",
 }
+
+#: ★`GetClientContextLocked` В `MUST_LOCK` НЕ ВНОСИТСЯ, И ЭТО НАМЕРЕННО.
+#: Его контракт — «вызывающий держит замок»: незалоченное обращение к `_clients`
+#: в теле и есть смысл метода (та же форма, что у лобби, R64-3). `judge` карает
+#: только `func in MUST_LOCK and not protected`, поэтому исключение достигается
+#: невнесением, а не особым случаем в коде. `FUNC_RE` его тело УЗНАЁТ (возврат
+#: `ClientContext&`), так что атрибуция строк по функциям не сбивается.
+#: Будущему раунду: внести его сюда — значит сделать гейт всегда-красным.
+GATE_EXCLUDED = {"GetClientContextLocked"}
 
 #: Функции, которые карту МЕНЯЮТ: им мало «какого-нибудь» замка, нужен
 #: исключительный.
@@ -93,21 +129,68 @@ MUST_LOCK_EXCLUSIVELY = {
     # мутант прежняя редакция пропускала.
     "HandleClientActivity",
     "SweepChatSockets",
+    # LOA (R82): единственный путь ЗАПИСИ значения поля извне залоченного блока.
+    # Разделяемого замка ему мало — «запись под замком для чтения» гейт обязан
+    # ловить (тот же довод, что у R80-7 для `SweepChatSockets`).
+    "MutateClientContext",
 }
+
+#: LOA (R82, round82, director-clients-lock-hardening): ФУНКЦИИ, КОТОРЫЕ ОБЯЗАНЫ
+#: ОБЪЯВИТЬ ЗАМОК В СВОЁМ ТЕЛЕ.
+#:
+#: ★ЗАЧЕМ ОТДЕЛЬНОЕ ПРАВИЛО, ЕСЛИ ЕСТЬ `MUST_LOCK`. `MUST_LOCK` судит ОБРАЩЕНИЯ
+#: к карте: «нашёл `_clients` — потребуй замок выше». После контракта-копии тело
+#: `GetClientContext` не содержит токена `_clients` вовсе — поиск переехал в
+#: `GetClientContextLocked`. Значит по правилу обращений `GetClientContext`
+#: сторожить НЕЧЕГО: снимите из него `shared_lock`, и копия начнёт сниматься
+#: незалоченной, а гейт промолчит — ровно «полнота по форме», от которой
+#: [[gate-by-form-gives-false-completeness]]. Поэтому у двух методов контракта
+#: требование прямое: замок обязан стоять В ТЕЛЕ.
+MUST_DECLARE_LOCK = {
+    "GetClientContext",
+    "MutateClientContext",
+}
+
+#: LOA (R82): КАЖДЫЙ вызов `GetClientContextLocked(` обязан стоять ПОД замком.
+#: Это вторая половина контракта «вызывающий держит замок»: без неё метод,
+#: намеренно выведенный из-под `MUST_LOCK`, стал бы чёрным ходом к живой карте
+#: без единой проверки. Единственные вызывающие сегодня — `GetClientContext`
+#: (под своим `shared_lock`) и `HandleChatterLogin` (три места под своими
+#: прямыми замками).
+LOCKED_CALL_RE = re.compile(r"\bGetClientContextLocked\s*\(")
 
 #: Ниже этого числа обращений файл заведомо не тот — проверка слепа.
 #: ★ПОДНЯТ ПО ЗАМЕРУ, А НЕ НАУГАД (R80-7): на дереве R78 гейт находил 30
 #: обращений при пороге 12 — то есть разбор мог ослепнуть больше чем вдвое и
 #: по-прежнему печатать «чисто». Кандидат R80 даёт 39; порог ставится чуть ниже
 #: замера, чтобы ловить именно слепоту, а не мелкую правку.
-MIN_ACCESSES = 34
+#: ★ПЕРЕИЗМЕРЕН R82. Форма изменилась: шесть «голых» `_clients` стали
+#: лямбдами-снимками под замком, добавились `GetClientContext`,
+#: `GetClientContextLocked`, `MutateClientContext` и их вызовы. Замер на
+#: кандидате R82 — 44 обращения (на базе `a1171d0b` было 39). Порог ставится
+#: чуть ниже НОВОГО замера. ★Читать этот гейт числом ОБРАЩЕНИЙ ВСЕГО, а не
+#: числом «под замком»: порог гейтует именно первое.
+MIN_ACCESSES = 40
 
 #: ★ТИП ВОЗВРАТА ПЕРЕЧИСЛЯЕТСЯ, И ЭТО ЦЕНА ФОРМЫ: функция, чей тип здесь не
 #: назван, для разбора НЕВИДИМА — её тело не приписывается никому, обращения из
 #: него не считаются, и «0 нарушений» становится тише, чем должно быть.
 #: R80 добавляет `chat::ReapThresholds MessengerDirector::GetReapThresholds()`.
+#: ★R82 ДОБАВЛЯЕТ АЛЬТЕРНАТИВУ БЕЗ АМПЕРСАНДА, И ЭТО ПЕРВЫЙ ШАГ, БЕЗ КОТОРОГО
+#: ВСЁ ОСТАЛЬНОЕ НЕДОСТИЖИМО. После перехода на контракт-копию
+#: `GetClientContext` возвращает `MessengerDirector::ClientContext` БЕЗ `&`.
+#: Прежний список типов знал только вариант с амперсандом — тело нового
+#: `GetClientContext` стало бы для разбора невидимо, функция не попала бы в
+#: `seen_functions`, и `missing = MUST_LOCK - seen` бросил бы `Invalid`, то есть
+#: гейт дал бы exit 2 (недействителен) на ПОЧИНЕННОМ дереве.
+#: ★ПОРЯДОК АЛЬТЕРНАТИВ ЗНАЧИМ: вариант с `&` стоит ПЕРВЫМ. Альтернация
+#: проверяется слева направо, поэтому строка возврата-по-ссылке
+#: (`GetClientContextLocked`) по-прежнему матчится вариантом с амперсандом, а
+#: by-value — вариантом без него. Поставь их наоборот — и `ClientContext&`
+#: разберётся как `ClientContext` с приклеенным `&`, а имя функции не найдётся.
 FUNC_RE = re.compile(
     r"^(?:void|bool|std::optional<[^>]*>|MessengerDirector::ClientContext&|"
+    r"MessengerDirector::ClientContext|"
     r"Config::Messenger&|chat::ReapThresholds)\s+MessengerDirector::(\w+)")
 LOCK_RE = re.compile(r"std::(?:shared_lock|unique_lock)\s+lock\(\s*"
                      r"(?:director\.)?_clientsMutex\s*\)")
@@ -209,6 +292,20 @@ def analyse(text: str):
             # Замок объявлен на ТЕКУЩЕЙ глубине и действует до её закрытия.
             lock_depths.append(depth)
 
+        # LOA (R82): вызов внутреннего пути «вызывающий держит замок» —
+        # обращение к карте по определению, и оно обязано стоять под замком.
+        # Определение самого метода из учёта исключается: `FUNC_RE` уже назвал
+        # текущую функцию, и `GetClientContextLocked` внутри себя не зовёт.
+        if (LOCKED_CALL_RE.search(code)
+                and func is not None
+                and func not in GATE_EXCLUDED):
+            protected_locked = bool(lock_depths)
+            accesses.append((number, func, protected_locked))
+            if not protected_locked:
+                violations.append(
+                    (number, func,
+                     "GetClientContextLocked вызван БЕЗ замка: " + raw.strip()))
+
         is_access = bool(ACCESS_RE.search(code))
         # Запись и чтение через ссылку считаются одинаково: и то и другое —
         # обращение к элементу карты, просто записанное не через `_clients`.
@@ -292,6 +389,15 @@ def judge(tree: Path) -> int:
         if not UNIQUE_LOCK_RE.search(body):
             exclusive_missing.append(name)
 
+    # LOA (R82): замок обязан стоять В ТЕЛЕ (см. MUST_DECLARE_LOCK).
+    declare_missing = []
+    for name in sorted(MUST_DECLARE_LOCK):
+        body = _function_body(text, name)
+        if body is None:
+            raise Invalid(f"функции {name} в файле нет — гейт стерёг бы пустоту")
+        if not LOCK_RE.search(body):
+            declare_missing.append(name)
+
     if len(accesses) < MIN_ACCESSES:
         raise Invalid(
             f"обращений к карте найдено {len(accesses)}, минимум {MIN_ACCESSES} — "
@@ -305,11 +411,19 @@ def judge(tree: Path) -> int:
     for name in exclusive_missing:
         violations.append((0, name, "меняет карту, но исключительного замка в "
                                     "функции нет (есть только разделяемый)"))
+    for name in declare_missing:
+        violations.append((0, name, "обязана объявить замок в СВОЁМ теле "
+                                    "(контракт R82), а объявления нет"))
     print("=== gate: замок над картой клиентов мессенджера ===")
     print(f"дерево            : {tree}")
     print(f"обращений к карте : {len(accesses)} (минимум {MIN_ACCESSES}) — "
           f"включая записи через ссылку из GetClientContext")
     print(f"обязаны быть под замком : {len(guarded)} в {len(MUST_LOCK)} функциях")
+    print(f"замок в СВОЁМ теле обязан : {len(MUST_DECLARE_LOCK) - len(declare_missing)}"
+          f" из {len(MUST_DECLARE_LOCK)} (R82)")
+    print(f"исключительный замок в теле : "
+          f"{len(MUST_LOCK_EXCLUSIVELY) - len(exclusive_missing)} "
+          f"из {len(MUST_LOCK_EXCLUSIVELY)}")
     print(f"нарушений         : {len(violations)} (ожидалось 0)")
     if violations:
         print("\nнарушители:")
@@ -362,11 +476,28 @@ def selftest() -> int:
             print(f"  · строка {number} ({owner}): замок не в поднадзорной "
                   "функции — гейт молчит, как и заявлено")
 
+    # ★ИМЕННОЕ ТРЕБОВАНИЕ R82: раунд вводит в надзор шесть снимко-держателей и
+    # два метода контракта. Без поимённого требования «N канареек поймано» не
+    # отличает их от N чужих — ровно та же причина, по которой R80 назвал свои
+    # две функции.
+    required_r82 = {
+        "HandleChatterBuddyAdd",
+        "HandleChatterBuddyAddReply",
+        "HandleChatterBuddyDelete",
+        "HandleChatterLetterSend",
+        "HandleChatterChatInvite",
+        "HandleChatterGuildLogin",
+    }
+
     # ★ИМЕННОЕ ТРЕБОВАНИЕ R80: без него «12 канареек» не доказывает, что гейт
     # видит именно ДВЕ НОВЫЕ функции раунда.
     required = {"HandleClientActivity", "SweepChatSockets"}
     if not required.issubset(named):
         print(f"САМОПРОВЕРКА ПРОВАЛЕНА: не названы поимённо {sorted(required - named)}")
+        failures += 1
+    if not required_r82.issubset(named):
+        print("САМОПРОВЕРКА ПРОВАЛЕНА: не названы поимённо (R82) "
+              f"{sorted(required_r82 - named)}")
         failures += 1
 
     caught = 0
@@ -380,10 +511,68 @@ def selftest() -> int:
               f"{len(lock_lines)}, ожидалось не меньше 4")
         failures += 1
 
+    # ★ФИКСТУРЫ УРОВНЯ `judge` (R82). Три правила раунда живут не в `analyse`,
+    # а в `judge` (замок в СВОЁМ теле, исключительный замок, вызов `*Locked` под
+    # замком), и снятием строки замка их не проверить. Каждая фикстура
+    # впрыскивает РОВНО ОДНО нарушение в текст и требует красного.
+    fixtures = (
+        ("GetClientContext без замка в теле",
+         lambda s: s.replace(
+             "  const std::shared_lock lock(_clientsMutex);\n"
+             "  return GetClientContextLocked(clientId, requireAuthentication);",
+             "  return GetClientContextLocked(clientId, requireAuthentication);",
+             1)),
+        ("MutateClientContext под shared_lock вместо unique_lock",
+         lambda s: s.replace(
+             "  const std::unique_lock lock(_clientsMutex);\n\n"
+             "  const auto clientContextIter = _clients.find(clientId);",
+             "  const std::shared_lock lock(_clientsMutex);\n\n"
+             "  const auto clientContextIter = _clients.find(clientId);",
+             1)),
+        ("снимок карты возвращён к незалоченному = _clients",
+         lambda s: s.replace(
+             "  const auto clientsSnapshot = [this]\n"
+             "  {\n"
+             "    const std::shared_lock lock(_clientsMutex);\n"
+             "    return _clients;\n"
+             "  }();",
+             "  const auto clientsSnapshot = _clients;",
+             1)),
+        ("GetClientContextLocked вызван вне замка",
+         lambda s: s.replace(
+             "    const std::shared_lock lock(_clientsMutex);\n"
+             "    const auto& clientContext = GetClientContextLocked(clientId, false);",
+             "    const auto& clientContext = GetClientContextLocked(clientId, false);",
+             1)),
+    )
+
+    import tempfile
+    for label, mutate in fixtures:
+        mutated = mutate(original)
+        if mutated == original:
+            print(f"  ✗ фикстуру «{label}» не удалось впрыснуть (якорь не найден)")
+            failures += 1
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp)
+            (fake / SOURCE).parent.mkdir(parents=True, exist_ok=True)
+            (fake / SOURCE).write_text(mutated, encoding="utf-8")
+            try:
+                code = judge(fake)
+            except Invalid as exc:
+                code = 2
+                print(f"    (фикстура дала «недействительна»: {exc})")
+        if code == 1:
+            print(f"  ✓ фикстура «{label}» поймана (код 1)")
+        else:
+            print(f"  ✗ фикстура «{label}» НЕ поймана (код {code})")
+            failures += 1
+
     if failures:
         print("=== ИТОГ САМОПРОВЕРКИ: ПРОВАЛ ✗ ===")
         return 2
-    print(f"=== ИТОГ САМОПРОВЕРКИ: ЧИСТО ✓ (поймано {caught} канареек) ===")
+    print(f"=== ИТОГ САМОПРОВЕРКИ: ЧИСТО ✓ (поймано {caught} канареек "
+          f"+ {len(fixtures)} фикстур R82) ===")
     return 0
 
 
