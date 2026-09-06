@@ -531,10 +531,35 @@ void AllChatDirector::HandleChatterChat(
   network::ClientId clientId,
   const protocol::ChatCmdChat& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  // LOA-fix (R80-9, round80, backlog #235, находка ревю #1 correctness-1):
+  // СВОЙ КОНТЕКСТ ЧИТАЕТСЯ КОПИЕЙ ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ, А НЕ ССЫЛКОЙ ВНУТРЬ
+  // КАРТЫ.
+  //
+  // ★ГОНКУ СЮДА ПРИВЁЛ САМ РАУНД, ПОЭТОМУ ЕЁ ЗАКРЫВАЕТ ОН ЖЕ — довод дословно
+  // тот же, что у обхода рассылки ниже, и распространяется он на ОБА чтения
+  // карты в этом обработчике, а не только на массовое. `GetClientContext`
+  // отдаёт ССЫЛКУ внутрь `_clients` и ничего не запирает; заведённый этим же
+  // раундом `CloseSessionsOfCharacter` пишет с потока лобби под замком ровно
+  // те поля (`isAuthenticated`, `characterUid`), которые читались через эту
+  // ссылку. Чтение без замка против записи под замком — не половина
+  // синхронизации, а её отсутствие.
+  //
+  // ★ЗАМОК НАКРЫВАЕТ ТОЛЬКО ПОИСК И КОПИЮ СКАЛЯРА, И ЭТО НЕСУЩЕЕ ТРЕБОВАНИЕ, А
+  // НЕ ОПРЯТНОСТЬ. Ни `GetCharacter`, ни `GetUserByCharacterUid`, ни
+  // `ProcessChatMessage`, ни `QueueCommand` под ним не стоят: замок карты,
+  // удержанный ЧЕРЕЗ вызов в чужой код, — дословно тот BLOCK, который получил
+  // R78. Проверка аутентификации остаётся ВНУТРИ (её делает сам
+  // `GetClientContext`): иначе решение «пускать» читалось бы из одного
+  // состояния, а личность бралась бы из другого.
+  data::Uid selfCharacterUid = data::InvalidUid;
+  {
+    const std::shared_lock lock(_clientsMutex);
+    const auto& clientContext = GetClientContext(clientId);
+    selfCharacterUid = clientContext.characterUid;
+  }
 
   const auto characterRecord = _serverInstance.GetDataDirector().GetCharacter(
-    clientContext.characterUid);
+    selfCharacterUid);
 
   std::string characterName{};
   bool isGameMaster = false;
@@ -546,7 +571,7 @@ void AllChatDirector::HandleChatterChat(
     });
 
   const auto userName = _serverInstance.GetLobbyDirector().GetUserByCharacterUid(
-    clientContext.characterUid).userName;
+    selfCharacterUid).userName;
 
   server::util::QuietLogInfo("[Global] {} ({}): {}",
     characterName,
@@ -554,7 +579,7 @@ void AllChatDirector::HandleChatterChat(
     command.message);
 
   const auto chatVerdict = _serverInstance.GetChatSystem().ProcessChatMessage(
-    clientContext.characterUid, command.message);
+    selfCharacterUid, command.message);
 
   // LOA-fix (R55-3, round55, backlog #179 часть 5): пустое значение = сообщение
   // не обработано. Причина уже записана в лог внутри; здесь просто молчим —
@@ -636,11 +661,21 @@ void AllChatDirector::HandleChatterInputState(
   const protocol::ChatCmdInputState& command)
 {
   // Note: might have to do with login state i.e. remember last online status (online/offline/away)
-  const auto& clientContext = GetClientContext(clientId);
+  //
+  // LOA-fix (R80-9, round80, backlog #235, находка ревю #1 correctness-1): своя
+  // личность берётся КОПИЕЙ под разделяемым замком — тот же довод и тот же
+  // предел, что у `HandleChatterChat` выше: под замком нет НИ ОДНОГО выхода
+  // наружу, только поиск в карте и копия скаляра.
+  data::Uid selfCharacterUid = data::InvalidUid;
+  {
+    const std::shared_lock lock(_clientsMutex);
+    const auto& clientContext = GetClientContext(clientId);
+    selfCharacterUid = clientContext.characterUid;
+  }
 
   // Get character's friends list
   std::set<data::Uid> friends{};
-  _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
+  _serverInstance.GetDataDirector().GetCharacter(selfCharacterUid).Immutable(
     [&friends](const data::Character& character)
     {
       friends = character.contacts.groups().at(0).members;
@@ -648,7 +683,7 @@ void AllChatDirector::HandleChatterInputState(
 
   // Prepare notify command
   protocol::ChatCmdInputStateTrs notify{
-    .unk0 = clientContext.characterUid, // Assumed, unknown effect
+    .unk0 = selfCharacterUid, // Assumed, unknown effect
     .state = command.state};
 
   // LOA-fix (R80-4, round80, backlog #235): обход по КОПИИ под разделяемым
