@@ -19,6 +19,7 @@
 
 #include "server/race/MagicApplication.hpp"
 #include "server/race/MagicSystem.hpp"
+#include "server/race/SpurTolerance.hpp"
 #include "libserver/util/QuietLog.hpp"
 #include "libserver/util/RecordAccess.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
@@ -2424,6 +2425,17 @@ void RaceNetworkHandler::HandleStartRace(
         racer.maxDiscardedStepMetres = 0.0f;
         racer.progressClipped = 0;
         racer.maxDeclaredProgress = 0.0f;
+        // LOA-fix (R81, #270/#273): пер-заездные счётчики рывков и мастерства —
+        // в ТОТ ЖЕ список, по той же причине. Инвариант раунда: НОВОЕ ПОЛЕ
+        // БЛОКА ОБЯЗАНО ПОЯВИТЬСЯ ЗДЕСЬ, и это стережёт check_track_journal.py.
+        racer.paidSpurCount = 0;
+        racer.toleratedSpurShortfalls = 0;
+        racer.raceSpurMagicCount = 0;
+        racer.raceJumpCount = 0;
+        racer.slidingMillis = 0;
+        racer.isSliding = false;
+        racer.slidingSince = std::chrono::steady_clock::time_point::max();
+        racer.raceGlideMetres = 0.0;
         switch (roomPlayer.GetTeam())
         {
           case Room::Player::Team::Solo:
@@ -3898,10 +3910,89 @@ bool RaceNetworkHandler::HandleRequestSpur(
   const auto& gameModeTemplate = GetServerInstance().GetCourseRegistry().GetCourseGameModeInfo(
     static_cast<uint8_t>(parameters.gameMode));
 
-  if (racer.starPointValue < gameModeTemplate.spurConsumeStarPoints)
-    throw std::runtime_error("Client is dead ass cheating (or is really desynced)");
+  // === LOA-fix (R81, backlog #270): ТОЛЕРАНТНЫЙ РЫВОК ВМЕСТО БРОСКА ========
+  //
+  // ЧТО БЫЛО. `throw std::runtime_error("Client is dead ass cheating …")` —
+  // апстримная строка. Она вылетала в диспетчер, где R71-31 печатал одну
+  // (задросселенную) строку [error], и заодно уносила ВЕСЬ хвост: списание,
+  // цепочку R75, квест 11036, оба ответа и `HandleTeamGauge` (контракт bool
+  // R57-3c). То есть честный игрок ТЕРЯЛ рывок. Наблюдалось дважды за два дня,
+  // на двух персонажах, всегда у финиша, всегда на заезде, который сервер сам
+  // признал доказанным (`outcome finished proven 1`).
+  //
+  // ПОЧЕМУ СЧЁТЧИКИ РАСХОДЯТСЯ — НЕ ЗНАЕМ, И ЭТО ЗАПИСАНО ЧЕСТНО. Серверная
+  // шкала не является авторитетной копией клиентской: главный её источник
+  // (`HandleStarPointGet`) начисляет ОБЪЯВЛЕННОЕ КЛИЕНТОМ значение. Это
+  // принятый остаток #241, и раунд его НЕ чинит — он ставит ИЗМЕРЕНИЕ.
+  //
+  // ★`now` СЧИТАЕТСЯ ЗДЕСЬ ЯВНО. Тот `now`, что есть ниже, объявлен ВНУТРИ
+  // фигурных скобок блока цепочки R75 и сюда не виден. Один
+  // `steady_clock::now()` на всю правку — и его же берут оба счётчика ниже.
+  //
+  // ТРИ УРОВНЯ ВМЕСТО ОДНОГО БРОСКА:
+  //   1) хватает очков                      -> как раньше;
+  //   2) не хватает, но рывок правдоподобен -> шкала в 0, рывок ЗАСЧИТАН;
+  //   3) иначе                              -> return false, ничего не меняем.
+  // Само правило правдоподобия вынесено в `race::SpurShortfallDecision`
+  // (SpurTolerance.hpp) — ради юнит-теста обеих границ.
+  const auto spurNow = std::chrono::steady_clock::now();
+  const bool spurUnderway = IsRaceUnderway(raceInstance, racer, spurNow);
+  const uint32_t spurCost = gameModeTemplate.spurConsumeStarPoints;
+  if (racer.starPointValue < spurCost)
+  {
+    const uint32_t shortfall = spurCost - racer.starPointValue;
+    const bool plausible = race::SpurShortfallDecision(
+      spurUnderway, racer.paidSpurCount, racer.toleratedSpurShortfalls);
 
-  racer.starPointValue -= gameModeTemplate.spurConsumeStarPoints;
+    if (not plausible)
+    {
+      uint64_t suppressed = 0, total = 0;
+      if (_spurRefusalThrottle.Allow(suppressed, total))
+        server::util::QuietLogWarn(
+          "Spur refused for character {}: gauge {} < cost {} (short {}), "
+          "spur {} of {} this race, {} of {} shortfalls forgiven, underway {} "
+          "(suppressed {}, total {})",
+          clientContext.characterUid, racer.starPointValue, spurCost, shortfall,
+          racer.paidSpurCount, tracker::MaxPlausibleSpursPerRace,
+          racer.toleratedSpurShortfalls, tracker::SpurShortfallGrace,
+          spurUnderway ? 1 : 0, suppressed, total);
+      // ★return false, А НЕ throw: хвост лямбды (`HandleTeamGauge`) не зовём,
+      // ответов не шлём, состояние гонщика не трогаем.
+      return false;
+    }
+
+    racer.toleratedSpurShortfalls += 1;
+    // ★ПРИРАВНИВАЕМ К ЦЕНЕ, А НЕ ПИШЕМ `= 0` В ВЕТКЕ. Одна точка списания
+    // вместо двух: два места, каждое из которых «обнуляет шкалу», разъедутся на
+    // первой же будущей правке цены рывка. Итог тождественный (0).
+    racer.starPointValue = spurCost;
+    uint64_t suppressed = 0, total = 0;
+    if (_spurShortfallThrottle.Allow(suppressed, total))
+      server::util::QuietLogInfo(
+        "Spur gauge shortfall forgiven for character {}: short {} of cost {}, "
+        "spur {} this race, forgiveness {} of {} (suppressed {}, total {})",
+        clientContext.characterUid, shortfall, spurCost,
+        racer.paidSpurCount + 1,
+        racer.toleratedSpurShortfalls, tracker::SpurShortfallGrace,
+        suppressed, total);
+  }
+
+  racer.starPointValue -= spurCost;
+
+  // ★ОБА ПЕР-ЗАЕЗДНЫХ СЧЁТЧИКА ГЕЙТЯТСЯ ЯВНО. `paidSpurCount` кормит
+  // АНТИЧИТОВЫЙ БЮДЖЕТ, `raceSpurMagicCount` — ВЕЧНОЕ поле лошади. Ни то, ни
+  // другое не должно расти от рывков в обратном отсчёте и после финиша: шкалу
+  // туда клиент способен насыпать сам (`HandleStarPointGet`), то есть без гейта
+  // он получил бы и «бесплатное» расширение бюджета, и внезаездные единицы
+  // мастерства. Условие — то же самое `IsRaceUnderway`, что и у цепочки R75
+  // ниже: одно определение «заезд идёт» на весь раунд.
+  if (spurUnderway)
+  {
+    if (racer.paidSpurCount < std::numeric_limits<uint32_t>::max())
+      racer.paidSpurCount += 1;
+    if (racer.raceSpurMagicCount < std::numeric_limits<uint32_t>::max())
+      racer.raceSpurMagicCount += 1; // #273
+  }
 
   // === LOA-fix (R75, #14 Ф2): ЦЕПОЧКА ПЛАТНЫХ РЫВКОВ =======================
   // Стоим ПОСЛЕ списания звёздных очков и ПОСЛЕ AI-гарда R57 — значит считаем
