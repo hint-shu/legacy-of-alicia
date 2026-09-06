@@ -360,6 +360,16 @@ if (NOT WIN32)
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh --self-test)
     add_test(NAME ToolChatSweepThreadGate
             COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh)
+    # LOA (R80-8, round80, backlog #235): сиблинг гейта замка — для all-chat.
+    # ★R80 создаёт ПЕРВОГО чужепоточного писателя AllChatDirector::_clients
+    # (уборка лобби на выходе игрока). До раунда у этой карты не было ни замка,
+    # ни проверки; без сиблинга новая дисциплина ехала бы вообще без гейта,
+    # способного покраснеть. Копия, а не параметризация файла R78: менять чужой
+    # отревьюенный гейт ради удобства дороже, чем продублировать профиль.
+    add_test(NAME ToolAllChatClientMapLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py --selftest)
+    add_test(NAME ToolAllChatClientMapLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py)
     # R74. Гейт ограниченных списков ключится на СВОЙСТВО («функция, среди
     # параметров которой есть SinkStream&»), а не на написание `::Write(` — та
     # формулировка не видела площадку в свободной функции, и дыра пережила бы
