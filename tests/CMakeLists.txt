@@ -348,6 +348,18 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
     add_test(NAME ToolMessengerDisconnectOutsideLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
+    # LOA (R80-6, round80, backlog #235): развёртка чат-сокетов обязана
+    # исполняться СВОИМ сетевым потоком. Самая дешёвая текстовая форма того же
+    # свойства — «Tick() обоих чат-директоров пуст»: Tick() приходит с потока
+    # задач директора, чужого и для карты клиентов, и для Server::_addressStates
+    # (та живёт вовсе без замка). Гейт сперва доказывает себя на четырёх
+    # фикстурах, ДВЕ из которых — слепота: «чисто» без находки читать нельзя.
+    # ★Он читает ТЕКСТ, а не поток управления: настоящий страж инварианта —
+    # арка стенда thread-identity, а это сторож регрессии.
+    add_test(NAME ToolChatSweepThreadSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh --self-test)
+    add_test(NAME ToolChatSweepThreadGate
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh)
     # R74. Гейт ограниченных списков ключится на СВОЙСТВО («функция, среди
     # параметров которой есть SinkStream&»), а не на написание `::Write(` — та
     # формулировка не видела площадку в свободной функции, и дыра пережила бы
