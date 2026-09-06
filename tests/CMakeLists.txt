@@ -233,6 +233,41 @@ target_include_directories(chat_test_socket_reap_rule
 target_link_libraries(chat_test_socket_reap_rule
         PRIVATE project-properties alicia-libserver)
 
+# LOA-fix (R81, backlog #270): решение о нехватке звёздной шкалы. ★Заголовочное,
+# поэтому линковать нечего, кроме include-пути и заголовков libserver: правило
+# вынесено из `RaceNetworkHandler.cpp` ИМЕННО затем, чтобы его границы
+# (`< потолок` против `<= потолок`) проверялись без поднятия сервера — стенд до
+# 50-го рывка и 8-го прощения не доходит.
+add_executable(race_test_spur_tolerance)
+target_sources(race_test_spur_tolerance PRIVATE
+        src/race/TestSpurTolerance.cpp)
+target_include_directories(race_test_spur_tolerance
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_spur_tolerance
+        PRIVATE project-properties alicia-libserver)
+
+# LOA-fix (R81, backlog #273): арифметика мастерства лошади. Величины уезжают в
+# ВЕЧНЫЕ монотонные поля, снять которые можно только правкой файлов при
+# ОСТАНОВЛЕННОМ сервере; арки стенда доказывают, что каждый потолок УМЕЕТ
+# сработать, а границы, насыщение и 64-битность долевого бюджета — здесь.
+add_executable(race_test_mastery_accrual)
+target_sources(race_test_mastery_accrual PRIVATE
+        src/race/TestMasteryAccrual.cpp)
+target_include_directories(race_test_mastery_accrual
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(race_test_mastery_accrual
+        PRIVATE project-properties alicia-libserver)
+
+# LOA-fix (R81, backlog #274): арифметика длины `RaceRecord`. Раунд НЕ трогает
+# `teamMode` именно потому, что `Single` дописывает 11 байт; тест пинует само
+# это число, чтобы будущая правка сериализатора не сделала обоснование раунда
+# молча неверным. Образ `neg-k` он не заменяет — тот показывает живой кадр.
+add_executable(protocol_test_race_record_length)
+target_sources(protocol_test_race_record_length PRIVATE
+        src/protocol/TestRaceRecordLength.cpp)
+target_link_libraries(protocol_test_race_record_length
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME ProtocolTestBoundedList COMMAND protocol_test_bounded_list)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
@@ -260,6 +295,9 @@ add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 add_test(NAME MessengerTestSessionEviction COMMAND messenger_test_session_eviction)
 add_test(NAME ServerTestOtpSystem COMMAND server_test_otp_system)
 add_test(NAME ChatTestSocketReapRule COMMAND chat_test_socket_reap_rule)
+add_test(NAME RaceTestSpurTolerance COMMAND race_test_spur_tolerance)
+add_test(NAME RaceTestMasteryAccrual COMMAND race_test_mastery_accrual)
+add_test(NAME ProtocolTestRaceRecordLength COMMAND protocol_test_race_record_length)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ

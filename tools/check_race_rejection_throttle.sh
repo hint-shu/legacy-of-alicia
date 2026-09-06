@@ -42,14 +42,14 @@
 #
 # ENV
 #   ROOT              по умолчанию — репозиторий, в котором лежит скрипт
-#   THROTTLE_MIN_FN   пол по числу найденных хендлеров (по умолчанию 8)
+#   THROTTLE_MIN_FN   пол по числу найденных хендлеров (по умолчанию 9)
 #   THROTTLE_MIN_LOG  пол по числу найденных вызовов лога внутри них (умолч. 20)
 #
 # ВЫХОД: 0 правило соблюдено · 1 есть сырые вызовы · 2 разбор слеп
 set -uo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SRC="$ROOT/src/server/race/RaceNetworkHandler.cpp"
-MIN_FN="${THROTTLE_MIN_FN:-8}"
+MIN_FN="${THROTTLE_MIN_FN:-9}"
 MIN_LOG="${THROTTLE_MIN_LOG:-20}"
 [ -r "$SRC" ] || { echo "ОСТАНОВ: нет $SRC"; exit 2; }
 
@@ -61,7 +61,8 @@ RaceNetworkHandler::HandleChangeMagicTarget
 RaceNetworkHandler::HandleActivateSkillEffect
 RaceNetworkHandler::ScheduleSkillEffect
 RaceNetworkHandler::HandleRelay
-RaceNetworkHandler::HandleUserRaceItemGet"
+RaceNetworkHandler::HandleUserRaceItemGet
+RaceNetworkHandler::HandleRequestSpur"
 
 REPORT="$(awk -v funcs="$FUNCS" '
 BEGIN {
@@ -85,7 +86,12 @@ BEGIN {
     depth += o - c;
     if (o > 0) started = 1;
 
-    if (line ~ /server::util::QuietLog(Warn|Error)\(/) {
+    # ★R81: матчер расширен на `Info`. Жалоба «нехватку простили» — это
+    # `QuietLogInfo`, и без расширения её дроссель не стерёг бы НИЧТО.
+    # ИЗМЕРЕНО ДО ПРАВКИ на дереве кандидата ДО добавления девятого хендлера:
+    # расширенный матчер дал FN=8 LOGS=31 RAW=0, код 0 — то есть расширение
+    # ничего не сломало и пол не «чинился» подгонкой.
+    if (line ~ /server::util::QuietLog(Warn|Error|Info)\(/) {
       logs++;
       if (armed <= 0) { raw++; printf "  ✗ сырая жалоба: %s:%d  в %s\n", FILENAME, NR, cur; }
     }

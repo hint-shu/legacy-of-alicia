@@ -46,16 +46,34 @@ import os
 import re
 import sys
 
-#: Заголовок блока полей R76 в `Racer`. Ищется ДОСЛОВНО: это тот же приём, что
-#: у `check_stop_tail.py` с маркером блока достижений.
-BLOCK_MARK = "LOA-fix (R76, backlog #30 этап 1): ПЕР-ЗАЕЗДНЫЙ ЖУРНАЛ ТРАССЫ"
+#: Заголовки блоков пер-заездных полей в `Racer`. Ищутся ДОСЛОВНО: тот же приём,
+#: что у `check_stop_tail.py` с маркером блока достижений.
+#: ★ТРИ МАРКЕРА, А НЕ ОДИН (R81). Инвариант «пер-заездное поле обнуляется в
+#: HandleStartRace» одинаков у всех трёх блоков; стеречь один из них значило бы
+#: объявить, что у двух других это свойство держится на честном слове.
+#: Пара «тег раунда, текст маркера»: тег нужен, чтобы блок закрывался ЧУЖИМ
+#: маркером, а не собственным продолжением.
+BLOCK_MARKS = (
+    ("R76", "LOA-fix (R76, backlog #30 этап 1): ПЕР-ЗАЕЗДНЫЙ ЖУРНАЛ ТРАССЫ"),
+    ("R75", "LOA-fix (R75, #14 Ф2): ПЛАНИРОВАНИЕ И ЦЕПОЧКА РЫВКОВ"),
+    ("R81", "LOA-fix (R81, #270/#273): ПЕР-ЗАЕЗДНЫЕ СЧЁТЧИКИ РЫВКОВ И МАСТЕРСТВА"),
+)
 
 #: Объявление данных-члена внутри структуры `Racer` (отступ 4 пробела, тип,
 #: имя, инициализатор `{…}`). `static constexpr` отсеивается отдельно — это
 #: константы блока, а не пер-заездное состояние.
+#: ★РАСШИРЕНО R81, И ОБА РАСШИРЕНИЯ ИЗМЕРЕНЫ, А НЕ ПРИДУМАНЫ:
+#:  (а) ХВОСТОВОЙ КОММЕНТАРИЙ после `;` — прежняя якорилась на `$` сразу за
+#:      точкой с запятой и такое поле не видела вовсе;
+#:  (б) МНОГОСТРОЧНЫЙ ИНИЦИАЛИЗАТОР (`{` в конце строки) — без него гейт не
+#:      видел ТРИ `time_point` блока R75 (`lastLandingTimePoint`,
+#:      `glideMarkTimePoint`, `lastSpurTimePoint`) и `slidingSince` блока R81,
+#:      то есть стерёг 7 полей из 10 и молчал об этом.
 FIELD_RE = re.compile(
-    r"^\s{4}(?!static\b)(?:\[\[[^\]]*\]\]\s*)?[A-Za-z_][\w:<>,\s]*?"
-    r"\b(?P<name>[a-z][A-Za-z0-9_]*)\s*(?:\{[^}]*\}|=)\s*;?\s*$")
+    r"^\s{4}(?!static\b)(?!return\b)(?:\[\[[^\]]*\]\]\s*)?[A-Za-z_][\w:<>,\s]*?"
+    r"\b(?P<name>[a-z][A-Za-z0-9_]*)\s*"
+    r"(?:\{[^{}]*\}\s*;|\{\s*$|=[^;]*;)"
+    r"\s*(?://.*)?$")
 
 #: Настоящий вызов обёртки тихого лога: имя целиком и открывающая скобка.
 LOG_CALL_RE = re.compile(r"\bQuietLog[A-Za-z]+\s*\(")
@@ -66,9 +84,12 @@ HANDLER_PATH = "src/server/race/RaceNetworkHandler.cpp"
 START_RACE_SIGNATURE = "void RaceNetworkHandler::HandleStartRace("
 USER_POS_SIGNATURE = "void RaceNetworkHandler::HandleRaceUserPos("
 
-#: Контроль слепоты, а НЕ ожидаемое число полей: раунд объявил восемь, но
-#! девятое обязано попасть под тот же инвариант само собой.
-MIN_FIELDS = 8
+#: Контроль слепоты, а НЕ ожидаемое число полей: следующее поле обязано попасть
+#: под тот же инвариант само собой.
+#: ★ЧИСЛО ИЗМЕРЕНО НА ДЕРЕВЕ, А НЕ НАЗНАЧЕНО: R76 = 8, R75 = 10, R81 = 8.
+#: «Починить» его вниз — это ровно тот приём, который сам гейт запрещает в своей
+#: шапке: пол, не отслеживающий длину блоков, превращается в декорацию.
+MIN_FIELDS = 26
 #: Столько вызовов логирования в теле `HandleRaceUserPos` стояло ДО R76.
 EXPECTED_LOG_CALLS = 1
 #: Тело обработчика позиции — сотни строк. Разбор, давший меньше, неверен.
@@ -80,17 +101,31 @@ def read_lines(path):
         return handle.read().splitlines()
 
 
-def block_fields(lines):
-    """Имена нестатических данных-членов блока R76 — ПО СВОЙСТВУ, не списком."""
-    start = next((i for i, line in enumerate(lines) if BLOCK_MARK in line), None)
+def one_block_fields(lines, tag, mark):
+    """Имена нестатических данных-членов ОДНОГО блока — ПО СВОЙСТВУ, не списком.
+
+    Блок закрывается ДВУМЯ способами, и второй появился в R81:
+      * соседним маркером ЧУЖОГО раунда — так было всегда;
+      * строкой `};`, то есть КОНЦОМ СТРУКТУРЫ. Блок, стоящий последним в
+        `Racer`, чужого маркера после себя не имеет, и разбор перелезал через
+        `};` и собирал поля соседних `ItemDeck`/`Event`/`TeamInfo` — ДЕСЯТЬ
+        чужих полей, которые в `HandleStartRace` не сбрасываются никогда.
+        Измерено: без терминатора блок R75 давал 17 полей вместо 10, а блок R81
+        — 10 ЧУЖИХ и НИ ОДНОГО своего.
+    """
+    start = next((i for i, line in enumerate(lines) if mark in line), None)
     if start is None:
-        return None, "блок R76 в %s не найден — гейту нечего осматривать" % HEADER_PATH
+        return None, "блок %s в %s не найден — гейту нечего осматривать" % (
+            tag, HEADER_PATH)
     names = []
     for index in range(start, len(lines)):
         line = lines[index]
+        # Конец структуры закрывает блок так же жёстко, как чужой маркер.
+        if index > start and line.strip() == "};":
+            break
         # Соседний блок другого раунда закрывает наш.
         if index > start and ("LOA-fix (R" in line or "LOA (R" in line) \
-                and "R76" not in line:
+                and tag not in line:
             break
         stripped = line.strip()
         if stripped.startswith("//"):
@@ -100,6 +135,17 @@ def block_fields(lines):
         found = FIELD_RE.match(line)
         if found:
             names.append(found.group("name"))
+    return names, None
+
+
+def block_fields(lines):
+    """Имена полей ВСЕХ трёх пер-заездных блоков. Имена не пересекаются."""
+    names = []
+    for tag, mark in BLOCK_MARKS:
+        found, error = one_block_fields(lines, tag, mark)
+        if error:
+            return None, error
+        names.extend(found)
     return names, None
 
 
@@ -225,14 +271,64 @@ def self_test(header_path, handler_path):
         print("САМОПРОВЕРКА: фикстура I6 НЕ УПАЛА ✗ (код %d)" % code)
         ok = False
 
-    # Фикстура 3 (слепота): заголовок блока журнала переименован.
-    blinded = [line.replace(BLOCK_MARK, "(блок скрыт фикстурой)")
-               for line in header_lines]
-    _p, _n, code = check(blinded, handler_lines)
-    if code == 2:
-        print("САМОПРОВЕРКА: фикстура «блок журнала не найден» — ОСТАНОВ (2) ✓")
+    # Фикстура 3 (слепота): заголовок блока переименован — НА КАЖДЫЙ из трёх
+    # маркеров. Один общий прогон доказывал бы только один блок.
+    for tag, mark in BLOCK_MARKS:
+        blinded = [line.replace(mark, "(блок скрыт фикстурой)")
+                   for line in header_lines]
+        _p, _n, code = check(blinded, handler_lines)
+        if code == 2:
+            print("САМОПРОВЕРКА: фикстура «блок %s не найден» — ОСТАНОВ (2) ✓" % tag)
+        else:
+            print("САМОПРОВЕРКА: фикстура слепоты %s НЕ ОСТАНОВИЛА гейт ✗ (код %d)"
+                  % (tag, code))
+            ok = False
+
+    # Фикстура 5 (R81): БЛОК В КОНЦЕ СТРУКТУРЫ. Маркер переносится в самый конец
+    # `Racer`, и гейт обязан извлечь ТОЛЬКО его поля — иначе он снова съест
+    # соседние структуры, и «26 полей» станут числом без смысла.
+    tail_fixture = []
+    struct_end = None
+    for index, line in enumerate(header_lines):
+        if line.strip() == "};":
+            struct_end = index
+            break
+    if struct_end is None:
+        print("САМОПРОВЕРКА: конец структуры не найден — фикстуру 5 не построить")
+        return 2
+    tail_fixture = list(header_lines[:struct_end]) + [
+        "    // === LOA-fix (RXX, фикстура): БЛОК В КОНЦЕ СТРУКТУРЫ =========",
+        "    //! поле фикстуры",
+        "    uint32_t fixtureTailField{};",
+    ] + list(header_lines[struct_end:])
+    found, error = one_block_fields(
+        tail_fixture, "RXX", "LOA-fix (RXX, фикстура): БЛОК В КОНЦЕ СТРУКТУРЫ")
+    if error is None and found == ["fixtureTailField"]:
+        print("САМОПРОВЕРКА: фикстура «блок в конце структуры» — "
+              "извлечено ровно своё ✓")
     else:
-        print("САМОПРОВЕРКА: фикстура слепоты 1 НЕ ОСТАНОВИЛА гейт ✗ (код %d)" % code)
+        print("САМОПРОВЕРКА: фикстура «блок в конце структуры» ПРОВАЛЕНА ✗ (%s)"
+              % (found,))
+        ok = False
+
+    # Фикстура 6 (R81): ПОЛЕ С ХВОСТОВЫМ КОММЕНТАРИЕМ И ПОЛЕ С МНОГОСТРОЧНЫМ
+    # ИНИЦИАЛИЗАТОРОМ. Обе формы гейт обязан ВИДЕТЬ — иначе расширение
+    # регулярки декорация, а не проверка.
+    form_fixture = list(header_lines[:struct_end]) + [
+        "    // === LOA-fix (RYY, фикстура): ФОРМЫ ОБЪЯВЛЕНИЯ ================",
+        "    //! хвостовой комментарий",
+        "    uint32_t fixtureTrailing{};   // хвостовой комментарий",
+        "    //! многострочный инициализатор",
+        "    std::chrono::steady_clock::time_point fixtureMultiline{",
+        "      std::chrono::steady_clock::time_point::max()};",
+    ] + list(header_lines[struct_end:])
+    found, error = one_block_fields(
+        form_fixture, "RYY", "LOA-fix (RYY, фикстура): ФОРМЫ ОБЪЯВЛЕНИЯ")
+    if error is None and found == ["fixtureTrailing", "fixtureMultiline"]:
+        print("САМОПРОВЕРКА: фикстура «хвостовой комментарий / многострочный "
+              "инициализатор» — ОБЕ ФОРМЫ ВИДНЫ ✓")
+    else:
+        print("САМОПРОВЕРКА: фикстура форм объявления ПРОВАЛЕНА ✗ (%s)" % (found,))
         ok = False
 
     # Фикстура 4 (слепота): переименована сама функция сброса.
