@@ -18,14 +18,35 @@
  **/
 
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
+#include "libserver/util/BoundedList.hpp"
 #include "libserver/util/Util.hpp"
 
 #include <cassert>
 #include <algorithm>
+#include <cstddef>
 #include <format>
 
 namespace server::protocol
 {
+
+namespace
+{
+
+//! LOA-fix (R74, round74, backlog #170): ПОТОЛКИ, КОТОРЫЕ КОД УЖЕ ОБЪЯВЛЯЛ.
+//!
+//! Все шесть чисел взяты дословно из стоявших рядом `assert`/`std::min` — раунд
+//! не выдумывает новых пределов, он переносит объявленные туда, где они КЛАМПЯТ
+//! в боевой сборке (`RelWithDebInfo` несёт `-DNDEBUG`, то есть `assert` в проде
+//! инертен, а `std::min` после сужающего каста считал неверно).
+constexpr std::size_t MaxRanchHorseCount = 10;
+constexpr std::size_t MaxRanchCharacterCount = 20;
+constexpr std::size_t MaxRanchHousingCount = 13;
+constexpr std::size_t MaxFailureCardChoiceCount = 2;
+constexpr std::size_t MaxSearchStallionCount = 10;
+constexpr std::size_t MaxBreedingMarketStallionCount = 20;
+constexpr std::size_t MaxBreedingWishlistCount = 8;
+
+} // namespace
 
 void AcCmdCRUseItem::Write(
   const AcCmdCRUseItem&,
@@ -105,14 +126,17 @@ void AcCmdCRMountFamilyTreeOK::Write(
   const AcCmdCRMountFamilyTreeOK& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.ancestors.size()));
-  for (const auto& item : command.ancestors)
-  {
-    stream.Write(item.hierarchyPosition)
-      .Write(item.name)
-      .Write(item.grade)
-      .Write(item.skinTid);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.ancestors,
+    {.name = "AcCmdCRMountFamilyTreeOK.ancestors"},
+    [](SinkStream& sink, const auto& item)
+    {
+      sink.Write(item.hierarchyPosition)
+        .Write(item.name)
+        .Write(item.grade)
+        .Write(item.skinTid);
+    });
 }
 
 void AcCmdCRMountFamilyTreeOK::Read(
@@ -164,39 +188,33 @@ void AcCmdCREnterRanchOK::Write(
     .Write(command.rancherName)
     .Write(command.ranchName);
 
+  // ★R74. Кламп здесь БЫЛ ВЕРНЫМ (в `size_t` до каста) — площадки переезжают
+  // на хелпер не ради счётчика, а ради второй половины защиты: у них не было
+  // никакой обороны по ВМЕСТИМОСТИ буфера команды. Потолки сохранены дословно.
   // Write the ranch horses
-  assert(command.horses.size() <= 10);
-  const auto ranchHorseCount = std::min(command.horses.size(), size_t{10});
-
-  stream.Write(static_cast<uint8_t>(ranchHorseCount));
-  for (std::size_t idx = 0; idx < ranchHorseCount; ++idx)
-  {
-    stream.Write(command.horses[idx]);
-  }
+  assert(command.horses.size() <= MaxRanchHorseCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.horses,
+    {.maxCount = MaxRanchHorseCount, .name = "AcCmdCREnterRanchOK.horses"});
 
   // Write the ranch characters
-  assert(command.characters.size() <= 20);
-  const auto ranchCharacterCount = std::min(command.characters.size(), size_t{20});
-
-  stream.Write(static_cast<uint8_t>(ranchCharacterCount));
-  for (std::size_t idx = 0; idx < ranchCharacterCount; ++idx)
-  {
-    stream.Write(command.characters[idx]);
-  }
+  assert(command.characters.size() <= MaxRanchCharacterCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.characters,
+    {.maxCount = MaxRanchCharacterCount, .name = "AcCmdCREnterRanchOK.characters"});
 
   stream.Write(command.member6)
     .Write(command.scramblingConstant)
     .Write(command.ranchProgress);
 
   // Write the ranch housing
-  assert(command.housing.size() <= 13);
-  const auto housingCount = std::min(command.housing.size(), size_t{13});
-
-  stream.Write(static_cast<uint8_t>(housingCount));
-  for (std::size_t idx = 0; idx < housingCount; ++idx)
-  {
-    stream.Write(command.housing[idx]);
-  }
+  assert(command.housing.size() <= MaxRanchHousingCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.housing,
+    {.maxCount = MaxRanchHousingCount, .name = "AcCmdCREnterRanchOK.housing"});
 
   stream.Write(command.horseSlots)
     .Write(command.member11)
@@ -619,12 +637,12 @@ void AcCmdCRBreedingFailureCardChooseOK::Write(
     .Write(command.rewardId);
 
   // There can be at most 2 elements in this array
-  assert(command.member4.size() <= 2);
-  stream.Write(static_cast<uint8_t>(command.member4.size()));
-  for (const auto& value : command.member4)
-  {
-    stream.Write(value);
-  }
+  assert(command.member4.size() <= MaxFailureCardChoiceCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.member4,
+    {.maxCount = MaxFailureCardChoiceCount,
+     .name = "AcCmdCRBreedingFailureCardChooseOK.member4"});
 
   stream.Write(command.item)
     .Write(command.rewardedCarrots);
@@ -889,29 +907,29 @@ void RanchCommandSearchStallionOK::Write(
   stream.Write(command.page)
     .Write(command.pageCount);
 
-  assert(command.stallions.size() <= 10);
-  const uint8_t count = std::min(
-    static_cast<uint8_t>(command.stallions.size()), uint8_t{10});
-
-  stream.Write(count);
-  for (uint8_t idx = 0; idx < count; ++idx)
-  {
-    const auto& stallion = command.stallions[idx];
-    stream.Write(stallion.owner)
-      .Write(stallion.uid)
-      .Write(stallion.tid)
-      .Write(stallion.name)
-      .Write(stallion.grade)
-      .Write(stallion.heritability)
-      .Write(stallion.breedFee)
-      .Write(stallion.pregnancyChance)
-      .Write(util::TimePointToAliciaTime(stallion.expiresAt))
-      .Write(stallion.stats)
-      .Write(stallion.parts)
-      .Write(stallion.appearance)
-      .Write(stallion.unk11)
-      .Write(stallion.lineage);
-  }
+  // ★R74. Та же форма дефекта, что этажом ниже: кламп стоял ПОСЛЕ каста.
+  assert(command.stallions.size() <= MaxSearchStallionCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.stallions,
+    {.maxCount = MaxSearchStallionCount, .name = "RanchCommandSearchStallionOK.stallions"},
+    [](SinkStream& sink, const auto& stallion)
+    {
+      sink.Write(stallion.owner)
+        .Write(stallion.uid)
+        .Write(stallion.tid)
+        .Write(stallion.name)
+        .Write(stallion.grade)
+        .Write(stallion.heritability)
+        .Write(stallion.breedFee)
+        .Write(stallion.pregnancyChance)
+        .Write(util::TimePointToAliciaTime(stallion.expiresAt))
+        .Write(stallion.stats)
+        .Write(stallion.parts)
+        .Write(stallion.appearance)
+        .Write(stallion.unk11)
+        .Write(stallion.lineage);
+    });
 }
 
 void RanchCommandSearchStallionOK::Read(
@@ -953,21 +971,23 @@ void RanchCommandEnterBreedingMarketOK::Write(
   const RanchCommandEnterBreedingMarketOK& command,
   SinkStream& stream)
 {
-  const uint8_t count = std::min(
-    static_cast<uint8_t>(command.stallions.size()),
-    uint8_t{20});
-
-  stream.Write(count);
-  for (uint8_t idx = 0; idx < count; ++idx)
-  {
-    const auto& stallion = command.stallions[idx];
-    stream.Write(stallion.uid)
-      .Write(stallion.tid)
-      .Write(stallion.breedingCombo)
-      .Write(stallion.expiresAt)
-      .Write(stallion.hasBreedingBonus)
-      .Write(stallion.lineage);
-  }
+  // ★R74. БЫЛ КЛАМП ПОСЛЕ СУЖАЮЩЕГО КАСТА: `min(uint8_t(size()), 20)` при
+  // `size() == 256` даёт 0, при 276 — 20 из 276 «имеющихся». Кламп обязан
+  // считаться в `size_t` ДО каста; этим и занимается хелпер.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.stallions,
+    {.maxCount = MaxBreedingMarketStallionCount,
+     .name = "RanchCommandEnterBreedingMarketOK.stallions"},
+    [](SinkStream& sink, const auto& stallion)
+    {
+      sink.Write(stallion.uid)
+        .Write(stallion.tid)
+        .Write(stallion.breedingCombo)
+        .Write(stallion.expiresAt)
+        .Write(stallion.hasBreedingBonus)
+        .Write(stallion.lineage);
+    });
 }
 
 void RanchCommandEnterBreedingMarketOK::Read(
@@ -1110,28 +1130,33 @@ void AcCmdCRBreedingWishlistOK::Write(
   SinkStream& stream)
 {
   // Wishlist can have at most 8 elements
-  assert(command.wishlist.size() <= 8);
-  stream.Write(static_cast<uint8_t>(command.wishlist.size()));
-  for (auto& wishlistElement : command.wishlist)
-  {
-    stream.Write(wishlistElement.ownerName)
-      .Write(wishlistElement.uid)
-      .Write(wishlistElement.tid)
-      .Write(wishlistElement.grade)
-      .Write(wishlistElement.name)
-      .Write(wishlistElement.heritability)
-      .Write(wishlistElement.breedingCount)
-      .Write(wishlistElement.breedingFee)
-      .Write(wishlistElement.expiresAt)
-      .Write(wishlistElement.unk7)
-      .Write(wishlistElement.unk8)
-      .Write(wishlistElement.stats)
-      .Write(wishlistElement.parts)
-      .Write(wishlistElement.appearance)
-      .Write(wishlistElement.registrationEnded)
-      .Write(wishlistElement.unk10)
-      .Write(wishlistElement.lineage);
-  }
+  // `assert` остаётся документацией инварианта; кламп — тем же числом, но он
+  // работает и в боевой сборке, где `-DNDEBUG` делает `assert` пустым.
+  assert(command.wishlist.size() <= MaxBreedingWishlistCount);
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.wishlist,
+    {.maxCount = MaxBreedingWishlistCount, .name = "AcCmdCRBreedingWishlistOK.wishlist"},
+    [](SinkStream& sink, const auto& wishlistElement)
+    {
+      sink.Write(wishlistElement.ownerName)
+        .Write(wishlistElement.uid)
+        .Write(wishlistElement.tid)
+        .Write(wishlistElement.grade)
+        .Write(wishlistElement.name)
+        .Write(wishlistElement.heritability)
+        .Write(wishlistElement.breedingCount)
+        .Write(wishlistElement.breedingFee)
+        .Write(wishlistElement.expiresAt)
+        .Write(wishlistElement.unk7)
+        .Write(wishlistElement.unk8)
+        .Write(wishlistElement.stats)
+        .Write(wishlistElement.parts)
+        .Write(wishlistElement.appearance)
+        .Write(wishlistElement.registrationEnded)
+        .Write(wishlistElement.unk10)
+        .Write(wishlistElement.lineage);
+    });
 }
 
 void AcCmdCRBreedingWishlistOK::Read(
@@ -1225,11 +1250,8 @@ void AcCmdCRRequestStorageOK::Write(
     .Write(command.page)
     .Write(command.pageCountAndNotification);
 
-  stream.Write(static_cast<uint8_t>(command.storedItems.size()));
-  for (const auto& storedItem : command.storedItems)
-  {
-    stream.Write(storedItem);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.storedItems, {.name = "AcCmdCRRequestStorageOK.storedItems"});
 }
 
 void AcCmdCRRequestStorageOK::Read(
@@ -1273,11 +1295,8 @@ void AcCmdCRGetItemFromStorageOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.storageItemUid);
-  stream.Write(static_cast<uint8_t>(command.items.size()));
-  for (const auto& item : command.items)
-  {
-    stream.Write(item);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.items, {.name = "AcCmdCRGetItemFromStorageOK.items"});
   stream.Write(command.updatedCarrots);
 }
 
@@ -1336,11 +1355,8 @@ void RanchCommandRequestNpcDressListOK::Write(
   SinkStream& stream)
 {
   stream.Write(command.unk0);
-  stream.Write(static_cast<uint8_t>(command.dressList.size()));
-  for (const auto& item : command.dressList)
-  {
-    stream.Write(item);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.dressList, {.name = "RanchCommandRequestNpcDressListOK.dressList"});
 }
 
 void RanchCommandRequestNpcDressListOK::Read(
@@ -1491,17 +1507,28 @@ void AcCmdCRUpdateEquipmentNotify::Write(
 {
   stream.Write(command.characterUid);
 
-  stream.Write(static_cast<uint8_t>(command.characterEquipment.size()));
-  for (const auto& item : command.characterEquipment)
-  {
-    stream.Write(item);
-  }
+  // ★R74-fix-2 (subreview #1, WARN 2): ТРЕТИЙ СЕРИАЛИЗАТОР ТОГО ЖЕ ХРАНИМОГО
+  // СПИСКА. `MaxCharacterEquipmentCount` стоял на двух площадках из трёх —
+  // в кадре входа и в `RanchCharacter`, — а рассылка смены экипировки соседям
+  // по ранчо оставалась на дефолте 255. Разбор клиента даёт настоящий контракт:
+  // счётчик читается ЗНАКОВЫМ (`movsx eax,al`), элементы кладутся в массив
+  // только пока `idx < 0x10`, то есть 17..127 молча теряются, а на 128..255
+  // счётчик уходит в минус, тело не вычитывается и кадр разъезжается до конца.
+  // Раунд объявил снятие этой несогласованности своей целью — значит она
+  // снимается на всех трёх площадках, а не на двух.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.characterEquipment,
+    {.maxCount = MaxCharacterEquipmentCount,
+     .name = "AcCmdCRUpdateEquipmentNotify.characterEquipment"});
 
-  stream.Write(static_cast<uint8_t>(command.mountEquipment.size()));
-  for (const auto& item : command.mountEquipment)
-  {
-    stream.Write(item);
-  }
+  // ★`mountEquipment` ОСТАЁТСЯ НА 255 СОЗНАТЕЛЬНО: числа-предшественника у
+  // этого списка нет нигде в протоколе, а правило раунда — переносить
+  // объявленные потолки, а не изобретать новые. Список питается только
+  // предметами, известными реестру, у которых четыре попарно непересекающихся
+  // слотовых бита, то есть практический потолок и так мал.
+  util::WriteBoundedList<uint8_t>(
+    stream, command.mountEquipment, {.name = "AcCmdCRUpdateEquipmentNotify.mountEquipment"});
 
   stream.Write(command.mount);
 }
@@ -1941,11 +1968,8 @@ void RanchCommandUserPetInfosOK::Write(
   const RanchCommandUserPetInfosOK& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint16_t>(command.pets.size()));
-  for (const auto& pet : command.pets)
-  {
-    stream.Write(pet);
-  }
+  util::WriteBoundedList<uint16_t>(
+    stream, command.pets, {.name = "RanchCommandUserPetInfosOK.pets"});
 }
 
 void RanchCommandUserPetInfosOK::Read(
@@ -2296,14 +2320,16 @@ void RanchCommandRequestLeagueTeamListOK::Write(
   stream.Write(command.lastWeekAvailable);
   stream.Write(command.unk13);
 
-  stream.Write(static_cast<uint8_t>(command.members.size()));
-
-  for (const auto& member : command.members)
-  {
-    stream.Write(member.uid)
-      .Write(member.points)
-      .Write(member.name);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.members,
+    {.name = "RanchCommandRequestLeagueTeamListOK.members"},
+    [](SinkStream& sink, const auto& member)
+    {
+      sink.Write(member.uid)
+        .Write(member.points)
+        .Write(member.name);
+    });
 }
 
 void RanchCommandRequestLeagueTeamListOK::Read(
@@ -2774,15 +2800,18 @@ void AcCmdCRGuildMemberListOK::Write(
   const AcCmdCRGuildMemberListOK& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.members.size()));
-  for (const auto& member : command.members)
-  {
-    stream.Write(member.memberUid)
-      .Write(member.nickname)
-      .Write(member.unk0)
-      .Write(member.guildRole)
-      .Write(member.unk2);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.members,
+    {.name = "AcCmdCRGuildMemberListOK.members"},
+    [](SinkStream& sink, const auto& member)
+    {
+      sink.Write(member.memberUid)
+        .Write(member.nickname)
+        .Write(member.unk0)
+        .Write(member.guildRole)
+        .Write(member.unk2);
+    });
 }
 
 void AcCmdCRRequestGuildMatchInfo::Read(
@@ -2987,11 +3016,8 @@ void AcCmdCREmblemListOK::Write(
   const AcCmdCREmblemListOK& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.unk0.size()));
-  for (const auto& val : command.unk0)
-  {
-    stream.Write(val);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.unk0, {.name = "AcCmdCREmblemListOK.unk0"});
 }
 
 void AcCmdCRUpdateDailyQuest::Write(
@@ -3143,12 +3169,8 @@ void AcCmdCRRequestDailyQuestRewardOK::Write(
   const AcCmdCRRequestDailyQuestRewardOK& command,
   SinkStream& stream)
 {
-  stream.Write(static_cast<uint8_t>(command.rewards.items.size()));
-
-  for (auto& member : command.rewards.items)
-  {
-    stream.Write(member);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.rewards.items, {.name = "AcCmdCRRequestDailyQuestRewardOK.rewards.items"});
 }
 
 void AcCmdCRRequestDailyQuestRewardOK::Read(
@@ -3265,19 +3287,15 @@ void AcCmdCRRequestQuestRewardOK::Write(
 {
   stream.Write(command.questTid);
   stream.Write(command.carrotsRewarded);
-  stream.Write(static_cast<uint8_t>(command.rewards.items.size()));
+  util::WriteBoundedList<uint8_t>(
+    stream, command.rewards.items, {.name = "AcCmdCRRequestQuestRewardOK.rewards.items"});
 
-  for (auto& reward : command.rewards.items)
-  {
-    stream.Write(reward);
-  }
-
-  stream.Write(static_cast<uint8_t>(command.npcEffects.size()));
-
-  for (auto& member : command.npcEffects)
-  {
-    stream.Write(member);
-  }
+  // Фиксированный std::array<NpcDressList, 5>; потолок задан явно и потому
+  // тождествен — кламп здесь недостижим по типу, а не по вере в тип.
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.npcEffects,
+    {.maxCount = 5, .name = "AcCmdCRRequestQuestRewardOK.npcEffects"});
 }
 
 void AcCmdCRRequestQuestRewardOK::Read(
@@ -3472,20 +3490,26 @@ void AcCmdCRBuyOwnItemOK::Write(
   SinkStream& stream)
 {
   // List size in one byte.
-  stream.Write(static_cast<uint8_t>(command.orderResults.size()));
-  for (const auto& shopItemResult : command.orderResults)
-  {
-    stream.Write(shopItemResult.order)
-      .Write(shopItemResult.result);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.orderResults,
+    {.name = "AcCmdCRBuyOwnItemOK.orderResults"},
+    [](SinkStream& sink, const auto& shopItemResult)
+    {
+      sink.Write(shopItemResult.order)
+        .Write(shopItemResult.result);
+    });
 
   // List size in one byte.
-  stream.Write(static_cast<uint8_t>(command.purchases.size()));
-  for (const auto& ownedItem : command.purchases)
-  {
-    stream.Write(ownedItem.equipImmediately)
-      .Write(ownedItem.item);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream,
+    command.purchases,
+    {.name = "AcCmdCRBuyOwnItemOK.purchases"},
+    [](SinkStream& sink, const auto& ownedItem)
+    {
+      sink.Write(ownedItem.equipImmediately)
+        .Write(ownedItem.item);
+    });
 
   stream.Write(command.newCarrots)
     .Write(command.newCash);
@@ -3616,10 +3640,8 @@ void AcCmdCROpenRandomBoxOK::Write(
     .Write(command.carrotsObtained)
     .Write(command.newBalance);
 
-  stream.Write(static_cast<uint8_t>(command.items.size()));
-  for (const auto& item : command.items) {
-    stream.Write(item);
-  }
+  util::WriteBoundedList<uint8_t>(
+    stream, command.items, {.name = "AcCmdCROpenRandomBoxOK.items"});
 }
 
 void AcCmdCROpenRandomBoxOK::Read(

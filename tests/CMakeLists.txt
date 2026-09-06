@@ -6,6 +6,18 @@ target_sources(protocol_test_magic PRIVATE
 target_link_libraries(protocol_test_magic
         PRIVATE project-properties alicia-libserver)
 
+# R74. Счётчик списка на проводе и бюджет блока макросов — свойства
+# СЕРИАЛИЗАТОРА, а стенд видит их только через клиента и только для тех
+# сообщений, которые арка успевает вызвать. Здесь судится сам примитив:
+# порядок клампа (264 при бонде 16 -> 16, а не 8), откат курсора при нехватке
+# места, масштаб счёта, байтовая тождественность на данных в пределах бонда и
+# ИЗМЕРЕННЫЕ бюджеты двух тяжёлых кадров.
+add_executable(protocol_test_bounded_list)
+target_sources(protocol_test_bounded_list PRIVATE
+        src/protocol/TestBoundedList.cpp)
+target_link_libraries(protocol_test_bounded_list
+        PRIVATE project-properties alicia-libserver)
+
 add_executable(util_test_stream)
 target_sources(util_test_stream PRIVATE
         src/util/TestStream.cpp)
@@ -210,6 +222,7 @@ target_link_libraries(server_test_otp_system
         PRIVATE project-properties)
 
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
+add_test(NAME ProtocolTestBoundedList COMMAND protocol_test_bounded_list)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
 add_test(NAME UtilTestScheduler COMMAND util_test_scheduler)
 add_test(NAME UtilTestLocale COMMAND util_test_locale)
@@ -322,6 +335,20 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
     add_test(NAME ToolMessengerDisconnectOutsideLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
+    # R74. Гейт ограниченных списков ключится на СВОЙСТВО («функция, среди
+    # параметров которой есть SinkStream&»), а не на написание `::Write(` — та
+    # формулировка не видела площадку в свободной функции, и дыра пережила бы
+    # раунд. Самопроверка на семи фикстурах доказывает, что он умеет краснеть,
+    # ДО того, как он что-либо судит; боевой прогон живёт в сборщике раунда,
+    # потому что негативная ветка обязана оставаться собираемой.
+    # ★R74-fix-2: боевой прогон этих двух живёт в `tools/round/Dockerfile.tests`
+    # (канон раунда с 52750a0b) — своей ступени `tests` раунд больше не держит.
+    add_test(NAME ToolCheckBoundedListsSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_bounded_lists.py --self-test
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(NAME ToolCheckBoundedListsGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_bounded_lists.py
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 else ()
     message(STATUS "Source gates (lobby auth, field init) are not wired on this platform")
 endif ()

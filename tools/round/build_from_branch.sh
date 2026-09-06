@@ -129,6 +129,27 @@ else
   say "  race-rejection-throttle gate: файла нет в этой ветке — ПРОПУЩЕН"
 fi
 
+# R74. Гейт ограниченных списков. Боевой прогон живёт ЗДЕСЬ, а не только в
+# ctest: негативная ветка раунда обязана оставаться собираемой (иначе
+# доказательство «без защиты плохо» недоступно), а образ, в котором сырая
+# площадка вернулась, собираться не должен. Гейт доказывает себя на семи
+# фикстурах перед тем, как судить дерево; код 3 — «не разобрался» — такой же
+# останов, как код 2.
+BOUNDED_GATE="$WORK/tools/check_bounded_lists.py"
+if [ -f "$BOUNDED_GATE" ]; then
+  python3 "$BOUNDED_GATE" --self-test "$WORK" > "$WORK/.gate-bounded-selftest.log" 2>&1
+  BSRC=$?
+  sed 's/^/    /' "$WORK/.gate-bounded-selftest.log"
+  [ "$BSRC" -eq 0 ] || die "самопроверка bounded-lists вернула $BSRC — гейт не доказал, что умеет краснеть"
+  python3 "$BOUNDED_GATE" "$WORK" > "$WORK/.gate-bounded.log" 2>&1
+  BRC=$?
+  sed 's/^/    /' "$WORK/.gate-bounded.log"
+  [ "$BRC" -eq 0 ] || die "bounded-lists gate вернул $BRC — сборка не начата"
+  say "  bounded-lists gate: EXIT=0 ✓"
+else
+  say "  bounded-lists gate: в клоне нет tools/check_bounded_lists.py (ветка до R74)"
+fi
+
 # ---- 4. the base image must be pinned by digest ---------------------------------
 BASE_DIGEST="$(sed -nE 's/^FROM[[:space:]]+[^[:space:]@]+@(sha256:[0-9a-f]{64}).*/\1/p' \
                 "$WORK/Dockerfile" | head -1)"

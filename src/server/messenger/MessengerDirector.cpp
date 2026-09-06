@@ -19,7 +19,11 @@
 
 #include "server/messenger/MessengerDirector.hpp"
 #include "server/messenger/MessengerSessionEviction.hpp"
+#include "libserver/util/Locale.hpp"
+#include "libserver/util/LogThrottle.hpp"
 #include "libserver/util/QuietLog.hpp"
+
+#include <algorithm>
 
 #include "libserver/util/Cleanup.hpp"
 
@@ -36,6 +40,13 @@ namespace server
 constexpr auto FriendsCategoryUid = 0;
 constexpr auto OnlinePlayersCategoryUid = std::numeric_limits<uint32_t>::max() - 2;
 constexpr std::string_view DateTimeFormat = "{:%H:%M:%S %d/%m/%Y} UTC";
+
+//! ★R74-fix-4 (subreview #3, BLOCK 1/2): САМИ ЧИСЛА ЖИВУТ В ЗАГОЛОВКЕ
+//! ПРОТОКОЛА ЧАТТЕРА (`ChatterMessageDefinitions.hpp`), рядом с писателями,
+//! которые они и ограничивают. Здесь их нет намеренно: цель `alicia-server` в
+//! тестовый бинарь не линкуется, и константа, объявленная тут, была бы
+//! невидима юнит-гейту — то есть её подмена не могла бы покрасить ни одну
+//! проверку. Ровно этот класс ревью уже ловило у отбора слотов макросов.
 
 const std::string GetSystemNameFromType(data::Mail::MailType type)
 {
@@ -1912,7 +1923,6 @@ void MessengerDirector::HandleChatterLetterSend(
     return;
   }
 
-  // TODO: enforce any character limit?
   // TODO: bad word checks and/or deny sending the letter as a result?
 
   const auto& clientContext = GetClientContext(clientId);
@@ -1925,6 +1935,62 @@ void MessengerDirector::HandleChatterLetterSend(
       senderUid = character.uid();
       senderName = character.name();
     });
+
+  // ★R74-fix-4 (subreview #3, BLOCK 1 и 2): ОТБРАСЫВАЕМ ДО ЗАПИСИ, ПО ФАКТИЧЕСКОЙ
+  // ШИРИНЕ ИМЁН НА ПРОВОДЕ.
+  //
+  // Проверка стоит ЗДЕСЬ, а не выше по функции, именно потому, что раньше имени
+  // отправителя ещё не знали — и прежняя редакция подставляла вместо него
+  // выдуманные «не больше 16 байт». Теперь считаются РЕАЛЬНЫЕ ширины:
+  // `locale::FromUtf8` — тот самый конвертер, которым строки уезжают на провод
+  // (`SinkStream::Write`), так что это не оценка, а тот же байтовый счёт.
+  //
+  // Проверяются ВСЕ ТРИ кадра, куда попадает тело: страница ящика жертвы,
+  // доставка жертве и квитанция отправителю. Письмо, не влезающее хотя бы в
+  // один, нельзя ни показать, ни доставить, а сохранённое — оно навсегда встаёт
+  // в голову инбокса и уже оттуда не убирается.
+  const auto senderWireWidth = locale::FromUtf8(senderName).size();
+  const auto recipientWireWidth = locale::FromUtf8(command.recipient).size();
+  const auto bodyWireWidth = locale::FromUtf8(command.body).size();
+
+  const auto pageAllowance = protocol::MailboxPageEntryBudget > protocol::MailboxEntryFixedBytes + senderWireWidth
+    ? protocol::MailboxPageEntryBudget - protocol::MailboxEntryFixedBytes - senderWireWidth
+    : std::size_t{0};
+  const auto arriveAllowance = protocol::ChatterFramePayloadBytes > protocol::MailArriveFixedBytes + senderWireWidth
+    ? protocol::ChatterFramePayloadBytes - protocol::MailArriveFixedBytes - senderWireWidth
+    : std::size_t{0};
+  const auto ackAllowance = protocol::ChatterFramePayloadBytes > protocol::MailSendAckFixedBytes + recipientWireWidth
+    ? protocol::ChatterFramePayloadBytes - protocol::MailSendAckFixedBytes - recipientWireWidth
+    : std::size_t{0};
+
+  const auto allowance = std::min(
+    {protocol::MaxMailBodyLength, pageAllowance, arriveAllowance, ackAllowance});
+
+  if (bodyWireWidth > allowance)
+  {
+    static util::LogThrottle oversizedMailThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (oversizedMailThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "refused an oversized mail body from client {}: {} wire bytes over the {} these"
+        " frames allow for this pair (sender {} B, recipient {} B); the recipient's"
+        " mailbox page could not have shown it (suppressed {} more, {} in total)",
+        clientId,
+        bodyWireWidth,
+        allowance,
+        senderWireWidth,
+        recipientWireWidth,
+        suppressed,
+        total);
+    }
+
+    protocol::ChatCmdLetterSendAckCancel cancel{
+      .errorCode = protocol::ChatterErrorCode::LetterSendBodyTooLong};
+    _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+    return;
+  }
 
   // UTC now in seconds
   const auto& utcNow = std::chrono::floor<std::chrono::seconds>(util::Clock::now());

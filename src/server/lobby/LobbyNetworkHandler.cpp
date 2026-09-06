@@ -21,6 +21,8 @@
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Cleanup.hpp"
+#include "libserver/util/KeyedLogThrottle.hpp"
+#include "libserver/util/LogThrottle.hpp"
 #include "server/ServerInstance.hpp"
 
 #include <libserver/data/helper/ProtocolHelper.hpp>
@@ -29,6 +31,9 @@
 #include <spdlog/spdlog.h>
 #include <zlib.h>
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <random>
 
 namespace server
@@ -1901,6 +1906,140 @@ void LobbyNetworkHandler::SendLoginOK(ClientId clientId)
   response.trainingProgression.mapProggressInfos = {
     mapProgressInfo};
 
+  // ★R74-fix-2 (subreview #1, WARN 1): ПОСЛЕДНЯЯ ЛИНИЯ ПЕРЕД ОТПРАВКОЙ.
+  //
+  // Кадр входа собран целиком; здесь и только здесь известно, влезает ли он.
+  // Три поля профиля, чью длину задаёт клиент (представление, привязки
+  // клавиатуры и геймпада, макросы), персистятся и уезжают в КАЖДОМ входе, а
+  // их собственные потолки в сумме кадр не вмещают. Перелив убивает не их, а
+  // ХВОСТ кадра — бросок из поставщика записи закрывает соединение, и так на
+  // каждой попытке входа: восстановление только правкой JSON руками.
+  //
+  // Сбрасываем копию, уезжающую на провод; данные на диске не трогаем.
+  const auto shed = protocol::BudgetLoginFrame(response);
+  if (shed != static_cast<uint32_t>(protocol::LoginFrameShed::Nothing))
+  {
+    // Жалоба задросселирована: содержимое профиля задаёт клиент, значит и
+    // частоту этой строки задавал бы он.
+    //
+    // ★R74-fix-3 (subreview #2, NIT 7 — тот же дефект, что у соседней строки):
+    // ДРОССЕЛЬ КЛЮЧИТСЯ ПО ПЕРСОНАЖУ, А НЕ ОДИН НА ПРОЦЕСС. С одним статиком
+    // второй игрок, чей кадр порезали в том же пятиминутном окне, не давал
+    // строки ВООБЩЕ — и это не теория: на негативном образе так пропала
+    // единственная улика решения о сбросе для `loatest-5`, потому что окно уже
+    // занял `loatest-4`. Строка несёт МАСКУ, то есть решение; терять её по
+    // соседству значит терять наблюдаемость самого механизма.
+    // ★R74-fix-4 (subreview #3, NIT 2): у `KeyedLogThrottle` нет пожизненного
+    // счётчика, и поле «{} in total» подпиралось литералом — то есть печатало
+    // ложь. Поле убрано, а не подперто: соседние строки на `LogThrottle` несут
+    // НАСТОЯЩИЙ total, и одинаковая форма при разном смысле хуже разной формы.
+    static util::KeyedLogThrottle loginFrameShedThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    // ★КЛЮЧ — `response.uid`, А НЕ `clientContext.characterUid`. Снимок
+    // контекста берётся в начале этой функции, ДО того как uid персонажа в нём
+    // проставляется отдельной мутацией под замком, — то есть здесь он ещё
+    // `InvalidUid` У ВСЕХ, все логины попадали бы в одно ведро и дроссель
+    // остался бы процессным, каким и был. Поймано стендом: на негативном
+    // образе строка сброса для `loatest-5` пропала, потому что окно занял
+    // `loatest-4`. `response.uid` заполнен выше из записи персонажа.
+    if (loginFrameShedThrottle.Allow(response.uid, suppressed))
+    {
+      util::QuietLogWarn(
+        "login frame over budget for user '{}': shed mask 0x{:x}"
+        " (macros={} gamepad={} keyboard={} introduction={} still-too-large={});"
+        " the stored profile is untouched by this frame (suppressed {} more for this character)",
+        clientContext.userName,
+        shed,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Macros)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::GamepadBindings)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::KeyboardBindings)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::Introduction)) != 0,
+        (shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0,
+        suppressed);
+    }
+
+    // ★R74-fix-3 (subreview #2, NIT 1): `StillTooLarge` ОБЯЗАН ОТКАЗЫВАТЬ, А НЕ
+    // СТАВИТЬ В ОЧЕРЕДЬ КАДР, КОТОРЫЙ ЗАВЕДОМО БРОСИТ.
+    //
+    // Раньше эта ветка только печатала строку и всё равно шла дальше: кадр
+    // уходил в очередь, поставщик записи бросал, `Client::WriteLoop` звал
+    // `End()` — то есть доревизионный клин ПЛЮС одна строка в журнале. Теперь
+    // клиент получает штатный отказ входа: он видит причину, а не молчаливый
+    // разрыв, и повторить попытку может сам.
+    if ((shed & static_cast<uint32_t>(protocol::LoginFrameShed::StillTooLarge)) != 0)
+    {
+      // ★R74-fix-4 (subreview #3, WARN 1 и NIT 3): ОТКАЗ РАЗМАТЫВАЕТ СЕССИЮ.
+      //
+      // Прежняя редакция только печатала строку и слала отказ, оставляя обе
+      // защёлки взведёнными: `isAuthenticated` и `characterUid` в контексте и
+      // запись в `_userInstances`. `AcCmdCLLogin` — pre-auth обработчик, а его
+      // гейт дубликатов идёт по всем контекстам БЕЗ исключения самого себя, —
+      // значит повтор на том же сокете получал `Duplicated`, а не свежую
+      // попытку. Комментарий «повторить попытку может сам» был неверен, и это
+      // НОВЫЙ режим отказа: до раунда бросок из поставщика звал `End()`, и
+      // `HandleClientDisconnected` чистил обе защёлки сразу.
+      //
+      // Разматываем ровно те две вещи, что взвёл вход: отметку «в игре» у
+      // директора и признаки аутентификации в контексте. Сокет не рвём — клиент
+      // получает названную причину и волен попробовать снова.
+      static util::KeyedLogThrottle refusalThrottle{std::chrono::minutes{5}};
+      uint64_t refusalsSuppressed = 0;
+      if (refusalThrottle.Allow(response.uid, refusalsSuppressed))
+      {
+        util::QuietLogError(
+          "refusing the login of user '{}': the login frame does not fit {} bytes"
+          " even with every client-authored profile block shed; the cause is"
+          " outside those blocks (an oversized server notice, or a failing"
+          " conversion) and the account cannot be let in until it is found"
+          " (suppressed {} more for this character)",
+          clientContext.userName,
+          protocol::MaxClientPacketDataBytes,
+          refusalsSuppressed);
+      }
+
+      _serverInstance.GetLobbyDirector().QueueClientLogout(
+        clientId, clientContext.userName);
+      MutateClientContext(
+        clientId,
+        [](ClientContext& context)
+        {
+          context.isAuthenticated = false;
+          context.characterUid = data::InvalidUid;
+          context.shedSettingsBlocks = 0;
+        });
+
+      // ★СТРОКА СУЩЕСТВУЕТ РАДИ ПРОВЕРЯЕМОСТИ. Размотка не оставляет никакого
+      // другого следа: `isAuthenticated` и `characterUid` — поля в памяти, а
+      // «logged out» пишет и обычный разрыв соединения. Без этой строки стенд
+      // не мог отличить образ с размоткой от образа без неё, то есть фикс
+      // WARN 1 держался бы на чтении кода, а не на измерении.
+      util::QuietLogWarn(
+        "unwound the refused login session of user '{}': the authentication"
+        " latch and the in-game marker are released, so a retry is answered"
+        " afresh instead of Duplicated",
+        clientContext.userName);
+
+      SendLoginCancel(clientId, protocol::AcCmdCLLoginCancel::Reason::Generic);
+      return;
+    }
+  }
+
+  // ★R74-fix-3 (subreview #2, WARN 3) + R74-fix-4 (subreview #3, NIT 4):
+  // СЕССИЯ ЗАПОМИНАЕТ, ЧТО СНЯЛА, И ДЕЛАЕТ ЭТО НА КАЖДОМ КАДРЕ ВХОДА.
+  //
+  // Клиент сброшенных блоков не получит, значит на его стороне они пусты — и
+  // его сохранение настроек затёрло бы хранимое. Присваивание стоит ВНЕ ветки
+  // «что-то сброшено» намеренно: второй `SendLoginOK` на том же соединении
+  // достижим (повтор `AcCmdCLCreateNickname`), и если его кадр помещается,
+  // СТАРАЯ маска обязана быть снята — иначе одно законное сохранение молча
+  // игнорируется. Присваиваем всегда, в том числе нулём.
+  MutateClientContext(
+    clientId,
+    [shed](ClientContext& context)
+    {
+      context.shedSettingsBlocks = shed;
+    });
+
   _commandServer.SetCode(clientId, {});
 
   _commandServer.QueueCommand<decltype(response)>(
@@ -2736,10 +2875,31 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
       std::format("Failed to create or retrieve settings for user '{}'", clientContext.userName));
   }
 
-  settingsRecord.Mutable([&settingsUid, &command](data::Settings& settings)
+  // ★R74 (backlog #170). Флаг ставится ВНУТРИ `Mutable`, а жалоба печатается
+  // ПОСЛЕ выхода из него: держать логгер под замком записи не за чем.
+  bool macroBlockRefused = false;
+  std::size_t macroBlockWireSize = 0;
+  std::size_t macroSlotsAccepted = 0;
+
+  // ★R74-fix-3 (subreview #2, WARN 3): БЛОКИ, КОТОРЫХ КЛИЕНТ НЕ ПОЛУЧАЛ, ОН НЕ
+  // ВПРАВЕ И СТИРАТЬ. Маску проставил `SendLoginOK` этой же сессии; она
+  // означает «сервер снял этот блок со СВОЕГО кадра, у клиента он пуст не
+  // потому, что игрок его очистил». Первое сохранение настроек в сессии такие
+  // блоки пропускает, а дальше флаг снимается — игрок, который действительно
+  // хочет очистить блок, сделает это вторым сохранением.
+  const auto shedBlocks = clientContext.shedSettingsBlocks;
+  const auto blockWasShed = [shedBlocks](const protocol::LoginFrameShed block)
+  {
+    return (shedBlocks & static_cast<uint32_t>(block)) != 0;
+  };
+
+  settingsRecord.Mutable([&settingsUid, &command, &macroBlockRefused, &macroBlockWireSize,
+                          &macroSlotsAccepted, &blockWasShed](
+    data::Settings& settings)
   {
     // Copy the keyboard bindings if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Keyboard))
+    if (command.settings.typeBitset.test(protocol::Settings::Keyboard)
+        && not blockWasShed(protocol::LoginFrameShed::KeyboardBindings))
     {
       settings.keyboardBindings().emplace();
 
@@ -2754,7 +2914,8 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     }
 
     // Copy the gamepad bindings if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Gamepad))
+    if (command.settings.typeBitset.test(protocol::Settings::Gamepad)
+        && not blockWasShed(protocol::LoginFrameShed::GamepadBindings))
     {
       settings.gamepadBindings().emplace();
 
@@ -2775,13 +2936,115 @@ void LobbyNetworkHandler::HandleUpdateUserSettings(
     }
 
     // Copy the macros if present in the command.
-    if (command.settings.typeBitset.test(protocol::Settings::Macros))
+    if (command.settings.typeBitset.test(protocol::Settings::Macros)
+        && not blockWasShed(protocol::LoginFrameShed::Macros))
     {
-      settings.macros() = command.settings.macroOptions.macros;
+      // ★R74 (backlog #170). МАКРОСЫ — ЕДИНСТВЕННОЕ ПОЛЕ ПРОФИЛЯ, ЧЬЮ ДЛИНУ
+      // ЗАДАЁТ КЛИЕНТ, КОТОРОЕ ПЕРСИСТИТСЯ НАВСЕГДА И УЕЗЖАЕТ НА ПРОВОД ПРИ
+      // КАЖДОМ ВХОДЕ.
+      //
+      // До этой проверки восемь строк произвольной длины копировались дословно:
+      // один поддельный `AcCmdCLUpdateUserSettings` на ~7 КБ макросов делал
+      // `LobbyCommandLoginOK` неупаковываемым (буфер команды — 8192 Б),
+      // поставщик записи бросал `std::overflow_error`, `Client::WriteLoop` звал
+      // `End()` — и персонаж не входил в игру больше НИКОГДА, потому что запись
+      // уже лежала на диске. Что клин случался, видно по апстриму: там есть
+      // GM-команда, единственное действие которой — обнулить все 8 макросов.
+      //
+      // ОТКАЗ ШТАТНЫЙ: остальные блоки настроек применяются, соединение живо,
+      // мы не рвём его из-за настроек. ★R74-fix-3 (subreview #2, WARN 1):
+      // прежняя формулировка «СТАРЫЕ макросы остаются» после fix-2 стала
+      // НЕВЕРНОЙ — ветка else записывает отобранный префикс. Правда теперь
+      // такая: принимаются те слоты, что влезли; если не влез НИ ОДИН,
+      // хранимый блок остаётся нетронутым.
+      macroBlockWireSize = protocol::MeasureMacroBlockWireSize(
+        command.settings.macroOptions);
+
+      if (macroBlockWireSize <= protocol::MaxMacroBlockWireBytes)
+      {
+        settings.macros() = command.settings.macroOptions.macros;
+      }
+      else
+      {
+        // ★R74-fix-2 (subreview #1, WARN 3): ЧАСТИЧНЫЙ ПРИЁМ ВМЕСТО «ВСЁ ИЛИ
+        // НИЧЕГО». Прежний отказ выбрасывал ВЕСЬ блок, включая те семь слотов,
+        // что влезали по отдельности, — а `AcCmdCLUpdateUserSettingsOK`
+        // отправляется в любом случае и тела не несёт, то есть клиент показывал
+        // «сохранено». Игрок узнавал о потере при следующем входе и без
+        // причины. Отдельного отказного кадра протокол не предлагает: опкод
+        // `AcCmdCLUpdateUserSettingsCancel` (0x92) в перечислении есть, но
+        // структуры у него нет и никто его не шлёт — выдумывать её раунд не
+        // будет. Поэтому берём то, что влезает, по одному слоту, в порядке
+        // слотов: игрок теряет ровно хвост, а не всё.
+        protocol::MacroOptions accepted{};
+        const auto slotsAccepted = protocol::SelectMacroSlotsWithinBudget(
+          command.settings.macroOptions, accepted);
+
+        // ★НИ ОДИН СЛОТ НЕ ВЛЕЗ — ХРАНИМОЕ НЕ ТРОГАЕМ. Записать здесь восемь
+        // пустых строк значило бы стереть чужой (свой прежний) блок за
+        // успешным ACK, то есть ровно та потеря, против которой правка.
+        if (slotsAccepted > 0)
+          settings.macros() = accepted.macros;
+        macroBlockRefused = true;
+        macroSlotsAccepted = slotsAccepted;
+      }
     }
 
     settingsUid = settings.uid();
   });
+
+  // ★R74-fix-4 (subreview #3, WARN 2): ЗАЩИТА ДЕРЖИТСЯ ВСЮ СЕССИЮ, А НЕ ОДНО
+  // СОХРАНЕНИЕ.
+  //
+  // Прежняя редакция снимала маску по битам, которые клиент ПРИСЛАЛ, — то есть
+  // тот же самый пакет, от которого защита сработала, её и снимал. Второе
+  // сохранение в той же сессии находило пустую маску и стирало все восемь
+  // слотов необратимо, без единой строки в журнале. Обоснование «одного круга
+  // достаточно, чтобы отличить потерю от намерения» было ложным:
+  // `AcCmdCLUpdateUserSettingsOK` — ПУСТАЯ структура, между сохранениями клиент
+  // блок не получает, и его состояние бит в бит то же самое.
+  //
+  // Снять маску вправе только ФАКТ ПОЛУЧЕНИЯ блока клиентом, а он бывает ровно
+  // в кадре входа: `BuildProtocolSettings` зовётся из одного места —
+  // `SendLoginOK`, и там же маска переписывается заново. Внутри сессии этого не
+  // случается никогда, поэтому здесь маска не трогается вовсе.
+  if (shedBlocks != 0)
+  {
+    static util::KeyedLogThrottle shedProtectionThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    if (shedProtectionThrottle.Allow(clientContext.characterUid, suppressed))
+    {
+      util::QuietLogWarn(
+        "kept the stored settings blocks 0x{:x} of user '{}': they were shed from"
+        " this session's login frame, so the client never had them to send back"
+        " (suppressed {} more for this character)",
+        shedBlocks,
+        clientContext.userName,
+        suppressed);
+    }
+  }
+
+  if (macroBlockRefused)
+  {
+    // Жалоба задросселирована: команду настроек шлёт клиент, то есть повторить
+    // её можно сколько угодно раз, и незадросселированная строка сама стала бы
+    // флудом, управляемым снаружи.
+    static util::LogThrottle macroRefusalThrottle{std::chrono::minutes{5}};
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (macroRefusalThrottle.Allow(suppressed, total))
+    {
+      util::QuietLogWarn(
+        "refused an oversized macro block from user '{}': {} over the {} byte budget;"
+        " kept the first {} slot(s) that fit (suppressed {} more, {} in total)",
+        clientContext.userName,
+        protocol::DescribeMacroBlockWireSize(macroBlockWireSize),
+        protocol::MaxMacroBlockWireBytes,
+        macroSlotsAccepted,
+        suppressed,
+        total);
+    }
+  }
 
   if (wasCreated)
   {
@@ -2847,6 +3110,19 @@ void LobbyNetworkHandler::HandleGoodsShopList(
   auto now = util::Clock::now() + std::chrono::days(1);
 
   //! Chunk size as defined in command handler.
+  // ★R74 (subreview #1, NIT 3): ЭТО ЧИСЛО ДЕРЖИТ ОТКАЗ БУЛК-ХЕЛПЕРА
+  // НЕДОСТИЖИМЫМ, И ЭТО НЕ СЛУЧАЙНОСТЬ, А ИНВАРИАНТ.
+  //
+  // `AcCmdLCGoodsShopListData::Write` пишет свой кусок через
+  // `util::WriteBoundedBytes`, а тот при нехватке места НЕ БРОСАЕТ — он
+  // укорачивает блок и оставляет счётчик согласованным с телом. Для zlib это
+  // хуже броска: клиент получит формально корректный кадр и неразжимаемый
+  // поток. Единственный производитель этих кусков — вот этот `chunk`, и
+  // 7168 против ~8174 доступных байт кадра оставляют запас 1006 Б, то есть
+  // резать нечего.
+  //
+  // Поднимешь ChunkSize выше ~8100 — хелпер начнёт молча резать сжатый поток.
+  // Расти этому числу можно только вместе с `MaxCommandDataSize`.
   constexpr auto ChunkSize = 7168;
 
   // Fragment shop data and send it in parts for the client to reconstruct and store.

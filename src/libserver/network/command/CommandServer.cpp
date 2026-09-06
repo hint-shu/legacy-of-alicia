@@ -18,6 +18,7 @@
  **/
 
 #include "libserver/network/command/CommandServer.hpp"
+#include "libserver/util/BoundedList.hpp"
 #include "libserver/util/QuietLog.hpp"
 
 #include "libserver/util/Deferred.hpp"
@@ -38,7 +39,10 @@ namespace
 {
 
 //! Max size of the command data.
-constexpr std::size_t MaxCommandDataSize = 8192;
+//! ★R74: единственное определение живёт в `libserver/util/BoundedList.hpp` —
+//! бюджеты кадра считаются от него же, и копия константы больше не может
+//! разъехаться с настоящим буфером.
+constexpr std::size_t MaxCommandDataSize = util::MaxCommandDataSizeBytes;
 
 //! Max size of the whole command payload.
 //! That is command data size + size of the message magic.

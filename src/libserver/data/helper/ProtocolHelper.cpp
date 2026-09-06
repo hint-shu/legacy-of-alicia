@@ -5,6 +5,11 @@
 #include "libserver/data/helper/ProtocolHelper.hpp"
 
 #include "libserver/data/DataDefinitions.hpp"
+#include "libserver/util/KeyedLogThrottle.hpp"
+#include "libserver/util/QuietLog.hpp"
+
+#include <chrono>
+#include <cstdint>
 
 namespace server
 {
@@ -402,9 +407,45 @@ void BuildProtocolSettings(
 
   if (settingsRecord.macros())
   {
-    settings.typeBitset.set(Settings::Macros);
+    // ★R74 (backlog #170). ЕДИНСТВЕННАЯ ТОЧКА ДАННЫЕ→ПРОТОКОЛ ДЛЯ МАКРОСОВ.
+    //
+    // Запись могла быть отравлена ДО того, как появился входной бюджет в
+    // `HandleUpdateUserSettings`, — или чужим инструментом, пишущим
+    // `data/settings/*.json` напрямую. Тогда блок макросов на провод не идёт
+    // вовсе: персонаж входит БЕЗ макросов вместо «не входит никогда».
+    // Миграции данных раунд не делает намеренно — менять протокол и переписывать
+    // записи на диске в одном раунде значило бы сделать два необратимых шага
+    // сразу; отравленная запись просто перестаёт публиковаться.
+    MacroOptions candidate{};
+    candidate.macros = settingsRecord.macros().value();
 
-    settings.macroOptions.macros = settingsRecord.macros().value();
+    const auto wireSize = MeasureMacroBlockWireSize(candidate);
+    if (wireSize <= MaxMacroBlockWireBytes)
+    {
+      settings.typeBitset.set(Settings::Macros);
+      settings.macroOptions = candidate;
+    }
+    else
+    {
+      // ★R74-fix-3 (subreview #2, NIT 7): СТРОКА НАЗЫВАЕТ ЗАПИСЬ, И ДРОССЕЛЬ
+      // КЛЮЧИТСЯ ПО НЕЙ ЖЕ. Прежняя строка не называла ни персонажа, ни
+      // запись, а дроссель был один function-local static на процесс — второй
+      // отравленный игрок в том же пятиминутном окне не давал вообще ничего,
+      // то есть оператор видел одну жалобу и не знал, чья она и сколько их.
+      static util::KeyedLogThrottle poisonedMacroThrottle{std::chrono::minutes{5}};
+      uint64_t suppressed = 0;
+      if (poisonedMacroThrottle.Allow(settingsRecord.uid(), suppressed))
+      {
+        util::QuietLogWarn(
+          "stored macros of settings record {} exceed the wire budget ({} over {});"
+          " the macro block is withheld from this login"
+          " (suppressed {} more for this record)",
+          settingsRecord.uid(),
+          DescribeMacroBlockWireSize(wireSize),
+          MaxMacroBlockWireBytes,
+          suppressed);
+      }
+    }
   }
 }
 
