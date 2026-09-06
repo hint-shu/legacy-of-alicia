@@ -20,6 +20,7 @@
 #include "server/race/MagicApplication.hpp"
 #include "server/race/MagicSystem.hpp"
 #include "libserver/util/QuietLog.hpp"
+#include "libserver/util/RecordAccess.hpp"
 #include "server/race/RaceNetworkHandler.hpp"
 
 #include "libserver/util/Cleanup.hpp"
@@ -2580,6 +2581,45 @@ void RaceNetworkHandler::HandleStartRace(
 
             auto& racer = raceInstance.GetTracker().GetRacer(characterUid);
             notify.hostOid = racer.oid;
+            // === LOA-fix (R81, backlog #274, площадка B): «РЕКОРД, КОТОРЫЙ
+            // НАДО ПОБИТЬ» В СТАРТОВОМ КАДРЕ ============================
+            // Комментарий самого поля (RaceMessageDefinitions.hpp, объявление
+            // `RaceRecord`) говорит про стартовый кадр «indicates the lap
+            // sector times TO BEAT». Здесь рекорд читается ДО заезда, то есть
+            // это честно «что бить».
+            // ★ТЕ ЖЕ ДВА ПРАВИЛА, ЧТО У ПЛОЩАДКИ A: только `finalRecordMs` и
+            // только через пояс. `teamMode` НЕ трогаем — он и есть длина кадра
+            // (ветка `trainingRecord`, +11 байт).
+            // ★ЗАЧЕМ ОБЕ ПЛОЩАДКИ. Какой из двух кадров кормит плашку — не
+            // измерено ничем, и различающий замер стоит окна живого тестера.
+            // Обе правки безопасны одинаково (длина пакета не меняется), обе
+            // берут значение из одного источника — `Character::courseRecords`.
+            // ★ЦЕНА, НАЗВАННАЯ ВСЛУХ: на заезде, ставшем НОВЫМ рекордом, две
+            // площадки дают разные числа (A — новое время, B — старый рекорд).
+            // Это ИЗМЕРЕНИЕ, а не расхождение: стенд снимает оба предиката.
+            notify.raceRecord.finalRecordMs = 0;
+            {
+              const uint64_t rawCourseId =
+                static_cast<uint64_t>(raceInstance.GetMapBlockId());
+              if (rawCourseId != 0
+                && rawCourseId <= std::numeric_limits<uint16_t>::max())
+              {
+                const auto courseId = static_cast<uint16_t>(rawCourseId);
+                uint32_t recordMs = 0;
+                (void)server::util::TryImmutable(
+                  GetServerInstance().GetDataDirector().GetCharacter(characterUid),
+                  "read the per-course record to beat",
+                  [courseId, &recordMs](const data::Character& character) noexcept
+                  {
+                    const auto& records = character.courseRecords();
+                    const auto found = std::ranges::find(
+                      records, courseId, &data::Character::CourseRecord::courseId);
+                    if (found != records.end())
+                      recordMs = found->recordTime;
+                  });
+                notify.raceRecord.finalRecordMs = recordMs;
+              }
+            }
 
             // Skills only apply for speed single or magic single
             if (isEligibleForSkills)

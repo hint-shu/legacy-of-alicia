@@ -961,6 +961,68 @@ void RaceInstance::Stop()
     }
   }
 
+  // === LOA-fix (R81, backlog #274): ПЛАШКА «ЛИЧНЫЙ РЕКОРД» В ТАБЛО ==========
+  //
+  // ЧТО БЫЛО. Сервер не заполнял `ScoreInfo::raceRecord` НИКОГДА (grep по `src/`
+  // давал только сериализацию), поэтому поле уезжало клиенту нулевым, и клиент
+  // рисовал в плашку «Личный рекорд» СВОЁ текущее время. Тестер видел это трижды
+  // из трёх: `2:30.81 (2:30.81)` в плашке против `02:29.03` во вкладке «Трассы».
+  //
+  // ★ЗАПОЛНЯЕМ ТОЛЬКО `finalRecordMs`. `mapBlockId`/`gameMode`/`teamMode`
+  // остаются дефолтными НАМЕРЕННО: `RaceRecord::Write` дописывает шесть полей
+  // `trainingRecord` (5×`uint16_t` + `uint8_t` = 11 БАЙТ) ТОЛЬКО при
+  // `teamMode == TeamMode::Single` (RaceMessageDefinitions.cpp, ветка после
+  // списка `lapRecords`), а дефолт члена — 0, то есть ни один из трёх режимов.
+  // Проставить `teamMode` «для полноты» значит УДЛИНИТЬ пакет на 11 байт и
+  // сдвинуть разбор `ScoreInfo` у КАЖДОГО клиента комнаты. Арифметику этих
+  // 11 байт пинует юнит-тест `ProtocolTestRaceRecordLength`.
+  //
+  // ★ЧИТАЕМ ПОСЛЕ ОБНОВЛЕНИЯ РЕКОРДОВ, И ЭТО ОСОЗНАННО: проехал хуже -> плашка
+  // покажет СТАРОЕ лучшее время (ровно то, чего ждёт игрок); проехал лучше ->
+  // покажет это время, и оно и есть новый рекорд. Обе стороны верны.
+  //
+  // ★ЧТЕНИЕ ЧЕРЕЗ ПОЯС, А НЕ ПРЯМЫМ `Immutable`: прямой доступ к непрогруженной
+  // записи бросил бы, и вся комната осталась бы без результата заезда.
+  //
+  // ★МЕСТО. Все `TryMutate` блока рекордов выше закрыты, `scores` отсортированы,
+  // ни один лок не вложен — тот же прецедент, что описывает блок мести
+  // («последняя точка перед отправкой пакета»). Разница одна и она в пользу
+  // этого места: значение берётся из `courseRecords`, которые обновляет блок
+  // НЕПОСРЕДСТВЕННО ВЫШЕ.
+  //
+  // ★`raceResult.scores` здесь ещё НЕ скопирован в `broadcastResult` (копия для
+  // ботов делается ниже), поэтому правка попадает и в живых игроков, и в копию.
+  // ★Запись рекорда в блоке выше идёт по `_tracker.GetRacers()`, а эта — по
+  // `scores`; расхождение штатно.
+  // ★`recordMs == 0` («рекорда ещё нет») пишется как ноль — то же значение, что
+  // сегодня, то есть ПЕРВЫЙ В ЖИЗНИ заезд по трассе поведения не меняет.
+  {
+    const uint64_t rawCourseId = static_cast<uint64_t>(_mapBlockId);
+    if (rawCourseId != 0 && rawCourseId <= std::numeric_limits<uint16_t>::max())
+    {
+      const auto courseId = static_cast<uint16_t>(rawCourseId);
+      for (auto& score : raceResult.scores)
+      {
+        if (score.uid == data::InvalidUid)
+          continue; // ботов в raceResult нет (R56), но контракт явный
+        uint32_t recordMs = 0;
+        (void)server::util::TryImmutable(
+          _raceNetworkHandler.GetServerInstance().GetDataDirector().GetCharacter(
+            score.uid),
+          "read the per-course record for the result board",
+          [courseId, &recordMs](const data::Character& character) noexcept
+          {
+            const auto& records = character.courseRecords();
+            const auto found = std::ranges::find(
+              records, courseId, &data::Character::CourseRecord::courseId);
+            if (found != records.end())
+              recordMs = found->recordTime;
+          });
+        score.raceRecord.finalRecordMs = recordMs;
+      }
+    }
+  }
+
   // === LOA (S8): прогресс ежедневных квестов финишировавших ============
   // Для каждого ДОЕХАВШЕГО гонщика дёргаем QuestSystem::OnQuestEvent — здесь,
   // ВНЕ characterRecord.Mutable (он уже закрыт выше), т.к. OnQuestEvent берёт
