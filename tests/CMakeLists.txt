@@ -221,6 +221,18 @@ target_include_directories(server_test_otp_system
 target_link_libraries(server_test_otp_system
         PRIVATE project-properties)
 
+# LOA (R80-1, round80, backlog #235): правило жатвы чат-сокетов. ★Заголовочное,
+# поэтому линковать нечего, кроме include-пути: правило вынесено из обоих
+# чат-директоров ИМЕННО затем, чтобы прод-пороги (60/60/0) можно было проверить
+# без часового ожидания на стенде.
+add_executable(chat_test_socket_reap_rule)
+target_sources(chat_test_socket_reap_rule PRIVATE
+        src/chat/TestChatSocketReapRule.cpp)
+target_include_directories(chat_test_socket_reap_rule
+        PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(chat_test_socket_reap_rule
+        PRIVATE project-properties alicia-libserver)
+
 add_test(NAME ProtocolTestMagic COMMAND protocol_test_magic)
 add_test(NAME ProtocolTestBoundedList COMMAND protocol_test_bounded_list)
 add_test(NAME UtilTestStream COMMAND util_test_stream)
@@ -247,6 +259,7 @@ add_test(NAME RaceTestRelayAuthz COMMAND race_test_relay_authz)
 add_test(NAME ProtocolTestRelayPayload COMMAND protocol_test_relay_payload)
 add_test(NAME MessengerTestSessionEviction COMMAND messenger_test_session_eviction)
 add_test(NAME ServerTestOtpSystem COMMAND server_test_otp_system)
+add_test(NAME ChatTestSocketReapRule COMMAND chat_test_socket_reap_rule)
 
 
 # LOA-fix (R72-fix-2, round72, находка Codex 3): ★ГАРДЫ ИСХОДНИКОВ — НА ОБЫЧНОМ
@@ -335,6 +348,28 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py --selftest)
     add_test(NAME ToolMessengerDisconnectOutsideLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_messenger_disconnect_outside_lock.py)
+    # LOA (R80-6, round80, backlog #235): развёртка чат-сокетов обязана
+    # исполняться СВОИМ сетевым потоком. Самая дешёвая текстовая форма того же
+    # свойства — «Tick() обоих чат-директоров пуст»: Tick() приходит с потока
+    # задач директора, чужого и для карты клиентов, и для Server::_addressStates
+    # (та живёт вовсе без замка). Гейт сперва доказывает себя на четырёх
+    # фикстурах, ДВЕ из которых — слепота: «чисто» без находки читать нельзя.
+    # ★Он читает ТЕКСТ, а не поток управления: настоящий страж инварианта —
+    # арка стенда thread-identity, а это сторож регрессии.
+    add_test(NAME ToolChatSweepThreadSelftest
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh --self-test)
+    add_test(NAME ToolChatSweepThreadGate
+            COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_chat_sweep_thread.sh)
+    # LOA (R80-8, round80, backlog #235): сиблинг гейта замка — для all-chat.
+    # ★R80 создаёт ПЕРВОГО чужепоточного писателя AllChatDirector::_clients
+    # (уборка лобби на выходе игрока). До раунда у этой карты не было ни замка,
+    # ни проверки; без сиблинга новая дисциплина ехала бы вообще без гейта,
+    # способного покраснеть. Копия, а не параметризация файла R78: менять чужой
+    # отревьюенный гейт ради удобства дороже, чем продублировать профиль.
+    add_test(NAME ToolAllChatClientMapLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py --selftest)
+    add_test(NAME ToolAllChatClientMapLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py)
     # R74. Гейт ограниченных списков ключится на СВОЙСТВО («функция, среди
     # параметров которой есть SinkStream&»), а не на написание `::Write(` — та
     # формулировка не видела площадку в свободной функции, и дыра пережила бы

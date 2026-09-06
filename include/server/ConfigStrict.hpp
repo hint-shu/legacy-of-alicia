@@ -94,6 +94,40 @@ public:
   return seconds;
 }
 
+//! ТО ЖЕ, ЧТО `ParseStrictPositiveSeconds`, НО НОЛЬ ДОПУСТИМ И ЗНАЧИТ
+//! «ВЫКЛЮЧЕНО».
+//!
+//! ★ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ ФЛАГ У ПРЕЖНЕЙ. Ноль осмыслен ровно там, где
+//! осмысленно выключение, и подмешивать его в общий разбор значило бы
+//! разрешить «удержание 0 секунд» соседям, для которых такое значение —
+//! дефект. Ровно то различие, ради которого `ParseStrictPositiveSeconds`
+//! ноль и отвергает.
+//!
+//! ★ВСЁ ОСТАЛЬНОЕ СТРОГО ТАК ЖЕ: пустая строка, мусор, ведущий пробел, хвост
+//! после числа, переполнение `uint32_t` — по-прежнему ОТКАЗ СТАРТА.
+//!
+//! @param key Имя ключа — попадает в текст исключения.
+//! @param value Поданное значение КАК ЕСТЬ.
+//! @returns Разобранное число секунд (ноль допустим и означает «выключено»).
+//! @throws ConfigError на любом невалидном значении.
+[[nodiscard]] inline uint32_t ParseStrictNonNegativeSeconds(
+  const std::string_view key,
+  const std::string_view value)
+{
+  if (value.empty())
+    throw ConfigError(key, "value is empty (remove the key to use the default)");
+
+  uint32_t seconds = 0;
+  const auto* const begin = value.data();
+  const auto* const end = value.data() + value.size();
+  const auto result = std::from_chars(begin, end, seconds);
+
+  if (result.ec != std::errc{} or result.ptr != end)
+    throw ConfigError(key, "value is not a whole number of seconds");
+
+  return seconds;
+}
+
 } // namespace server
 
 #endif // CONFIGSTRICT_HPP

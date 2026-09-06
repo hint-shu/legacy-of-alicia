@@ -32,6 +32,7 @@
 #include <boost/container_hash/hash.hpp>
 #include <locale>
 #include <shared_mutex>
+#include <unordered_set>
 
 namespace server
 {
@@ -311,6 +312,10 @@ void MessengerDirector::HandleNetworkTick()
   // армируется на `_io_ctx` того же сервера, поэтому тик приходит с того же
   // потока, что accept, чтение пакетов и разрывы — то есть с того, которому
   // карта клиентов принадлежит.
+  //
+  // LOA-fix (R80-3, round80, backlog #235): развёртка идёт ПЕРЕД сливом — то,
+  // что она поставит в очередь, закрывается ТЕМ ЖЕ тиком, а не следующим.
+  SweepChatSockets();
   DrainPendingDisconnects();
 }
 
@@ -332,43 +337,89 @@ void MessengerDirector::DrainPendingDisconnects()
   size_t rebound = 0;
   for (const PendingDisconnect& entry : pending)
   {
-    // ★ПЕРЕПРОВЕРКА ПЕРЕД РАЗРЫВОМ (NIT ревю #3 №3). Пока запись лежала в
-    // очереди, сокет мог пройти повторный вход и СНОВА стать законной сессией
-    // персонажа: гард повтора его не остановит, потому что фаза 1 сняла оба
-    // поля. Рвать такую сессию значило бы бить по живому входу, которого
-    // просьба о гашении не касалась. Монотонность `ClientId` спасает только от
-    // НОВЫХ соединений, а это — то же самое.
-    bool stillUnbound = false;
-    {
-      const std::shared_lock lock(_clientsMutex);
-      const auto clientIter = _clients.find(entry.clientId);
-      stillUnbound = clientIter != _clients.cend()
-        && clientIter->second.characterUid == data::InvalidUid;
-    }
-    if (not stillUnbound)
-    {
-      ++rebound;
-      continue;
-    }
-
-    // ★РАССЫЛКА «ОФЛАЙН» ИДЁТ ДО РАЗРЫВА И ПО СОХРАНЁННОЙ ЛИЧНОСТИ
-    // (ревю #3 WARN-1). После разрыва уборка синтезирует Offline сама, но
-    // упирается в снятый фазой 1 флаг и молчит. Здесь флаг не спрашивается.
-    const protocol::Presence offlinePresence{
-      .status = protocol::Status::Offline,
-      .scene = protocol::Presence::Scene::Ranch,
-      .sceneUid = 0};
-    BroadcastPresenceOfCharacter(
-      entry.characterUid, offlinePresence, entry.clientId, "teardown");
-
+    // LOA-fix (R80-3, round80, backlog #235): ПОЯС НА ЭЛЕМЕНТ ОЧЕРЕДИ.
+    //
+    // ★ЧТО ЭТО ЧИНИТ. Очередь уже снята `swap`-ом: бросок посреди цикла унёс бы
+    // ВЕСЬ остаток `pending` — те сокеты никто не закроет, в очередь их не
+    // вернуть и переспросить некому, а наверху напечатается «Unhandled exception
+    // in a network tick». До R80 это был редкий остаток: очередь наполняли
+    // только логауты и GM-баны, личность в ней всегда валидна. R80 делает эту
+    // очередь ШТАТНЫМ путём — каждая развёртка кладёт в неё всё, что зажала,
+    // включая сокеты, которые никогда не привязывались. Форма — та же, что у
+    // `util::RunCleanupStep` в уборке лобби: шаг вправе провалиться, проход
+    // обязан дойти до конца.
     try
     {
-      _chatterServer.DisconnectClient(entry.clientId);
-      ++closed;
+      // ★ПЕРЕПРОВЕРКА ПЕРЕД РАЗРЫВОМ (NIT ревю #3 №3). Пока запись лежала в
+      // очереди, сокет мог пройти повторный вход и СНОВА стать законной сессией
+      // персонажа: гард повтора его не остановит, потому что фаза 1 сняла оба
+      // поля. Рвать такую сессию значило бы бить по живому входу, которого
+      // просьба о гашении не касалась. Монотонность `ClientId` спасает только от
+      // НОВЫХ соединений, а это — то же самое.
+      bool stillUnbound = false;
+      {
+        const std::shared_lock lock(_clientsMutex);
+        const auto clientIter = _clients.find(entry.clientId);
+        stillUnbound = clientIter != _clients.cend()
+          && clientIter->second.characterUid == data::InvalidUid;
+      }
+      if (not stillUnbound)
+      {
+        ++rebound;
+        continue;
+      }
+
+      // ★РАССЫЛКА «ОФЛАЙН» ИДЁТ ДО РАЗРЫВА И ПО СОХРАНЁННОЙ ЛИЧНОСТИ
+      // (ревю #3 WARN-1). После разрыва уборка синтезирует Offline сама, но
+      // упирается в снятый фазой 1 флаг и молчит. Здесь флаг не спрашивается.
+      //
+      // LOA-fix (R80-3, round80, backlog #235): ГАРД `InvalidUid`.
+      // ★ЛИЧНОСТИ МОЖЕТ НЕ БЫТЬ ВОВСЕ. Развёртка ставит в очередь и сокеты,
+      // которые никогда не привязывались (P1 — сканеры, брошенные
+      // рукопожатия). `BroadcastPresenceOfCharacter` первым делом идёт в
+      // `GetCharacter(characterUid).Immutable(...)`, а тот БРОСАЕТ на
+      // недоступной записи — то есть без гарда ПЕРВАЯ ЖЕ развёртка со сканером
+      // уходила бы в пояс выше, и раунд молча перестал бы работать ровно в том
+      // случае, ради которого заведён #235.
+      // ★ГАРД НАКРЫВАЕТ И ТРАССУ: след `... (teardown)` печатает САМА рассылка
+      // (R78-fix), поэтому отдельного оператора здесь нет и разделить их
+      // невозможно — что и требуется: трасса без рассылки была бы ложной
+      // уликой, а `... 0 (teardown)` стенд прочитал бы как «рассылка
+      // состоялась».
+      if (entry.characterUid != data::InvalidUid)
+      {
+        const protocol::Presence offlinePresence{
+          .status = protocol::Status::Offline,
+          .scene = protocol::Presence::Scene::Ranch,
+          .sceneUid = 0};
+        BroadcastPresenceOfCharacter(
+          entry.characterUid, offlinePresence, entry.clientId, "teardown");
+      }
+
+      try
+      {
+        _chatterServer.DisconnectClient(entry.clientId);
+        ++closed;
+      }
+      catch (const std::exception&)
+      {
+        // Соединения уже нет — ровно та цель, которой добивались.
+      }
     }
-    catch (const std::exception&)
+    catch (const std::exception& x)
     {
-      // Соединения уже нет — ровно та цель, которой добивались.
+      uint64_t suppressed = 0;
+      uint64_t total = 0;
+      if (_drainStepThrottle.Allow(suppressed, total))
+      {
+        server::util::QuietLogWarn(
+          "Deferred chat session teardown failed for client {}: {}"
+          " (suppressed {}, total {})",
+          entry.clientId,
+          x.what(),
+          suppressed,
+          total);
+      }
     }
   }
 
@@ -377,6 +428,173 @@ void MessengerDirector::DrainPendingDisconnects()
     " ({} rebound and spared)",
     closed,
     rebound);
+}
+
+chat::ReapThresholds MessengerDirector::GetReapThresholds() const
+{
+  const auto& cfg = _serverInstance.GetSettings().chatReap;
+  return chat::ReapThresholds{
+    .handshakeTimeout = std::chrono::seconds(cfg.handshakeTimeoutSeconds),
+    .orphanGrace = std::chrono::seconds(cfg.orphanGraceSeconds),
+    .absoluteIdle = std::chrono::seconds(cfg.absoluteIdleSeconds)};
+}
+
+void MessengerDirector::HandleClientActivity(const network::ClientId clientId)
+{
+  // LOA-fix (R80-3, round80, backlog #235): ШТАМП АКТИВНОСТИ ЧАТ-СОКЕТА.
+  //
+  // ★UPDATE-ONLY, как у `RanchDirector::HandleClientActivity` (R21-2a): здесь
+  // НЕЛЬЗЯ `_clients[clientId]` — запись, созданную `operator[]` уже после
+  // уборки, не подберёт ни один выходной путь, и она осталась бы сиротой
+  // навсегда. `find` + присваивание такой сироты создать не может.
+  // ★`find`, а не `GetClientContext`: тот бросает, а бросок отсюда уходит в
+  // сетевой read-loop и рвёт клиенту соединение — то есть крючок «жив ли пир»
+  // сам бы пира и убивал.
+  // ★ЗАМОК ИСКЛЮЧИТЕЛЬНЫЙ И ЛИСТОВОЙ: под ним ровно `find` и одно
+  // присваивание, ни одного вызова наружу. Разделяемого мало — мы ПИШЕМ поле,
+  // а копию карты снимают чужие потоки (`GetClientByCharacterUid` с ранча и
+  // заезда). Цена — одно неоспариваемое взятие мьютекса на входящий кадр;
+  // чат-канал событийный (единицы кадров в минуту на клиента), это не горячий
+  // путь.
+  const std::unique_lock lock(_clientsMutex);
+  const auto clientIter = _clients.find(clientId);
+  if (clientIter != _clients.end())
+    clientIter->second.lastActivity = chat::ReapClock::now();
+}
+
+void MessengerDirector::SweepChatSockets()
+{
+  // LOA-fix (R80-3, round80, backlog #235): РАЗВЁРТКА-BACKSTOP.
+  //
+  // ★ПОЧЕМУ ЗДЕСЬ, А НЕ В `Tick()`. `Tick()` приходит с потока задач директора
+  // (`RunDirectorTaskLoop`, 50 Гц) — ЧУЖОГО и для `_clients`, и для
+  // `Server::_clients`, и, главное, для `Server::_addressStates`, которая живёт
+  // ВОВСЕ БЕЗ ЗАМКА и правится приёмом и разрывом соединения. Решение о жатве,
+  // принятое там, пришлось бы там же и исполнять. Это тот же довод, которым
+  // R78 завёл очередь отложенных разрывов.
+  //
+  // ★ЗАЧЕМ ЯРУС 2, КОГДА ЕСТЬ ЯРУС 1 (закрытие на выходе игрока). Ярус 1
+  // гейтится `revoked == true` и вообще не случается, если ключ мессенджера не
+  // выдавался или уже перевыдан. И он НИКОГДА не видит сокет, который не
+  // доходил до входа: у сканера нет ни персонажа, ни ключа, ни логаута.
+  //
+  // ★КОНФИГ ЧИТАЕТСЯ ОДИН РАЗ ЗА РАЗВЁРТКУ И ДО ЗАМКА: одно решение судит всех
+  // клиентов одной развёртки по ОДНИМ порогам, и под замком не остаётся ни
+  // одного обращения к настройкам.
+  const auto now = chat::ReapClock::now();
+  const auto& reapConfig = _serverInstance.GetSettings().chatReap;
+  const auto sweepInterval = std::chrono::seconds(reapConfig.sweepIntervalSeconds);
+  if (now - _lastChatSweep < sweepInterval)
+    return;
+  _lastChatSweep = now;
+  const chat::ReapThresholds thresholds = GetReapThresholds();
+
+  // ★СНИМОК ЛОББИ — ОДИН НА РАЗВЁРТКУ, А НЕ НА КЛИЕНТА: `SnapshotUsers` берёт
+  // чужой `shared_lock`, и дёргать его N раз за проход значит держать чужой
+  // замок N раз без нужды.
+  // ★ЗАМКИ НЕ ПЕРЕСЕКАЮТСЯ ВО ВРЕМЕНИ, и это сильнее, чем «порядок захвата
+  // строгий»: `SnapshotUsers()` возвращает КОПИЮ, копия целиком
+  // перекладывается в `charactersInGame`, и только ПОСЛЕ этого берётся
+  // `_clientsMutex`. Инверсии порядка не существует, потому что нет
+  // вложенности.
+  // ★СБОЙ СНИМКА ВЫКЛЮЧАЕТ ТОЛЬКО P2/P3, НЕ ВЕСЬ РАУНД. `SnapshotUsers` не
+  // `noexcept` и ВЫДЕЛЯЕТ ПАМЯТЬ; жать «сироту», не сумев спросить, в игре ли
+  // персонаж, — ровно тот катастрофический ложно-зелёный, ради которого гейт
+  // окна выката писался «в пользу игрока».
+  std::unordered_set<data::Uid> charactersInGame;
+  bool lobbyKnown = false;
+  try
+  {
+    for (const auto& user : _serverInstance.GetLobbyDirector().SnapshotUsers())
+    {
+      if (user.characterUid != data::InvalidUid)
+        charactersInGame.insert(user.characterUid);
+    }
+    lobbyKnown = true;
+  }
+  catch (const std::exception& x)
+  {
+    uint64_t suppressed = 0;
+    uint64_t total = 0;
+    if (_lobbySnapshotThrottle.Allow(suppressed, total))
+    {
+      server::util::QuietLogWarn(
+        "Chat reaper could not read the lobby snapshot: {}"
+        " (suppressed {}, total {})",
+        x.what(),
+        suppressed,
+        total);
+    }
+  }
+
+  // Фаза 1 — ПОД ЗАМКОМ: решить, отвязать, собрать. Ни одного вызова наружу.
+  std::vector<PendingDisconnect> condemned;
+  size_t handshake = 0;
+  size_t orphan = 0;
+  size_t idle = 0;
+  {
+    const std::unique_lock lock(_clientsMutex);
+    for (auto& [clientId, clientContext] : _clients)
+    {
+      const chat::ChatSocketState state{
+        .isAuthenticated = clientContext.isAuthenticated,
+        .characterUid = clientContext.characterUid,
+        .connectedAt = clientContext.connectedAt,
+        .lastActivity = clientContext.lastActivity};
+
+      // ★НЕИЗВЕСТНОСТЬ — В ПОЛЬЗУ ИГРОКА: снимка нет ⇒ считаем персонажа В
+      // ИГРЕ, и тогда правило вернёт `Keep` по P2 (P3 на проде выключен).
+      const bool inGame = not lobbyKnown
+        || charactersInGame.contains(clientContext.characterUid);
+
+      const auto verdict = chat::DecideChatSocketReap(
+        state, inGame, now, thresholds);
+      if (verdict == chat::ReapVerdict::Keep)
+        continue;
+
+      switch (verdict)
+      {
+        case chat::ReapVerdict::Handshake: ++handshake; break;
+        case chat::ReapVerdict::Orphan:    ++orphan;    break;
+        case chat::ReapVerdict::Idle:      ++idle;      break;
+        case chat::ReapVerdict::Keep:      break;
+      }
+
+      // ★ОТВЯЗКА ДО ЗАКРЫТИЯ — ОБЯЗАТЕЛЬНА, И СЛИВ НА НЕЁ ОПИРАЕТСЯ:
+      // `DrainPendingDisconnects` пропускает записи, успевшие перевязаться, и
+      // распознаёт их именно по `characterUid == InvalidUid`. Личность
+      // сохраняем В ОЧЕРЕДЬ: она нужна сливу для рассылки Offline.
+      condemned.emplace_back(
+        PendingDisconnect{
+          .clientId = clientId,
+          .characterUid = clientContext.characterUid});
+      clientContext.isAuthenticated = false;
+      clientContext.characterUid = data::InvalidUid;
+      clientContext.otpCode.reset();
+    }
+  }
+
+  if (condemned.empty())
+    return;
+
+  // Фаза 2 — постановка в СУЩЕСТВУЮЩУЮ очередь R78. ★Второго кросс-поточного
+  // пути раунд не заводит: закрывает по-прежнему один-единственный слив.
+  {
+    const std::lock_guard lock(_pendingDisconnectsMutex);
+    for (const PendingDisconnect& entry : condemned)
+      _pendingDisconnects.emplace_back(entry);
+  }
+
+  // ★ОДНА СТРОКА НА РАЗВЁРТКУ, И ТОЛЬКО КОГДА ДЕЙСТВИТЕЛЬНО ЖАЛИ. Пер-сокетной
+  // диагностики нет намеренно: «одна строка на пакет» — ровно тот флуд, который
+  // R57 поймал на проде (15 350 строк из 15 589 за час).
+  server::util::QuietLogInfo(
+    "Reaped {} chat socket(s) on {}: {} handshake, {} orphan, {} idle",
+    condemned.size(),
+    "the messenger",
+    handshake,
+    orphan,
+    idle);
 }
 
 void MessengerDirector::DisconnectUnboundSessions(
@@ -584,7 +802,14 @@ void MessengerDirector::HandleClientConnected(const network::ClientId clientId)
   // РЕХЭШ, то есть для копирующего с чужого потока она опаснее правки значений.
   {
     const std::unique_lock lock(_clientsMutex);
-    _clients.try_emplace(clientId);
+    // LOA (R80-3, round80, backlog #235): ОБЕ МЕТКИ СТАВЯТСЯ ПРИ РОЖДЕНИИ
+    // ЗАПИСИ. Через `try_emplace` + присваивание, а не агрегатом: `ClientContext`
+    // уже имеет NSDMI, и агрегатная инициализация перечисляла бы поля, которых
+    // раунд не касается.
+    const auto now = chat::ReapClock::now();
+    const auto [clientIter, inserted] = _clients.try_emplace(clientId);
+    clientIter->second.connectedAt = now;
+    clientIter->second.lastActivity = now;
   }
 }
 

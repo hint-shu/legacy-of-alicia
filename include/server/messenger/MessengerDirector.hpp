@@ -11,6 +11,9 @@
 #include <libserver/data/DataDefinitions.hpp>
 
 #include "server/Config.hpp"
+#include "server/chat/ChatSocketReapRule.hpp"
+
+#include <libserver/util/LogThrottle.hpp>
 
 #include <mutex>
 #include <shared_mutex>
@@ -37,6 +40,13 @@ private:
     data::Uid characterUid{data::InvalidUid};
     //! Online presence of the client.
     protocol::Presence presence{};
+
+    //! LOA (R80-3, round80, backlog #235): МОМЕНТ ПОДКЛЮЧЕНИЯ. Основание P1, и
+    //! оно НЕ ОСВЕЖАЕТСЯ активностью — иначе шумящий сканер бессмертен.
+    chat::ReapClock::time_point connectedAt{};
+    //! LOA (R80-3, round80, backlog #235): последняя входящая порция данных.
+    //! Основание грейса P2 и (если включён) P3.
+    chat::ReapClock::time_point lastActivity{};
   };
 
   struct Client
@@ -92,6 +102,10 @@ public:
 private:
   void HandleClientConnected(network::ClientId clientId) override;
   void HandleClientDisconnected(network::ClientId clientId) override;
+
+  //! LOA (R80-3, round80, backlog #235): штамп «пир говорит». Приходит с потока
+  //! чат-сервера на КАЖДУЮ входящую порцию данных, ДО разбора кадра.
+  void HandleClientActivity(network::ClientId clientId) override;
 
   // Handler methods for chatter commands
   void HandleChatterLogin(
@@ -201,6 +215,14 @@ private:
   //! Слить очередь отложенных разрывов. Только с потока мессенджера.
   void DrainPendingDisconnects();
 
+  //! LOA (R80-3, round80, backlog #235): РАЗВЁРТКА-BACKSTOP. Только с потока
+  //! мессенджера (`HandleNetworkTick`): фаза 1 обходит карту клиентов, а фаза 2
+  //! кладёт находки в ту же очередь отложенных разрывов, что и уборка лобби.
+  void SweepChatSockets();
+
+  //! Пороги жатвы, снятые из настроек ОДНИМ чтением на развёртку.
+  [[nodiscard]] chat::ReapThresholds GetReapThresholds() const;
+
   ChatterServer _chatterServer;
   ServerInstance& _serverInstance;
 
@@ -274,6 +296,18 @@ private:
 
   std::mutex _pendingDisconnectsMutex;
   std::vector<PendingDisconnect> _pendingDisconnects;
+
+  //! LOA (R80-3, round80, backlog #235): когда развёртка шла последний раз.
+  //! ★ЗАМКА НЕ ТРЕБУЕТ: читается и пишется ТОЛЬКО в `SweepChatSockets`, а та
+  //! зовётся ТОЛЬКО из `HandleNetworkTick`, то есть только потоком чат-сервера.
+  chat::ReapClock::time_point _lastChatSweep{};
+
+  //! Дроссель жалобы «снимок лобби не снялся». Путь штатный (раз в развёртку),
+  //! поэтому «одна строка на событие» была бы заготовкой флуда (урок R57).
+  util::LogThrottle _lobbySnapshotThrottle{std::chrono::seconds(60)};
+
+  //! Дроссель пояса на элемент слива.
+  util::LogThrottle _drainStepThrottle{std::chrono::seconds(60)};
 };
 
 } // namespace server

@@ -156,6 +156,13 @@ size_t ChatterServer::OnClientData(
   network::ClientId clientId,
   const std::span<const std::byte>& data)
 {
+  // LOA-fix (R80-0, round80, backlog #235): отметка «пир говорит» ДО разбора
+  // кадра. Здесь, а не в хендлере: любая команда без зарегистрированного
+  // обработчика уходит в ветку «Unhandled chatter command». Здесь же, а не
+  // после разбора: битый заголовок бросает и уносит управление мимо любой
+  // строки ниже, а пир от этого живым быть не перестаёт.
+  _chatterServerEventsHandler.HandleClientActivity(clientId);
+
   SourceStream commandStream{data};
 
   while (commandStream.GetCursor() != commandStream.Size())

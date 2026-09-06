@@ -124,6 +124,64 @@ void TestLeadingSpaceRejected()
   Check(Rejected("+20"), "«+20» обязано быть отвергнуто тем же правилом");
 }
 
+//! LOA (R80-2, round80, backlog #235): БРАТ СТРОГОГО РАЗБОРА, У КОТОРОГО НОЛЬ
+//! ЗАКОНЕН И ЗНАЧИТ «ВЫКЛЮЧЕНО».
+//!
+//! ★ЗАЧЕМ ЕМУ СВОИ СЛУЧАИ. Единственное отличие от старшего брата — ровно один
+//! допустимый ноль; всё остальное обязано остаться строгим. Без этих строк
+//! «ноль допустим» легко превратилось бы в «разбор помягче», и `20junk` тихо
+//! стал бы двадцаткой в ключе, который выключает механизм.
+bool RejectedNonNegative(const std::string_view value)
+{
+  try
+  {
+    (void)server::ParseStrictNonNegativeSeconds("test.key", value);
+  }
+  catch (const server::ConfigError&)
+  {
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+  return false;
+}
+
+void TestNonNegativeAcceptsZeroAndKeepsTheRestStrict()
+{
+  Check(server::ParseStrictNonNegativeSeconds("test.key", "0") == 0,
+    "«0» обязан разбираться в ноль: это и есть «выключено»");
+  Check(server::ParseStrictNonNegativeSeconds("test.key", "10") == 10,
+    "обычное значение обязано разбираться");
+  Check(server::ParseStrictNonNegativeSeconds("test.key", "4294967295")
+      == 4294967295u,
+    "потолок uint32_t обязан приниматься");
+
+  Check(RejectedNonNegative(""),
+    "пустое значение обязано отвергаться: явная опечатка не умолчание");
+  Check(RejectedNonNegative("abc"), "«abc» обязано отвергаться");
+  Check(RejectedNonNegative(" 20"), "ведущий пробел обязан отвергаться");
+  Check(RejectedNonNegative("20s"), "суффикс единиц обязан отвергаться");
+  Check(RejectedNonNegative("20 "), "хвостовой пробел обязан отвергаться");
+  Check(RejectedNonNegative("20junk"),
+    "хвост после числа обязан отвергаться, а не читаться как 20");
+  Check(RejectedNonNegative("4294967296"),
+    "переполнение uint32_t обязано отвергаться, а не заворачиваться");
+  Check(RejectedNonNegative("-1"),
+    "отрицательное обязано отвергаться");
+  Check(RejectedNonNegative("+20"),
+    "знак «+» обязан отвергаться тем же правилом «съесть всю строку»");
+}
+
+//! ★СТАРШИЙ БРАТ ОБЯЗАН ОСТАТЬСЯ СТРОГИМ К НУЛЮ. Иначе «завёл брата» тихо
+//! означало бы «ослабил обоих».
+void TestPositiveStillRejectsZero()
+{
+  Check(Rejected("0"),
+    "ParseStrictPositiveSeconds обязан по-прежнему отвергать ноль");
+}
+
 } // namespace
 
 int main()
@@ -134,6 +192,8 @@ int main()
   TestEmptyRejected();
   TestZeroAndNegativeRejected();
   TestLeadingSpaceRejected();
+  TestNonNegativeAcceptsZeroAndKeepsTheRestStrict();
+  TestPositiveStillRejectsZero();
 
   if (g_failures != 0)
   {
