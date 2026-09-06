@@ -408,6 +408,20 @@ if (NOT WIN32)
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py --selftest)
     add_test(NAME ToolAllChatClientMapLockGate
             COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_client_map_lock.py)
+    # LOA (R82, round82, backlog: director-clients-lock-hardening): сиблинг
+    # disconnect-гейта мессенджера — для all-chat. R80 сделал HandleChatterChat/
+    # HandleChatterInputState верными (self под коротким shared_lock, рассылка по
+    # снимку-под-замком, все выходы вне замка), но постоянного гейта «под замком
+    # нет выхода в чужой код» у all-chat не было: соседний client-map-lock гейт
+    # утверждает лишь «замок присутствует» и про содержимое блока прямо молчит.
+    # Копия, а не параметризация чужого отревьюенного файла R78: дороже менять
+    # его ради удобства. Единственное расхождение регулярки — необязательные
+    # шаблонные аргументы (`QueueCommand<decltype(x)>(`), без них гейт не увидел
+    # бы ни одного из шести настоящих выходов рассылки.
+    add_test(NAME ToolAllChatCalloutOutsideLockSelftest
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_callout_outside_lock.py --selftest)
+    add_test(NAME ToolAllChatCalloutOutsideLockGate
+            COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/check_allchat_callout_outside_lock.py)
     # R74. Гейт ограниченных списков ключится на СВОЙСТВО («функция, среди
     # параметров которой есть SinkStream&»), а не на написание `::Write(` — та
     # формулировка не видела площадку в свободной функции, и дыра пережила бы
