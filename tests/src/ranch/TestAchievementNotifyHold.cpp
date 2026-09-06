@@ -82,14 +82,17 @@ void TestTakeReturnsInOrder()
   AchievementNotifyHold hold(std::chrono::minutes(15));
   const auto t0 = Clock::time_point{} + std::chrono::hours(1);
 
-  Check(hold.Push(7, MakeNotify(10003), t0) == 0, "первый Push не должен вытеснять");
-  Check(hold.Push(7, MakeNotify(10018), t0) == 0, "второй Push не должен вытеснять");
+  Check(hold.Push(7, MakeNotify(10003), t0).droppedByCharacterCap == 0,
+    "первый Push не должен вытеснять");
+  Check(hold.Push(7, MakeNotify(10018), t0).droppedByCharacterCap == 0,
+    "второй Push не должен вытеснять");
   Check(hold.HeldCount() == 2, "удержано должно быть две записи");
   Check(hold.CharacterCount() == 1, "персонаж в удержании должен быть один");
 
   const auto taken = hold.Take(7);
   Check(taken.size() == 2, "Take обязан отдать обе записи");
-  Check(taken.at(0).achievementTid == 10003 and taken.at(1).achievementTid == 10018,
+  Check(taken.at(0).notify.achievementTid == 10003
+      and taken.at(1).notify.achievementTid == 10018,
     "Take обязан сохранять ПОРЯДОК появления");
   Check(hold.HeldCount() == 0, "после Take удержание обязано опустеть");
   Check(hold.CharacterCount() == 0, "после Take пустое ведро обязано быть стёрто");
@@ -129,7 +132,8 @@ void TestExpiryDropsOnlyOldEntries()
   Check(hold.Expire(t0 + std::chrono::seconds(20)) == 1,
     "ровно на сроке обязана выброситься СТАРШАЯ запись");
   Check(hold.HeldCount() == 1, "младшая запись обязана остаться");
-  Check(hold.Take(7).at(0).achievementTid == 10018, "остаться обязана именно младшая");
+  Check(hold.Take(7).at(0).notify.achievementTid == 10018,
+    "остаться обязана именно младшая");
 
   hold.Push(9, MakeNotify(10036), t0);
   Check(hold.Expire(t0 + std::chrono::hours(1)) == 1, "просрочка обязана выброситься");
@@ -145,19 +149,20 @@ void TestCapDropsOldest()
 
   std::size_t dropped = 0;
   for (uint16_t index = 0; index < AchievementNotifyHold::CharacterCap; ++index)
-    dropped += hold.Push(7, MakeNotify(index), t0);
+    dropped += hold.Push(7, MakeNotify(index), t0).droppedByCharacterCap;
   Check(dropped == 0, "до потолка не должно вытесняться ничего");
   Check(hold.HeldCount() == AchievementNotifyHold::CharacterCap,
     "удержано должно быть ровно по потолок");
 
-  dropped = hold.Push(7, MakeNotify(999), t0);
+  dropped = hold.Push(7, MakeNotify(999), t0).droppedByCharacterCap;
   Check(dropped == 1, "запись сверх потолка обязана вытеснить ровно одну");
   Check(hold.HeldCount() == AchievementNotifyHold::CharacterCap,
     "потолок обязан держаться");
 
   const auto taken = hold.Take(7);
-  Check(taken.front().achievementTid == 1, "★вытесняться обязана САМАЯ СТАРАЯ (tid 0), а не свежая");
-  Check(taken.back().achievementTid == 999, "свежая запись обязана остаться");
+  Check(taken.front().notify.achievementTid == 1,
+    "★вытесняться обязана САМАЯ СТАРАЯ (tid 0), а не свежая");
+  Check(taken.back().notify.achievementTid == 999, "свежая запись обязана остаться");
 }
 
 //! Потолок — на ПЕРСОНАЖА, а не на всё удержание: сосед не выталкивает соседа.
@@ -188,7 +193,8 @@ void TestCharactersAreIndependent()
 
   Check(hold.Take(7).size() == 1, "Take обязан отдать записи ЗАПРОШЕННОГО");
   Check(hold.HeldCount() == 1, "записи соседа обязаны остаться на месте");
-  Check(hold.Take(9).at(0).achievementTid == 10018, "и остаться ИМЕННО его записями");
+  Check(hold.Take(9).at(0).notify.achievementTid == 10018,
+    "и остаться ИМЕННО его записями");
 }
 
 //! LOA (R70-fix-8, находка Codex 6 WARN-3): ★ПОТОЛОК ВЫТЕСНЯЕТ ПРОГРЕСС, А НЕ
@@ -201,7 +207,7 @@ void TestCapEvictsProgressBeforeCompletion()
   const auto t0 = Clock::time_point{} + std::chrono::hours(1);
 
   Check(
-    hold.Push(7, MakeCompletedNotify(10003), t0) == 0,
+    hold.Push(7, MakeCompletedNotify(10003), t0).droppedByCharacterCap == 0,
     "первый Push не должен вытеснять");
   for (std::size_t index = 1; index < AchievementNotifyHold::CharacterCap; ++index)
     hold.Push(7, MakeNotify(static_cast<uint16_t>(20000 + index)), t0);
@@ -210,7 +216,7 @@ void TestCapEvictsProgressBeforeCompletion()
     "очередь обязана быть заполнена ровно под потолок");
 
   Check(
-    hold.Push(7, MakeNotify(30000), t0) == 1,
+    hold.Push(7, MakeNotify(30000), t0).droppedByCharacterCap == 1,
     "запись сверх потолка обязана вытеснить ровно одну");
 
   const auto taken = hold.Take(7);
@@ -218,19 +224,20 @@ void TestCapEvictsProgressBeforeCompletion()
     taken.size() == AchievementNotifyHold::CharacterCap,
     "после вытеснения обязано остаться ровно столько, сколько потолок");
   bool completionSurvived = false;
-  for (const auto& notify : taken)
+  for (const auto& entry : taken)
   {
-    if (notify.objectiveProgress.isCompleted and notify.achievementTid == 10003)
+    if (entry.notify.objectiveProgress.isCompleted
+      and entry.notify.achievementTid == 10003)
       completionSurvived = true;
   }
   Check(
     completionSurvived,
     "вытеснение обязано было выбросить ПРОГРЕССНЫЙ кадр, а не взятый тир");
   Check(
-    taken.front().achievementTid == 10003,
+    taken.front().notify.achievementTid == 10003,
     "уцелевшее завершение обязано остаться первым в порядке выдачи");
   Check(
-    taken.at(1).achievementTid == 20002,
+    taken.at(1).notify.achievementTid == 20002,
     "выброшен обязан быть САМЫЙ СТАРЫЙ прогрессный кадр (20001), а не любой");
 }
 
@@ -245,7 +252,7 @@ void TestCapEvictsOldestCompletionWhenAllCompleted()
   for (std::size_t index = 0; index < AchievementNotifyHold::CharacterCap; ++index)
     hold.Push(7, MakeCompletedNotify(static_cast<uint16_t>(20000 + index)), t0);
   Check(
-    hold.Push(7, MakeCompletedNotify(30000), t0) == 1,
+    hold.Push(7, MakeCompletedNotify(30000), t0).droppedByCharacterCap == 1,
     "потолок обязан сработать и на одних завершениях");
   Check(
     hold.HeldCount() == AchievementNotifyHold::CharacterCap,
@@ -253,10 +260,10 @@ void TestCapEvictsOldestCompletionWhenAllCompleted()
 
   const auto taken = hold.Take(7);
   Check(
-    taken.front().achievementTid == 20001,
+    taken.front().notify.achievementTid == 20001,
     "выброшено обязано быть САМОЕ СТАРОЕ завершение (20000)");
   Check(
-    taken.back().achievementTid == 30000,
+    taken.back().notify.achievementTid == 30000,
     "новое завершение обязано лежать в хвосте");
 }
 
