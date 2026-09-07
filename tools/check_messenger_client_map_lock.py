@@ -290,6 +290,47 @@ CONTEXT_WRITE_RE = re.compile(
 CONTEXT_READ_RE = re.compile(r"\bclientContext\.\w+")
 
 
+#: LOA (R82-2, round82, находка ревю WARN-1): ВЫХОДЫ В ЧУЖОЙ КОД, ПОСЛЕ КОТОРЫХ
+#: СНИМОК КАРТЫ ПРОТУХ.
+#:
+#: ★ЗАЧЕМ ЭТО ОТДЕЛЬНОЕ ПРАВИЛО. Контракт-копия (`GetClientContext` отдаёт
+#: значение) сделал БЕЗОПАСНЫМ то, что раньше было гонкой, и одновременно —
+#: МЁРТВЫМ то, что раньше было гардом. Гард «а не сняли ли с сессии
+#: аутентификацию, пока мы ходили в `DataDirector`» по замороженной копии
+#: момента входа ВСЕГДА ложен: чужой поток фазы 1 гашения правит КАРТУ, а не
+#: нашу копию. Ревю итерации 1 нашло ровно это в `HandleChatterGuildLogin`, и
+#: правка на ЭТОМ месте без правила означала бы, что следующий такой же гард
+#: умрёт молча ([[total-invariant-beats-list-of-sites]]).
+#:
+#: ★ПОЧЕМУ ИМЕННО `isAuthenticated`, А НЕ «любое поле». Это ЕДИНСТВЕННОЕ поле,
+#: чья протухшая копия превращает ОТКАЗ в СОГЛАСИЕ: фаза 1 гашения снимает флаг,
+#: и гард, читающий его по копии, пропускает погашенную сессию дальше.
+#: `characterUid` после callout читают ЗАКОННО — как личность, уже проверенную
+#: выше (`GetCharacter(clientContext.characterUid)`), и запрет на такое чтение
+#: был бы ложным красным. Ограничение объявлено вслух, а не спрятано:
+#: `characterUid` в гардах ОТКАЗА стережёт правило B ниже, поимённо.
+CALLOUT_RE = re.compile(
+    r"\b(GetDataDirector|GetCharacter|GetGuild|GetHorse|GetMail|GetItem|"
+    r"Immutable|Mutable|QueueCommand|BroadcastPresenceOfCharacter|"
+    r"DisconnectClient|SendStallionReward)\s*(?:<[^<>;{}]*>)?\s*\(")
+#: Чтение `<переменная>.isAuthenticated` (не запись).
+AUTH_READ_RE = re.compile(r"\b(\w+)\.isAuthenticated\b(?!\s*=[^=])")
+#: Определение локальной переменной: `const auto X =`, `auto& X =`, `bool X =`,
+#: `X =` — годится любое, важна СТРОКА, на которой значение получено.
+def _def_re(name: str) -> re.Pattern:
+    return re.compile(r"(?:^|[^\w.>])" + re.escape(name) + r"\s*=[^=]")
+
+#: Правило B (поимённое): гарды ОТКАЗА гильдийного входа. Оба обязаны судить по
+#: значению, взятому ПОСЛЕ последнего выхода в чужой код и ПОД замком карты.
+#: ★ПОИМЁННОЕ — ПОТОМУ ЧТО ЭТО ФИКС ЭТОГО РАУНДА, и запись раунда обязана уметь
+#: покраснеть именно на его откате, а не только на «похожем классе».
+GUILD_LOGIN_FUNC = "HandleChatterGuildLogin"
+GUILD_LOGIN_REFUSALS = (
+    "GuildLoginClientNotAuthenticated",
+    "CommandCharacterIsNotClientCharacter",
+)
+
+
 class Invalid(Exception):
     """Проверка недействительна (exit 2)."""
 
@@ -585,6 +626,187 @@ def mutation_lambdas(text: str, encapsulators: set[str] | None = None):
     return calls, violations
 
 
+def _function_span(text: str, name: str) -> tuple[int, int] | None:
+    """Границы тела `MessengerDirector::<name>` в номерах строк (1-based, вкл.)."""
+    lines = text.splitlines()
+    start = None
+    depth = 0
+    func_depth = 0
+    for number, raw in enumerate(lines, 1):
+        code = _strip_comment(raw)
+        match = FUNC_RE.match(raw)
+        if match and start is None and match.group(1) == name:
+            start = number
+            func_depth = depth
+        opened = code.count("{")
+        closed = code.count("}")
+        depth += opened
+        if closed:
+            depth -= closed
+            if start is not None and depth <= func_depth:
+                return start, number
+    return None
+
+
+def _locked_lines(text: str) -> set[int]:
+    """Номера строк, стоящих ПОД объявленным замком `_clientsMutex`.
+
+    Та же механика областей, что у `analyse` (глубина фигурных скобок по коду с
+    вырезанными комментариями), вынесенная сюда, чтобы правила уровня `judge`
+    могли спросить «а эта строка вообще под замком?».
+    """
+    lines = text.splitlines()
+    depth = 0
+    lock_depths: list[int] = []
+    locked: set[int] = set()
+    for number, raw in enumerate(lines, 1):
+        code = _strip_comment(raw)
+        if LOCK_RE.search(code):
+            lock_depths.append(depth)
+        if lock_depths:
+            locked.add(number)
+        opened = code.count("{")
+        closed = code.count("}")
+        depth += opened
+        if closed:
+            depth -= closed
+            lock_depths = [d for d in lock_depths if d <= depth]
+    return locked
+
+
+def stale_auth_reads(text: str):
+    """ПРАВИЛО A. Чтение `X.isAuthenticated`, отделённое от определения `X`
+    выходом в чужой код, — протухший гард.
+
+    ★ЧТО ИМЕННО ЛОВИТСЯ. Копия, снятая ДО `GetCharacter(...).Immutable(...)`, к
+    моменту чтения уже не отвечает на вопрос «сессия ещё аутентифицирована?»:
+    флаг снимает ЧУЖОЙ поток в КАРТЕ. Значит чтение обязано быть свежим
+    относительно ВСЕХ выходов между определением и собой.
+    """
+    lines = text.splitlines()
+    violations = []
+    func = None
+    func_depth = 0
+    depth = 0
+    body_start = 0
+    for number, raw in enumerate(lines, 1):
+        code = _strip_comment(raw)
+        match = FUNC_RE.match(raw)
+        if match and func is None:
+            func = match.group(1)
+            func_depth = depth
+            body_start = number
+
+        if func is not None:
+            for read in AUTH_READ_RE.finditer(code):
+                holder = read.group(1)
+                pattern = _def_re(holder)
+                def_line = None
+                for back in range(number - 1, body_start - 1, -1):
+                    back_code = _strip_comment(lines[back - 1])
+                    if pattern.search(back_code):
+                        def_line = back
+                        break
+                    # Разбор структурной привязки: `for (auto& [id, X] : _clients)`
+                    if re.search(r"\[\s*\w+\s*,\s*" + re.escape(holder)
+                                 + r"\s*\]", back_code):
+                        def_line = back
+                        break
+                if def_line is None:
+                    # Держатель объявлен не в этой функции (параметр, поле) —
+                    # правило о нём ничего не утверждает и молчит вслух.
+                    continue
+                between = [
+                    n for n in range(def_line + 1, number)
+                    if CALLOUT_RE.search(_strip_comment(lines[n - 1]))]
+                if between:
+                    violations.append((
+                        number, func,
+                        f"чтение {holder}.isAuthenticated по снимку строки "
+                        f"{def_line}, между ними выход в чужой код (строка "
+                        f"{between[0]}): гард судит ДОcallout-состояние"))
+
+        opened = code.count("{")
+        closed = code.count("}")
+        depth += opened
+        if closed:
+            depth -= closed
+            if func is not None and depth <= func_depth:
+                func = None
+    return violations
+
+
+def guild_login_guard_violations(text: str):
+    """ПРАВИЛО B. Оба гарда ОТКАЗА гильдийного входа обязаны судить по значению,
+    взятому ПОСЛЕ последнего выхода в чужой код и ПОД замком карты.
+
+    ★ЗАЧЕМ ПОИМЁННО, ЕСЛИ ЕСТЬ ПРАВИЛО A. Правило A стережёт КЛАСС и ключится на
+    `isAuthenticated`; сверку личности (`characterUid`) оно намеренно не трогает,
+    иначе ложно краснело бы на законных чтениях личности после callout. Откат
+    ЭТОГО фикса — это откат ОБЕИХ веток сразу, и запись раунда обязана уметь
+    покраснеть на нём целиком.
+    """
+    span = _function_span(text, GUILD_LOGIN_FUNC)
+    if span is None:
+        raise Invalid(f"функции {GUILD_LOGIN_FUNC} в файле нет — правило B "
+                      "стерегло бы пустоту")
+    start, end = span
+    lines = text.splitlines()
+    locked = _locked_lines(text)
+
+    callouts = [n for n in range(start, end + 1)
+                if CALLOUT_RE.search(_strip_comment(lines[n - 1]))]
+    if not callouts:
+        raise Invalid(f"в {GUILD_LOGIN_FUNC} не найдено ни одного выхода в чужой "
+                      "код — разбор не сработал, правило B слепо")
+
+    violations = []
+    for refusal in GUILD_LOGIN_REFUSALS:
+        sites = [n for n in range(start, end + 1) if refusal in lines[n - 1]
+                 and "emplace" in _strip_comment(lines[n - 1])]
+        if not sites:
+            raise Invalid(f"ветка {refusal} в {GUILD_LOGIN_FUNC} не найдена — "
+                          "правило B стерегло бы пустоту")
+        site = sites[0]
+        # Ближайшее `if (`/`else if (` ВЫШЕ ветки — её условие.
+        guard_line = None
+        for back in range(site - 1, start - 1, -1):
+            if re.match(r"\s*(?:else\s+)?if\s*\(", _strip_comment(lines[back - 1])):
+                guard_line = back
+                break
+        if guard_line is None:
+            violations.append((site, GUILD_LOGIN_FUNC,
+                               f"у ветки {refusal} не нашлось условия"))
+            continue
+        condition = _strip_comment(lines[guard_line - 1])
+        # Выход в чужой код, стоящий ПЕРЕД гардом: снимок обязан быть свежее его.
+        last_callout = max((n for n in callouts if n < guard_line), default=None)
+        if last_callout is None:
+            violations.append((guard_line, GUILD_LOGIN_FUNC,
+                               f"гард {refusal} стоит ДО единственного выхода — "
+                               "разбор не сработал"))
+            continue
+        identifiers = [i for i in re.findall(r"\b([A-Za-z_]\w*)\b", condition)
+                       if i not in {"if", "else", "not", "and", "or", "command",
+                                    "true", "false"}]
+        fresh = False
+        for name in identifiers:
+            pattern = _def_re(name)
+            for back in range(guard_line - 1, start - 1, -1):
+                if pattern.search(_strip_comment(lines[back - 1])):
+                    if back > last_callout and back in locked:
+                        fresh = True
+                    break
+            if fresh:
+                break
+        if not fresh:
+            violations.append((
+                guard_line, GUILD_LOGIN_FUNC,
+                f"гард {refusal} судит по значению, взятому ДО выхода в чужой "
+                f"код (строка {last_callout}) или вне замка карты: {condition.strip()}"))
+    return violations
+
+
 def _owning_function(text: str, line_number: int) -> str | None:
     """Имя функции `MessengerDirector::<name>`, чьё ТЕЛО содержит эту строку.
 
@@ -667,6 +889,14 @@ def judge(tree: Path) -> int:
             "по свойству ослепло, «ноль выходов под замком» здесь ничего не значит")
     mutation_calls, mutation_violations = mutation_lambdas(
         text, set(encapsulators))
+
+    # LOA (R82-2, находка ревю WARN-1): гард, судящий ДОcallout-состояние.
+    stale_violations = stale_auth_reads(text)
+    for number, name, why in stale_violations:
+        violations.append((number, name, why))
+    guild_violations = guild_login_guard_violations(text)
+    for number, name, why in guild_violations:
+        violations.append((number, name, why))
     for number, name, code in mutation_violations:
         violations.append((number, "лямбда под инкапсулированным замком",
                            f"выход {name} ПОД исключительным замком: {code}"))
@@ -681,6 +911,10 @@ def judge(tree: Path) -> int:
           f"[{', '.join(f'{n}:{ln}' for n, ln in sorted(encapsulators.items()))}]")
     print(f"лямбд под ними    : {mutation_calls}, выходов в них: "
           f"{len(mutation_violations)} (ожидалось 0)")
+    print(f"протухших гардов isAuthenticated : {len(stale_violations)} "
+          f"(правило A, ожидалось 0)")
+    print(f"гардов отказа GuildLogin не по свежему снимку : "
+          f"{len(guild_violations)} (правило B, ожидалось 0)")
     print(f"исключительный замок в теле : "
           f"{len(MUST_LOCK_EXCLUSIVELY) - len(exclusive_missing)} "
           f"из {len(MUST_LOCK_EXCLUSIVELY)}")
@@ -867,6 +1101,19 @@ void MessengerDirector::CanaryUseMutateClientState(const network::ClientId clien
          lambda s: s.replace(
              "  const std::function<void(ClientContext&)>& mutation)",
              "  const CallerMutation& mutation)", 1)),
+        # ★КАНАРЕЙКИ ФИКСА WARN-1 (R82-2). Обе — ровно те два способа откатить
+        # восстановленный гард, и обе обязаны краснить.
+        (1, "гард GuildLogin возвращён к копии момента входа (откат WARN-1)",
+         lambda s: s.replace(
+             "  if (not currentIsAuthenticated)",
+             "  if (not clientContext.isAuthenticated)", 1).replace(
+             "  else if (command.characterUid != currentCharacterUid)",
+             "  else if (command.characterUid != clientContext.characterUid)", 1)),
+        (1, "с пост-callout перечитывания снят замок карты",
+         lambda s: s.replace(
+             "    const std::shared_lock lock(_clientsMutex);\n"
+             "    const auto currentIter = _clients.find(clientId);",
+             "    const auto currentIter = _clients.find(clientId);", 1)),
     )
 
     import tempfile
