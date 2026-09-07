@@ -198,9 +198,45 @@ MUTATION_FORBIDDEN = (
 )
 MUTATION_FORBIDDEN_RE = re.compile(
     r"\b(" + "|".join(MUTATION_FORBIDDEN) + r")\s*(?:<[^<>;{}]*>)?\s*\(")
-MUTATION_CALL_RE = re.compile(r"\bMutateClientContext\s*\(")
-#: Строка ОПРЕДЕЛЕНИЯ метода — не вызов; её из учёта исключаем.
-MUTATION_DEF_RE = re.compile(r"MessengerDirector::MutateClientContext\s*\(")
+
+#: LOA (R82-2, round82, находка ревю NIT-1): ПРАВИЛО КЛЮЧИТСЯ НА СВОЙСТВО, А НЕ
+#: НА ИМЯ `MutateClientContext`.
+#:
+#: ★ЧТО БЫЛО НЕ ТАК. Первая редакция правила искала литерал
+#: `MutateClientContext(`. Сегодня ложно-зелёного это не давало — метод такой в
+#: мессенджере ровно один, — но проверка стерегла ИМЯ, а опасен КЛАСС: метод,
+#: который берёт `_clientsMutex` ИСКЛЮЧИТЕЛЬНО внутри себя и исполняет под ним
+#: ЛЯМБДУ ВЫЗЫВАЮЩЕГО. Заведи следующий раунд второй такой хелпер под другим
+#: именем — и выход в чужой код под исключительным замком снова стал бы
+#: невидимым, молча ([[gate-by-form-gives-false-completeness]]).
+#:
+#: ★ЧТО СЧИТАЕТСЯ СВОЙСТВОМ. Метод `MessengerDirector::X`, у которого
+#: ОДНОВРЕМЕННО: (а) в списке параметров есть вызываемое, переданное
+#: вызывающим — `std::function<…> имя` или (при шаблонном определении) `T&& имя`,
+#: где `T` объявлен в `template <…>` над определением; (б) в теле объявлен
+#: замок `_clientsMutex` ЛЮБОГО рода — `shared_lock` или `unique_lock` (почему
+#: не только исключительный — врезка в `mutation_encapsulators`); (в) это
+#: вызываемое в теле ВЫЗЫВАЕТСЯ (`имя(`). Тело такого метода — замок, и текст
+#: лямбды на стороне вызывающего стоит БЕЗ единого объявления замка над собой:
+#: соседний `check_messenger_disconnect_outside_lock.py` его физически не видит.
+#:
+#: ★ПОРОГ СЛЕПОТЫ ДЕТЕКТОРА. Правило по свойству само может ослепнуть (сменилась
+#: форма объявления — и «инкапсуляторов не найдено», ноль лямбд, зелено). Поэтому
+#: у детектора есть ПОЛ: он ОБЯЗАН заново найти известного члена класса. Не нашёл
+#: — гейт недействителен (exit 2), а не чист ([[a-gate-must-prove-itself-first]]).
+MUTATION_ENCAPSULATOR_FLOOR = {"MutateClientContext"}
+
+#: Определение метода класса: `<тип> MessengerDirector::<Имя>(`.
+#: ★ТИП НЕ ПЕРЕЧИСЛЯЕТСЯ (в отличие от `FUNC_RE`): здесь важно НЕ пропустить
+#: будущий хелпер с любым типом возврата — перечисление типов было бы ровно той
+#: слепотой по форме, от которой это правило и заводится.
+DEF_HEAD_RE = re.compile(r"\bMessengerDirector::(\w+)\s*\(")
+#: Параметр-вызываемое, форма 1: `std::function<…> имя` / `const std::function<…>& имя`.
+FUNCTION_PARAM_RE = re.compile(
+    r"std::function\s*<.*?>\s*&{0,2}\s*(\w+)\s*(?:,|\)|$)", re.DOTALL)
+#: Параметр-вызываемое, форма 2: `T&& имя` при шаблонном определении.
+TEMPLATE_HEAD_RE = re.compile(r"template\s*<([^>]*)>")
+TEMPLATE_NAME_RE = re.compile(r"(?:typename|class)\s+(\w+)")
 
 #: Ниже этого числа обращений файл заведомо не тот — проверка слепа.
 #: ★ПОДНЯТ ПО ЗАМЕРУ, А НЕ НАУГАД (R80-7): на дереве R78 гейт находил 30
@@ -385,8 +421,111 @@ def analyse(text: str):
     return accesses, violations, seen_functions
 
 
-def mutation_lambdas(text: str):
-    """Вернуть (вызовов `MutateClientContext`, нарушений внутри их лямбд).
+def mutation_encapsulators(text: str) -> dict[str, int]:
+    """Найти методы, ИНКАПСУЛИРУЮЩИЕ исключительный `_clientsMutex` и
+    исполняющие под ним лямбду ВЫЗЫВАЮЩЕГО. Ключ — имя, значение — строка
+    определения.
+
+    ★ИМЯ НЕ УЧАСТВУЕТ В РЕШЕНИИ. Решают три признака (см. врезку у
+    `MUTATION_ENCAPSULATOR_FLOOR`): параметр-вызываемое, `unique_lock` на
+    `_clientsMutex` в теле и вызов этого параметра в теле.
+    """
+    lines = text.splitlines()
+    found: dict[str, int] = {}
+    for index, raw in enumerate(lines):
+        code = _strip_comment(raw)
+        head = DEF_HEAD_RE.search(code)
+        if not head:
+            continue
+        name = head.group(1)
+
+        # Список параметров — по балансу круглых скобок от найденной `(`.
+        depth = 0
+        opened = False
+        params: list[str] = []
+        cursor = index
+        offset = head.end() - 1
+        while cursor < len(lines):
+            chunk = _strip_comment(lines[cursor])[offset:]
+            for char in chunk:
+                if char == "(":
+                    depth += 1
+                    opened = True
+                    if depth == 1:
+                        continue
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                if opened and depth >= 1:
+                    params.append(char)
+            offset = 0
+            if opened and depth == 0:
+                break
+            params.append("\n")
+            cursor += 1
+        if not opened or depth != 0:
+            continue
+        param_text = "".join(params)
+
+        # ★ЭТО ОБЪЯВЛЕНИЕ, А НЕ ОПРЕДЕЛЕНИЕ? Тела нет — свойства не проверить.
+        tail = _strip_comment(lines[cursor])
+        rest = tail[tail.rfind(")") + 1:]
+        if ";" in rest and "{" not in rest:
+            continue
+
+        # Параметры-вызываемые: `std::function<…> имя` …
+        callables = set(FUNCTION_PARAM_RE.findall(param_text))
+        # … и `T&& имя`, если `T` объявлен в `template <…>` над определением.
+        template_names: set[str] = set()
+        for back in range(max(0, index - 3), index):
+            head_match = TEMPLATE_HEAD_RE.search(_strip_comment(lines[back]))
+            if head_match:
+                template_names |= set(TEMPLATE_NAME_RE.findall(head_match.group(1)))
+        for template_name in template_names:
+            callables |= set(re.findall(
+                r"\b" + re.escape(template_name) + r"\s*&&\s*(\w+)", param_text))
+        if not callables:
+            continue
+
+        # ★ТЕЛО БЕРЁТСЯ ПО СКОБКАМ ОТ ЭТОГО ЖЕ ОПРЕДЕЛЕНИЯ, А НЕ ЧЕРЕЗ
+        # `_function_body`: тот ищет функцию по `FUNC_RE`, а `FUNC_RE`
+        # ПЕРЕЧИСЛЯЕТ типы возврата. Хелпер с типом вне списка стал бы для
+        # детектора невидим — то есть правило по свойству снова ослепло бы по
+        # форме, ровно от чего оно и заводится.
+        body_depth = 0
+        body_opened = False
+        body_lines: list[str] = []
+        for raw_body in lines[cursor:]:
+            body_code = _strip_comment(raw_body)
+            body_lines.append(raw_body)
+            body_depth += body_code.count("{")
+            if body_depth > 0:
+                body_opened = True
+            body_depth -= body_code.count("}")
+            if body_opened and body_depth <= 0:
+                break
+        if not body_opened:
+            continue
+        body = "\n".join(body_lines)
+        # ★ЗАМОК ЛЮБОГО РОДА, А НЕ ТОЛЬКО ИСКЛЮЧИТЕЛЬНЫЙ. Требуй тут
+        # `unique_lock` — и мутант, переведший хелпер на `shared_lock`, выпал бы
+        # из НАДЗОРА (детектор перестал бы его видеть) ровно тогда, когда он
+        # опаснее всего. `shared_mutex` нерекурсивен в обе стороны: выход в
+        # `BroadcastPresenceOfCharacter` из-под разделяемого замка — тот же
+        # самозахват. «Исключительный он или нет» судит `MUST_LOCK_EXCLUSIVELY`,
+        # и это ОТДЕЛЬНОЕ правило с отдельным вердиктом.
+        if not LOCK_RE.search(body):
+            continue
+        if not any(re.search(r"\b" + re.escape(c) + r"\s*\(", body)
+                   for c in callables):
+            continue
+        found[name] = index + 1
+    return found
+
+
+def mutation_lambdas(text: str, encapsulators: set[str] | None = None):
+    """Вернуть (вызовов инкапсуляторов замка, нарушений внутри их лямбд).
 
     ★РАЗБОР ПО БАЛАНСУ КРУГЛЫХ СКОБОК, а не по строкам: аргумент-лямбда занимает
     несколько строк, и «следующие N строк» было бы догадкой. Область вызова —
@@ -394,13 +533,28 @@ def mutation_lambdas(text: str):
     вернулся к нулю. Первое вхождение самого имени в счёт не идёт, иначе вызов
     объявлял бы нарушителем сам себя.
     """
+    names = sorted(encapsulators if encapsulators is not None
+                   else mutation_encapsulators(text))
+    if not names:
+        return 0, []
+    alternation = "|".join(re.escape(n) for n in names)
+    call_re = re.compile(r"\b(?:" + alternation + r")\s*\(")
+    #: Строка ОПРЕДЕЛЕНИЯ метода — не вызов; её из учёта исключаем.
+    def_re = re.compile(r"MessengerDirector::(?:" + alternation + r")\s*\(")
+    #: ★САМ ИНКАПСУЛЯТОР ВНУТРИ ЧУЖОЙ ЛЯМБДЫ — ТОЖЕ ВЫХОД: он берёт тот же
+    #: нерекурсивный замок. Поэтому обнаруженные имена добавляются к запрету
+    #: динамически, а не переписываются руками в `MUTATION_FORBIDDEN`.
+    forbidden_re = re.compile(
+        r"\b(" + "|".join(list(MUTATION_FORBIDDEN) + names)
+        + r")\s*(?:<[^<>;{}]*>)?\s*\(")
+
     lines = text.splitlines()
     calls = 0
     violations = []
     index = 0
     while index < len(lines):
         code = _strip_comment(lines[index])
-        if not MUTATION_CALL_RE.search(code) or MUTATION_DEF_RE.search(code):
+        if not call_re.search(code) or def_re.search(code):
             index += 1
             continue
 
@@ -421,10 +575,10 @@ def mutation_lambdas(text: str):
                 break
 
         for number, raw, code in region:
-            for match in MUTATION_FORBIDDEN_RE.finditer(code):
-                # Само имя `MutateClientContext` на открывающей строке — это
+            for match in forbidden_re.finditer(code):
+                # Имя самого инкапсулятора на открывающей строке — это
                 # разбираемый вызов, а не выход из-под замка.
-                if number == start + 1 and match.group(1) == "MutateClientContext":
+                if number == start + 1 and match.group(1) in names:
                     continue
                 violations.append((number, match.group(1), raw.strip()))
 
@@ -503,9 +657,18 @@ def judge(tree: Path) -> int:
     for name in declare_missing:
         violations.append((0, name, "обязана объявить замок в СВОЁМ теле "
                                     "(контракт R82), а объявления нет"))
-    mutation_calls, mutation_violations = mutation_lambdas(text)
+    # LOA (R82-2, находка ревю NIT-1): набор поднадзорных методов вычисляется
+    # ПО СВОЙСТВУ, а пол ловит слепоту самого детектора.
+    encapsulators = mutation_encapsulators(text)
+    missing_floor = sorted(MUTATION_ENCAPSULATOR_FLOOR - set(encapsulators))
+    if missing_floor:
+        raise Invalid(
+            f"детектор инкапсуляторов замка не нашёл {missing_floor} — правило "
+            "по свойству ослепло, «ноль выходов под замком» здесь ничего не значит")
+    mutation_calls, mutation_violations = mutation_lambdas(
+        text, set(encapsulators))
     for number, name, code in mutation_violations:
-        violations.append((number, "MutateClientContext-лямбда",
+        violations.append((number, "лямбда под инкапсулированным замком",
                            f"выход {name} ПОД исключительным замком: {code}"))
     print("=== gate: замок над картой клиентов мессенджера ===")
     print(f"дерево            : {tree}")
@@ -514,7 +677,9 @@ def judge(tree: Path) -> int:
     print(f"обязаны быть под замком : {len(guarded)} в {len(MUST_LOCK)} функциях")
     print(f"замок в СВОЁМ теле обязан : {len(MUST_DECLARE_LOCK) - len(declare_missing)}"
           f" из {len(MUST_DECLARE_LOCK)} (R82)")
-    print(f"лямбд MutateClientContext  : {mutation_calls}, выходов в них: "
+    print(f"инкапсуляторов замка (по СВОЙСТВУ) : {len(encapsulators)} "
+          f"[{', '.join(f'{n}:{ln}' for n, ln in sorted(encapsulators.items()))}]")
+    print(f"лямбд под ними    : {mutation_calls}, выходов в них: "
           f"{len(mutation_violations)} (ожидалось 0)")
     print(f"исключительный замок в теле : "
           f"{len(MUST_LOCK_EXCLUSIVELY) - len(exclusive_missing)} "
@@ -610,21 +775,24 @@ def selftest() -> int:
     # а в `judge` (замок в СВОЁМ теле, исключительный замок, вызов `*Locked` под
     # замком), и снятием строки замка их не проверить. Каждая фикстура
     # впрыскивает РОВНО ОДНО нарушение в текст и требует красного.
+    # ★ЭЛЕМЕНТ = (подпись, мутация, ОЖИДАЕМЫЙ КОД). Код указывается явно,
+    # потому что часть канареек обязана дать не «красный» (1), а «зелёный» (0)
+    # или «недействителен» (2), и «поймана» для них значит РАЗНОЕ.
     fixtures = (
-        ("GetClientContext без замка в теле",
+        (1, "GetClientContext без замка в теле",
          lambda s: s.replace(
              "  const std::shared_lock lock(_clientsMutex);\n"
              "  return GetClientContextLocked(clientId, requireAuthentication);",
              "  return GetClientContextLocked(clientId, requireAuthentication);",
              1)),
-        ("MutateClientContext под shared_lock вместо unique_lock",
+        (1, "MutateClientContext под shared_lock вместо unique_lock",
          lambda s: s.replace(
              "  const std::unique_lock lock(_clientsMutex);\n\n"
              "  const auto clientContextIter = _clients.find(clientId);",
              "  const std::shared_lock lock(_clientsMutex);\n\n"
              "  const auto clientContextIter = _clients.find(clientId);",
              1)),
-        ("снимок карты возвращён к незалоченному = _clients",
+        (1, "снимок карты возвращён к незалоченному = _clients",
          lambda s: s.replace(
              "  const auto clientsSnapshot = [this]\n"
              "  {\n"
@@ -633,7 +801,7 @@ def selftest() -> int:
              "  }();",
              "  const auto clientsSnapshot = _clients;",
              1)),
-        ("выход в чужой код внутри лямбды MutateClientContext",
+        (1, "выход в чужой код внутри лямбды MutateClientContext",
          lambda s: s.replace(
              "      mutableClientContext.presence = command.presence;",
              "      mutableClientContext.presence = command.presence;\n"
@@ -641,7 +809,7 @@ def selftest() -> int:
              "        mutableClientContext.characterUid, command.presence, "
              "clientId, nullptr);",
              1)),
-        ("GetClientContextLocked вызван вне замка",
+        (1, "GetClientContextLocked вызван вне замка",
          lambda s: s.replace(
              "    const std::shared_lock lock(_clientsMutex);\n"
              "    const auto& clientContext = GetClientContextLocked(clientId, false);",
@@ -649,8 +817,60 @@ def selftest() -> int:
              1)),
     )
 
+    # ★КАНАРЕЙКИ ПРАВИЛА ПО СВОЙСТВУ (R82-2, находка ревю NIT-1). Правило больше
+    # не ключится на имя `MutateClientContext`, и доказать это можно только
+    # ДРУГИМ ИМЕНЕМ: фикстура вводит хелпер `MutateClientState` — ту же форму
+    # (исключительный `_clientsMutex` внутри + лямбда вызывающего), но чужое имя.
+    # Троица обязательна целиком: красная (выход в лямбде ловится), ЗЕЛЁНАЯ (без
+    # выхода гейт молчит — иначе «красный» доказывал бы лишь то, что появилась
+    # новая функция) и НЕДЕЙСТВИТЕЛЬНАЯ (детектор ослеп → exit 2, а не «чисто»).
+    encapsulator_helper = """bool MessengerDirector::MutateClientState(
+  const network::ClientId clientId,
+  const std::function<void(ClientContext&)>& stateMutation)
+{
+  const std::unique_lock lock(_clientsMutex);
+
+  const auto stateIter = _clients.find(clientId);
+  if (stateIter == _clients.end())
+    return false;
+
+  stateMutation(stateIter->second);
+  return true;
+}
+
+void MessengerDirector::CanaryUseMutateClientState(const network::ClientId clientId)
+{
+  MutateClientState(
+    clientId,
+    [this, clientId](ClientContext& mutableClientContext)
+    {
+      mutableClientContext.presence = protocol::Presence{};
+%(callout)s    });
+}
+
+"""
+    callout_line = ("      BroadcastPresenceOfCharacter(\n"
+                    "        mutableClientContext.characterUid, "
+                    "protocol::Presence{}, clientId, nullptr);\n")
+    namespace_end = "} // namespace server"
+
+    def _inject(callout: str):
+        block = encapsulator_helper % {"callout": callout}
+        return lambda s: s.replace(namespace_end, block + namespace_end, 1)
+
+    fixtures = fixtures + (
+        (1, "ЧУЖОЕ ИМЯ: хелпер MutateClientState с выходом в лямбде",
+         _inject(callout_line)),
+        (0, "ЧУЖОЕ ИМЯ: тот же хелпер БЕЗ выхода — гейт обязан молчать",
+         _inject("")),
+        (2, "детектор свойства ослеп (параметр-вызываемое не распознан)",
+         lambda s: s.replace(
+             "  const std::function<void(ClientContext&)>& mutation)",
+             "  const CallerMutation& mutation)", 1)),
+    )
+
     import tempfile
-    for label, mutate in fixtures:
+    for expected, label, mutate in fixtures:
         mutated = mutate(original)
         if mutated == original:
             print(f"  ✗ фикстуру «{label}» не удалось впрыснуть (якорь не найден)")
@@ -664,11 +884,12 @@ def selftest() -> int:
                 code = judge(fake)
             except Invalid as exc:
                 code = 2
-                print(f"    (фикстура дала «недействительна»: {exc})")
-        if code == 1:
-            print(f"  ✓ фикстура «{label}» поймана (код 1)")
+                if expected != 2:
+                    print(f"    (фикстура дала «недействительна»: {exc})")
+        if code == expected:
+            print(f"  ✓ фикстура «{label}» дала ожидаемый код {expected}")
         else:
-            print(f"  ✗ фикстура «{label}» НЕ поймана (код {code})")
+            print(f"  ✗ фикстура «{label}»: код {code}, ожидался {expected}")
             failures += 1
 
     if failures:
