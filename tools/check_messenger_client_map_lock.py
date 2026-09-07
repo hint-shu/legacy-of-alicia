@@ -929,6 +929,31 @@ def judge(tree: Path) -> int:
     return 0
 
 
+def _move_reread_above_callout(source: str) -> str:
+    """Перенести блок пост-callout перечитывания ВЫШЕ выхода в `DataDirector`.
+
+    Мутация текстовая и якорная: не нашла якорь — вернула исходник без правок, и
+    самопроверка объявит фикстуру невнедрённой (провал), а не тихо зачтёт её.
+    """
+    block = (
+        "  bool currentIsAuthenticated{false};\n"
+        "  data::Uid currentCharacterUid{data::InvalidUid};\n"
+        "  {\n"
+        "    const std::shared_lock lock(_clientsMutex);\n"
+        "    const auto currentIter = _clients.find(clientId);\n"
+        "    if (currentIter != _clients.end())\n"
+        "    {\n"
+        "      currentIsAuthenticated = currentIter->second.isAuthenticated;\n"
+        "      currentCharacterUid = currentIter->second.characterUid;\n"
+        "    }\n"
+        "  }\n\n")
+    callout = ("  // Check if client belongs to the guild in the command\n"
+               "  data::Uid characterGuildUid{data::InvalidUid};\n")
+    if source.count(block) != 1 or source.count(callout) != 1:
+        return source
+    return source.replace(block, "", 1).replace(callout, block + callout, 1)
+
+
 def selftest() -> int:
     """★ГЕЙТ ОБЯЗАН СПЕРВА ДОКАЗАТЬ СЕБЯ: снимаем каждый замок по очереди и
     требуем, чтобы гейт покраснел ровно на нём."""
@@ -1114,6 +1139,10 @@ void MessengerDirector::CanaryUseMutateClientState(const network::ClientId clien
              "    const std::shared_lock lock(_clientsMutex);\n"
              "    const auto currentIter = _clients.find(clientId);",
              "    const auto currentIter = _clients.find(clientId);", 1)),
+        # ★ТРЕТИЙ СПОСОБ ОТКАТА: блок перечитывания цел и под замком, но
+        # ПЕРЕЕХАЛ ВЫШЕ выхода в `DataDirector` — и снова судит доcallout-состояние.
+        (1, "пост-callout перечитывание переехало ВЫШЕ выхода в чужой код",
+         _move_reread_above_callout),
     )
 
     import tempfile
