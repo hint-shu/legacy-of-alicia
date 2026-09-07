@@ -190,10 +190,20 @@ void MessengerDirector::Terminate()
   _chatterServer.EndHost();
 }
 
-MessengerDirector::ClientContext& MessengerDirector::GetClientContext(
+// LOA-fix (R82, round82, director-clients-lock-hardening): КОНТРАКТ R64-3 В
+// МЕССЕНДЖЕРЕ. Разбор — во врезке `MessengerDirector.hpp` над `_clientsMutex`;
+// коротко: наружу уходит КОПИЯ, внутрь залоченного блока — ссылка через
+// `*Locked`, запись значения — только через `MutateClientContext`.
+
+MessengerDirector::ClientContext& MessengerDirector::GetClientContextLocked(
   const network::ClientId clientId,
   const bool requireAuthentication)
 {
+  // ★ВНУТРЕННИЙ ПУТЬ: замок ОБЯЗАН быть уже взят вызывающим. Существует ровно
+  // затем, чтобы вход (`HandleChatterLogin`), у которого в теле стоят СВОИ
+  // прямые замки с R78, не брал `shared_mutex` повторно: он НЕ рекурсивный, и
+  // такой самозахват — не падение на ревью, а тихий отказ в проде (glibc
+  // возвращает EDEADLK, страж глотает бросок, запись остаётся зомби).
   auto clientContextIter = _clients.find(clientId);
   if (clientContextIter == _clients.end())
     throw std::runtime_error("Messenger client is not available");
@@ -203,6 +213,37 @@ MessengerDirector::ClientContext& MessengerDirector::GetClientContext(
     throw std::runtime_error("Messenger client is not authenticated");
 
   return clientContext;
+}
+
+MessengerDirector::ClientContext MessengerDirector::GetClientContext(
+  const network::ClientId clientId,
+  const bool requireAuthentication)
+{
+  // ★КОПИЯ, А НЕ ССЫЛКА. Замок снимается на выходе, поэтому наружу нельзя
+  // отдавать ничего, что указывает внутрь карты: вызывающие держат результат
+  // через `GetCharacter`/`GetDataDirector`/`QueueCommand`, а чужой поток фазы 1
+  // гашения в это время правит те же поля.
+  const std::shared_lock lock(_clientsMutex);
+  return GetClientContextLocked(clientId, requireAuthentication);
+}
+
+bool MessengerDirector::MutateClientContext(
+  const network::ClientId clientId,
+  const std::function<void(ClientContext&)>& mutation)
+{
+  const std::unique_lock lock(_clientsMutex);
+
+  const auto clientContextIter = _clients.find(clientId);
+  if (clientContextIter == _clients.end())
+    return false;
+
+  // ★В ЛЯМБДЕ ДОПУСТИМЫ ТОЛЬКО ПРИСВАИВАНИЯ ПОЛЕЙ. Любой вызов наружу отсюда
+  // уводит исключительный замок в чужой код; в мессенджере ближайший такой
+  // выход — `BroadcastPresenceOfCharacter`, а он сам берёт `_clientsMutex`
+  // (через `GetClientByCharacterUid`-подобный снимок) и дал бы самозахват.
+  // Это стережёт `tools/check_messenger_disconnect_outside_lock.py`.
+  mutation(clientContextIter->second);
+  return true;
 }
 
 std::optional<MessengerDirector::Client> MessengerDirector::GetClientByCharacterUid(
@@ -918,7 +959,14 @@ void MessengerDirector::HandleChatterLogin(
     command.characterUid,
     command.guildUid);
 
-  auto& clientContext = GetClientContext(clientId, false);
+  // LOA-fix (R82, round82, director-clients-lock-hardening): ССЫЛКИ НА ВСЁ ТЕЛО
+  // ВХОДА БОЛЬШЕ НЕТ. Здесь стояло `auto& clientContext = GetClientContext(...)`,
+  // и эта ссылка жила через весь тяжёлый вход — чтение почты, групп, друзей,
+  // выходы в `DataDirector` — пока чужой поток фазы 1 гашения вправе править те
+  // же поля. Теперь каждый из ЧЕТЫРЁХ участков берёт то, что ему нужно, у себя:
+  // гард повтора и обе точки записи работают с ЖИВОЙ картой под своими прямыми
+  // замками (`GetClientContextLocked`), а сборка ответа читает уже снятые
+  // локальные величины (`boundCharacterUid`), как её научил R78-fix7.
 
   // LOA-fix (R78-fix5, round78, backlog #255, находка ревю W3): ПОВТОРНЫЙ ВХОД
   // НА ТОМ ЖЕ СОЕДИНЕНИИ НЕ ПЕРЕИГРЫВАЕТ ТЕЛО.
@@ -944,9 +992,14 @@ void MessengerDirector::HandleChatterLogin(
   // руками — та же гонка, что и писать. Снимаем ОБА под одним разделяемым
   // замком: решение принимается по согласованной паре, а не по двум значениям
   // из разных мгновений.
+  // ★ЧИТАЕМ ЖИВУЮ КАРТУ, А НЕ КОПИЮ (R82). Гард обязан судить о состоянии НА
+  // МОМЕНТ СВОЕГО ЗАМКА: по копии, снятой выше по телу, он сторожил бы
+  // неизменяемый снимок и перестал бы быть гардом. Отсюда `*Locked`-путь —
+  // замок уже взят этой же строкой выше.
   bool alreadyLoggedInAsSameCharacter = false;
   {
     const std::shared_lock lock(_clientsMutex);
+    const auto& clientContext = GetClientContextLocked(clientId, false);
     alreadyLoggedInAsSameCharacter =
       clientContext.isAuthenticated
       && clientContext.characterUid == command.characterUid;
@@ -1005,8 +1058,16 @@ void MessengerDirector::HandleChatterLogin(
   // ходят под `shared_lock`, а вход писал те же записи голыми руками. Это
   // гонка данных, то есть UB, и живёт она на строке, которую раунд сам и
   // переписывает. Решение — сперва РЕШИТЬ, потом записать под замком.
+  //
+  // ★ЗАПИСЬ ИДЁТ В КАРТУ, А НЕ В КОПИЮ (R82). Прямой `unique_lock` в теле
+  // ОСТАЁТСЯ: он несущий и для гейта (`MUST_LOCK_EXCLUSIVELY` требует
+  // исключительный замок именно ЗДЕСЬ), и для смысла — решение `authorized`
+  // принято выше, а публикация обязана быть атомарной относительно чужого
+  // читателя. Через `MutateClientContext` этот участок уводить НЕЛЬЗЯ: замок
+  // ушёл бы внутрь метода, из тела исчез бы, и гейт покраснел бы справедливо.
   {
     const std::unique_lock lock(_clientsMutex);
+    auto& clientContext = GetClientContextLocked(clientId, false);
     clientContext.isAuthenticated = authorized;
   }
 
@@ -1092,6 +1153,10 @@ void MessengerDirector::HandleChatterLogin(
   bool keyLostDuringLogin = false;
   {
     const std::unique_lock lock(_clientsMutex);
+    // ★ЖИВАЯ КАРТА ПОД ТЕМ ЖЕ ЗАМКОМ (R82). Атомарность «перепроверка ключа +
+    // публикация личности» сохраняется дословно: ссылка берётся ВНУТРИ блока и
+    // не переживает его.
+    auto& clientContext = GetClientContextLocked(clientId, false);
 
     // LOA-fix (R78-fix8, round78, backlog #255, NIT ревю #3 №2): ПЕРЕПРОВЕРКА
     // КЛЮЧА В ТОЧКЕ ПРИВЯЗКИ.
@@ -1145,9 +1210,12 @@ void MessengerDirector::HandleChatterLogin(
       .errorCode = protocol::ChatterErrorCode::LoginFailed};
     _chatterServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
 
-    // ★С ЭТОЙ СТРОКИ `clientContext` — ВИСЯЧАЯ ССЫЛКА: разрыв синхронно уводит
-    // в уборку, а та стирает запись из `_clients`. Ниже к ней не обращаемся —
-    // как и ветка `not authorized`, которая устроена так же.
+    // ★РАЗРЫВ СИНХРОННО УВОДИТ В УБОРКУ, а та стирает запись из `_clients` и
+    // берёт тот же замок. Раньше здесь висела ссылка `clientContext`, взятая на
+    // всё тело входа, и эта строка предупреждала, что ниже к ней обращаться
+    // нельзя. С R82 ссылки нет вовсе: она живёт только внутри своего
+    // залоченного блока выше, поэтому опасность снята формой кода, а не
+    // договорённостью. Разрыв по-прежнему стоит ВНЕ замка — иначе самозахват.
     _chatterServer.DisconnectClient(clientId);
     return;
   }
@@ -1303,7 +1371,7 @@ void MessengerDirector::HandleChatterBuddyAdd(
   const network::ClientId clientId,
   const protocol::ChatCmdBuddyAdd& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Get target character uid by name, if any
   const data::Uid targetCharacterUid = 
@@ -1363,7 +1431,15 @@ void MessengerDirector::HandleChatterBuddyAdd(
 
   // Check if character is online, if so send request live, 
   // else queue it up for when character next comes online.
-  const auto clientsSnapshot = _clients;
+  // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ВСЕЙ КАРТЫ —
+  // ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ. Форма — та же, что у `GetClientByCharacterUid`
+  // (эталон стоит в этом же файле): замок держится РОВНО НА КОПИРОВАНИИ, дальше
+  // перебор идёт по снимку, и ни одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   auto targetClient = std::ranges::find_if(
     clientsSnapshot,
     [targetCharacterUid](const auto& client)
@@ -1391,7 +1467,7 @@ void MessengerDirector::HandleChatterBuddyAddReply(
     command.requestingCharacterUid,
     command.requestAccepted);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   
   // Get requesting character's record
   const auto& requestingCharacterRecord = _serverInstance.GetDataDirector().GetCharacter(
@@ -1464,7 +1540,13 @@ void MessengerDirector::HandleChatterBuddyAddReply(
 
     // Check if requesting character is online, if so send response live,
     // else simply add responding character to friends list
-    const auto clientsSnapshot = _clients;
+    // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ПОД
+    // РАЗДЕЛЯЕМЫМ ЗАМКОМ (форма `GetClientByCharacterUid`), перебор — по снимку.
+    const auto clientsSnapshot = [this]
+    {
+      const std::shared_lock lock(_clientsMutex);
+      return _clients;
+    }();
     const auto requestingClient = std::ranges::find_if(
       clientsSnapshot,
       [requestingCharacterUid = command.requestingCharacterUid](const auto& client)
@@ -1544,7 +1626,7 @@ void MessengerDirector::HandleChatterBuddyDelete(
   network::ClientId clientId,
   const protocol::ChatCmdBuddyDelete& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Check if character by that uid even exist
   const auto& targetCharacterRecord = _serverInstance.GetDataDirector().GetCharacter(
@@ -1589,7 +1671,15 @@ void MessengerDirector::HandleChatterBuddyDelete(
   _chatterServer.QueueCommand<decltype(response)>(clientId, [response](){ return response; });
 
   // Send delete confirmation to target character if they are online
-  const auto clientsSnapshot = _clients;
+  // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ВСЕЙ КАРТЫ —
+  // ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ. Форма — та же, что у `GetClientByCharacterUid`
+  // (эталон стоит в этом же файле): замок держится РОВНО НА КОПИРОВАНИИ, дальше
+  // перебор идёт по снимку, и ни одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   auto targetClient = std::ranges::find_if(
     clientsSnapshot,
     [targetCharacterUid = command.characterUid](const auto& client)
@@ -1616,7 +1706,7 @@ void MessengerDirector::HandleChatterBuddyMove(
     command.characterUid,
     command.groupUid);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // 1. Check if group exists
   // 2. Check if already in that group
@@ -1693,7 +1783,7 @@ void MessengerDirector::HandleChatterGroupAdd(
 {
   server::util::QuietLogDebug("[{}] ChatCmdGroupAdd: {}", clientId, command.groupName);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // TODO: implement the creation and storing of new group in character
   data::Uid groupUid{data::InvalidUid};
@@ -1788,7 +1878,7 @@ void MessengerDirector::HandleChatterGroupRename(
   network::ClientId clientId,
   const protocol::ChatCmdGroupRename& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   std::optional<protocol::ChatterErrorCode> errorCode{};
   _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Mutable(
@@ -1838,7 +1928,7 @@ void MessengerDirector::HandleChatterGroupDelete(
   network::ClientId clientId,
   const protocol::ChatCmdGroupDelete& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Check if group by that uid exists
   std::optional<protocol::ChatterErrorCode> errorCode{};
@@ -1943,7 +2033,7 @@ void MessengerDirector::HandleChatterLetterList(
     return;
   }
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   protocol::ChatCmdLetterListAckOk response{
     .mailboxFolder = command.mailboxFolder
@@ -2150,7 +2240,7 @@ void MessengerDirector::HandleChatterLetterSend(
 
   // TODO: bad word checks and/or deny sending the letter as a result?
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   std::string senderName{};
   data::Uid senderUid{data::InvalidUid};
@@ -2275,14 +2365,23 @@ void MessengerDirector::HandleChatterLetterSend(
   _chatterServer.QueueCommand<decltype(response)>(clientId, [response](){ return response; });
 
   // Check if recipient is online for live mail delivery
+  // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ВСЕЙ КАРТЫ —
+  // ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ. Форма — та же, что у `GetClientByCharacterUid`
+  // (эталон стоит в этом же файле): замок держится РОВНО НА КОПИРОВАНИИ, дальше
+  // перебор идёт по снимку, и ни одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
   auto client = std::ranges::find_if(
-    _clients,
+    clientsSnapshot,
     [&recipientCharacterUid](const std::pair<network::ClientId, ClientContext>& client)
     {
       return client.second.characterUid == recipientCharacterUid;
     });
 
-  if (client == _clients.cend())
+  if (client == clientsSnapshot.cend())
     // Character is not online, all good and handled
     return;
 
@@ -2308,7 +2407,7 @@ void MessengerDirector::HandleChatterLetterRead(
     command.unk0,
     command.mailUid);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Confirm if the mail even exists
   const auto& mailRecord = _serverInstance.GetDataDirector().GetMail(command.mailUid);
@@ -2383,7 +2482,7 @@ void MessengerDirector::HandleChatterLetterDelete(
       isRequestInbox ? "Inbox" : "Unknown",
     command.mailUid);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
   
   Record<data::Mail> mailRecord{};
   std::optional<protocol::ChatterErrorCode> errorCode{};
@@ -2485,7 +2584,11 @@ void MessengerDirector::HandleChatterUpdateState(
   network::ClientId clientId,
   const protocol::ChatCmdUpdateState& command)
 {
-  auto& clientContext = GetClientContext(clientId, false);
+  // LOA-fix (R82, round82, director-clients-lock-hardening): РЕШЕНИЕ — ПО КОПИИ,
+  // ЗАПИСЬ — ЧЕРЕЗ `MutateClientContext`. Прежняя ссылка внутрь карты жила
+  // здесь до самой рассылки, то есть через `GetCharacter`/`QueueCommand`, пока
+  // чужой поток фазы 1 гашения правил те же поля.
+  const auto clientContext = GetClientContext(clientId, false);
   if (not clientContext.isAuthenticated)
     return;
 
@@ -2525,7 +2628,21 @@ void MessengerDirector::HandleChatterUpdateState(
   }
 
   // Update state for client context
-  clientContext.presence = command.presence;
+  //
+  // ★ЗАПИСЬ ИДЁТ В КАРТУ, А НЕ В КОПИЮ (R82). `presence` — многополевая
+  // структура, и её читают-обратно другие пути: список друзей в ответе входа
+  // и список гильдийцев. Если запись уйдёт в локальную копию, карта останется
+  // со статусом времени входа, и пир увидит устаревший статус — ровно это
+  // ловит стенд-арка `messenger-presence`.
+  // ★ЛЯМБДА — ТОЛЬКО ПРИСВАИВАНИЕ. `BroadcastPresenceOfCharacter` стоит НИЖЕ,
+  // вне лямбды и вне замка: он сам берёт `_clientsMutex` снимком, и вызов его
+  // из-под исключительного замка был бы самозахватом (класс R59/R78).
+  MutateClientContext(
+    clientId,
+    [&command](ClientContext& mutableClientContext)
+    {
+      mutableClientContext.presence = command.presence;
+    });
 
   BroadcastPresenceOfCharacter(
     clientContext.characterUid, command.presence, clientId, nullptr);
@@ -2666,7 +2783,7 @@ void MessengerDirector::HandleChatterChatInvite(
   network::ClientId clientId,
   const protocol::ChatCmdChatInvite& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Get private chat config and check if private chat is enabled
   const auto& privateChatConfig = _serverInstance.GetPrivateChatDirector().GetConfig();
@@ -2696,8 +2813,18 @@ void MessengerDirector::HandleChatterChatInvite(
     clientId,
     concatParticipants(command.chatParticipantUids));
 
+  // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ВСЕЙ КАРТЫ —
+  // ПОД РАЗДЕЛЯЕМЫМ ЗАМКОМ. Форма — та же, что у `GetClientByCharacterUid`
+  // (эталон стоит в этом же файле): замок держится РОВНО НА КОПИРОВАНИИ, дальше
+  // перебор идёт по снимку, и ни одного выхода в чужой код под замком нет.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
+
   std::vector<network::ClientId> clientIdsToNotify{};
-  for (const auto& [targetClientId, targetClientContext] : _clients)
+  for (const auto& [targetClientId, targetClientContext] : clientsSnapshot)
   {
     // Skip unauthenticated clients
     if (not targetClientContext.isAuthenticated)
@@ -2739,7 +2866,7 @@ void MessengerDirector::HandleChatterChatInvite(
 
   for (const auto& targetClientId : clientIdsToNotify)
   {
-    const auto& targetClientContext = GetClientContext(targetClientId);
+    const auto targetClientContext = GetClientContext(targetClientId);
 
     // Initiate chat window for the invoker
     notify.unk1 = clientContext.characterUid;
@@ -2767,7 +2894,7 @@ void MessengerDirector::HandleChatterGameInvite(
   const network::ClientId clientId,
   const protocol::ChatCmdGameInvite& command)
 {
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Get client id of recipient by character uid
   const std::optional<Client> recipientClient = GetClientByCharacterUid(command.recipientCharacterUid);
@@ -2799,7 +2926,7 @@ void MessengerDirector::HandleChatterChannelInfo(
 {
   server::util::QuietLogDebug("[{}] ChatCmdChannelInfo", clientId);
 
-  const auto& clientContext = GetClientContext(clientId);
+  const auto clientContext = GetClientContext(clientId);
 
   // Get lobby config to get the chat advertisement address and port
   const auto& lobbyConfig = _serverInstance.GetLobbyDirector().GetConfig();
@@ -2862,7 +2989,10 @@ void MessengerDirector::HandleChatterGuildLogin(
     command.characterUid,
     command.guildUid);
 
-  auto& clientContext = GetClientContext(clientId);
+  // LOA-fix (R82, round82, director-clients-lock-hardening): КОПИЯ, а не ссылка
+  // внутрь карты — `otpCode`/`characterUid` читаются ниже через выходы в
+  // `DataDirector` и очередь кадров.
+  const auto clientContext = GetClientContext(clientId);
 
   // Reauthenticate against the already-used otp code that the client
   // gave when authenticating with the `ChatCmdLogin` command handler.
@@ -2884,7 +3014,22 @@ void MessengerDirector::HandleChatterGuildLogin(
     return;
   }
 
-  clientContext.isAuthenticated = true;
+  // LOA-fix (R82, round82, director-clients-lock-hardening): ИЗБЫТОЧНАЯ ЗАПИСЬ
+  // СНЯТА, а не переведена под замок.
+  //
+  // ★ЗДЕСЬ СТОЯЛО `clientContext.isAuthenticated = true;`, и это была запись
+  // TRUE ПОВЕРХ ГАРАНТИРОВАННОГО TRUE: `GetClientContext(clientId)` выше зовётся
+  // с `requireAuthentication = true` (значение по умолчанию), а его тело бросает
+  // `"Messenger client is not authenticated"`, если флаг снят. Значит до этой
+  // строки управление доходит ТОЛЬКО при уже поднятом флаге. Потеря записи
+  // ненаблюдаема ни на одном пути — поэтому раунд её удаляет, а не «прикрывает»
+  // замком и зелёной аркой, которая не умеет покраснеть.
+  //
+  // ★А ВОТ ЧИТАТЕЛЬ НИЖЕ — НЕ ИЗБЫТОЧНЫЙ, И ЕГО РАУНД НЕ СНИМАЕТ. Проверка
+  // «аутентифицирован ли ещё» стоит ПОСЛЕ выхода в `DataDirector` и сторожит
+  // окно, в котором чужой поток вправе снять флаг. По замороженной копии момента
+  // входа она была бы мертва, поэтому снимок для неё берётся заново, под своим
+  // коротким замком (см. врезку ниже). Поведение не меняется.
 
   // Check if client belongs to the guild in the command
   data::Uid characterGuildUid{data::InvalidUid};
@@ -2894,8 +3039,51 @@ void MessengerDirector::HandleChatterGuildLogin(
       characterGuildUid = character.guildUid();
     });
 
+  // LOA-fix (R82-2, round82, director-clients-lock-hardening, находка ревю
+  // WARN-1): ПОСЛЕ ВЫХОДА В ЧУЖОЙ КОД КАРТА ПЕРЕЧИТЫВАЕТСЯ ЗАНОВО.
+  //
+  // ★ЗАЧЕМ. До перехода на контракт-копию две проверки ниже читали ЖИВУЮ запись
+  // карты (`GetClientContext` отдавал ссылку внутрь `_clients`) и потому судили
+  // состояние, каким оно стало ПОСЛЕ выхода в `DataDirector` строкой выше.
+  // Именно в это окно чужой поток вправе снять аутентификацию: выход игрока или
+  // GM-бан ведёт с потока лобби в `CloseSessionsOfCharacter` →
+  // `UnbindAllSessionsOfCharacter`, а тот под исключительным замком ставит
+  // `isAuthenticated = false` и `characterUid = InvalidUid`
+  // (`MessengerSessionEviction.hpp`). Оставь мы здесь замороженную копию момента
+  // входа — обе ветки стали бы МЁРТВЫМИ, и сессия, погашенная в это окно,
+  // получила бы `AckOK` вместо `Cancel`. Раунд чисто синхронизационный, менять
+  // этот исход он не вправе, поэтому снимок берётся ЗАНОВО, а не наследуется.
+  //
+  // ★ЗАМОК ДЕРЖИТСЯ РОВНО НА ДВУХ СКАЛЯРАХ, И ЭТО НЕ КОСМЕТИКА. Ни одного
+  // выхода в чужой код под ним нет: и ответ (`Cancel`/`AckOK`), и `QueueCommand`,
+  // и `GetGuild`, и хвостовой `HandleChatterUpdateState` строятся уже ПОСЛЕ его
+  // снятия. Затащить сюда любой из них — это ровно класс R59/R78: `_clientsMutex`
+  // нерекурсивный, а `HandleChatterUpdateState`/`BroadcastPresenceOfCharacter`
+  // берут его снова.
+  //
+  // ★ПОЧЕМУ НЕ `GetClientContext(clientId)`. С `requireAuthentication = true` он
+  // БРОСАЕТ на снятом флаге — то есть ровно на том случае, который обязан
+  // ответить `Cancel` с `GuildLoginClientNotAuthenticated`, а не улететь
+  // исключением из обработчика кадра.
+  //
+  // ★ЗАПИСИ НЕТ В КАРТЕ — ЭТО ТОЖЕ «НЕ АУТЕНТИФИЦИРОВАН». Стирание идёт с ЭТОГО
+  // же потока чата (`HandleClientDisconnected`), поэтому посреди обработчика
+  // недостижимо; ветка оставлена потому, что копия обязана уметь ответить на
+  // вопрос, на который ссылка отвечала бы разыменованием мусора.
+  bool currentIsAuthenticated{false};
+  data::Uid currentCharacterUid{data::InvalidUid};
+  {
+    const std::shared_lock lock(_clientsMutex);
+    const auto currentIter = _clients.find(clientId);
+    if (currentIter != _clients.end())
+    {
+      currentIsAuthenticated = currentIter->second.isAuthenticated;
+      currentCharacterUid = currentIter->second.characterUid;
+    }
+  }
+
   std::optional<protocol::ChatterErrorCode> errorCode{};
-  if (not clientContext.isAuthenticated)
+  if (not currentIsAuthenticated)
   {
     // Client is not authenticated with chatter server
     server::util::QuietLogWarn("Client {} tried to login to guild {} but is not authenticated with the chatter server.",
@@ -2903,12 +3091,12 @@ void MessengerDirector::HandleChatterGuildLogin(
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginClientNotAuthenticated);
   }
-  else if (command.characterUid != clientContext.characterUid)
+  else if (command.characterUid != currentCharacterUid)
   {
     // Command `characterUid` does match the client context `characterUid 
     server::util::QuietLogWarn("Client {} tried to login, who is character {}, to guild {} on behalf of another character {}",
       clientId,
-      clientContext.characterUid,
+      currentCharacterUid,
       command.guildUid,
       command.characterUid);
     errorCode.emplace(protocol::ChatterErrorCode::CommandCharacterIsNotClientCharacter);
@@ -2917,7 +3105,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   {
     // Character does not belong to the guild in the guild login
     server::util::QuietLogWarn("Character {} tried to login to guild {} but character is not a guild member.",
-      clientContext.characterUid,
+      currentCharacterUid,
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginCharacterNotGuildMember);
   }
@@ -2933,8 +3121,28 @@ void MessengerDirector::HandleChatterGuildLogin(
   }
 
   protocol::ChatCmdGuildLoginAckOK response{};
+
+  // LOA-fix (R82, round82, director-clients-lock-hardening): СНИМОК ПОД ЗАМКОМ,
+  // И ВЗЯТ ОН ДО ВХОДА В ЧУЖУЮ ЗАПИСЬ.
+  //
+  // ★ПОЧЕМУ СНАРУЖИ ЛЯМБДЫ, А НЕ ВНУТРИ. Незалоченная копия стояла ВНУТРИ
+  // `GetGuild(...).Immutable(...)`, то есть под разделяемым замком записи
+  // гильдии, и повторялась НА КАЖДОГО гильдийца. Взять там наш `_clientsMutex`
+  // значило бы завести порядок «замок записи гильдии → замок карты клиентов»,
+  // которого в мессенджере больше нигде нет (проверено: под `_clientsMutex` не
+  // стоит ни одного обращения к `DataDirector`), — то есть завести половину
+  // будущей инверсии ради одной строки. Снимок берётся один раз ДО входа в
+  // чужую запись и передаётся в лямбду ссылкой: и замки не вкладываются, и
+  // список гильдийцев считается по ОДНОМУ согласованному мгновению карты, а не
+  // по стольким, сколько в гильдии участников.
+  const auto clientsSnapshot = [this]
+  {
+    const std::shared_lock lock(_clientsMutex);
+    return _clients;
+  }();
+
   _serverInstance.GetDataDirector().GetGuild(command.guildUid).Immutable(
-    [this, &response](const data::Guild& guild)
+    [&response, &clientsSnapshot](const data::Guild& guild)
     {
       for (const data::Uid& guildMemberUid : guild.members())
       {
@@ -2944,8 +3152,7 @@ void MessengerDirector::HandleChatterGuildLogin(
             .characterUid = guildMemberUid});
 
         // Find if the guild member is connected to the messenger server
-        const auto clientsSnapshot = _clients;
-        for (auto& onlineClientContext : clientsSnapshot | std::views::values)
+        for (const auto& onlineClientContext : clientsSnapshot | std::views::values)
         {
           // If guild member is connected, set status to the one set by the character
           if (onlineClientContext.characterUid == guildMemberUid)
