@@ -3021,11 +3021,15 @@ void MessengerDirector::HandleChatterGuildLogin(
   // TRUE ПОВЕРХ ГАРАНТИРОВАННОГО TRUE: `GetClientContext(clientId)` выше зовётся
   // с `requireAuthentication = true` (значение по умолчанию), а его тело бросает
   // `"Messenger client is not authenticated"`, если флаг снят. Значит до этой
-  // строки управление доходит ТОЛЬКО при уже поднятом флаге; читатель ниже
-  // (`if (not clientContext.isAuthenticated)`) по той же причине всегда читает
-  // true. Потеря записи ненаблюдаема ни на одном пути — поэтому раунд её
-  // удаляет, а не «прикрывает» замком и зелёной аркой, которая не умеет
-  // покраснеть. Поведение не меняется.
+  // строки управление доходит ТОЛЬКО при уже поднятом флаге. Потеря записи
+  // ненаблюдаема ни на одном пути — поэтому раунд её удаляет, а не «прикрывает»
+  // замком и зелёной аркой, которая не умеет покраснеть.
+  //
+  // ★А ВОТ ЧИТАТЕЛЬ НИЖЕ — НЕ ИЗБЫТОЧНЫЙ, И ЕГО РАУНД НЕ СНИМАЕТ. Проверка
+  // «аутентифицирован ли ещё» стоит ПОСЛЕ выхода в `DataDirector` и сторожит
+  // окно, в котором чужой поток вправе снять флаг. По замороженной копии момента
+  // входа она была бы мертва, поэтому снимок для неё берётся заново, под своим
+  // коротким замком (см. врезку ниже). Поведение не меняется.
 
   // Check if client belongs to the guild in the command
   data::Uid characterGuildUid{data::InvalidUid};
@@ -3035,8 +3039,51 @@ void MessengerDirector::HandleChatterGuildLogin(
       characterGuildUid = character.guildUid();
     });
 
+  // LOA-fix (R82-2, round82, director-clients-lock-hardening, находка ревю
+  // WARN-1): ПОСЛЕ ВЫХОДА В ЧУЖОЙ КОД КАРТА ПЕРЕЧИТЫВАЕТСЯ ЗАНОВО.
+  //
+  // ★ЗАЧЕМ. До перехода на контракт-копию две проверки ниже читали ЖИВУЮ запись
+  // карты (`GetClientContext` отдавал ссылку внутрь `_clients`) и потому судили
+  // состояние, каким оно стало ПОСЛЕ выхода в `DataDirector` строкой выше.
+  // Именно в это окно чужой поток вправе снять аутентификацию: выход игрока или
+  // GM-бан ведёт с потока лобби в `CloseSessionsOfCharacter` →
+  // `UnbindAllSessionsOfCharacter`, а тот под исключительным замком ставит
+  // `isAuthenticated = false` и `characterUid = InvalidUid`
+  // (`MessengerSessionEviction.hpp`). Оставь мы здесь замороженную копию момента
+  // входа — обе ветки стали бы МЁРТВЫМИ, и сессия, погашенная в это окно,
+  // получила бы `AckOK` вместо `Cancel`. Раунд чисто синхронизационный, менять
+  // этот исход он не вправе, поэтому снимок берётся ЗАНОВО, а не наследуется.
+  //
+  // ★ЗАМОК ДЕРЖИТСЯ РОВНО НА ДВУХ СКАЛЯРАХ, И ЭТО НЕ КОСМЕТИКА. Ни одного
+  // выхода в чужой код под ним нет: и ответ (`Cancel`/`AckOK`), и `QueueCommand`,
+  // и `GetGuild`, и хвостовой `HandleChatterUpdateState` строятся уже ПОСЛЕ его
+  // снятия. Затащить сюда любой из них — это ровно класс R59/R78: `_clientsMutex`
+  // нерекурсивный, а `HandleChatterUpdateState`/`BroadcastPresenceOfCharacter`
+  // берут его снова.
+  //
+  // ★ПОЧЕМУ НЕ `GetClientContext(clientId)`. С `requireAuthentication = true` он
+  // БРОСАЕТ на снятом флаге — то есть ровно на том случае, который обязан
+  // ответить `Cancel` с `GuildLoginClientNotAuthenticated`, а не улететь
+  // исключением из обработчика кадра.
+  //
+  // ★ЗАПИСИ НЕТ В КАРТЕ — ЭТО ТОЖЕ «НЕ АУТЕНТИФИЦИРОВАН». Стирание идёт с ЭТОГО
+  // же потока чата (`HandleClientDisconnected`), поэтому посреди обработчика
+  // недостижимо; ветка оставлена потому, что копия обязана уметь ответить на
+  // вопрос, на который ссылка отвечала бы разыменованием мусора.
+  bool currentIsAuthenticated{false};
+  data::Uid currentCharacterUid{data::InvalidUid};
+  {
+    const std::shared_lock lock(_clientsMutex);
+    const auto currentIter = _clients.find(clientId);
+    if (currentIter != _clients.end())
+    {
+      currentIsAuthenticated = currentIter->second.isAuthenticated;
+      currentCharacterUid = currentIter->second.characterUid;
+    }
+  }
+
   std::optional<protocol::ChatterErrorCode> errorCode{};
-  if (not clientContext.isAuthenticated)
+  if (not currentIsAuthenticated)
   {
     // Client is not authenticated with chatter server
     server::util::QuietLogWarn("Client {} tried to login to guild {} but is not authenticated with the chatter server.",
@@ -3044,12 +3091,12 @@ void MessengerDirector::HandleChatterGuildLogin(
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginClientNotAuthenticated);
   }
-  else if (command.characterUid != clientContext.characterUid)
+  else if (command.characterUid != currentCharacterUid)
   {
     // Command `characterUid` does match the client context `characterUid 
     server::util::QuietLogWarn("Client {} tried to login, who is character {}, to guild {} on behalf of another character {}",
       clientId,
-      clientContext.characterUid,
+      currentCharacterUid,
       command.guildUid,
       command.characterUid);
     errorCode.emplace(protocol::ChatterErrorCode::CommandCharacterIsNotClientCharacter);
@@ -3058,7 +3105,7 @@ void MessengerDirector::HandleChatterGuildLogin(
   {
     // Character does not belong to the guild in the guild login
     server::util::QuietLogWarn("Character {} tried to login to guild {} but character is not a guild member.",
-      clientContext.characterUid,
+      currentCharacterUid,
       command.guildUid);
     errorCode.emplace(protocol::ChatterErrorCode::GuildLoginCharacterNotGuildMember);
   }
